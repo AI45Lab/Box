@@ -89,6 +89,10 @@ pub struct PoolScaler {
     current_min_idle: usize,
     /// Effective upper bound for min_idle.
     max_min_idle: usize,
+    /// External pressure signal from Gateway (0.0 = idle, 1.0 = saturated).
+    gateway_pressure: f64,
+    /// Timestamp of last gateway pressure update.
+    gateway_pressure_at: Option<Instant>,
 }
 
 impl PoolScaler {
@@ -106,6 +110,8 @@ impl PoolScaler {
             last_scale_at: None,
             current_min_idle: initial_min_idle,
             max_min_idle,
+            gateway_pressure: 0.0,
+            gateway_pressure_at: None,
         }
     }
 
@@ -117,6 +123,48 @@ impl PoolScaler {
     /// Get the current dynamic min_idle value.
     pub fn current_min_idle(&self) -> usize {
         self.current_min_idle
+    }
+
+    /// Update the external Gateway pressure signal.
+    ///
+    /// Pressure is a value from 0.0 (idle) to 1.0 (saturated), derived from
+    /// Gateway metrics like request rate, queue depth, or latency percentiles.
+    ///
+    /// When Gateway pressure is high, the scaler biases toward scaling up
+    /// even if the local miss rate is moderate.
+    pub fn update_gateway_pressure(&mut self, pressure: f64) {
+        self.gateway_pressure = pressure.clamp(0.0, 1.0);
+        self.gateway_pressure_at = Some(Instant::now());
+    }
+
+    /// Get the current Gateway pressure value.
+    pub fn gateway_pressure(&self) -> f64 {
+        self.gateway_pressure
+    }
+
+    /// Check if the Gateway pressure signal is fresh (within 2x window).
+    fn is_gateway_pressure_fresh(&self) -> bool {
+        match self.gateway_pressure_at {
+            Some(at) => at.elapsed().as_secs() < self.policy.window_secs * 2,
+            None => false,
+        }
+    }
+
+    /// Compute the effective miss rate, blending local miss rate with Gateway pressure.
+    ///
+    /// If Gateway pressure is available and fresh, the effective rate is:
+    ///   `effective = local_miss_rate * 0.6 + gateway_pressure * 0.4`
+    ///
+    /// This allows the scaler to pre-warm VMs when Gateway sees rising traffic
+    /// even before local misses occur.
+    fn effective_miss_rate(&mut self) -> Option<f64> {
+        let local = self.window.miss_rate()?;
+
+        if self.is_gateway_pressure_fresh() && self.gateway_pressure > 0.0 {
+            Some(local * 0.6 + self.gateway_pressure * 0.4)
+        } else {
+            Some(local)
+        }
     }
 
     /// Evaluate pressure and return a scaling decision.
@@ -135,7 +183,7 @@ impl PoolScaler {
             return ScaleDecision::Hold;
         }
 
-        let miss_rate = match self.window.miss_rate() {
+        let miss_rate = match self.effective_miss_rate() {
             Some(rate) => rate,
             None => return ScaleDecision::Hold,
         };
@@ -464,5 +512,129 @@ mod tests {
         assert!((policy.scale_up_threshold - 0.3).abs() < 0.001);
         assert_eq!(policy.cooldown_secs, 60);
         assert_eq!(policy.window_secs, 120);
+    }
+
+    // --- Gateway Pressure tests ---
+
+    #[test]
+    fn test_gateway_pressure_default_zero() {
+        let scaler = PoolScaler::new(default_policy(), 2, 10);
+        assert_eq!(scaler.gateway_pressure(), 0.0);
+    }
+
+    #[test]
+    fn test_update_gateway_pressure() {
+        let mut scaler = PoolScaler::new(default_policy(), 2, 10);
+        scaler.update_gateway_pressure(0.75);
+        assert!((scaler.gateway_pressure() - 0.75).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_gateway_pressure_clamped() {
+        let mut scaler = PoolScaler::new(default_policy(), 2, 10);
+        scaler.update_gateway_pressure(1.5);
+        assert!((scaler.gateway_pressure() - 1.0).abs() < 0.001);
+
+        scaler.update_gateway_pressure(-0.5);
+        assert!((scaler.gateway_pressure() - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_gateway_pressure_boosts_scale_up() {
+        let mut policy = default_policy();
+        policy.cooldown_secs = 0;
+        policy.scale_up_threshold = 0.3;
+        let mut scaler = PoolScaler::new(policy, 2, 10);
+
+        // Local: 1 miss, 9 hits → 10% miss rate (below 30% threshold)
+        scaler.record_acquire(false);
+        for _ in 0..9 {
+            scaler.record_acquire(true);
+        }
+
+        // Without gateway pressure: should hold
+        assert_eq!(scaler.evaluate(), ScaleDecision::Hold);
+
+        // With high gateway pressure: effective = 0.1 * 0.6 + 0.8 * 0.4 = 0.38 > 0.3
+        scaler.update_gateway_pressure(0.8);
+        assert_eq!(scaler.evaluate(), ScaleDecision::ScaleUp(1));
+    }
+
+    #[test]
+    fn test_gateway_pressure_zero_no_effect() {
+        let mut policy = default_policy();
+        policy.cooldown_secs = 0;
+        let mut scaler = PoolScaler::new(policy, 3, 10);
+
+        // All hits, gateway pressure = 0
+        for _ in 0..10 {
+            scaler.record_acquire(true);
+        }
+        scaler.update_gateway_pressure(0.0);
+
+        // effective = 0.0 * 0.6 + 0.0 * 0.4 = 0.0 → scale down
+        assert_eq!(scaler.evaluate(), ScaleDecision::ScaleDown(1));
+    }
+
+    #[test]
+    fn test_gateway_pressure_stale_ignored() {
+        let mut policy = default_policy();
+        policy.cooldown_secs = 0;
+        policy.window_secs = 1; // 1 second window → stale after 2 seconds
+        let mut scaler = PoolScaler::new(policy, 2, 10);
+
+        // Set pressure but backdate it
+        scaler.gateway_pressure = 0.9;
+        scaler.gateway_pressure_at = Some(Instant::now() - std::time::Duration::from_secs(10));
+
+        // Local: 1 miss, 9 hits → 10% miss rate
+        scaler.record_acquire(false);
+        for _ in 0..9 {
+            scaler.record_acquire(true);
+        }
+
+        // Stale gateway pressure should be ignored → use local only → hold
+        assert_eq!(scaler.evaluate(), ScaleDecision::Hold);
+    }
+
+    #[test]
+    fn test_effective_miss_rate_blending() {
+        let mut policy = default_policy();
+        policy.cooldown_secs = 0;
+        let mut scaler = PoolScaler::new(policy, 2, 10);
+
+        // 5 misses, 5 hits → 50% local miss rate
+        for _ in 0..5 {
+            scaler.record_acquire(false);
+        }
+        for _ in 0..5 {
+            scaler.record_acquire(true);
+        }
+
+        // No gateway pressure → effective = local = 0.5
+        let rate = scaler.effective_miss_rate().unwrap();
+        assert!((rate - 0.5).abs() < 0.001);
+
+        // With gateway pressure 0.2 → effective = 0.5 * 0.6 + 0.2 * 0.4 = 0.38
+        scaler.update_gateway_pressure(0.2);
+        let rate = scaler.effective_miss_rate().unwrap();
+        assert!((rate - 0.38).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_gateway_pressure_prevents_scale_down() {
+        let mut policy = default_policy();
+        policy.cooldown_secs = 0;
+        policy.scale_down_threshold = 0.05;
+        let mut scaler = PoolScaler::new(policy, 3, 10);
+
+        // All hits locally → 0% miss rate → would normally scale down
+        for _ in 0..10 {
+            scaler.record_acquire(true);
+        }
+
+        // But gateway pressure is moderate → effective = 0.0 * 0.6 + 0.3 * 0.4 = 0.12 > 0.05
+        scaler.update_gateway_pressure(0.3);
+        assert_eq!(scaler.evaluate(), ScaleDecision::Hold);
     }
 }

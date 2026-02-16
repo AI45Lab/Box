@@ -28,9 +28,9 @@
 - [x] Instance health reporting (`ServiceHealth` aggregation: avg CPU, total memory, inflight requests, unhealthy count)
 - [x] Graceful scale-down (`start_drain()` → `is_drain_complete()` → `complete_drain()`, Draining state in lifecycle)
 - [x] Instance self-registration (`InstanceRegistry` with heartbeat, stale eviction, per-host/per-service queries)
+- [x] Warm pool auto-scaling with Gateway pressure signals (blended effective miss rate, pre-warm on rising traffic)
 
 ## Next
 
 - [ ] Real hardware testing on AMD SEV-SNP (Azure DCasv5 / bare-metal EPYC)
 - [ ] Kubernetes Operator (BoxAutoscaler CRD)
-- [ ] Warm pool auto-scaling (Gateway pressure signals → dynamic min_idle)
