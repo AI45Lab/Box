@@ -6,6 +6,7 @@
 #![allow(clippy::result_large_err)]
 
 pub mod cache;
+pub mod compose;
 pub mod fs;
 pub mod grpc;
 pub mod host_check;
@@ -23,6 +24,7 @@ pub mod vmm;
 pub mod volume;
 
 // Re-export common types
+pub use compose::{ComposeProject, ProjectState};
 pub use cache::{LayerCache, RootfsCache};
 pub use grpc::{AgentClient, AttestationClient, ExecClient, PtyClient, RaTlsAttestationClient};
 pub use grpc::{SealClient, SealResult, SecretEntry, SecretInjectionResult, SecretInjector, UnsealResult};

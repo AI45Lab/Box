@@ -4,6 +4,7 @@ mod attach;
 mod attest;
 mod build;
 mod commit;
+mod compose;
 mod container_update;
 mod cp;
 mod create;
@@ -126,6 +127,8 @@ pub enum Command {
     Events(events::EventsArgs),
     /// Update resource limits of a box
     ContainerUpdate(container_update::ContainerUpdateArgs),
+    /// Manage multi-container workloads with a compose file
+    Compose(compose::ComposeArgs),
     /// Build an image from a Dockerfile
     Build(build::BuildArgs),
     /// List cached images
@@ -263,6 +266,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Diff(args) => diff::execute(args).await,
         Command::Events(args) => events::execute(args).await,
         Command::ContainerUpdate(args) => container_update::execute(args).await,
+        Command::Compose(args) => compose::execute(args).await,
         Command::Build(args) => build::execute(args).await,
         Command::Images(args) => images::execute(args).await,
         Command::Pull(args) => pull::execute(args).await,

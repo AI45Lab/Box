@@ -16,8 +16,8 @@
 - [x] Seccomp profiles, no-new-privileges, capability dropping (default BPF filter, `SecurityConfig`, env var bridge)
 
 - [x] Image signing (cosign-compatible `SignaturePolicy`, `VerifyResult`, registry signature fetch, payload verification)
+- [x] Multi-container orchestration (compose YAML: `ComposeConfig`, `ComposeProject`, topological boot order, `a3s-box compose up/down/ps/config`)
 
 ## Next
 
-- [ ] Multi-container orchestration (compose-like YAML)
 - [ ] Buildx multi-platform builds
