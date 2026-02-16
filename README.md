@@ -54,6 +54,7 @@ A3S Box is **application-agnostic** — it doesn't know or care what runs inside
 - **Security Options** — Capabilities (`--cap-add/drop`), seccomp profiles (`--security-opt seccomp=`), no-new-privileges, read-only rootfs, privileged mode, device mapping, GPU access
 - **Image Signing** — Cosign-compatible signature verification (`SignaturePolicy`: skip, key-based, keyless), registry signature fetch, digest validation before pull
 - **Audit Logging** — Persistent JSON-lines audit trail with rotation, structured events (who/what/when/outcome), queryable via `a3s-box audit` with action/box/outcome filters
+- **Network Isolation** — Per-container network policies (`IsolationMode`: None/Strict/Custom), ingress/egress rules with port/protocol filtering, first-match-wins evaluation, policy-aware peer discovery
 - **Restart Policies** — `always`, `on-failure:N`, `unless-stopped` with exponential backoff
 - **Health Checks** — Configurable commands with interval, timeout, retries, start period
 - **Logging** — JSON logging driver with rotation, or `--log-driver none`
@@ -290,12 +291,12 @@ Simulation generates fake attestation reports with deterministic keys. Not suita
 
 ## Testing
 
-### Unit Tests — 1,284 passed
+### Unit Tests — 1,299 passed
 
 | Crate | Tests | Coverage |
 |-------|------:|----------|
 | `a3s-box-cli` | 372 | State management, name resolution, output formatting, restart policies, compose CLI, audit CLI |
-| `a3s-box-core` | 229 | Config validation, error types, event serialization, TEE protocol types, TEE self-detection, security config, compose types, platform types, audit types |
+| `a3s-box-core` | 244 | Config validation, error types, event serialization, TEE protocol types, TEE self-detection, security config, compose types, platform types, audit types, network isolation policies |
 | `a3s-box-runtime` | 585 | OCI parsing, rootfs, health checking, attestation, RA-TLS, sealed storage, heartbeat, Prometheus metrics, tracing spans, pool autoscaler, image signing, compose orchestrator, audit log |
 | `a3s-box-cri` | 34 | CRI sandbox/container lifecycle, config mapping |
 | `a3s-box-guest-init` | 53 | Exec server, attest server frame I/O, secret validation, namespace security |
@@ -411,7 +412,7 @@ A3S Box is the **infrastructure layer** of the A3S ecosystem. It provides VM iso
 
 **Production Hardening**
 - [ ] VM snapshot/restore (save running state to SSD, restore < 500ms)
-- [ ] Network isolation policies
+- [x] Network isolation policies (`NetworkPolicy`, `IsolationMode`: None/Strict/Custom, `PolicyRule` with from/to/ports/action, policy-aware peer discovery)
 - [x] Audit logging (`AuditEvent` types, `AuditLog` with rotation, `AuditQuery` filters, `a3s-box audit` CLI)
 
 **TEE Hardening**

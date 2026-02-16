@@ -62,6 +62,10 @@ pub struct NetworkConfig {
 
     /// Creation timestamp (RFC 3339).
     pub created_at: String,
+
+    /// Network isolation policy.
+    #[serde(default)]
+    pub policy: NetworkPolicy,
 }
 
 fn default_driver() -> String {
@@ -82,6 +86,120 @@ pub struct NetworkEndpoint {
 
     /// Assigned MAC address (hex string, e.g., "02:42:0a:58:00:02").
     pub mac_address: String,
+}
+
+/// Network isolation policy.
+///
+/// Controls which boxes can communicate with each other on a network.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NetworkPolicy {
+    /// Isolation mode (default: None — all boxes can communicate).
+    #[serde(default)]
+    pub isolation: IsolationMode,
+
+    /// Ingress rules (who can receive traffic from whom).
+    /// Only used when isolation is `Custom`.
+    #[serde(default)]
+    pub ingress: Vec<PolicyRule>,
+
+    /// Egress rules (who can send traffic to whom).
+    /// Only used when isolation is `Custom`.
+    #[serde(default)]
+    pub egress: Vec<PolicyRule>,
+}
+
+/// Network isolation mode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum IsolationMode {
+    /// No isolation — all boxes on the network can communicate freely (default).
+    #[default]
+    None,
+    /// Strict isolation — no box-to-box communication allowed (only gateway/external).
+    Strict,
+    /// Custom rules — use ingress/egress rules to control traffic.
+    Custom,
+}
+
+/// A network policy rule that allows traffic between specific boxes or ports.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyRule {
+    /// Source box name pattern (e.g., "web", "*" for any).
+    #[serde(default = "wildcard")]
+    pub from: String,
+
+    /// Destination box name pattern (e.g., "db", "*" for any).
+    #[serde(default = "wildcard")]
+    pub to: String,
+
+    /// Allowed ports (empty = all ports).
+    #[serde(default)]
+    pub ports: Vec<u16>,
+
+    /// Protocol: "tcp", "udp", or "any" (default).
+    #[serde(default = "default_protocol")]
+    pub protocol: String,
+
+    /// Rule action: allow or deny.
+    #[serde(default)]
+    pub action: PolicyAction,
+}
+
+/// Policy rule action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyAction {
+    /// Allow the traffic (default).
+    #[default]
+    Allow,
+    /// Deny the traffic.
+    Deny,
+}
+
+fn wildcard() -> String {
+    "*".to_string()
+}
+
+fn default_protocol() -> String {
+    "any".to_string()
+}
+
+impl NetworkPolicy {
+    /// Check if a box is allowed to communicate with a peer.
+    pub fn is_peer_allowed(&self, box_name: &str, peer_name: &str) -> bool {
+        match self.isolation {
+            IsolationMode::None => true,
+            IsolationMode::Strict => false,
+            IsolationMode::Custom => {
+                // Check egress rules (from box_name to peer_name)
+                self.evaluate_rules(&self.egress, box_name, peer_name)
+            }
+        }
+    }
+
+    /// Evaluate a set of rules. Default-deny: if no rule matches, deny.
+    fn evaluate_rules(&self, rules: &[PolicyRule], from: &str, to: &str) -> bool {
+        for rule in rules {
+            if matches_pattern(&rule.from, from) && matches_pattern(&rule.to, to) {
+                return rule.action == PolicyAction::Allow;
+            }
+        }
+        // No matching rule → deny in Custom mode
+        false
+    }
+
+    /// Get the list of allowed peers for a box, given all peer names.
+    pub fn allowed_peers<'a>(&self, box_name: &str, peers: &'a [(String, String)]) -> Vec<&'a (String, String)> {
+        peers
+            .iter()
+            .filter(|(_, peer_name)| self.is_peer_allowed(box_name, peer_name))
+            .collect()
+    }
+}
+
+/// Simple wildcard pattern matching: "*" matches anything, otherwise exact match.
+fn matches_pattern(pattern: &str, name: &str) -> bool {
+    pattern == "*" || pattern == name
 }
 
 /// Simple sequential IPAM (IP Address Management) for a subnet.
@@ -198,6 +316,7 @@ impl NetworkConfig {
             labels: HashMap::new(),
             endpoints: HashMap::new(),
             created_at: chrono::Utc::now().to_rfc3339(),
+            policy: NetworkPolicy::default(),
         })
     }
 
@@ -249,6 +368,25 @@ impl NetworkConfig {
             .values()
             .filter(|ep| ep.box_id != exclude_box_id)
             .map(|ep| (ep.ip_address.to_string(), ep.box_name.clone()))
+            .collect()
+    }
+
+    /// Get peer endpoints filtered by the network's isolation policy.
+    ///
+    /// Like `peer_endpoints`, but only returns peers that the given box
+    /// is allowed to communicate with according to the network policy.
+    pub fn allowed_peer_endpoints(&self, exclude_box_id: &str) -> Vec<(String, String)> {
+        let box_name = self
+            .endpoints
+            .get(exclude_box_id)
+            .map(|ep| ep.box_name.as_str())
+            .unwrap_or("");
+
+        let all_peers = self.peer_endpoints(exclude_box_id);
+        self.policy
+            .allowed_peers(box_name, &all_peers)
+            .into_iter()
+            .cloned()
             .collect()
     }
 }
@@ -553,5 +691,237 @@ mod tests {
         let json = serde_json::to_string(&ep).unwrap();
         let parsed: NetworkEndpoint = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, ep);
+    }
+
+    // --- NetworkPolicy tests ---
+
+    #[test]
+    fn test_network_policy_default_allows_all() {
+        let policy = NetworkPolicy::default();
+        assert_eq!(policy.isolation, IsolationMode::None);
+        assert!(policy.is_peer_allowed("web", "db"));
+        assert!(policy.is_peer_allowed("any", "any"));
+    }
+
+    #[test]
+    fn test_network_policy_strict_denies_all() {
+        let policy = NetworkPolicy {
+            isolation: IsolationMode::Strict,
+            ..Default::default()
+        };
+        assert!(!policy.is_peer_allowed("web", "db"));
+        assert!(!policy.is_peer_allowed("any", "any"));
+    }
+
+    #[test]
+    fn test_network_policy_custom_allow_rule() {
+        let policy = NetworkPolicy {
+            isolation: IsolationMode::Custom,
+            egress: vec![PolicyRule {
+                from: "web".to_string(),
+                to: "db".to_string(),
+                ports: vec![],
+                protocol: "any".to_string(),
+                action: PolicyAction::Allow,
+            }],
+            ..Default::default()
+        };
+        assert!(policy.is_peer_allowed("web", "db"));
+        assert!(!policy.is_peer_allowed("web", "redis")); // no rule → deny
+        assert!(!policy.is_peer_allowed("api", "db")); // from doesn't match
+    }
+
+    #[test]
+    fn test_network_policy_custom_wildcard_from() {
+        let policy = NetworkPolicy {
+            isolation: IsolationMode::Custom,
+            egress: vec![PolicyRule {
+                from: "*".to_string(),
+                to: "db".to_string(),
+                ports: vec![],
+                protocol: "any".to_string(),
+                action: PolicyAction::Allow,
+            }],
+            ..Default::default()
+        };
+        assert!(policy.is_peer_allowed("web", "db"));
+        assert!(policy.is_peer_allowed("api", "db"));
+        assert!(!policy.is_peer_allowed("web", "redis"));
+    }
+
+    #[test]
+    fn test_network_policy_custom_wildcard_to() {
+        let policy = NetworkPolicy {
+            isolation: IsolationMode::Custom,
+            egress: vec![PolicyRule {
+                from: "web".to_string(),
+                to: "*".to_string(),
+                ports: vec![],
+                protocol: "any".to_string(),
+                action: PolicyAction::Allow,
+            }],
+            ..Default::default()
+        };
+        assert!(policy.is_peer_allowed("web", "db"));
+        assert!(policy.is_peer_allowed("web", "redis"));
+        assert!(!policy.is_peer_allowed("api", "db"));
+    }
+
+    #[test]
+    fn test_network_policy_custom_deny_rule() {
+        let policy = NetworkPolicy {
+            isolation: IsolationMode::Custom,
+            egress: vec![
+                PolicyRule {
+                    from: "web".to_string(),
+                    to: "db".to_string(),
+                    ports: vec![],
+                    protocol: "any".to_string(),
+                    action: PolicyAction::Deny,
+                },
+                PolicyRule {
+                    from: "web".to_string(),
+                    to: "*".to_string(),
+                    ports: vec![],
+                    protocol: "any".to_string(),
+                    action: PolicyAction::Allow,
+                },
+            ],
+            ..Default::default()
+        };
+        // First matching rule wins: web→db is denied
+        assert!(!policy.is_peer_allowed("web", "db"));
+        // web→redis matches the wildcard allow
+        assert!(policy.is_peer_allowed("web", "redis"));
+    }
+
+    #[test]
+    fn test_network_policy_custom_no_rules_denies() {
+        let policy = NetworkPolicy {
+            isolation: IsolationMode::Custom,
+            egress: vec![],
+            ..Default::default()
+        };
+        assert!(!policy.is_peer_allowed("web", "db"));
+    }
+
+    #[test]
+    fn test_network_policy_allowed_peers() {
+        let policy = NetworkPolicy {
+            isolation: IsolationMode::Custom,
+            egress: vec![PolicyRule {
+                from: "web".to_string(),
+                to: "db".to_string(),
+                ports: vec![],
+                protocol: "any".to_string(),
+                action: PolicyAction::Allow,
+            }],
+            ..Default::default()
+        };
+
+        let peers = vec![
+            ("10.88.0.3".to_string(), "db".to_string()),
+            ("10.88.0.4".to_string(), "redis".to_string()),
+        ];
+
+        let allowed = policy.allowed_peers("web", &peers);
+        assert_eq!(allowed.len(), 1);
+        assert_eq!(allowed[0].1, "db");
+    }
+
+    #[test]
+    fn test_network_policy_serde_roundtrip() {
+        let policy = NetworkPolicy {
+            isolation: IsolationMode::Custom,
+            egress: vec![PolicyRule {
+                from: "web".to_string(),
+                to: "db".to_string(),
+                ports: vec![5432],
+                protocol: "tcp".to_string(),
+                action: PolicyAction::Allow,
+            }],
+            ingress: vec![],
+        };
+        let json = serde_json::to_string(&policy).unwrap();
+        let parsed: NetworkPolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.isolation, IsolationMode::Custom);
+        assert_eq!(parsed.egress.len(), 1);
+        assert_eq!(parsed.egress[0].ports, vec![5432]);
+    }
+
+    #[test]
+    fn test_isolation_mode_serde() {
+        let modes = vec![
+            (IsolationMode::None, "\"none\""),
+            (IsolationMode::Strict, "\"strict\""),
+            (IsolationMode::Custom, "\"custom\""),
+        ];
+        for (mode, expected) in modes {
+            let json = serde_json::to_string(&mode).unwrap();
+            assert_eq!(json, expected);
+            let parsed: IsolationMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, mode);
+        }
+    }
+
+    #[test]
+    fn test_allowed_peer_endpoints_none_policy() {
+        let mut net = NetworkConfig::new("mynet", "10.88.0.0/24").unwrap();
+        net.connect("box-1", "web").unwrap();
+        net.connect("box-2", "db").unwrap();
+        net.connect("box-3", "redis").unwrap();
+
+        // Default policy (None) → all peers visible
+        let peers = net.allowed_peer_endpoints("box-1");
+        assert_eq!(peers.len(), 2);
+    }
+
+    #[test]
+    fn test_allowed_peer_endpoints_strict_policy() {
+        let mut net = NetworkConfig::new("mynet", "10.88.0.0/24").unwrap();
+        net.policy = NetworkPolicy {
+            isolation: IsolationMode::Strict,
+            ..Default::default()
+        };
+        net.connect("box-1", "web").unwrap();
+        net.connect("box-2", "db").unwrap();
+
+        let peers = net.allowed_peer_endpoints("box-1");
+        assert!(peers.is_empty());
+    }
+
+    #[test]
+    fn test_allowed_peer_endpoints_custom_policy() {
+        let mut net = NetworkConfig::new("mynet", "10.88.0.0/24").unwrap();
+        net.policy = NetworkPolicy {
+            isolation: IsolationMode::Custom,
+            egress: vec![PolicyRule {
+                from: "web".to_string(),
+                to: "db".to_string(),
+                ports: vec![],
+                protocol: "any".to_string(),
+                action: PolicyAction::Allow,
+            }],
+            ..Default::default()
+        };
+        net.connect("box-1", "web").unwrap();
+        net.connect("box-2", "db").unwrap();
+        net.connect("box-3", "redis").unwrap();
+
+        let peers = net.allowed_peer_endpoints("box-1");
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].1, "db");
+    }
+
+    #[test]
+    fn test_matches_pattern() {
+        assert!(matches_pattern("*", "anything"));
+        assert!(matches_pattern("web", "web"));
+        assert!(!matches_pattern("web", "api"));
+    }
+
+    #[test]
+    fn test_policy_action_default() {
+        assert_eq!(PolicyAction::default(), PolicyAction::Allow);
     }
 }

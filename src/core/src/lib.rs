@@ -25,7 +25,7 @@ pub use config::{BoxConfig, ResourceConfig, ResourceLimits};
 pub use error::{BoxError, Result};
 pub use event::{BoxEvent, EventEmitter};
 pub use exec::{ExecOutput, ExecRequest};
-pub use network::{NetworkConfig, NetworkEndpoint, NetworkMode};
+pub use network::{IsolationMode, NetworkConfig, NetworkEndpoint, NetworkMode, NetworkPolicy};
 pub use platform::Platform;
 pub use pty::PTY_VSOCK_PORT;
 pub use security::{SeccompMode, SecurityConfig};
