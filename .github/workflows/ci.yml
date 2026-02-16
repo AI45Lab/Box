@@ -60,6 +60,36 @@ jobs:
           workspaces: src
       - run: cd src && cargo test --workspace --lib
 
+  # ── Python SDK Tests ─────────────────────────────────────────
+  test-python-sdk:
+    name: Test Python SDK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: |
+          pip install pytest pytest-asyncio
+          cd sdk/python && python -m pytest tests/ -v
+
+  # ── TypeScript SDK Tests ─────────────────────────────────────
+  test-typescript-sdk:
+    name: Test TypeScript SDK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: |
+          cd sdk/typescript
+          npm ci
+          npm test
+      - run: |
+          cd sdk/typescript
+          npx tsc --noEmit
+
   # ── Build: Linux x86_64 ───────────────────────────────────────
   build-linux-x86_64:
     name: Build (linux-x86_64)
