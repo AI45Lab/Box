@@ -238,6 +238,8 @@ jobs:
       - name: Install maturin
         run: pip install maturin
       - name: Build wheel
+        env:
+          LIBRARY_PATH: /usr/local/lib
         run: |
           cd sdk/python
           maturin build --release --strip
@@ -292,6 +294,8 @@ jobs:
           sudo mkdir -p /usr/local/lib
           sudo cp /tmp/libkrun.dylib /usr/local/lib/
       - name: Build native module
+        env:
+          LIBRARY_PATH: /usr/local/lib
         run: |
           cd sdk/node
           npm install
