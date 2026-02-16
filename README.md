@@ -36,7 +36,7 @@ A3S Box is **application-agnostic** — it doesn't know or care what runs inside
 - **Warm Pool** — Pre-booted idle MicroVMs for instant allocation (`min_idle` / `max_size` / `idle_ttl`)
 - **Compose** — Multi-container orchestration via YAML (`compose up/down/ps/config`), dependency-ordered boot, shared networks
 - **Snapshot/Restore** — Configuration-based VM snapshots (`snapshot create/restore/ls/rm/inspect`), rootfs preservation, sub-500ms restore via cache
-- **Scale API** — Gateway ↔ Box instance scaling (`ScaleRequest`/`ScaleResponse`), per-service tracking, capacity management, readiness signaling with `InstanceEvent` lifecycle transitions
+- **Scale API** — Gateway ↔ Box instance scaling (`ScaleRequest`/`ScaleResponse`), per-service tracking, capacity management, readiness signaling with `InstanceEvent` lifecycle transitions, `ServiceHealth` aggregation, graceful drain, `InstanceRegistry` for multi-node discovery
 - **Pool Autoscaler** — Pressure-based dynamic `min_idle` adjustment (miss rate sliding window, cooldown, configurable thresholds)
 - **Rootfs Caching** — Content-addressable cache with SHA256 keys and TTL/size pruning
 - **Cross-Platform** — macOS (Apple Silicon) and Linux (x86_64/ARM64), no root required
@@ -296,13 +296,13 @@ Simulation generates fake attestation reports with deterministic keys. Not suita
 
 ## Testing
 
-### Unit Tests — 1,412 passed
+### Unit Tests — 1,434 passed
 
 | Crate | Tests | Coverage |
 |-------|------:|----------|
 | `a3s-box-cli` | 376 | State management, name resolution, output formatting, restart policies, compose CLI, audit CLI, snapshot CLI |
 | `a3s-box-core` | 267 | Config validation, error types, event serialization, TEE protocol types, TEE self-detection, security config, compose types, platform types, audit types, network isolation policies, snapshot types, scale API types |
-| `a3s-box-runtime` | 671 | OCI parsing, rootfs, health checking, attestation, RA-TLS, sealed storage, heartbeat, Prometheus metrics, tracing spans, pool autoscaler, image signing, compose orchestrator, audit log, snapshot store, KBS client, re-attestation, rollback protection, scale manager |
+| `a3s-box-runtime` | 693 | OCI parsing, rootfs, health checking, attestation, RA-TLS, sealed storage, heartbeat, Prometheus metrics, tracing spans, pool autoscaler, image signing, compose orchestrator, audit log, snapshot store, KBS client, re-attestation, rollback protection, scale manager, service health, graceful drain, instance registry |
 | `a3s-box-cri` | 34 | CRI sandbox/container lifecycle, config mapping |
 | `a3s-box-guest-init` | 53 | Exec server, attest server frame I/O, secret validation, namespace security |
 | `a3s-box-sdk` | 11 | SDK init, config building, exec result conversion, serde roundtrip |
@@ -449,9 +449,9 @@ Box acts as the "hands" of Knative-style serverless serving — it executes inst
 - [x] **Scale API (standalone mode)**: Expose an internal API for Gateway to request instance scale-up/scale-down (`ScaleRequest`/`ScaleResponse`, `ScaleManager` with capacity tracking, per-service instance management)
 - [x] **Instance readiness signaling**: Report instance state transitions (Creating → Booting → Ready → Busy → Draining → Stopping → Stopped/Failed) via `InstanceEvent`, `InstanceInfo` with health metrics, `InstanceRegistration`/`InstanceDeregistration`
 - [ ] **Warm pool auto-scaling**: Dynamically adjust warm pool `min_idle` based on Gateway's scaling pressure signals — pre-warm more VMs when traffic is trending up
-- [ ] **Instance health reporting**: Continuously report per-instance health (CPU, memory, in-flight requests) to Gateway for autoscaler decision-making
-- [ ] **Graceful scale-down**: Drain in-flight requests before stopping a VM — coordinate with Gateway to stop routing new requests, wait for completion, then terminate
-- [ ] **Instance self-registration (standalone mode)**: On boot, each Box instance registers its endpoint with Gateway's service discovery — enables multi-node standalone deployments without K8s
+- [x] **Instance health reporting**: Continuously report per-instance health (CPU, memory, in-flight requests) to Gateway for autoscaler decision-making (`ServiceHealth` aggregation, avg CPU, total inflight, unhealthy count)
+- [x] **Graceful scale-down**: Drain in-flight requests before stopping a VM — `start_drain()` → wait for `is_drain_complete()` → `complete_drain()`, with Draining state in lifecycle
+- [x] **Instance self-registration (standalone mode)**: On boot, each Box instance registers its endpoint with Gateway's service discovery — `InstanceRegistry` with heartbeat, stale eviction, per-host/per-service queries
 
 **Docker Parity (remaining)**
 - [x] Multi-container orchestration (`ComposeConfig` YAML, `ComposeProject` with topological boot order, `a3s-box compose up/down/ps/config`)

@@ -25,12 +25,12 @@
 - [x] Periodic re-attestation (`ReattestConfig`, `ReattestState`, configurable interval/threshold/action, grace period)
 - [x] Version-based rollback protection for sealed storage (`VersionStore`, `VersionedSealedData`, monotonic version counter)
 - [x] Scale API and instance readiness signaling (`ScaleRequest`/`ScaleResponse`, `ScaleManager`, `InstanceEvent` lifecycle, `InstanceRegistration`)
+- [x] Instance health reporting (`ServiceHealth` aggregation: avg CPU, total memory, inflight requests, unhealthy count)
+- [x] Graceful scale-down (`start_drain()` → `is_drain_complete()` → `complete_drain()`, Draining state in lifecycle)
+- [x] Instance self-registration (`InstanceRegistry` with heartbeat, stale eviction, per-host/per-service queries)
 
 ## Next
 
 - [ ] Real hardware testing on AMD SEV-SNP (Azure DCasv5 / bare-metal EPYC)
 - [ ] Kubernetes Operator (BoxAutoscaler CRD)
 - [ ] Warm pool auto-scaling (Gateway pressure signals → dynamic min_idle)
-- [ ] Instance health reporting (CPU, memory, in-flight requests → Gateway)
-- [ ] Graceful scale-down (drain in-flight requests before stopping)
-- [ ] Instance self-registration (standalone multi-node discovery)
