@@ -14,6 +14,7 @@ pub mod log;
 pub mod network;
 pub mod platform;
 pub mod pty;
+pub mod scale;
 pub mod security;
 pub mod snapshot;
 pub mod tee;
@@ -28,6 +29,10 @@ pub use event::{BoxEvent, EventEmitter};
 pub use exec::{ExecOutput, ExecRequest};
 pub use network::{IsolationMode, NetworkConfig, NetworkEndpoint, NetworkMode, NetworkPolicy};
 pub use platform::Platform;
+pub use scale::{
+    InstanceDeregistration, InstanceEvent, InstanceHealth, InstanceInfo, InstanceRegistration,
+    InstanceState, ScaleConfig, ScaleRequest, ScaleResponse,
+};
 pub use pty::PTY_VSOCK_PORT;
 pub use security::{SeccompMode, SecurityConfig};
 pub use snapshot::{SnapshotConfig, SnapshotMetadata};

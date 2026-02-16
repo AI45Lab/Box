@@ -24,8 +24,13 @@
 - [x] KBS (Key Broker Service) integration (`KbsClient`, `KbsConfig`, RATS challenge-response, resource path parsing)
 - [x] Periodic re-attestation (`ReattestConfig`, `ReattestState`, configurable interval/threshold/action, grace period)
 - [x] Version-based rollback protection for sealed storage (`VersionStore`, `VersionedSealedData`, monotonic version counter)
+- [x] Scale API and instance readiness signaling (`ScaleRequest`/`ScaleResponse`, `ScaleManager`, `InstanceEvent` lifecycle, `InstanceRegistration`)
 
 ## Next
 
 - [ ] Real hardware testing on AMD SEV-SNP (Azure DCasv5 / bare-metal EPYC)
 - [ ] Kubernetes Operator (BoxAutoscaler CRD)
+- [ ] Warm pool auto-scaling (Gateway pressure signals → dynamic min_idle)
+- [ ] Instance health reporting (CPU, memory, in-flight requests → Gateway)
+- [ ] Graceful scale-down (drain in-flight requests before stopping)
+- [ ] Instance self-registration (standalone multi-node discovery)
