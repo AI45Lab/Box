@@ -912,41 +912,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_exec_heartbeat_success() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let sock_path = tmp.path().join("heartbeat.sock");
-        let listener = UnixListener::bind(&sock_path).unwrap();
-
-        tokio::spawn(async move {
-            // Accept connect verification
-            let (stream, _) = listener.accept().await.unwrap();
-            drop(stream);
-            // Accept heartbeat: read frame, echo back as Heartbeat
-            let (stream, _) = listener.accept().await.unwrap();
-            let (r, _w) = tokio::io::split(stream);
-            let mut reader = a3s_transport::FrameReader::new(r);
-            let frame = reader.read_frame().await.unwrap().unwrap();
-            assert_eq!(frame.frame_type, a3s_transport::FrameType::Heartbeat);
-            // Respond with Heartbeat
-            let response = a3s_transport::Frame::heartbeat();
-            let encoded = response.encode().unwrap();
-            let mut w = reader.into_inner();
-            // Reassemble stream to write response
-            drop(w);
-        });
-
-        // Use a simpler approach: just test with a mock that echoes frames
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-
-        // For a proper test, we need a server that reads and responds
-        // The connect() test already verifies socket connectivity
-        let client = ExecClient::connect(&sock_path).await.unwrap();
-        // heartbeat() will connect again, so we need the server to accept again
-        // This test verifies the client doesn't panic on connection
-        assert_eq!(client.socket_path(), sock_path);
-    }
-
-    #[tokio::test]
     async fn test_exec_heartbeat_with_echo_server() {
         let tmp = tempfile::TempDir::new().unwrap();
         let sock_path = tmp.path().join("hb_echo.sock");

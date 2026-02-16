@@ -112,6 +112,9 @@ pub struct VmManager {
 
     /// Path to the PTY Unix socket (set after boot)
     pty_socket_path: Option<PathBuf>,
+
+    /// Prometheus metrics (optional, for instrumented deployments).
+    prom: Option<crate::prom::RuntimeMetrics>,
 }
 
 impl VmManager {
@@ -135,6 +138,7 @@ impl VmManager {
             tee: None,
             exec_socket_path: None,
             pty_socket_path: None,
+            prom: None,
         }
     }
 
@@ -157,6 +161,7 @@ impl VmManager {
             tee: None,
             exec_socket_path: None,
             pty_socket_path: None,
+            prom: None,
         }
     }
 
@@ -176,7 +181,7 @@ impl VmManager {
             handler: Arc::new(RwLock::new(None)),
             agent_client: None, exec_client: None, passt_manager: None,
             home_dir, anonymous_volumes: Vec::new(), tee: None,
-            exec_socket_path: None, pty_socket_path: None,
+            exec_socket_path: None, pty_socket_path: None, prom: None,
         }
     }
 
@@ -208,6 +213,16 @@ impl VmManager {
     /// Get the PTY socket path, if the VM has been booted.
     pub fn pty_socket_path(&self) -> Option<&Path> {
         self.pty_socket_path.as_deref()
+    }
+
+    /// Attach Prometheus metrics to this VM manager.
+    pub fn set_metrics(&mut self, metrics: crate::prom::RuntimeMetrics) {
+        self.prom = Some(metrics);
+    }
+
+    /// Get the attached Prometheus metrics (if any).
+    pub fn metrics_prom(&self) -> Option<&crate::prom::RuntimeMetrics> {
+        self.prom.as_ref()
     }
 
     /// Get the names of anonymous volumes created during boot.
@@ -251,7 +266,20 @@ impl VmManager {
             stdin: None,
             user: None,
         };
-        client.exec_command(&request).await
+
+        let exec_start = std::time::Instant::now();
+        let result = client.exec_command(&request).await;
+
+        // Record Prometheus metrics
+        if let Some(ref prom) = self.prom {
+            prom.exec_total.inc();
+            prom.exec_duration.observe(exec_start.elapsed().as_secs_f64());
+            if result.is_err() || result.as_ref().is_ok_and(|o| o.exit_code != 0) {
+                prom.exec_errors_total.inc();
+            }
+        }
+
+        result
     }
 
     /// Boot the VM.
@@ -263,6 +291,8 @@ impl VmManager {
                 return Err(BoxError::Other("VM already booted".to_string()));
             }
         }
+
+        let boot_start = std::time::Instant::now();
 
         tracing::info!(box_id = %self.box_id, "Booting VM");
 
@@ -333,6 +363,14 @@ impl VmManager {
 
         // 6. Update state to Ready
         *self.state.write().await = BoxState::Ready;
+
+        // Record Prometheus metrics
+        if let Some(ref prom) = self.prom {
+            let boot_duration = boot_start.elapsed().as_secs_f64();
+            prom.vm_boot_duration.observe(boot_duration);
+            prom.vm_created_total.inc();
+            prom.vm_count.with_label_values(&["ready"]).inc();
+        }
 
         // Emit ready event
         self.event_emitter.emit(BoxEvent::empty("box.ready"));
@@ -479,6 +517,12 @@ impl VmManager {
         self.passt_manager = None;
 
         *state = BoxState::Stopped;
+
+        // Record Prometheus metrics
+        if let Some(ref prom) = self.prom {
+            prom.vm_destroyed_total.inc();
+            prom.vm_count.with_label_values(&["ready"]).dec();
+        }
 
         // Emit stopped event
         self.event_emitter.emit(BoxEvent::empty("box.stopped"));
@@ -2014,6 +2058,7 @@ mod tests {
             tee: None,
             exec_socket_path: None,
             pty_socket_path: None,
+            prom: None,
         }
     }
 

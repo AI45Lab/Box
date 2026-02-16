@@ -10,8 +10,8 @@
 - [x] Guest-side TEE self-detection API (`detect_tee()`, `TeeCapability`, `TeeType` in core)
 - [x] AgentClient health check migration (HTTP → Frame Heartbeat on exec server)
 - [x] Prometheus metrics (`RuntimeMetrics`: VM lifecycle, exec, image, warm pool)
+- [x] Instrument VM boot, exec, destroy with Prometheus metrics
 
 ## Next
 
 - [ ] OpenTelemetry spans (VM lifecycle: create → boot → ready)
-- [ ] Instrument VM boot, exec, image pull with Prometheus metrics

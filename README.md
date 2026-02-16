@@ -281,13 +281,13 @@ Simulation generates fake attestation reports with deterministic keys. Not suita
 
 ## Testing
 
-### Unit Tests — 1,153 passed
+### Unit Tests — 1,152 passed
 
 | Crate | Tests | Coverage |
 |-------|------:|----------|
 | `a3s-box-cli` | 367 | State management, name resolution, output formatting, restart policies |
 | `a3s-box-core` | 171 | Config validation, error types, event serialization, TEE protocol types, TEE self-detection |
-| `a3s-box-runtime` | 518 | OCI parsing, rootfs, health checking, attestation, RA-TLS, sealed storage, heartbeat, Prometheus metrics |
+| `a3s-box-runtime` | 517 | OCI parsing, rootfs, health checking, attestation, RA-TLS, sealed storage, heartbeat, Prometheus metrics |
 | `a3s-box-cri` | 34 | CRI sandbox/container lifecycle, config mapping |
 | `a3s-box-guest-init` | 52 | Exec server, attest server frame I/O, secret validation |
 | `a3s-box-sdk` | 11 | SDK init, config building, exec result conversion, serde roundtrip |
