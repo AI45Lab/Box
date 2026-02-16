@@ -39,6 +39,11 @@
 - [x] Persistent workspaces (named workspaces that survive sandbox restart, `WorkspaceConfig`, volume reuse)
 - [x] Execution metrics (per-exec CPU/memory/duration stats, `ExecMetrics` in `ExecResult`)
 
+## Next — Multi-Language SDKs
+
+- [x] Python SDK (`a3s-box` on PyPI: BoxSdk, Sandbox, streaming exec, file transfer, 25 tests)
+- [x] TypeScript SDK (`@a3s-lab/box` on npm: BoxSdk, Sandbox, streaming exec, file transfer, 21 tests)
+
 ## Later
 
 - [ ] Real hardware testing on AMD SEV-SNP (Azure DCasv5 / bare-metal EPYC)

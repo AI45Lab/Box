@@ -85,6 +85,11 @@ A3S Box is **application-agnostic** — it doesn't know or care what runs inside
 - **Configurable** — vCPUs, memory, environment variables, host mounts, working directory, TEE mode
 - **PTY Support** — Open interactive terminal sessions via `sandbox.pty()`
 
+### Multi-Language SDKs
+- **Python SDK** — `pip install a3s-box` — async/await API, context manager, streaming exec, file transfer (25 tests)
+- **TypeScript SDK** — `npm install @a3s-lab/box` — Node.js API, async iterator streaming, file transfer (21 tests)
+- **Rust SDK** — `a3s-box-sdk` crate — native embedded API with full feature parity
+
 ### Kubernetes Integration
 - **CRI Runtime** — RuntimeService + ImageService for kubelet
 - **Deployment** — DaemonSet, RuntimeClass, Kustomize base, RBAC

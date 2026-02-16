@@ -1,0 +1,36 @@
+{
+  "name": "@a3s-lab/box",
+  "version": "0.2.0",
+  "description": "TypeScript SDK for A3S Box — embedded MicroVM sandboxes",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/A3S-Lab/Box"
+  },
+  "keywords": [
+    "sandbox",
+    "microvm",
+    "container",
+    "tee",
+    "confidential-computing"
+  ],
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest --run",
+    "lint": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^25.2.3",
+    "typescript": "^5.4",
+    "vitest": "^3.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
