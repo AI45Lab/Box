@@ -41,6 +41,7 @@ mod rmi;
 mod run;
 mod save;
 mod seal;
+mod snapshot;
 mod start;
 mod stats;
 mod stop;
@@ -132,6 +133,8 @@ pub enum Command {
     ContainerUpdate(container_update::ContainerUpdateArgs),
     /// Manage multi-container workloads with a compose file
     Compose(compose::ComposeArgs),
+    /// Manage VM snapshots (create, restore, list, remove)
+    Snapshot(snapshot::SnapshotArgs),
     /// Build an image from a Dockerfile
     Build(build::BuildArgs),
     /// List cached images
@@ -271,6 +274,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Events(args) => events::execute(args).await,
         Command::ContainerUpdate(args) => container_update::execute(args).await,
         Command::Compose(args) => compose::execute(args).await,
+        Command::Snapshot(args) => snapshot::execute(args).await,
         Command::Build(args) => build::execute(args).await,
         Command::Images(args) => images::execute(args).await,
         Command::Pull(args) => pull::execute(args).await,

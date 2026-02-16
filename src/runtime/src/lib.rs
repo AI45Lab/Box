@@ -19,6 +19,7 @@ pub mod oci;
 pub mod pool;
 pub mod prom;
 pub mod rootfs;
+pub mod snapshot;
 pub mod tee;
 pub mod vm;
 pub mod vmm;
@@ -40,6 +41,7 @@ pub use oci::{OciImage, OciImageConfig, OciRootfsBuilder, RootfsComposition};
 pub use oci::{SignaturePolicy, VerifyResult};
 pub use pool::{PoolStats, WarmPool};
 pub use prom::RuntimeMetrics;
+pub use snapshot::SnapshotStore;
 pub use rootfs::{find_agent_binary, GuestLayout, RootfsBuilder, GUEST_AGENT_PATH, GUEST_WORKDIR};
 pub use tee::{check_sev_snp_support, require_sev_snp_support, SevSnpSupport};
 pub use tee::{

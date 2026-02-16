@@ -35,16 +35,18 @@ A3S Box is **application-agnostic** — it doesn't know or care what runs inside
 - **Multi-Platform Build** — Buildx-style `--platform linux/amd64,linux/arm64` with OCI Image Index output
 - **Warm Pool** — Pre-booted idle MicroVMs for instant allocation (`min_idle` / `max_size` / `idle_ttl`)
 - **Compose** — Multi-container orchestration via YAML (`compose up/down/ps/config`), dependency-ordered boot, shared networks
+- **Snapshot/Restore** — Configuration-based VM snapshots (`snapshot create/restore/ls/rm/inspect`), rootfs preservation, sub-500ms restore via cache
 - **Pool Autoscaler** — Pressure-based dynamic `min_idle` adjustment (miss rate sliding window, cooldown, configurable thresholds)
 - **Rootfs Caching** — Content-addressable cache with SHA256 keys and TTL/size pruning
 - **Cross-Platform** — macOS (Apple Silicon) and Linux (x86_64/ARM64), no root required
 
-### Docker-Compatible CLI (49 commands)
+### Docker-Compatible CLI (50 commands)
 - **Lifecycle**: `run`, `create`, `start`, `stop`, `pause`, `unpause`, `restart`, `rm`, `kill`, `rename`
 - **Exec & PTY**: `exec` (with `-it`, `-u`, `-e`, `-w`), `attach -it`, `run -it`, `top`
 - **Images**: `pull`, `push`, `build`, `images`, `rmi`, `tag`, `image-inspect`, `image-prune`, `save`, `load`, `export`, `commit`, `diff`
 - **Networking**: `network create/ls/rm/inspect/connect/disconnect`, bridge driver, IPAM, DNS discovery
 - **Volumes**: `volume create/ls/rm/inspect/prune`, named volumes, anonymous volumes, tmpfs
+- **Snapshots**: `snapshot create/restore/ls/rm/inspect`, configuration-based save/restore
 - **Observability**: `ps`, `logs`, `inspect`, `stats`, `events`, `cp`
 - **System**: `system-prune`, `container-update`, `version`, `info`, `monitor`, `login`, `logout`
 
@@ -291,13 +293,13 @@ Simulation generates fake attestation reports with deterministic keys. Not suita
 
 ## Testing
 
-### Unit Tests — 1,299 passed
+### Unit Tests — 1,329 passed
 
 | Crate | Tests | Coverage |
 |-------|------:|----------|
-| `a3s-box-cli` | 372 | State management, name resolution, output formatting, restart policies, compose CLI, audit CLI |
-| `a3s-box-core` | 244 | Config validation, error types, event serialization, TEE protocol types, TEE self-detection, security config, compose types, platform types, audit types, network isolation policies |
-| `a3s-box-runtime` | 585 | OCI parsing, rootfs, health checking, attestation, RA-TLS, sealed storage, heartbeat, Prometheus metrics, tracing spans, pool autoscaler, image signing, compose orchestrator, audit log |
+| `a3s-box-cli` | 376 | State management, name resolution, output formatting, restart policies, compose CLI, audit CLI, snapshot CLI |
+| `a3s-box-core` | 252 | Config validation, error types, event serialization, TEE protocol types, TEE self-detection, security config, compose types, platform types, audit types, network isolation policies, snapshot types |
+| `a3s-box-runtime` | 603 | OCI parsing, rootfs, health checking, attestation, RA-TLS, sealed storage, heartbeat, Prometheus metrics, tracing spans, pool autoscaler, image signing, compose orchestrator, audit log, snapshot store |
 | `a3s-box-cri` | 34 | CRI sandbox/container lifecycle, config mapping |
 | `a3s-box-guest-init` | 53 | Exec server, attest server frame I/O, secret validation, namespace security |
 | `a3s-box-sdk` | 11 | SDK init, config building, exec result conversion, serde roundtrip |
@@ -407,13 +409,9 @@ A3S Box is the **infrastructure layer** of the A3S ecosystem. It provides VM iso
 | Performance | Rootfs caching, layer cache, warm pool with TTL and auto-replenish |
 | Host SDK & Transport | `a3s-transport` Frame protocol, exec/PTY/attest servers migrated, `FrameReader`/`FrameWriter` async I/O, shared port constants and TEE request types |
 | Embedded Sandbox SDK | `a3s-box-sdk` crate: `BoxSdk` → `Sandbox` lifecycle, exec/PTY from Rust code, no daemon required, OCI image support, configurable resources/env/mounts |
+| Production Hardening | VM snapshot/restore, network isolation policies, audit logging |
 
 ### In Progress 🚧
-
-**Production Hardening**
-- [ ] VM snapshot/restore (save running state to SSD, restore < 500ms)
-- [x] Network isolation policies (`NetworkPolicy`, `IsolationMode`: None/Strict/Custom, `PolicyRule` with from/to/ports/action, policy-aware peer discovery)
-- [x] Audit logging (`AuditEvent` types, `AuditLog` with rotation, `AuditQuery` filters, `a3s-box audit` CLI)
 
 **TEE Hardening**
 - [x] Bind TLS public key hash to `report_data` (RA-TLS key binding)

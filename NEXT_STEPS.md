@@ -20,7 +20,7 @@
 - [x] Buildx multi-platform builds (`Platform` type, `--platform` flag, parameterized OCI config architecture, Image Index with platform annotations)
 - [x] Audit logging (`AuditEvent`, `AuditLog` with rotation, `AuditQuery` with filters, `a3s-box audit` CLI)
 - [x] Network isolation policies (`NetworkPolicy`, `IsolationMode`: None/Strict/Custom, `PolicyRule` with from/to/ports/action, policy-aware peer discovery)
+- [x] VM snapshot/restore (configuration-based `SnapshotStore`, `SnapshotMetadata`, rootfs copy, `snapshot create/restore/ls/rm/inspect` CLI, pruning)
 
 ## Next
 
-- [ ] VM snapshot/restore (save running state to SSD, restore < 500ms)

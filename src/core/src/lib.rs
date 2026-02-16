@@ -15,6 +15,7 @@ pub mod network;
 pub mod platform;
 pub mod pty;
 pub mod security;
+pub mod snapshot;
 pub mod tee;
 pub mod volume;
 
@@ -29,6 +30,7 @@ pub use network::{IsolationMode, NetworkConfig, NetworkEndpoint, NetworkMode, Ne
 pub use platform::Platform;
 pub use pty::PTY_VSOCK_PORT;
 pub use security::{SeccompMode, SecurityConfig};
+pub use snapshot::{SnapshotConfig, SnapshotMetadata};
 pub use tee::ATTEST_VSOCK_PORT;
 pub use tee::{TeeCapability, TeeType, detect_tee, is_tee_available};
 pub use volume::VolumeConfig;
