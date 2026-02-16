@@ -76,6 +76,11 @@ A3S Box is **application-agnostic** — it doesn't know or care what runs inside
 ### Embedded Sandbox SDK
 - **No Daemon** — Create, exec, and stop MicroVM sandboxes directly from Rust code, no CLI or daemon required
 - **Simple API** — `BoxSdk::new()` → `sdk.create(options)` → `sandbox.exec("cmd", &["args"])` → `sandbox.stop()`
+- **Streaming Exec** — Real-time stdout/stderr via `sandbox.exec_stream()` with async event iterator
+- **File Transfer** — Upload/download files to/from sandbox via `sandbox.upload()` / `sandbox.download()`
+- **Port Forwarding** — Expose guest ports to host via `SandboxOptions::port_forwards`
+- **Persistent Workspaces** — Named workspaces that survive sandbox restarts, eliminating rebuild overhead
+- **Execution Metrics** — Per-exec duration, stdout/stderr byte counts in `ExecResult::metrics`
 - **OCI Images** — Specify any OCI image (`alpine:latest`, `python:3.12-slim`, etc.)
 - **Configurable** — vCPUs, memory, environment variables, host mounts, working directory, TEE mode
 - **PTY Support** — Open interactive terminal sessions via `sandbox.pty()`
@@ -297,16 +302,16 @@ Simulation generates fake attestation reports with deterministic keys. Not suita
 
 ## Testing
 
-### Unit Tests — 1,473 passed
+### Unit Tests — 1,492 passed
 
 | Crate | Tests | Coverage |
 |-------|------:|----------|
 | `a3s-box-cli` | 376 | State management, name resolution, output formatting, restart policies, compose CLI, audit CLI, snapshot CLI |
-| `a3s-box-core` | 280 | Config validation, error types, event serialization, TEE protocol types, TEE self-detection, security config, compose types, platform types, audit types, network isolation policies, snapshot types, scale API types, operator CRD types |
+| `a3s-box-core` | 292 | Config validation, error types, event serialization, TEE protocol types, TEE self-detection, security config, compose types, platform types, audit types, network isolation policies, snapshot types, scale API types, operator CRD types, streaming exec types, file transfer types, exec metrics |
 | `a3s-box-runtime` | 719 | OCI parsing, rootfs, health checking, attestation, RA-TLS, sealed storage, heartbeat, Prometheus metrics, tracing spans, pool autoscaler, gateway pressure, image signing, compose orchestrator, audit log, snapshot store, KBS client, re-attestation, rollback protection, scale manager, service health, graceful drain, instance registry, autoscaler controller |
 | `a3s-box-cri` | 34 | CRI sandbox/container lifecycle, config mapping |
 | `a3s-box-guest-init` | 53 | Exec server, attest server frame I/O, secret validation, namespace security |
-| `a3s-box-sdk` | 11 | SDK init, config building, exec result conversion, serde roundtrip |
+| `a3s-box-sdk` | 18 | SDK init, config building, exec result conversion, port forwards, workspaces, serde roundtrip |
 
 All unit tests run without VM, network, or hardware dependencies (`A3S_DEPS_STUB=1` for CI).
 
@@ -412,7 +417,7 @@ A3S Box is the **infrastructure layer** of the A3S ecosystem. It provides VM iso
 | Secret Injection | RA-TLS channel, `/run/secrets/`, env var support |
 | Performance | Rootfs caching, layer cache, warm pool with TTL and auto-replenish |
 | Host SDK & Transport | `a3s-transport` Frame protocol, exec/PTY/attest servers migrated, `FrameReader`/`FrameWriter` async I/O, shared port constants and TEE request types |
-| Embedded Sandbox SDK | `a3s-box-sdk` crate: `BoxSdk` → `Sandbox` lifecycle, exec/PTY from Rust code, no daemon required, OCI image support, configurable resources/env/mounts |
+| Embedded Sandbox SDK | `a3s-box-sdk` crate: `BoxSdk` → `Sandbox` lifecycle, exec/PTY from Rust code, streaming exec, file upload/download, port forwarding, persistent workspaces, execution metrics, no daemon required |
 | Production Hardening | VM snapshot/restore, network isolation policies, audit logging |
 
 ### In Progress 🚧

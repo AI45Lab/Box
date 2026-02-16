@@ -29,9 +29,12 @@ mod options;
 mod sandbox;
 mod sdk;
 
-pub use options::SandboxOptions;
+pub use options::{MountSpec, PortForward, SandboxOptions, WorkspaceConfig};
 pub use sandbox::{ExecResult, Sandbox};
 pub use sdk::BoxSdk;
+
+// Re-export streaming types from runtime for convenience
+pub use a3s_box_runtime::StreamingExec;
 
 /// SDK version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

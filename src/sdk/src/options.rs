@@ -40,6 +40,15 @@ pub struct SandboxOptions {
     /// Custom sandbox name (auto-generated if not set).
     #[serde(default)]
     pub name: Option<String>,
+
+    /// Port forwarding rules (guest port → host port).
+    #[serde(default)]
+    pub port_forwards: Vec<PortForward>,
+
+    /// Persistent workspace configuration.
+    /// When set, the workspace directory survives sandbox restarts.
+    #[serde(default)]
+    pub workspace: Option<WorkspaceConfig>,
 }
 
 /// A host-to-guest mount specification.
@@ -54,6 +63,32 @@ pub struct MountSpec {
     pub readonly: bool,
 }
 
+/// Port forwarding rule: expose a guest port on the host.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortForward {
+    /// Port inside the guest.
+    pub guest_port: u16,
+    /// Port on the host (0 = auto-assign).
+    #[serde(default)]
+    pub host_port: u16,
+    /// Protocol (default: "tcp").
+    #[serde(default = "default_protocol")]
+    pub protocol: String,
+}
+
+/// Persistent workspace configuration.
+///
+/// Named workspaces retain their contents across sandbox restarts,
+/// eliminating rebuild overhead for agent workflows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceConfig {
+    /// Workspace name (used as directory name under ~/.a3s/workspaces/).
+    pub name: String,
+    /// Guest path to mount the workspace (default: "/workspace").
+    #[serde(default = "default_workspace_path")]
+    pub guest_path: String,
+}
+
 impl Default for SandboxOptions {
     fn default() -> Self {
         Self {
@@ -66,6 +101,8 @@ impl Default for SandboxOptions {
             network: true,
             tee: false,
             name: None,
+            port_forwards: Vec::new(),
+            workspace: None,
         }
     }
 }
@@ -80,6 +117,14 @@ fn default_memory_mb() -> u32 {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_protocol() -> String {
+    "tcp".to_string()
+}
+
+fn default_workspace_path() -> String {
+    "/workspace".to_string()
 }
 
 #[cfg(test)]
@@ -98,6 +143,8 @@ mod tests {
         assert!(opts.mounts.is_empty());
         assert!(opts.workdir.is_none());
         assert!(opts.name.is_none());
+        assert!(opts.port_forwards.is_empty());
+        assert!(opts.workspace.is_none());
     }
 
     #[test]
@@ -116,6 +163,15 @@ mod tests {
             network: false,
             tee: true,
             name: Some("my-sandbox".into()),
+            port_forwards: vec![PortForward {
+                guest_port: 8080,
+                host_port: 3000,
+                protocol: "tcp".into(),
+            }],
+            workspace: Some(WorkspaceConfig {
+                name: "my-project".into(),
+                guest_path: "/workspace".into(),
+            }),
         };
         let json = serde_json::to_string(&opts).unwrap();
         let parsed: SandboxOptions = serde_json::from_str(&json).unwrap();
@@ -129,6 +185,11 @@ mod tests {
         assert!(!parsed.network);
         assert!(parsed.tee);
         assert_eq!(parsed.name.as_deref(), Some("my-sandbox"));
+        assert_eq!(parsed.port_forwards.len(), 1);
+        assert_eq!(parsed.port_forwards[0].guest_port, 8080);
+        assert_eq!(parsed.port_forwards[0].host_port, 3000);
+        assert!(parsed.workspace.is_some());
+        assert_eq!(parsed.workspace.as_ref().unwrap().name, "my-project");
     }
 
     #[test]
@@ -139,6 +200,8 @@ mod tests {
         assert_eq!(opts.cpus, 1);
         assert_eq!(opts.memory_mb, 256);
         assert!(opts.network);
+        assert!(opts.port_forwards.is_empty());
+        assert!(opts.workspace.is_none());
     }
 
     #[test]
@@ -153,5 +216,47 @@ mod tests {
         let parsed: MountSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.guest_path, "/workspace");
         assert!(!parsed.readonly);
+    }
+
+    #[test]
+    fn test_port_forward_defaults() {
+        let json = r#"{"guest_port":8080}"#;
+        let pf: PortForward = serde_json::from_str(json).unwrap();
+        assert_eq!(pf.guest_port, 8080);
+        assert_eq!(pf.host_port, 0);
+        assert_eq!(pf.protocol, "tcp");
+    }
+
+    #[test]
+    fn test_port_forward_serde_roundtrip() {
+        let pf = PortForward {
+            guest_port: 3000,
+            host_port: 9000,
+            protocol: "tcp".into(),
+        };
+        let json = serde_json::to_string(&pf).unwrap();
+        let parsed: PortForward = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.guest_port, 3000);
+        assert_eq!(parsed.host_port, 9000);
+    }
+
+    #[test]
+    fn test_workspace_config_defaults() {
+        let json = r#"{"name":"my-ws"}"#;
+        let ws: WorkspaceConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(ws.name, "my-ws");
+        assert_eq!(ws.guest_path, "/workspace");
+    }
+
+    #[test]
+    fn test_workspace_config_custom_path() {
+        let ws = WorkspaceConfig {
+            name: "project-x".into(),
+            guest_path: "/home/user/project".into(),
+        };
+        let json = serde_json::to_string(&ws).unwrap();
+        let parsed: WorkspaceConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.name, "project-x");
+        assert_eq!(parsed.guest_path, "/home/user/project");
     }
 }

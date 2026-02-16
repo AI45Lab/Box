@@ -188,6 +188,7 @@ async fn handle_exec_oneshot(
         working_dir: None,
         stdin: None,
         user: None,
+        streaming: false,
     };
 
     let body = serde_json::to_string(&exec_req)?;
@@ -366,6 +367,7 @@ async fn handle_port_forward_stream(
         working_dir: None,
         stdin: None,
         user: None,
+        streaming: false,
     };
 
     let body = serde_json::to_string(&exec_req)?;

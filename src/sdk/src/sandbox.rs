@@ -3,8 +3,9 @@
 use std::path::PathBuf;
 
 use a3s_box_core::error::Result;
-use a3s_box_core::exec::{ExecOutput, ExecRequest};
-use a3s_box_runtime::{ExecClient, PtyClient, VmManager};
+use a3s_box_core::exec::{ExecMetrics, ExecOutput, ExecRequest, FileOp, FileRequest};
+use a3s_box_runtime::{ExecClient, PtyClient, StreamingExec, VmManager};
+use base64::Engine;
 
 /// Result of executing a command in a sandbox.
 #[derive(Debug, Clone)]
@@ -15,11 +16,18 @@ pub struct ExecResult {
     pub stderr: String,
     /// Exit code (0 = success).
     pub exit_code: i32,
+    /// Execution metrics (duration, bytes transferred).
+    pub metrics: ExecMetrics,
 }
 
 impl From<ExecOutput> for ExecResult {
     fn from(output: ExecOutput) -> Self {
         Self {
+            metrics: ExecMetrics {
+                stdout_bytes: output.stdout.len() as u64,
+                stderr_bytes: output.stderr.len() as u64,
+                ..Default::default()
+            },
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
             exit_code: output.exit_code,
@@ -29,8 +37,8 @@ impl From<ExecOutput> for ExecResult {
 
 /// A running MicroVM sandbox.
 ///
-/// Provides methods to execute commands, open PTY sessions,
-/// and manage the sandbox lifecycle.
+/// Provides methods to execute commands, stream output, transfer files,
+/// open PTY sessions, and manage the sandbox lifecycle.
 pub struct Sandbox {
     /// Unique sandbox identifier.
     id: String,
@@ -79,13 +87,13 @@ impl Sandbox {
 
     /// Execute a command in the sandbox.
     ///
+    /// Waits for the command to complete and returns all output at once.
+    ///
     /// # Arguments
     /// * `cmd` - Command to execute
     /// * `args` - Command arguments
-    ///
-    /// # Returns
-    /// * `ExecResult` with stdout, stderr, and exit code
     pub async fn exec(&self, cmd: &str, args: &[&str]) -> Result<ExecResult> {
+        let started = std::time::Instant::now();
         let mut cmd_parts = vec![cmd.to_string()];
         cmd_parts.extend(args.iter().map(|a| a.to_string()));
 
@@ -96,11 +104,14 @@ impl Sandbox {
             working_dir: None,
             stdin: None,
             user: None,
+            streaming: false,
         };
 
         let client = ExecClient::connect(&self.exec_socket).await?;
         let output = client.exec_command(&request).await?;
-        Ok(ExecResult::from(output))
+        let mut result = ExecResult::from(output);
+        result.metrics.duration_ms = started.elapsed().as_millis() as u64;
+        Ok(result)
     }
 
     /// Execute a command with environment variables and working directory.
@@ -111,6 +122,7 @@ impl Sandbox {
         working_dir: Option<String>,
         stdin: Option<Vec<u8>>,
     ) -> Result<ExecResult> {
+        let started = std::time::Instant::now();
         let request = ExecRequest {
             cmd,
             timeout_ns: 0,
@@ -118,11 +130,126 @@ impl Sandbox {
             working_dir,
             stdin,
             user: None,
+            streaming: false,
         };
 
         let client = ExecClient::connect(&self.exec_socket).await?;
         let output = client.exec_command(&request).await?;
-        Ok(ExecResult::from(output))
+        let mut result = ExecResult::from(output);
+        result.metrics.duration_ms = started.elapsed().as_millis() as u64;
+        Ok(result)
+    }
+
+    /// Execute a command in streaming mode.
+    ///
+    /// Returns a `StreamingExec` handle that yields output chunks as they
+    /// arrive from the guest. Use this for long-running commands or when
+    /// you need real-time output.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use a3s_box_sdk::Sandbox;
+    /// # async fn example(sandbox: &Sandbox) -> Result<(), Box<dyn std::error::Error>> {
+    /// use a3s_box_core::exec::ExecEvent;
+    ///
+    /// let mut stream = sandbox.exec_stream("tail", &["-f", "/var/log/syslog"]).await?;
+    /// while let Some(event) = stream.next_event().await? {
+    ///     match event {
+    ///         ExecEvent::Chunk(chunk) => {
+    ///             print!("{}", String::from_utf8_lossy(&chunk.data));
+    ///         }
+    ///         ExecEvent::Exit(exit) => {
+    ///             println!("Exited with code {}", exit.exit_code);
+    ///         }
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn exec_stream(&self, cmd: &str, args: &[&str]) -> Result<StreamingExec> {
+        let mut cmd_parts = vec![cmd.to_string()];
+        cmd_parts.extend(args.iter().map(|a| a.to_string()));
+
+        let request = ExecRequest {
+            cmd: cmd_parts,
+            timeout_ns: 0,
+            env: Vec::new(),
+            working_dir: None,
+            stdin: None,
+            user: None,
+            streaming: true,
+        };
+
+        let client = ExecClient::connect(&self.exec_socket).await?;
+        client.exec_stream(&request).await
+    }
+
+    /// Upload a file from the host into the sandbox.
+    ///
+    /// # Arguments
+    /// * `data` - File contents
+    /// * `guest_path` - Destination path inside the sandbox
+    pub async fn upload(&self, data: &[u8], guest_path: &str) -> Result<()> {
+        let request = FileRequest {
+            op: FileOp::Upload,
+            guest_path: guest_path.to_string(),
+            data: Some(base64::engine::general_purpose::STANDARD.encode(data)),
+        };
+
+        let client = ExecClient::connect(&self.exec_socket).await?;
+        let response = client.file_transfer(&request).await?;
+
+        if !response.success {
+            return Err(a3s_box_core::error::BoxError::ExecError(format!(
+                "Upload failed: {}",
+                response.error.unwrap_or_else(|| "unknown error".into())
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Download a file from the sandbox to the host.
+    ///
+    /// # Arguments
+    /// * `guest_path` - Path inside the sandbox to download
+    ///
+    /// # Returns
+    /// Raw file contents as bytes.
+    pub async fn download(&self, guest_path: &str) -> Result<Vec<u8>> {
+        let request = FileRequest {
+            op: FileOp::Download,
+            guest_path: guest_path.to_string(),
+            data: None,
+        };
+
+        let client = ExecClient::connect(&self.exec_socket).await?;
+        let response = client.file_transfer(&request).await?;
+
+        if !response.success {
+            return Err(a3s_box_core::error::BoxError::ExecError(format!(
+                "Download failed: {}",
+                response.error.unwrap_or_else(|| "unknown error".into())
+            )));
+        }
+
+        let data = response
+            .data
+            .ok_or_else(|| {
+                a3s_box_core::error::BoxError::ExecError(
+                    "Download response missing data".to_string(),
+                )
+            })?;
+
+        base64::engine::general_purpose::STANDARD
+            .decode(&data)
+            .map_err(|e| {
+                a3s_box_core::error::BoxError::ExecError(format!(
+                    "Failed to decode downloaded file: {}",
+                    e
+                ))
+            })
     }
 
     /// Open an interactive PTY session.
@@ -183,6 +310,8 @@ mod tests {
         assert_eq!(result.stdout, "hello\n");
         assert_eq!(result.stderr, "");
         assert_eq!(result.exit_code, 0);
+        assert_eq!(result.metrics.stdout_bytes, 6);
+        assert_eq!(result.metrics.stderr_bytes, 0);
     }
 
     #[test]
@@ -195,5 +324,18 @@ mod tests {
         let result = ExecResult::from(output);
         assert_eq!(result.exit_code, 127);
         assert_eq!(result.stderr, "not found\n");
+        assert_eq!(result.metrics.stderr_bytes, 10);
+    }
+
+    #[test]
+    fn test_exec_result_metrics_byte_counts() {
+        let output = ExecOutput {
+            stdout: vec![0u8; 1024],
+            stderr: vec![0u8; 512],
+            exit_code: 0,
+        };
+        let result = ExecResult::from(output);
+        assert_eq!(result.metrics.stdout_bytes, 1024);
+        assert_eq!(result.metrics.stderr_bytes, 512);
     }
 }

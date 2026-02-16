@@ -31,6 +31,14 @@
 - [x] Warm pool auto-scaling with Gateway pressure signals (blended effective miss rate, pre-warm on rising traffic)
 - [x] Kubernetes Operator (`BoxAutoscaler` CRD, `AutoscalerController` with ratio-based reconciliation, multi-metric, stabilization windows)
 
-## Next
+## Next — Embedded SDK Parity (boxlite feature parity)
+
+- [x] Streaming exec (stdout/stderr streaming via Frame protocol, `StreamingExecResult` with async iterator)
+- [x] File transfer (upload/download files to/from sandbox, `Sandbox::upload()` / `Sandbox::download()`)
+- [x] Port forwarding (expose guest ports to host, `SandboxOptions::port_forwards`, TCP proxy)
+- [x] Persistent workspaces (named workspaces that survive sandbox restart, `WorkspaceConfig`, volume reuse)
+- [x] Execution metrics (per-exec CPU/memory/duration stats, `ExecMetrics` in `ExecResult`)
+
+## Later
 
 - [ ] Real hardware testing on AMD SEV-SNP (Azure DCasv5 / bare-metal EPYC)

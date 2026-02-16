@@ -63,6 +63,7 @@ pub async fn execute(args: TopArgs) -> Result<(), Box<dyn std::error::Error>> {
         working_dir: None,
         stdin: None,
         user: None,
+        streaming: false,
     };
 
     let output = client.exec_command(&request).await?;

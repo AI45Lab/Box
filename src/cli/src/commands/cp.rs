@@ -114,6 +114,7 @@ async fn is_directory_in_box(
         working_dir: None,
         stdin: None,
         user: None,
+        streaming: false,
     };
 
     let output = client.exec_command(&request).await?;
@@ -142,6 +143,7 @@ async fn copy_file_from_box(
         working_dir: None,
         stdin: None,
         user: None,
+        streaming: false,
     };
 
     let output = client.exec_command(&request).await?;
@@ -196,6 +198,7 @@ async fn copy_file_to_box(
         working_dir: None,
         stdin: None,
         user: None,
+        streaming: false,
     };
 
     let output = client.exec_command(&request).await?;
@@ -235,6 +238,7 @@ async fn copy_dir_from_box(
         working_dir: None,
         stdin: None,
         user: None,
+        streaming: false,
     };
 
     let output = client.exec_command(&request).await?;
@@ -296,6 +300,7 @@ async fn copy_dir_to_box(
         working_dir: None,
         stdin: None,
         user: None,
+        streaming: false,
     };
 
     let output = client.exec_command(&request).await?;

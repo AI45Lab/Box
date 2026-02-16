@@ -31,7 +31,7 @@ pub mod volume;
 pub use audit::{AuditLog, AuditQuery, read_audit_log};
 pub use compose::{ComposeProject, ProjectState};
 pub use cache::{LayerCache, RootfsCache};
-pub use grpc::{AgentClient, AttestationClient, ExecClient, PtyClient, RaTlsAttestationClient};
+pub use grpc::{AgentClient, AttestationClient, ExecClient, PtyClient, RaTlsAttestationClient, StreamingExec};
 pub use grpc::{SealClient, SealResult, SecretEntry, SecretInjectionResult, SecretInjector, UnsealResult};
 pub use host_check::{check_virtualization_support, VirtualizationSupport};
 pub use network::NetworkStore;

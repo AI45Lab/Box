@@ -52,7 +52,7 @@ impl BoxSdk {
     }
 
     async fn init(home_dir: PathBuf) -> Result<Self> {
-        let dirs = ["images", "rootfs-cache", "sandboxes"];
+        let dirs = ["images", "rootfs-cache", "sandboxes", "workspaces"];
         for dir in &dirs {
             let path = home_dir.join(dir);
             std::fs::create_dir_all(&path).map_err(|e| {
@@ -144,7 +144,7 @@ impl BoxSdk {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
 
-        let volumes: Vec<String> = options
+        let mut volumes: Vec<String> = options
             .mounts
             .iter()
             .map(|m| {
@@ -156,6 +156,27 @@ impl BoxSdk {
             })
             .collect();
 
+        // Add persistent workspace as a volume mount
+        if let Some(ref ws) = options.workspace {
+            let ws_host_path = self.home_dir.join("workspaces").join(&ws.name);
+            // Ensure workspace directory exists
+            std::fs::create_dir_all(&ws_host_path).map_err(|e| {
+                BoxError::Other(format!(
+                    "Failed to create workspace directory {}: {}",
+                    ws_host_path.display(),
+                    e
+                ))
+            })?;
+            volumes.push(format!("{}:{}", ws_host_path.display(), ws.guest_path));
+        }
+
+        // Build port map from port forwards
+        let port_map: Vec<String> = options
+            .port_forwards
+            .iter()
+            .map(|pf| format!("{}:{}", pf.host_port, pf.guest_port))
+            .collect();
+
         Ok(BoxConfig {
             agent: AgentType::OciRegistry {
                 reference: options.image.clone(),
@@ -163,6 +184,7 @@ impl BoxSdk {
             resources,
             extra_env: env,
             volumes,
+            port_map,
             cmd: options
                 .workdir
                 .as_ref()
@@ -193,6 +215,7 @@ mod tests {
         assert!(tmp.path().join("images").exists());
         assert!(tmp.path().join("rootfs-cache").exists());
         assert!(tmp.path().join("sandboxes").exists());
+        assert!(tmp.path().join("workspaces").exists());
     }
 
     #[tokio::test]
@@ -270,5 +293,57 @@ mod tests {
         assert_eq!(config.resources.memory_mb, 256);
         assert!(config.extra_env.is_empty());
         assert!(config.volumes.is_empty());
+        assert!(config.port_map.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_sdk_build_config_port_forwards() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sdk = BoxSdk::with_home(tmp.path().to_path_buf()).await.unwrap();
+
+        let options = SandboxOptions {
+            image: "alpine:latest".into(),
+            port_forwards: vec![
+                crate::options::PortForward {
+                    guest_port: 8080,
+                    host_port: 3000,
+                    protocol: "tcp".into(),
+                },
+                crate::options::PortForward {
+                    guest_port: 5432,
+                    host_port: 5432,
+                    protocol: "tcp".into(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let config = sdk.build_config(&options).unwrap();
+        assert_eq!(config.port_map.len(), 2);
+        assert_eq!(config.port_map[0], "3000:8080");
+        assert_eq!(config.port_map[1], "5432:5432");
+    }
+
+    #[tokio::test]
+    async fn test_sdk_build_config_workspace() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sdk = BoxSdk::with_home(tmp.path().to_path_buf()).await.unwrap();
+
+        let options = SandboxOptions {
+            image: "alpine:latest".into(),
+            workspace: Some(crate::options::WorkspaceConfig {
+                name: "my-project".into(),
+                guest_path: "/workspace".into(),
+            }),
+            ..Default::default()
+        };
+
+        let config = sdk.build_config(&options).unwrap();
+        // Workspace should be added as a volume mount
+        assert_eq!(config.volumes.len(), 1);
+        assert!(config.volumes[0].contains("my-project"));
+        assert!(config.volumes[0].ends_with(":/workspace"));
+        // Workspace directory should be created
+        assert!(tmp.path().join("workspaces").join("my-project").exists());
     }
 }

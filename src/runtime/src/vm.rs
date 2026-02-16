@@ -267,6 +267,7 @@ impl VmManager {
             working_dir: None,
             stdin: None,
             user: None,
+            streaming: false,
         };
 
         let exec_start = std::time::Instant::now();
