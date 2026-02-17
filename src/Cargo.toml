@@ -118,8 +118,8 @@ ring = "0.17"
 # Self-update
 a3s-updater = { version = "0.2", path = "../updater" }
 
-# Shared transport protocol
-a3s-transport = { version = "0.1", path = "../transport" }
+# Shared types (transport protocol, privacy, tools)
+a3s-transport = { version = "0.1", path = "../../common", package = "a3s-common" }
 
 # Metrics
 prometheus = "0.13"
