@@ -158,4 +158,12 @@ impl StateFile {
             .map(|r| r.id.clone())
             .collect()
     }
+
+    /// Find all records matching a label key-value pair.
+    pub fn find_by_label(&self, key: &str, value: &str) -> Vec<&BoxRecord> {
+        self.records
+            .iter()
+            .filter(|r| r.labels.get(key).is_some_and(|v| v == value))
+            .collect()
+    }
 }

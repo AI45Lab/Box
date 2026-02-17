@@ -932,3 +932,34 @@ fn test_box_record_exit_code_none() {
     let parsed: BoxRecord = serde_json::from_str(&json).unwrap();
     assert!(parsed.exit_code.is_none());
 }
+
+#[test]
+fn test_find_by_label() {
+    let tmp = TempDir::new().unwrap();
+    let path = test_state_path(&tmp);
+    let mut state = file::StateFile::load(&path).unwrap();
+
+    let mut r1 = sample_record("id-1", "web", "running");
+    r1.labels.insert("com.a3s.compose.project".to_string(), "myapp".to_string());
+    r1.labels.insert("com.a3s.compose.service".to_string(), "web".to_string());
+
+    let mut r2 = sample_record("id-2", "db", "running");
+    r2.labels.insert("com.a3s.compose.project".to_string(), "myapp".to_string());
+    r2.labels.insert("com.a3s.compose.service".to_string(), "db".to_string());
+
+    let r3 = sample_record("id-3", "other", "running");
+
+    state.add(r1).unwrap();
+    state.add(r2).unwrap();
+    state.add(r3).unwrap();
+
+    let results = state.find_by_label("com.a3s.compose.project", "myapp");
+    assert_eq!(results.len(), 2);
+
+    let results = state.find_by_label("com.a3s.compose.project", "other");
+    assert!(results.is_empty());
+
+    let results = state.find_by_label("com.a3s.compose.service", "web");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].name, "web");
+}
