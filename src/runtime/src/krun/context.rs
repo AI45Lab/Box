@@ -23,12 +23,6 @@ pub struct KrunContext {
 }
 
 impl KrunContext {
-    /// Get the context ID.
-    #[allow(dead_code)]
-    pub fn id(&self) -> u32 {
-        self.ctx_id
-    }
-
     /// Initialize libkrun logging system based on RUST_LOG environment variable.
     /// Must be called before creating any context.
     pub unsafe fn init_logging() -> Result<()> {

@@ -14,10 +14,6 @@ pub struct OciImage {
     /// Root directory of the OCI image layout
     root_dir: PathBuf,
 
-    /// Image manifest
-    #[allow(dead_code)]
-    manifest: ImageManifest,
-
     /// Image configuration
     config: OciImageConfig,
 
@@ -115,7 +111,6 @@ impl OciImage {
 
         Ok(Self {
             root_dir,
-            manifest,
             config,
             layer_paths,
         })

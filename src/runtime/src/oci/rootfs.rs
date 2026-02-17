@@ -488,25 +488,6 @@ impl OciRootfsBuilder {
     }
 }
 
-/// Get the full path to agent executable within rootfs.
-#[allow(dead_code)]
-pub fn agent_executable_path(agent_target: &str, entrypoint: &[String]) -> String {
-    if entrypoint.is_empty() {
-        return format!("{}/bin/agent", agent_target);
-    }
-
-    let executable = &entrypoint[0];
-
-    // If entrypoint is absolute path, use it directly
-    if executable.starts_with('/') {
-        // Prepend agent target to make it relative to agent's root
-        format!("{}{}", agent_target.trim_end_matches('/'), executable)
-    } else {
-        // Relative path, prepend agent target
-        format!("{}/{}", agent_target.trim_end_matches('/'), executable)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -642,24 +623,6 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Agent OCI image"));
-    }
-
-    #[test]
-    fn test_agent_executable_path_absolute() {
-        let path = agent_executable_path("/agent", &["/bin/python".to_string()]);
-        assert_eq!(path, "/agent/bin/python");
-    }
-
-    #[test]
-    fn test_agent_executable_path_relative() {
-        let path = agent_executable_path("/agent", &["venv/bin/python".to_string()]);
-        assert_eq!(path, "/agent/venv/bin/python");
-    }
-
-    #[test]
-    fn test_agent_executable_path_empty() {
-        let path = agent_executable_path("/agent", &[]);
-        assert_eq!(path, "/agent/bin/agent");
     }
 
     // Helper function to create a minimal test OCI image

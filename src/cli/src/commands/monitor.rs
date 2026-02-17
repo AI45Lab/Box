@@ -14,10 +14,6 @@ use clap::Args;
 use crate::boot;
 use crate::state::StateFile;
 
-/// Poll interval for checking box liveness.
-#[allow(dead_code)]
-const POLL_INTERVAL: Duration = Duration::from_secs(5);
-
 /// Minimum backoff delay before retrying a restart.
 const MIN_BACKOFF: Duration = Duration::from_secs(1);
 
@@ -125,12 +121,6 @@ impl BackoffTracker {
         if let Some(entry) = self.entries.get_mut(box_id) {
             entry.mark_dead();
         }
-    }
-
-    /// Remove tracking for a box (e.g., when removed from state).
-    #[allow(dead_code)]
-    pub fn remove(&mut self, box_id: &str) {
-        self.entries.remove(box_id);
     }
 
     /// Get the current backoff delay for a box.
