@@ -1,49 +1,21 @@
 //! `a3s-box run` command — Pull + Create + Start.
 
-use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
-use a3s_box_core::config::{AgentType, BoxConfig, ResourceConfig, ResourceLimits, TeeConfig};
+use a3s_box_core::config::{AgentType, BoxConfig, ResourceConfig, TeeConfig};
 use a3s_box_core::event::EventEmitter;
 use a3s_box_runtime::VmManager;
 use clap::Args;
 
+use super::common::{self, CommonBoxArgs};
 use crate::output::parse_memory;
 use crate::state::{generate_name, BoxRecord, StateFile};
 
 #[derive(Args)]
 pub struct RunArgs {
-    /// OCI image reference
-    pub image: String,
-
-    /// Assign a name to the box
-    #[arg(long)]
-    pub name: Option<String>,
-
-    /// Number of CPUs
-    #[arg(long, default_value = "2")]
-    pub cpus: u32,
-
-    /// Memory (e.g., "512m", "2g")
-    #[arg(long, default_value = "512m")]
-    pub memory: String,
-
-    /// Volume mount (host:guest), can be repeated
-    #[arg(short = 'v', long = "volume")]
-    pub volumes: Vec<String>,
-
-    /// Environment variable (KEY=VALUE), can be repeated
-    #[arg(short = 'e', long = "env")]
-    pub env: Vec<String>,
-
-    /// Publish a port (host_port:guest_port), can be repeated
-    #[arg(short = 'p', long = "publish")]
-    pub publish: Vec<String>,
-
-    /// Set custom DNS servers, can be repeated
-    #[arg(long)]
-    pub dns: Vec<String>,
+    #[command(flatten)]
+    pub common: CommonBoxArgs,
 
     /// Run in detached mode (background)
     #[arg(short = 'd', long)]
@@ -57,97 +29,13 @@ pub struct RunArgs {
     #[arg(short = 't', long = "tty")]
     pub tty: bool,
 
-    /// Override the image entrypoint
-    #[arg(long)]
-    pub entrypoint: Option<String>,
-
-    /// Set the box hostname
-    #[arg(long)]
-    pub hostname: Option<String>,
-
-    /// Run as a specific user (e.g., "root", "1000:1000")
-    #[arg(short = 'u', long)]
-    pub user: Option<String>,
-
-    /// Working directory inside the box
-    #[arg(short = 'w', long)]
-    pub workdir: Option<String>,
-
-    /// Restart policy: no, always, on-failure, unless-stopped
-    #[arg(long, default_value = "no")]
-    pub restart: String,
-
     /// Automatically remove the box when it stops
     #[arg(long)]
     pub rm: bool,
 
-    /// Mount a tmpfs (e.g., "/tmp" or "/tmp:size=100m"), can be repeated
-    #[arg(long)]
-    pub tmpfs: Vec<String>,
-
-    /// Connect to a network (e.g., "mynet")
-    #[arg(long)]
-    pub network: Option<String>,
-
-    /// Set metadata labels (KEY=VALUE), can be repeated
-    #[arg(short = 'l', long = "label")]
-    pub labels: Vec<String>,
-
-    /// Health check command (e.g., "curl -f http://localhost/health")
-    #[arg(long)]
-    pub health_cmd: Option<String>,
-
-    /// Health check interval in seconds (default: 30)
-    #[arg(long, default_value = "30")]
-    pub health_interval: u64,
-
-    /// Health check timeout in seconds (default: 5)
-    #[arg(long, default_value = "5")]
-    pub health_timeout: u64,
-
-    /// Health check retries before unhealthy (default: 3)
-    #[arg(long, default_value = "3")]
-    pub health_retries: u32,
-
-    /// Health check start period in seconds (default: 0)
-    #[arg(long, default_value = "0")]
-    pub health_start_period: u64,
-
     /// Command to run (override entrypoint)
     #[arg(last = true)]
     pub cmd: Vec<String>,
-
-    /// Limit PIDs inside the box (--pids-limit)
-    #[arg(long)]
-    pub pids_limit: Option<u64>,
-
-    /// Pin to specific CPUs (e.g., "0,1,3" or "0-3")
-    #[arg(long)]
-    pub cpuset_cpus: Option<String>,
-
-    /// Set ulimit (e.g., "nofile=1024:4096"), can be repeated
-    #[arg(long = "ulimit")]
-    pub ulimits: Vec<String>,
-
-    /// CPU shares (relative weight, 2-262144)
-    #[arg(long)]
-    pub cpu_shares: Option<u64>,
-
-    /// CPU quota in microseconds per cpu-period
-    #[arg(long)]
-    pub cpu_quota: Option<i64>,
-
-    /// CPU period in microseconds (default: 100000)
-    #[arg(long)]
-    pub cpu_period: Option<u64>,
-
-    /// Memory reservation/soft limit (e.g., "256m", "1g")
-    #[arg(long)]
-    pub memory_reservation: Option<String>,
-
-    /// Memory+swap limit (e.g., "1g", "-1" for unlimited)
-    #[arg(long)]
-    pub memory_swap: Option<String>,
 
     /// Logging driver (json-file, none) [default: json-file]
     #[arg(long, default_value = "json-file")]
@@ -156,74 +44,6 @@ pub struct RunArgs {
     /// Log driver options (KEY=VALUE), can be repeated
     #[arg(long = "log-opt")]
     pub log_opts: Vec<String>,
-
-    /// Read environment variables from a file, can be repeated
-    #[arg(long)]
-    pub env_file: Vec<String>,
-
-    /// Add a custom host-to-IP mapping (host:ip), can be repeated
-    #[arg(long)]
-    pub add_host: Vec<String>,
-
-    /// Set target platform (e.g., "linux/amd64", "linux/arm64")
-    #[arg(long)]
-    pub platform: Option<String>,
-
-    /// Run an init process (tini) as PID 1
-    #[arg(long)]
-    pub init: bool,
-
-    /// Mount the root filesystem as read-only
-    #[arg(long)]
-    pub read_only: bool,
-
-    /// Add a Linux capability, can be repeated
-    #[arg(long)]
-    pub cap_add: Vec<String>,
-
-    /// Drop a Linux capability, can be repeated
-    #[arg(long)]
-    pub cap_drop: Vec<String>,
-
-    /// Security options (e.g., "seccomp=unconfined"), can be repeated
-    #[arg(long)]
-    pub security_opt: Vec<String>,
-
-    /// Give extended privileges to the box
-    #[arg(long)]
-    pub privileged: bool,
-
-    /// Add a host device to the box (host_path[:guest_path[:perms]]), can be repeated
-    #[arg(long)]
-    pub device: Vec<String>,
-
-    /// GPU devices to add (e.g., "all", "0,1")
-    #[arg(long)]
-    pub gpus: Option<String>,
-
-    /// Size of /dev/shm (e.g., "64m", "1g")
-    #[arg(long)]
-    pub shm_size: Option<String>,
-
-    /// Override the default signal to stop the box
-    #[arg(long)]
-    pub stop_signal: Option<String>,
-
-    /// Timeout (in seconds) to stop the box before killing
-    #[arg(long)]
-    pub stop_timeout: Option<u64>,
-
-    /// Disable any healthcheck defined in the image
-    #[arg(long)]
-    pub no_healthcheck: bool,
-
-    /// Disable OOM Killer for the box
-    #[arg(long)]
-    pub oom_kill_disable: bool,
-
-    /// Tune the host OOM score adjustment (-1000 to 1000)
-    #[arg(long)]
-    pub oom_score_adj: Option<i32>,
 
     /// Enable TEE (Trusted Execution Environment) with AMD SEV-SNP.
     /// Use --tee-simulate for development without hardware support.
@@ -240,49 +60,49 @@ pub struct RunArgs {
 }
 
 pub async fn execute(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let memory_mb = parse_memory(&args.memory).map_err(|e| format!("Invalid --memory: {e}"))?;
+    let memory_mb = parse_memory(&args.common.memory).map_err(|e| format!("Invalid --memory: {e}"))?;
 
     // Build resource limits before any partial moves of args
-    let resource_limits = build_resource_limits(&args)?;
+    let resource_limits = common::build_resource_limits(&args.common)?;
 
     // Parse logging config
     let log_driver: a3s_box_core::log::LogDriver = args
         .log_driver
         .parse()
         .map_err(|e: String| format!("Invalid --log-driver: {e}"))?;
-    let log_opts = parse_env_vars(&args.log_opts)
+    let log_opts = common::parse_env_vars(&args.log_opts)
         .map_err(|e| e.replace("environment variable", "log option"))?;
     let log_config = a3s_box_core::log::LogConfig {
         driver: log_driver,
         options: log_opts,
     };
 
-    let name = args.name.unwrap_or_else(generate_name);
-    let mut env = parse_env_vars(&args.env)?;
+    let name = args.common.name.unwrap_or_else(generate_name);
+    let mut env = common::parse_env_vars(&args.common.env)?;
 
     // Load --env-file entries (merged into env, CLI --env takes precedence)
-    for env_file in &args.env_file {
-        let file_env = parse_env_file(env_file)?;
+    for env_file in &args.common.env_file {
+        let file_env = common::parse_env_file(env_file)?;
         for (k, v) in file_env {
             env.entry(k).or_insert(v);
         }
     }
 
     let labels =
-        parse_env_vars(&args.labels).map_err(|e| e.replace("environment variable", "label"))?;
+        common::parse_env_vars(&args.common.labels).map_err(|e| e.replace("environment variable", "label"))?;
 
     // Parse health check config (--no-healthcheck disables)
-    let health_check = if args.no_healthcheck {
+    let health_check = if args.common.no_healthcheck {
         None
     } else {
-        args.health_cmd
+        args.common.health_cmd
             .as_ref()
             .map(|cmd| crate::state::HealthCheck {
                 cmd: vec!["sh".to_string(), "-c".to_string(), cmd.clone()],
-                interval_secs: args.health_interval,
-                timeout_secs: args.health_timeout,
-                retries: args.health_retries,
-                start_period_secs: args.health_start_period,
+                interval_secs: args.common.health_interval,
+                timeout_secs: args.common.health_timeout,
+                retries: args.common.health_retries,
+                start_period_secs: args.common.health_start_period,
             })
     };
     let health_status = if health_check.is_some() {
@@ -293,6 +113,7 @@ pub async fn execute(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // Parse entrypoint override: split string into argv
     let entrypoint_override = args
+        .common
         .entrypoint
         .as_ref()
         .map(|ep| ep.split_whitespace().map(String::from).collect::<Vec<_>>());
@@ -300,7 +121,7 @@ pub async fn execute(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Resolve named volumes (e.g., "mydata:/app/data" → "/home/user/.a3s/volumes/mydata:/app/data")
     let mut resolved_volumes = Vec::new();
     let mut volume_names = Vec::new();
-    for vol_spec in &args.volumes {
+    for vol_spec in &args.common.volumes {
         let (resolved, vol_name) = super::volume::resolve_named_volume(vol_spec)?;
         if let Some(name) = vol_name {
             volume_names.push(name);
@@ -309,13 +130,13 @@ pub async fn execute(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Parse --shm-size
-    let shm_size = match &args.shm_size {
-        Some(s) => Some(parse_memory_bytes(s).map_err(|e| format!("Invalid --shm-size: {e}"))?),
+    let shm_size = match &args.common.shm_size {
+        Some(s) => Some(common::parse_memory_bytes(s).map_err(|e| format!("Invalid --shm-size: {e}"))?),
         None => None,
     };
 
     // Determine network mode
-    let network_mode = match &args.network {
+    let network_mode = match &args.common.network {
         Some(name) => a3s_box_core::NetworkMode::Bridge {
             network: name.clone(),
         },
@@ -328,7 +149,7 @@ pub async fn execute(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             workload_id: args
                 .tee_workload_id
                 .clone()
-                .unwrap_or_else(|| args.image.clone()),
+                .unwrap_or_else(|| args.common.image.clone()),
             generation: Default::default(),
             simulate: args.tee_simulate,
         }
@@ -339,10 +160,10 @@ pub async fn execute(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Build BoxConfig
     let config = BoxConfig {
         agent: AgentType::OciRegistry {
-            reference: args.image.clone(),
+            reference: args.common.image.clone(),
         },
         resources: ResourceConfig {
-            vcpus: args.cpus,
+            vcpus: args.common.cpus,
             memory_mb,
             ..Default::default()
         },
@@ -350,10 +171,10 @@ pub async fn execute(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         entrypoint_override: entrypoint_override.clone(),
         volumes: resolved_volumes.clone(),
         extra_env: env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-        port_map: args.publish.clone(),
-        dns: args.dns.clone(),
+        port_map: args.common.publish.clone(),
+        dns: args.common.dns.clone(),
         network: network_mode.clone(),
-        tmpfs: args.tmpfs.clone(),
+        tmpfs: args.common.tmpfs.clone(),
         resource_limits: resource_limits.clone(),
         tee,
         ..Default::default()
@@ -371,7 +192,7 @@ pub async fn execute(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Register endpoint in network store BEFORE boot so the VM can find its IP
-    if let Some(ref net_name) = args.network {
+    if let Some(ref net_name) = args.common.network {
         let net_store = a3s_box_runtime::NetworkStore::default_path()?;
         let mut net_config = net_store
             .get(net_name)?
@@ -403,10 +224,10 @@ pub async fn execute(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         id: box_id.clone(),
         short_id: BoxRecord::make_short_id(&box_id),
         name: name.clone(),
-        image: args.image.clone(),
+        image: args.common.image.clone(),
         status: "running".to_string(),
         pid,
-        cpus: args.cpus,
+        cpus: args.common.cpus,
         memory_mb,
         volumes: resolved_volumes.clone(),
         env,
@@ -418,11 +239,11 @@ pub async fn execute(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         created_at: chrono::Utc::now(),
         started_at: Some(chrono::Utc::now()),
         auto_remove: args.rm,
-        hostname: args.hostname.clone(),
-        user: args.user.clone(),
-        workdir: args.workdir.clone(),
-        restart_policy: args.restart.clone(),
-        port_map: args.publish.clone(),
+        hostname: args.common.hostname.clone(),
+        user: args.common.user.clone(),
+        workdir: args.common.workdir.clone(),
+        restart_policy: args.common.restart.clone(),
+        port_map: args.common.publish.clone(),
         labels,
         stopped_by_user: false,
         restart_count: 0,
@@ -431,27 +252,27 @@ pub async fn execute(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         health_retries: 0,
         health_last_check: None,
         network_mode: network_mode.clone(),
-        network_name: args.network.clone(),
+        network_name: args.common.network.clone(),
         volume_names: volume_names.clone(),
-        tmpfs: args.tmpfs.clone(),
+        tmpfs: args.common.tmpfs.clone(),
         anonymous_volumes: vm.anonymous_volumes().to_vec(),
         resource_limits,
         log_config: log_config.clone(),
-        add_host: args.add_host.clone(),
-        platform: args.platform.clone(),
-        init: args.init,
-        read_only: args.read_only,
-        cap_add: args.cap_add.clone(),
-        cap_drop: args.cap_drop.clone(),
-        security_opt: args.security_opt.clone(),
-        privileged: args.privileged,
-        devices: args.device.clone(),
-        gpus: args.gpus.clone(),
+        add_host: args.common.add_host.clone(),
+        platform: args.common.platform.clone(),
+        init: args.common.init,
+        read_only: args.common.read_only,
+        cap_add: args.common.cap_add.clone(),
+        cap_drop: args.common.cap_drop.clone(),
+        security_opt: args.common.security_opt.clone(),
+        privileged: args.common.privileged,
+        devices: args.common.device.clone(),
+        gpus: args.common.gpus.clone(),
         shm_size,
-        stop_signal: args.stop_signal.clone(),
-        stop_timeout: args.stop_timeout,
-        oom_kill_disable: args.oom_kill_disable,
-        oom_score_adj: args.oom_score_adj,
+        stop_signal: args.common.stop_signal.clone(),
+        stop_timeout: args.common.stop_timeout,
+        oom_kill_disable: args.common.oom_kill_disable,
+        oom_score_adj: args.common.oom_score_adj,
         max_restart_count: 0,
         exit_code: None,
     };
@@ -521,9 +342,9 @@ pub async fn execute(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         client
             .send_request(&PtyRequest {
                 cmd: pty_cmd,
-                env: args.env.clone(),
-                working_dir: args.workdir.clone(),
-                user: args.user.clone(),
+                env: args.common.env.clone(),
+                working_dir: args.common.workdir.clone(),
+                user: args.common.user.clone(),
                 cols,
                 rows,
             })
@@ -537,7 +358,7 @@ pub async fn execute(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         // Clean up: destroy VM
         vm.destroy().await?;
         super::volume::detach_volumes(&volume_names, &box_id);
-        if let Some(ref net_name) = args.network {
+        if let Some(ref net_name) = args.common.network {
             let net_store = a3s_box_runtime::NetworkStore::default_path()?;
             if let Some(mut net_config) = net_store.get(net_name)? {
                 net_config.disconnect(&box_id).ok();
@@ -591,7 +412,7 @@ pub async fn execute(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     super::volume::detach_volumes(&volume_names, &box_id);
 
     // Disconnect from network if connected
-    if let Some(ref net_name) = args.network {
+    if let Some(ref net_name) = args.common.network {
         let net_store = a3s_box_runtime::NetworkStore::default_path()?;
         if let Some(mut net_config) = net_store.get(net_name)? {
             net_config.disconnect(&box_id).ok();
@@ -618,254 +439,79 @@ pub async fn execute(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Parse KEY=VALUE pairs into a HashMap.
-fn parse_env_vars(vars: &[String]) -> Result<HashMap<String, String>, String> {
-    let mut map = HashMap::new();
-    for var in vars {
-        let (key, value) = var
-            .split_once('=')
-            .ok_or_else(|| format!("Invalid environment variable (expected KEY=VALUE): {var}"))?;
-        map.insert(key.to_string(), value.to_string());
-    }
-    Ok(map)
-}
-
-/// Load environment variables from a file.
-///
-/// Each line should be KEY=VALUE. Empty lines and lines starting with '#' are skipped.
-fn parse_env_file(path: &str) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("Failed to read env file '{}': {}", path, e))?;
-    let mut map = HashMap::new();
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        if let Some((key, value)) = trimmed.split_once('=') {
-            map.insert(key.trim().to_string(), value.trim().to_string());
-        } else {
-            // KEY without value — set to empty string (Docker behavior)
-            map.insert(trimmed.to_string(), String::new());
-        }
-    }
-    Ok(map)
-}
-
-/// Build ResourceLimits from CLI args.
-fn build_resource_limits(args: &RunArgs) -> Result<ResourceLimits, Box<dyn std::error::Error>> {
-    let memory_reservation = match &args.memory_reservation {
-        Some(s) => {
-            Some(parse_memory_bytes(s).map_err(|e| format!("Invalid --memory-reservation: {e}"))?)
-        }
-        None => None,
-    };
-    let memory_swap = match &args.memory_swap {
-        Some(s) if s == "-1" => Some(-1i64),
-        Some(s) => {
-            Some(parse_memory_bytes(s).map_err(|e| format!("Invalid --memory-swap: {e}"))? as i64)
-        }
-        None => None,
-    };
-
-    Ok(ResourceLimits {
-        pids_limit: args.pids_limit,
-        cpuset_cpus: args.cpuset_cpus.clone(),
-        ulimits: args.ulimits.clone(),
-        cpu_shares: args.cpu_shares,
-        cpu_quota: args.cpu_quota,
-        cpu_period: args.cpu_period,
-        memory_reservation,
-        memory_swap,
-    })
-}
-
-/// Parse a memory size string (e.g., "256m", "1g", "1073741824") into bytes.
-fn parse_memory_bytes(s: &str) -> Result<u64, String> {
-    let s = s.trim().to_lowercase();
-    if s.is_empty() {
-        return Err("empty value".to_string());
-    }
-
-    if let Ok(bytes) = s.parse::<u64>() {
-        return Ok(bytes);
-    }
-
-    let (num_str, multiplier) = if s.ends_with("gb") || s.ends_with("g") {
-        let num = s.trim_end_matches("gb").trim_end_matches('g');
-        (num, 1024u64 * 1024 * 1024)
-    } else if s.ends_with("mb") || s.ends_with("m") {
-        let num = s.trim_end_matches("mb").trim_end_matches('m');
-        (num, 1024u64 * 1024)
-    } else if s.ends_with("kb") || s.ends_with("k") {
-        let num = s.trim_end_matches("kb").trim_end_matches('k');
-        (num, 1024u64)
-    } else if s.ends_with('b') {
-        let num = s.trim_end_matches('b');
-        (num, 1u64)
-    } else {
-        return Err(format!("unrecognized memory format: {s}"));
-    };
-
-    let num: u64 = num_str
-        .parse()
-        .map_err(|_| format!("invalid number: {num_str}"))?;
-    Ok(num * multiplier)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // --- parse_env_vars tests ---
+    // --- build_resource_limits tests (using new struct layout) ---
 
-    #[test]
-    fn test_parse_env_vars_valid() {
-        let vars = vec!["FOO=bar".to_string(), "BAZ=qux".to_string()];
-        let map = parse_env_vars(&vars).unwrap();
-        assert_eq!(map.get("FOO").unwrap(), "bar");
-        assert_eq!(map.get("BAZ").unwrap(), "qux");
-    }
-
-    #[test]
-    fn test_parse_env_vars_empty() {
-        let map = parse_env_vars(&[]).unwrap();
-        assert!(map.is_empty());
-    }
-
-    #[test]
-    fn test_parse_env_vars_value_with_equals() {
-        let vars = vec!["KEY=val=ue".to_string()];
-        let map = parse_env_vars(&vars).unwrap();
-        assert_eq!(map.get("KEY").unwrap(), "val=ue");
-    }
-
-    #[test]
-    fn test_parse_env_vars_invalid_no_equals() {
-        let vars = vec!["INVALID".to_string()];
-        let result = parse_env_vars(&vars);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("KEY=VALUE"));
-    }
-
-    #[test]
-    fn test_parse_env_vars_empty_value() {
-        let vars = vec!["KEY=".to_string()];
-        let map = parse_env_vars(&vars).unwrap();
-        assert_eq!(map.get("KEY").unwrap(), "");
-    }
-
-    // --- parse_memory_bytes tests ---
-
-    #[test]
-    fn test_parse_memory_bytes_raw_number() {
-        assert_eq!(parse_memory_bytes("1073741824").unwrap(), 1073741824);
-    }
-
-    #[test]
-    fn test_parse_memory_bytes_megabytes() {
-        assert_eq!(parse_memory_bytes("512m").unwrap(), 512 * 1024 * 1024);
-        assert_eq!(parse_memory_bytes("512mb").unwrap(), 512 * 1024 * 1024);
-        assert_eq!(parse_memory_bytes("512M").unwrap(), 512 * 1024 * 1024);
-    }
-
-    #[test]
-    fn test_parse_memory_bytes_gigabytes() {
-        assert_eq!(parse_memory_bytes("2g").unwrap(), 2 * 1024 * 1024 * 1024);
-        assert_eq!(parse_memory_bytes("2gb").unwrap(), 2 * 1024 * 1024 * 1024);
-    }
-
-    #[test]
-    fn test_parse_memory_bytes_kilobytes() {
-        assert_eq!(parse_memory_bytes("100k").unwrap(), 100 * 1024);
-        assert_eq!(parse_memory_bytes("100kb").unwrap(), 100 * 1024);
-    }
-
-    #[test]
-    fn test_parse_memory_bytes_bytes_suffix() {
-        assert_eq!(parse_memory_bytes("4096b").unwrap(), 4096);
-    }
-
-    #[test]
-    fn test_parse_memory_bytes_empty() {
-        assert!(parse_memory_bytes("").is_err());
-    }
-
-    #[test]
-    fn test_parse_memory_bytes_invalid_format() {
-        assert!(parse_memory_bytes("abc").is_err());
-        assert!(parse_memory_bytes("12x").is_err());
-    }
-
-    #[test]
-    fn test_parse_memory_bytes_whitespace() {
-        assert_eq!(parse_memory_bytes("  512m  ").unwrap(), 512 * 1024 * 1024);
-    }
-
-    // --- build_resource_limits tests ---
-
-    #[test]
-    fn test_build_resource_limits_defaults() {
-        let args = RunArgs {
-            image: "test".to_string(),
-            name: None,
-            cpus: 2,
-            memory: "512m".to_string(),
-            volumes: vec![],
-            env: vec![],
-            publish: vec![],
-            dns: vec![],
+    fn default_run_args() -> RunArgs {
+        RunArgs {
+            common: common::CommonBoxArgs {
+                image: "test".to_string(),
+                name: None,
+                cpus: 2,
+                memory: "512m".to_string(),
+                volumes: vec![],
+                env: vec![],
+                publish: vec![],
+                dns: vec![],
+                entrypoint: None,
+                hostname: None,
+                user: None,
+                workdir: None,
+                restart: "no".to_string(),
+                labels: vec![],
+                tmpfs: vec![],
+                network: None,
+                health_cmd: None,
+                health_interval: 30,
+                health_timeout: 5,
+                health_retries: 3,
+                health_start_period: 0,
+                pids_limit: None,
+                cpuset_cpus: None,
+                ulimits: vec![],
+                cpu_shares: None,
+                cpu_quota: None,
+                cpu_period: None,
+                memory_reservation: None,
+                memory_swap: None,
+                env_file: vec![],
+                add_host: vec![],
+                platform: None,
+                init: false,
+                read_only: false,
+                cap_add: vec![],
+                cap_drop: vec![],
+                security_opt: vec![],
+                privileged: false,
+                device: vec![],
+                gpus: None,
+                shm_size: None,
+                stop_signal: None,
+                stop_timeout: None,
+                no_healthcheck: false,
+                oom_kill_disable: false,
+                oom_score_adj: None,
+            },
             detach: false,
             interactive: false,
             tty: false,
-            entrypoint: None,
-            hostname: None,
-            user: None,
-            workdir: None,
-            restart: "no".to_string(),
             rm: false,
-            tmpfs: vec![],
-            network: None,
-            labels: vec![],
-            health_cmd: None,
-            health_interval: 30,
-            health_timeout: 5,
-            health_retries: 3,
-            health_start_period: 0,
             cmd: vec![],
-            pids_limit: None,
-            cpuset_cpus: None,
-            ulimits: vec![],
-            cpu_shares: None,
-            cpu_quota: None,
-            cpu_period: None,
-            memory_reservation: None,
-            memory_swap: None,
             log_driver: "json-file".to_string(),
             log_opts: vec![],
-            env_file: vec![],
-            add_host: vec![],
-            platform: None,
-            init: false,
-            read_only: false,
-            cap_add: vec![],
-            cap_drop: vec![],
-            security_opt: vec![],
-            privileged: false,
-            device: vec![],
-            gpus: None,
-            shm_size: None,
-            stop_signal: None,
-            stop_timeout: None,
-            no_healthcheck: false,
-            oom_kill_disable: false,
-            oom_score_adj: None,
             tee: false,
             tee_workload_id: None,
             tee_simulate: false,
-        };
+        }
+    }
 
-        let limits = build_resource_limits(&args).unwrap();
+    #[test]
+    fn test_build_resource_limits_defaults() {
+        let args = default_run_args();
+        let limits = common::build_resource_limits(&args.common).unwrap();
         assert!(limits.pids_limit.is_none());
         assert!(limits.cpuset_cpus.is_none());
         assert!(limits.cpu_shares.is_none());
@@ -875,66 +521,17 @@ mod tests {
 
     #[test]
     fn test_build_resource_limits_with_values() {
-        let args = RunArgs {
-            image: "test".to_string(),
-            name: None,
-            cpus: 2,
-            memory: "512m".to_string(),
-            volumes: vec![],
-            env: vec![],
-            publish: vec![],
-            dns: vec![],
-            detach: false,
-            interactive: false,
-            tty: false,
-            entrypoint: None,
-            hostname: None,
-            user: None,
-            workdir: None,
-            restart: "no".to_string(),
-            rm: false,
-            tmpfs: vec![],
-            network: None,
-            labels: vec![],
-            health_cmd: None,
-            health_interval: 30,
-            health_timeout: 5,
-            health_retries: 3,
-            health_start_period: 0,
-            cmd: vec![],
-            pids_limit: Some(100),
-            cpuset_cpus: Some("0-3".to_string()),
-            ulimits: vec!["nofile=1024:4096".to_string()],
-            cpu_shares: Some(512),
-            cpu_quota: Some(50000),
-            cpu_period: Some(100000),
-            memory_reservation: Some("256m".to_string()),
-            memory_swap: Some("-1".to_string()),
-            log_driver: "json-file".to_string(),
-            log_opts: vec![],
-            env_file: vec![],
-            add_host: vec![],
-            platform: None,
-            init: false,
-            read_only: false,
-            cap_add: vec![],
-            cap_drop: vec![],
-            security_opt: vec![],
-            privileged: false,
-            device: vec![],
-            gpus: None,
-            shm_size: None,
-            stop_signal: None,
-            stop_timeout: None,
-            no_healthcheck: false,
-            oom_kill_disable: false,
-            oom_score_adj: None,
-            tee: false,
-            tee_workload_id: None,
-            tee_simulate: false,
-        };
+        let mut args = default_run_args();
+        args.common.pids_limit = Some(100);
+        args.common.cpuset_cpus = Some("0-3".to_string());
+        args.common.ulimits = vec!["nofile=1024:4096".to_string()];
+        args.common.cpu_shares = Some(512);
+        args.common.cpu_quota = Some(50000);
+        args.common.cpu_period = Some(100000);
+        args.common.memory_reservation = Some("256m".to_string());
+        args.common.memory_swap = Some("-1".to_string());
 
-        let limits = build_resource_limits(&args).unwrap();
+        let limits = common::build_resource_limits(&args.common).unwrap();
         assert_eq!(limits.pids_limit, Some(100));
         assert_eq!(limits.cpuset_cpus, Some("0-3".to_string()));
         assert_eq!(limits.cpu_shares, Some(512));
@@ -946,121 +543,10 @@ mod tests {
 
     #[test]
     fn test_build_resource_limits_memory_swap_value() {
-        let args = RunArgs {
-            image: "test".to_string(),
-            name: None,
-            cpus: 2,
-            memory: "512m".to_string(),
-            volumes: vec![],
-            env: vec![],
-            publish: vec![],
-            dns: vec![],
-            detach: false,
-            interactive: false,
-            tty: false,
-            entrypoint: None,
-            hostname: None,
-            user: None,
-            workdir: None,
-            restart: "no".to_string(),
-            rm: false,
-            tmpfs: vec![],
-            network: None,
-            labels: vec![],
-            health_cmd: None,
-            health_interval: 30,
-            health_timeout: 5,
-            health_retries: 3,
-            health_start_period: 0,
-            cmd: vec![],
-            pids_limit: None,
-            cpuset_cpus: None,
-            ulimits: vec![],
-            cpu_shares: None,
-            cpu_quota: None,
-            cpu_period: None,
-            memory_reservation: None,
-            memory_swap: Some("1g".to_string()),
-            log_driver: "json-file".to_string(),
-            log_opts: vec![],
-            env_file: vec![],
-            add_host: vec![],
-            platform: None,
-            init: false,
-            read_only: false,
-            cap_add: vec![],
-            cap_drop: vec![],
-            security_opt: vec![],
-            privileged: false,
-            device: vec![],
-            gpus: None,
-            shm_size: None,
-            stop_signal: None,
-            stop_timeout: None,
-            no_healthcheck: false,
-            oom_kill_disable: false,
-            oom_score_adj: None,
-            tee: false,
-            tee_workload_id: None,
-            tee_simulate: false,
-        };
+        let mut args = default_run_args();
+        args.common.memory_swap = Some("1g".to_string());
 
-        let limits = build_resource_limits(&args).unwrap();
+        let limits = common::build_resource_limits(&args.common).unwrap();
         assert_eq!(limits.memory_swap, Some(1024 * 1024 * 1024));
-    }
-
-    // --- parse_env_file tests ---
-
-    #[test]
-    fn test_parse_env_file_basic() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("env");
-        std::fs::write(&path, "FOO=bar\nBAZ=qux\n").unwrap();
-        let map = parse_env_file(path.to_str().unwrap()).unwrap();
-        assert_eq!(map.get("FOO").unwrap(), "bar");
-        assert_eq!(map.get("BAZ").unwrap(), "qux");
-    }
-
-    #[test]
-    fn test_parse_env_file_comments_and_blanks() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("env");
-        std::fs::write(&path, "# comment\n\nKEY=val\n  \n# another\n").unwrap();
-        let map = parse_env_file(path.to_str().unwrap()).unwrap();
-        assert_eq!(map.len(), 1);
-        assert_eq!(map.get("KEY").unwrap(), "val");
-    }
-
-    #[test]
-    fn test_parse_env_file_key_without_value() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("env");
-        std::fs::write(&path, "STANDALONE\n").unwrap();
-        let map = parse_env_file(path.to_str().unwrap()).unwrap();
-        assert_eq!(map.get("STANDALONE").unwrap(), "");
-    }
-
-    #[test]
-    fn test_parse_env_file_value_with_equals() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("env");
-        std::fs::write(&path, "CONN=postgres://host?opt=1\n").unwrap();
-        let map = parse_env_file(path.to_str().unwrap()).unwrap();
-        assert_eq!(map.get("CONN").unwrap(), "postgres://host?opt=1");
-    }
-
-    #[test]
-    fn test_parse_env_file_missing_file() {
-        let result = parse_env_file("/nonexistent/path/env");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_env_file_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("env");
-        std::fs::write(&path, "").unwrap();
-        let map = parse_env_file(path.to_str().unwrap()).unwrap();
-        assert!(map.is_empty());
     }
 }

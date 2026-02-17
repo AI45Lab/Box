@@ -5,6 +5,7 @@ mod attest;
 mod audit;
 mod build;
 mod commit;
+pub(crate) mod common;
 mod compose;
 mod container_update;
 mod cp;

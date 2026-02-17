@@ -5,6 +5,7 @@
 
 use clap::Args;
 
+use super::common;
 use crate::output::parse_memory;
 use crate::resolve;
 use crate::state::StateFile;
@@ -74,7 +75,7 @@ pub async fn execute(args: ContainerUpdateArgs) -> Result<(), Box<dyn std::error
     }
 
     if let Some(ref reservation) = args.memory_reservation {
-        let bytes = parse_memory_bytes(reservation)
+        let bytes = common::parse_memory_bytes(reservation)
             .map_err(|e| format!("Invalid --memory-reservation: {e}"))?;
         record.resource_limits.memory_reservation = Some(bytes);
         updated.push(format!("memory-reservation={reservation}"));
@@ -84,7 +85,7 @@ pub async fn execute(args: ContainerUpdateArgs) -> Result<(), Box<dyn std::error
         let val = if swap == "-1" {
             -1i64
         } else {
-            parse_memory_bytes(swap).map_err(|e| format!("Invalid --memory-swap: {e}"))? as i64
+            common::parse_memory_bytes(swap).map_err(|e| format!("Invalid --memory-swap: {e}"))? as i64
         };
         record.resource_limits.memory_swap = Some(val);
         updated.push(format!("memory-swap={swap}"));
@@ -132,68 +133,4 @@ pub async fn execute(args: ContainerUpdateArgs) -> Result<(), Box<dyn std::error
     println!("{name}");
 
     Ok(())
-}
-
-/// Parse a memory size string into bytes.
-fn parse_memory_bytes(s: &str) -> Result<u64, String> {
-    let s = s.trim().to_lowercase();
-    if s.is_empty() {
-        return Err("empty value".to_string());
-    }
-
-    if let Ok(bytes) = s.parse::<u64>() {
-        return Ok(bytes);
-    }
-
-    let (num_str, multiplier) = if s.ends_with("gb") || s.ends_with("g") {
-        let num = s.trim_end_matches("gb").trim_end_matches('g');
-        (num, 1024u64 * 1024 * 1024)
-    } else if s.ends_with("mb") || s.ends_with("m") {
-        let num = s.trim_end_matches("mb").trim_end_matches('m');
-        (num, 1024u64 * 1024)
-    } else if s.ends_with("kb") || s.ends_with("k") {
-        let num = s.trim_end_matches("kb").trim_end_matches('k');
-        (num, 1024u64)
-    } else if s.ends_with('b') {
-        let num = s.trim_end_matches('b');
-        (num, 1u64)
-    } else {
-        return Err(format!("unrecognized memory format: {s}"));
-    };
-
-    let num: u64 = num_str
-        .parse()
-        .map_err(|_| format!("invalid number: {num_str}"))?;
-    Ok(num * multiplier)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_memory_bytes_megabytes() {
-        assert_eq!(parse_memory_bytes("512m").unwrap(), 512 * 1024 * 1024);
-        assert_eq!(parse_memory_bytes("512mb").unwrap(), 512 * 1024 * 1024);
-    }
-
-    #[test]
-    fn test_parse_memory_bytes_gigabytes() {
-        assert_eq!(parse_memory_bytes("2g").unwrap(), 2 * 1024 * 1024 * 1024);
-    }
-
-    #[test]
-    fn test_parse_memory_bytes_raw() {
-        assert_eq!(parse_memory_bytes("1048576").unwrap(), 1048576);
-    }
-
-    #[test]
-    fn test_parse_memory_bytes_empty() {
-        assert!(parse_memory_bytes("").is_err());
-    }
-
-    #[test]
-    fn test_parse_memory_bytes_invalid() {
-        assert!(parse_memory_bytes("abc").is_err());
-    }
 }
