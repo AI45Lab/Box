@@ -2,6 +2,7 @@
 
 use clap::Args;
 
+use crate::cleanup;
 use crate::resolve;
 use crate::state::StateFile;
 
@@ -64,8 +65,8 @@ fn rm_one(
     let volume_names = record.volume_names.clone();
     let anonymous_volumes = record.anonymous_volumes.clone();
 
-    // Detach named volumes
-    super::volume::detach_volumes(&volume_names, &box_id);
+    // Clean up volumes and network
+    cleanup::cleanup_box_resources(&box_id, &volume_names, network_name.as_deref());
 
     // Remove anonymous volumes (auto-created from OCI VOLUME directives)
     if !anonymous_volumes.is_empty() {
@@ -74,16 +75,6 @@ fn rm_one(
                 if let Err(e) = vol_store.remove(anon_name, true) {
                     tracing::debug!(volume = anon_name, error = %e, "Failed to remove anonymous volume");
                 }
-            }
-        }
-    }
-
-    // Disconnect from network if connected
-    if let Some(ref net_name) = network_name {
-        if let Ok(net_store) = a3s_box_runtime::NetworkStore::default_path() {
-            if let Ok(Some(mut net_config)) = net_store.get(net_name) {
-                net_config.disconnect(&box_id).ok();
-                net_store.update(&net_config).ok();
             }
         }
     }

@@ -5,6 +5,7 @@
 use clap::Args;
 
 use crate::boot;
+use crate::process;
 use crate::resolve;
 use crate::state::StateFile;
 
@@ -51,26 +52,7 @@ async fn restart_one(
     // Phase 1: Stop the box if it's running
     if was_running {
         if let Some(pid) = pid {
-            unsafe {
-                libc::kill(pid as i32, libc::SIGTERM);
-            }
-
-            let start = std::time::Instant::now();
-            let timeout_ms = timeout * 1000;
-            loop {
-                if !is_process_alive(pid) {
-                    break;
-                }
-                if start.elapsed().as_millis() > timeout_ms as u128 {
-                    unsafe {
-                        libc::kill(pid as i32, libc::SIGKILL);
-                    }
-                    // Wait briefly for SIGKILL to take effect
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                    break;
-                }
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            }
+            process::graceful_stop(pid, timeout).await;
         }
 
         // Update state to stopped
@@ -101,32 +83,4 @@ async fn restart_one(
 
     println!("{name}");
     Ok(())
-}
-
-fn is_process_alive(pid: u32) -> bool {
-    unsafe { libc::kill(pid as i32, 0) == 0 }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_is_process_alive_current_process() {
-        let current_pid = std::process::id();
-        assert!(is_process_alive(current_pid));
-    }
-
-    #[test]
-    fn test_is_process_alive_nonexistent() {
-        // PID 99999 is very unlikely to exist
-        assert!(!is_process_alive(99999));
-    }
-
-    #[test]
-    fn test_is_process_alive_parent_process() {
-        // Parent process should be alive (the test runner)
-        let parent_pid = unsafe { libc::getppid() as u32 };
-        assert!(is_process_alive(parent_pid));
-    }
 }

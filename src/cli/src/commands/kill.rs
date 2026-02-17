@@ -2,6 +2,7 @@
 
 use clap::Args;
 
+use crate::cleanup;
 use crate::resolve;
 use crate::state::StateFile;
 
@@ -91,18 +92,7 @@ fn kill_one(
 
     // Only update state to stopped for terminating signals
     if signal == libc::SIGKILL || signal == libc::SIGTERM {
-        // Detach named volumes
-        super::volume::detach_volumes(&volume_names, &box_id);
-
-        // Disconnect from network if connected
-        if let Some(ref net_name) = network_name {
-            if let Ok(net_store) = a3s_box_runtime::NetworkStore::default_path() {
-                if let Ok(Some(mut net_config)) = net_store.get(net_name) {
-                    net_config.disconnect(&box_id).ok();
-                    net_store.update(&net_config).ok();
-                }
-            }
-        }
+        cleanup::cleanup_box_resources(&box_id, &volume_names, network_name.as_deref());
 
         let record = resolve::resolve_mut(state, &box_id)?;
         record.status = "stopped".to_string();

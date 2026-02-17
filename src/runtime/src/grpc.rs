@@ -519,6 +519,34 @@ impl AttestationClient {
     }
 }
 
+/// Establish an RA-TLS connection to the guest attestation server.
+///
+/// Creates a TLS connector with the given attestation policy, connects to the
+/// Unix socket, and performs the TLS handshake (which verifies the TEE).
+async fn connect_ratls(
+    socket_path: &Path,
+    policy: crate::tee::AttestationPolicy,
+    allow_simulated: bool,
+) -> Result<tokio_rustls::client::TlsStream<UnixStream>> {
+    let client_config = crate::tee::ratls::create_client_config(policy, allow_simulated)?;
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(client_config));
+
+    let stream = UnixStream::connect(socket_path).await.map_err(|e| {
+        BoxError::AttestationError(format!(
+            "Failed to connect to RA-TLS server at {}: {}",
+            socket_path.display(),
+            e,
+        ))
+    })?;
+
+    let server_name = rustls::pki_types::ServerName::try_from("localhost")
+        .map_err(|e| BoxError::AttestationError(format!("Invalid server name: {}", e)))?;
+
+    connector.connect(server_name, stream).await.map_err(|e| {
+        BoxError::AttestationError(format!("RA-TLS handshake failed: {}", e))
+    })
+}
+
 /// Client for verifying TEE attestation via RA-TLS handshake.
 ///
 /// Connects to the guest's RA-TLS attestation server over Unix socket,
@@ -561,26 +589,7 @@ impl RaTlsAttestationClient {
     ) -> Result<crate::tee::VerificationResult> {
         use a3s_box_core::tee::{AttestRequest, AttestRoute};
 
-        // Build RA-TLS client config with custom verifier
-        let client_config = crate::tee::ratls::create_client_config(policy, allow_simulated)?;
-        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(client_config));
-
-        // Connect to the Unix socket
-        let stream = UnixStream::connect(&self.socket_path).await.map_err(|e| {
-            BoxError::AttestationError(format!(
-                "Failed to connect to RA-TLS server at {}: {}",
-                self.socket_path.display(),
-                e,
-            ))
-        })?;
-
-        // Perform TLS handshake — attestation is verified here
-        let server_name = rustls::pki_types::ServerName::try_from("localhost")
-            .map_err(|e| BoxError::AttestationError(format!("Invalid server name: {}", e)))?;
-
-        let mut tls_stream = connector.connect(server_name, stream).await.map_err(|e| {
-            BoxError::AttestationError(format!("RA-TLS handshake failed: {}", e))
-        })?;
+        let mut tls_stream = connect_ratls(&self.socket_path, policy, allow_simulated).await?;
 
         // Send a Frame-based status request
         let req = AttestRequest {
@@ -702,29 +711,8 @@ impl SecretInjector {
             });
         }
 
-        // Build RA-TLS client config (attestation verified during handshake)
-        let client_config = crate::tee::ratls::create_client_config(policy, allow_simulated)?;
-        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(client_config));
-
-        // Connect to attestation socket
-        let stream = UnixStream::connect(&self.socket_path).await.map_err(|e| {
-            BoxError::AttestationError(format!(
-                "Failed to connect to RA-TLS server at {}: {}",
-                self.socket_path.display(),
-                e,
-            ))
-        })?;
-
-        // TLS handshake — TEE attestation verified here
-        let server_name = rustls::pki_types::ServerName::try_from("localhost")
-            .map_err(|e| BoxError::AttestationError(format!("Invalid server name: {}", e)))?;
-
-        let mut tls_stream = connector.connect(server_name, stream).await.map_err(|e| {
-            BoxError::AttestationError(format!(
-                "RA-TLS handshake failed (TEE verification failed): {}",
-                e,
-            ))
-        })?;
+        // Build RA-TLS connection (attestation verified during handshake)
+        let mut tls_stream = connect_ratls(&self.socket_path, policy, allow_simulated).await?;
 
         // Build and send Frame-based secret injection request
         let req = AttestRequest {
@@ -820,24 +808,8 @@ impl SealClient {
         use a3s_box_core::tee::{AttestRequest, AttestRoute};
         use base64::Engine;
 
-        let client_config =
-            crate::tee::ratls::create_client_config(attestation_policy, allow_simulated)?;
-        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(client_config));
-
-        let stream = UnixStream::connect(&self.socket_path).await.map_err(|e| {
-            BoxError::AttestationError(format!(
-                "Failed to connect to RA-TLS server at {}: {}",
-                self.socket_path.display(),
-                e,
-            ))
-        })?;
-
-        let server_name = rustls::pki_types::ServerName::try_from("localhost")
-            .map_err(|e| BoxError::AttestationError(format!("Invalid server name: {}", e)))?;
-
-        let mut tls_stream = connector.connect(server_name, stream).await.map_err(|e| {
-            BoxError::AttestationError(format!("RA-TLS handshake failed: {}", e))
-        })?;
+        let mut tls_stream =
+            connect_ratls(&self.socket_path, attestation_policy, allow_simulated).await?;
 
         let req = AttestRequest {
             route: AttestRoute::Seal,
@@ -893,24 +865,8 @@ impl SealClient {
         use a3s_box_core::tee::{AttestRequest, AttestRoute};
         use base64::Engine;
 
-        let client_config =
-            crate::tee::ratls::create_client_config(attestation_policy, allow_simulated)?;
-        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(client_config));
-
-        let stream = UnixStream::connect(&self.socket_path).await.map_err(|e| {
-            BoxError::AttestationError(format!(
-                "Failed to connect to RA-TLS server at {}: {}",
-                self.socket_path.display(),
-                e,
-            ))
-        })?;
-
-        let server_name = rustls::pki_types::ServerName::try_from("localhost")
-            .map_err(|e| BoxError::AttestationError(format!("Invalid server name: {}", e)))?;
-
-        let mut tls_stream = connector.connect(server_name, stream).await.map_err(|e| {
-            BoxError::AttestationError(format!("RA-TLS handshake failed: {}", e))
-        })?;
+        let mut tls_stream =
+            connect_ratls(&self.socket_path, attestation_policy, allow_simulated).await?;
 
         let req = AttestRequest {
             route: AttestRoute::Unseal,

@@ -2,6 +2,8 @@
 
 use clap::Args;
 
+use crate::cleanup;
+use crate::process;
 use crate::resolve;
 use crate::state::StateFile;
 
@@ -58,38 +60,11 @@ async fn stop_one(
 
     // Send SIGTERM, then SIGKILL after timeout
     if let Some(pid) = pid {
-        unsafe {
-            libc::kill(pid as i32, libc::SIGTERM);
-        }
-
-        let start = std::time::Instant::now();
-        let timeout_ms = timeout * 1000;
-        loop {
-            if !is_process_alive(pid) {
-                break;
-            }
-            if start.elapsed().as_millis() > timeout_ms as u128 {
-                unsafe {
-                    libc::kill(pid as i32, libc::SIGKILL);
-                }
-                break;
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        }
+        process::graceful_stop(pid, timeout).await;
     }
 
-    // Detach named volumes
-    super::volume::detach_volumes(&volume_names, &box_id);
-
-    // Disconnect from network if connected
-    if let Some(ref net_name) = network_name {
-        if let Ok(net_store) = a3s_box_runtime::NetworkStore::default_path() {
-            if let Ok(Some(mut net_config)) = net_store.get(net_name) {
-                net_config.disconnect(&box_id).ok();
-                net_store.update(&net_config).ok();
-            }
-        }
-    }
+    // Clean up volumes and network
+    cleanup::cleanup_box_resources(&box_id, &volume_names, network_name.as_deref());
 
     // Update state
     let record = resolve::resolve_mut(state, &box_id)?;
@@ -107,32 +82,4 @@ async fn stop_one(
     }
 
     Ok(())
-}
-
-fn is_process_alive(pid: u32) -> bool {
-    unsafe { libc::kill(pid as i32, 0) == 0 }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_is_process_alive_current_process() {
-        let current_pid = std::process::id();
-        assert!(is_process_alive(current_pid));
-    }
-
-    #[test]
-    fn test_is_process_alive_nonexistent() {
-        // PID 99999 is very unlikely to exist
-        assert!(!is_process_alive(99999));
-    }
-
-    #[test]
-    fn test_is_process_alive_parent_process() {
-        // Parent process should be alive (the test runner)
-        let parent_pid = unsafe { libc::getppid() as u32 };
-        assert!(is_process_alive(parent_pid));
-    }
 }
