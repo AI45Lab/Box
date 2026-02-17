@@ -11,11 +11,22 @@ use a3s_box_core::error::{BoxError, Result};
 use a3s_box_core::platform::Platform;
 
 use super::dockerfile::{Dockerfile, Instruction};
-use super::layer::{create_layer, create_layer_from_dir, sha256_bytes, sha256_file, LayerInfo};
+use super::layer::{sha256_bytes, sha256_file, LayerInfo};
 use crate::oci::image::OciImageConfig;
 use crate::oci::layers::extract_layer;
 use crate::oci::store::ImageStore;
 use crate::oci::{ImagePuller, RegistryAuth};
+
+mod handlers;
+mod stages;
+mod utils;
+
+#[cfg(test)]
+mod tests;
+
+use handlers::{apply_base_config, execute_onbuild_trigger, handle_add, handle_copy, handle_run, instruction_to_string};
+use stages::{resolve_stage_rootfs, split_into_stages};
+use utils::{compute_diff_id, expand_args, format_size, resolve_path};
 
 /// Configuration for a build operation.
 #[derive(Debug, Clone)]
@@ -49,46 +60,46 @@ pub struct BuildResult {
 }
 
 /// Mutable state accumulated during the build.
-struct BuildState {
+pub(super) struct BuildState {
     /// Working directory inside the image
-    workdir: String,
+    pub(super) workdir: String,
     /// Environment variables
-    env: Vec<(String, String)>,
+    pub(super) env: Vec<(String, String)>,
     /// Entrypoint
-    entrypoint: Option<Vec<String>>,
+    pub(super) entrypoint: Option<Vec<String>>,
     /// Default command
-    cmd: Option<Vec<String>>,
+    pub(super) cmd: Option<Vec<String>>,
     /// User
-    user: Option<String>,
+    pub(super) user: Option<String>,
     /// Exposed ports
-    exposed_ports: Vec<String>,
+    pub(super) exposed_ports: Vec<String>,
     /// Labels
-    labels: HashMap<String, String>,
+    pub(super) labels: HashMap<String, String>,
     /// Layer info accumulated during build
-    layers: Vec<LayerInfo>,
+    pub(super) layers: Vec<LayerInfo>,
     /// Diff IDs (uncompressed layer digests) for the OCI config
-    diff_ids: Vec<String>,
+    pub(super) diff_ids: Vec<String>,
     /// History entries
-    history: Vec<HistoryEntry>,
+    pub(super) history: Vec<HistoryEntry>,
     /// Build arguments
-    build_args: HashMap<String, String>,
+    pub(super) build_args: HashMap<String, String>,
     /// Shell override (default: ["/bin/sh", "-c"])
-    shell: Vec<String>,
+    pub(super) shell: Vec<String>,
     /// Stop signal
-    stop_signal: Option<String>,
+    pub(super) stop_signal: Option<String>,
     /// Health check configuration
-    health_check: Option<OciHealthCheck>,
+    pub(super) health_check: Option<OciHealthCheck>,
     /// ONBUILD triggers to store in the image config
-    onbuild: Vec<String>,
+    pub(super) onbuild: Vec<String>,
     /// Volumes declared via VOLUME instruction
-    volumes: Vec<String>,
+    pub(super) volumes: Vec<String>,
 }
 
 /// A single history entry for the OCI config.
 #[derive(Debug, Clone)]
-struct HistoryEntry {
-    created_by: String,
-    empty_layer: bool,
+pub(super) struct HistoryEntry {
+    pub(super) created_by: String,
+    pub(super) empty_layer: bool,
 }
 
 /// Health check configuration for OCI image config.
@@ -612,83 +623,7 @@ pub async fn build(config: BuildConfig, store: Arc<ImageStore>) -> Result<BuildR
 }
 
 // =============================================================================
-// Multi-stage support
-// =============================================================================
-
-/// A build stage: a FROM instruction followed by its body instructions.
-struct BuildStage {
-    alias: Option<String>,
-    instructions: Vec<Instruction>,
-}
-
-/// Split a flat list of instructions into stages, each starting with FROM.
-fn split_into_stages(instructions: &[Instruction]) -> Vec<BuildStage> {
-    let mut stages = Vec::new();
-    let mut current: Option<BuildStage> = None;
-
-    for instr in instructions {
-        if let Instruction::From { alias, .. } = instr {
-            if let Some(stage) = current.take() {
-                stages.push(stage);
-            }
-            current = Some(BuildStage {
-                alias: alias.clone(),
-                instructions: vec![instr.clone()],
-            });
-        } else if let Some(ref mut stage) = current {
-            stage.instructions.push(instr.clone());
-        }
-        // Instructions before first FROM (only ARG allowed) are attached to first stage
-    }
-
-    if let Some(stage) = current {
-        stages.push(stage);
-    }
-
-    stages
-}
-
-/// Resolve a stage reference (name or index) to its rootfs path.
-fn resolve_stage_rootfs<'a>(
-    from_ref: &str,
-    completed_stages: &'a [(Option<String>, PathBuf)],
-) -> Result<&'a Path> {
-    // Try by alias first
-    for (alias, rootfs) in completed_stages {
-        if let Some(a) = alias {
-            if a == from_ref {
-                return Ok(rootfs);
-            }
-        }
-    }
-
-    // Try by index
-    if let Ok(idx) = from_ref.parse::<usize>() {
-        if idx < completed_stages.len() {
-            return Ok(&completed_stages[idx].1);
-        }
-    }
-
-    Err(BoxError::BuildError(format!(
-        "COPY --from={}: stage not found (available: {})",
-        from_ref,
-        completed_stages
-            .iter()
-            .enumerate()
-            .map(|(i, (alias, _))| {
-                if let Some(a) = alias {
-                    format!("{} ({})", i, a)
-                } else {
-                    i.to_string()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
-    )))
-}
-
-// =============================================================================
-// Instruction handlers
+// Helper functions
 // =============================================================================
 
 /// Handle FROM: pull base image and extract layers into rootfs.
@@ -734,464 +669,6 @@ async fn handle_from(
     let config = oci_image.config().clone();
     Ok((base_layers, base_diff_ids, config))
 }
-
-/// Handle COPY: copy files from build context into rootfs, create a layer.
-fn handle_copy(
-    src_patterns: &[String],
-    dst: &str,
-    context_dir: &Path,
-    rootfs_dir: &Path,
-    layers_dir: &Path,
-    workdir: &str,
-    layer_index: usize,
-) -> Result<LayerInfo> {
-    // Resolve destination path
-    let resolved_dst = resolve_path(workdir, dst);
-    let dst_in_rootfs = rootfs_dir.join(resolved_dst.trim_start_matches('/'));
-
-    // Ensure destination directory exists
-    if dst.ends_with('/') || src_patterns.len() > 1 {
-        std::fs::create_dir_all(&dst_in_rootfs).map_err(|e| {
-            BoxError::BuildError(format!(
-                "Failed to create COPY destination {}: {}",
-                dst_in_rootfs.display(),
-                e
-            ))
-        })?;
-    } else if let Some(parent) = dst_in_rootfs.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            BoxError::BuildError(format!("Failed to create parent directory: {}", e))
-        })?;
-    }
-
-    // Copy each source
-    for src in src_patterns {
-        let src_path = context_dir.join(src);
-        if !src_path.exists() {
-            return Err(BoxError::BuildError(format!(
-                "COPY source not found: {} (in context {})",
-                src,
-                context_dir.display()
-            )));
-        }
-
-        if src_path.is_dir() {
-            copy_dir_recursive(&src_path, &dst_in_rootfs)?;
-        } else {
-            // If dst ends with / or is a directory, copy into it
-            let target = if dst_in_rootfs.is_dir() {
-                dst_in_rootfs.join(
-                    src_path
-                        .file_name()
-                        .unwrap_or_else(|| std::ffi::OsStr::new(src)),
-                )
-            } else {
-                dst_in_rootfs.clone()
-            };
-            std::fs::copy(&src_path, &target).map_err(|e| {
-                BoxError::BuildError(format!(
-                    "Failed to copy {} to {}: {}",
-                    src_path.display(),
-                    target.display(),
-                    e
-                ))
-            })?;
-        }
-    }
-
-    // Create a layer from the copied files
-    // We use create_layer_from_dir approach: snapshot the destination
-    let layer_path = layers_dir.join(format!("layer_{}.tar.gz", layer_index));
-
-    // For COPY, create a layer containing just the destination files
-    let target_prefix = Path::new(resolved_dst.trim_start_matches('/'));
-    if dst_in_rootfs.is_dir() {
-        create_layer_from_dir(&dst_in_rootfs, target_prefix, &layer_path)
-    } else if dst_in_rootfs.parent().is_some() {
-        // Single file copy: create layer with just that file
-        let changed = vec![PathBuf::from(
-            dst_in_rootfs
-                .strip_prefix(rootfs_dir)
-                .unwrap_or(target_prefix),
-        )];
-        create_layer(rootfs_dir, &changed, &layer_path)
-    } else {
-        Err(BoxError::BuildError("Invalid COPY destination".to_string()))
-    }
-}
-
-/// Handle RUN: execute a command in the rootfs.
-///
-/// On Linux, uses chroot. On macOS, skips with a warning.
-/// Returns Some(LayerInfo) if a layer was created, None if skipped.
-#[allow(clippy::too_many_arguments)]
-fn handle_run(
-    command: &str,
-    _rootfs_dir: &Path,
-    _layers_dir: &Path,
-    _workdir: &str,
-    _env: &[(String, String)],
-    _shell: &[String],
-    _layer_index: usize,
-    quiet: bool,
-) -> Result<Option<LayerInfo>> {
-    if cfg!(target_os = "macos") {
-        if !quiet {
-            println!("  ⚠ RUN skipped on macOS (Linux rootfs cannot be executed on macOS host)");
-            println!("    Command: {}", command);
-        }
-        return Ok(None);
-    }
-
-    // Linux: execute via chroot
-    #[cfg(target_os = "linux")]
-    {
-        use super::layer::DirSnapshot;
-
-        let rootfs_dir = _rootfs_dir;
-        let layers_dir = _layers_dir;
-        let env = _env;
-        let shell = _shell;
-        let layer_index = _layer_index;
-
-        let before = DirSnapshot::capture(rootfs_dir)?;
-
-        // Build the command using the configured shell
-        let mut cmd = std::process::Command::new("chroot");
-        cmd.arg(rootfs_dir);
-        if shell.len() >= 2 {
-            cmd.arg(&shell[0]);
-            for arg in &shell[1..] {
-                cmd.arg(arg);
-            }
-        } else if shell.len() == 1 {
-            cmd.arg(&shell[0]);
-        } else {
-            cmd.arg("/bin/sh");
-            cmd.arg("-c");
-        }
-        cmd.arg(command);
-
-        // Set environment
-        cmd.env_clear();
-        cmd.env(
-            "PATH",
-            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        );
-        cmd.env("HOME", "/root");
-        for (key, value) in env {
-            cmd.env(key, value);
-        }
-
-        let output = cmd
-            .output()
-            .map_err(|e| BoxError::BuildError(format!("Failed to execute RUN command: {}", e)))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(BoxError::BuildError(format!(
-                "RUN command failed (exit {}): {}",
-                output.status.code().unwrap_or(-1),
-                stderr.trim()
-            )));
-        }
-
-        if !quiet {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if !stdout.is_empty() {
-                print!("{}", stdout);
-            }
-        }
-
-        // Capture diff
-        let after = DirSnapshot::capture(rootfs_dir)?;
-        let changed = before.diff(&after);
-
-        if changed.is_empty() {
-            return Ok(None);
-        }
-
-        let layer_path = layers_dir.join(format!("layer_{}.tar.gz", layer_index));
-        let layer_info = create_layer(rootfs_dir, &changed, &layer_path)?;
-        Ok(Some(layer_info))
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    Ok(None)
-}
-
-/// Handle ADD: like COPY but supports URL download and tar auto-extraction.
-#[allow(clippy::too_many_arguments)]
-fn handle_add(
-    src_patterns: &[String],
-    dst: &str,
-    _chown: Option<&str>,
-    context_dir: &Path,
-    rootfs_dir: &Path,
-    layers_dir: &Path,
-    workdir: &str,
-    layer_index: usize,
-) -> Result<LayerInfo> {
-    let resolved_dst = resolve_path(workdir, dst);
-    let dst_in_rootfs = rootfs_dir.join(resolved_dst.trim_start_matches('/'));
-
-    // Ensure destination directory exists
-    if dst.ends_with('/') || src_patterns.len() > 1 {
-        std::fs::create_dir_all(&dst_in_rootfs).map_err(|e| {
-            BoxError::BuildError(format!(
-                "Failed to create ADD destination {}: {}",
-                dst_in_rootfs.display(),
-                e
-            ))
-        })?;
-    } else if let Some(parent) = dst_in_rootfs.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            BoxError::BuildError(format!("Failed to create parent directory: {}", e))
-        })?;
-    }
-
-    for src in src_patterns {
-        if src.starts_with("http://") || src.starts_with("https://") {
-            // URL download — not supported in offline build, create placeholder
-            tracing::warn!(
-                url = src.as_str(),
-                "ADD URL download not supported in offline build, skipping"
-            );
-            continue;
-        }
-
-        let src_path = context_dir.join(src);
-        if !src_path.exists() {
-            return Err(BoxError::BuildError(format!(
-                "ADD source not found: {} (in context {})",
-                src,
-                context_dir.display()
-            )));
-        }
-
-        // Check if it's a tar archive that should be auto-extracted
-        if is_tar_archive(src) && !src_path.is_dir() {
-            extract_tar_to_dst(&src_path, &dst_in_rootfs)?;
-        } else if src_path.is_dir() {
-            copy_dir_recursive(&src_path, &dst_in_rootfs)?;
-        } else {
-            let target = if dst_in_rootfs.is_dir() {
-                dst_in_rootfs.join(
-                    src_path
-                        .file_name()
-                        .unwrap_or_else(|| std::ffi::OsStr::new(src)),
-                )
-            } else {
-                dst_in_rootfs.clone()
-            };
-            std::fs::copy(&src_path, &target).map_err(|e| {
-                BoxError::BuildError(format!(
-                    "Failed to copy {} to {}: {}",
-                    src_path.display(),
-                    target.display(),
-                    e
-                ))
-            })?;
-        }
-    }
-
-    // Create a layer from the destination
-    let layer_path = layers_dir.join(format!("layer_{}.tar.gz", layer_index));
-    let target_prefix = Path::new(resolved_dst.trim_start_matches('/'));
-    if dst_in_rootfs.is_dir() {
-        create_layer_from_dir(&dst_in_rootfs, target_prefix, &layer_path)
-    } else if dst_in_rootfs.parent().is_some() {
-        let changed = vec![PathBuf::from(
-            dst_in_rootfs
-                .strip_prefix(rootfs_dir)
-                .unwrap_or(target_prefix),
-        )];
-        create_layer(rootfs_dir, &changed, &layer_path)
-    } else {
-        Err(BoxError::BuildError("Invalid ADD destination".to_string()))
-    }
-}
-
-/// Check if a filename looks like a tar archive.
-fn is_tar_archive(name: &str) -> bool {
-    let lower = name.to_lowercase();
-    lower.ends_with(".tar")
-        || lower.ends_with(".tar.gz")
-        || lower.ends_with(".tgz")
-        || lower.ends_with(".tar.bz2")
-        || lower.ends_with(".tar.xz")
-}
-
-/// Extract a tar archive to a destination directory.
-fn extract_tar_to_dst(archive_path: &Path, dst: &Path) -> Result<()> {
-    use flate2::read::GzDecoder;
-    use std::io::BufReader;
-
-    std::fs::create_dir_all(dst).map_err(|e| {
-        BoxError::BuildError(format!(
-            "Failed to create extraction directory {}: {}",
-            dst.display(),
-            e
-        ))
-    })?;
-
-    let file = std::fs::File::open(archive_path).map_err(|e| {
-        BoxError::BuildError(format!(
-            "Failed to open archive {}: {}",
-            archive_path.display(),
-            e
-        ))
-    })?;
-
-    let name = archive_path.to_str().unwrap_or("").to_lowercase();
-
-    if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
-        let decoder = GzDecoder::new(BufReader::new(file));
-        let mut archive = tar::Archive::new(decoder);
-        archive.unpack(dst).map_err(|e| {
-            BoxError::BuildError(format!(
-                "Failed to extract tar.gz {}: {}",
-                archive_path.display(),
-                e
-            ))
-        })?;
-    } else if name.ends_with(".tar") {
-        let mut archive = tar::Archive::new(BufReader::new(file));
-        archive.unpack(dst).map_err(|e| {
-            BoxError::BuildError(format!(
-                "Failed to extract tar {}: {}",
-                archive_path.display(),
-                e
-            ))
-        })?;
-    } else {
-        // .tar.bz2, .tar.xz — not supported yet, fall back to plain copy
-        tracing::warn!(
-            path = archive_path.to_str().unwrap_or(""),
-            "Unsupported archive format for auto-extraction, copying as-is"
-        );
-        let target = dst.join(
-            archive_path
-                .file_name()
-                .unwrap_or_else(|| std::ffi::OsStr::new("archive")),
-        );
-        std::fs::copy(archive_path, &target)
-            .map_err(|e| BoxError::BuildError(format!("Failed to copy archive: {}", e)))?;
-    }
-
-    Ok(())
-}
-
-/// Execute an ONBUILD trigger instruction.
-fn execute_onbuild_trigger(
-    trigger: &str,
-    state: &mut BuildState,
-    _config: &BuildConfig,
-    _rootfs_dir: &Path,
-    _layers_dir: &Path,
-    _base_layers: &[LayerInfo],
-    _completed_stages: &[(Option<String>, PathBuf)],
-) -> Result<()> {
-    // Parse the trigger as an instruction
-    let instruction = super::dockerfile::parse_single_instruction(trigger)?;
-
-    // Only handle metadata instructions in ONBUILD triggers for now
-    // (RUN/COPY would need full execution context)
-    match &instruction {
-        Instruction::Env { key, value } => {
-            let expanded = expand_args(value, &state.build_args);
-            if let Some(existing) = state.env.iter_mut().find(|(k, _)| k == key) {
-                existing.1 = expanded;
-            } else {
-                state.env.push((key.clone(), expanded));
-            }
-        }
-        Instruction::Label { key, value } => {
-            state.labels.insert(key.clone(), value.clone());
-        }
-        Instruction::Workdir { path } => {
-            state.workdir = resolve_path(&state.workdir, path);
-        }
-        Instruction::Expose { port } => {
-            state.exposed_ports.push(port.clone());
-        }
-        Instruction::User { user } => {
-            state.user = Some(user.clone());
-        }
-        _ => {
-            tracing::warn!(
-                trigger = trigger,
-                "ONBUILD trigger requires execution context, skipping"
-            );
-        }
-    }
-
-    state.history.push(HistoryEntry {
-        created_by: format!("ONBUILD {}", trigger),
-        empty_layer: true,
-    });
-
-    Ok(())
-}
-
-/// Convert an Instruction back to a string representation for ONBUILD storage.
-fn instruction_to_string(instr: &Instruction) -> String {
-    match instr {
-        Instruction::Run { command } => format!("RUN {}", command),
-        Instruction::Copy { src, dst, from } => {
-            if let Some(f) = from {
-                format!("COPY --from={} {} {}", f, src.join(" "), dst)
-            } else {
-                format!("COPY {} {}", src.join(" "), dst)
-            }
-        }
-        Instruction::Add { src, dst, chown } => {
-            if let Some(c) = chown {
-                format!("ADD --chown={} {} {}", c, src.join(" "), dst)
-            } else {
-                format!("ADD {} {}", src.join(" "), dst)
-            }
-        }
-        Instruction::Workdir { path } => format!("WORKDIR {}", path),
-        Instruction::Env { key, value } => format!("ENV {}={}", key, value),
-        Instruction::Entrypoint { exec } => format!("ENTRYPOINT {:?}", exec),
-        Instruction::Cmd { exec } => format!("CMD {:?}", exec),
-        Instruction::Expose { port } => format!("EXPOSE {}", port),
-        Instruction::Label { key, value } => format!("LABEL {}={}", key, value),
-        Instruction::User { user } => format!("USER {}", user),
-        Instruction::Arg { name, default } => {
-            if let Some(d) = default {
-                format!("ARG {}={}", name, d)
-            } else {
-                format!("ARG {}", name)
-            }
-        }
-        Instruction::Shell { exec } => format!("SHELL {:?}", exec),
-        Instruction::StopSignal { signal } => format!("STOPSIGNAL {}", signal),
-        Instruction::HealthCheck { cmd, .. } => {
-            if let Some(c) = cmd {
-                format!("HEALTHCHECK CMD {}", c.join(" "))
-            } else {
-                "HEALTHCHECK NONE".to_string()
-            }
-        }
-        Instruction::OnBuild { instruction } => {
-            format!("ONBUILD {}", instruction_to_string(instruction))
-        }
-        Instruction::Volume { paths } => format!("VOLUME {}", paths.join(" ")),
-        Instruction::From { image, alias } => {
-            if let Some(a) = alias {
-                format!("FROM {} AS {}", image, a)
-            } else {
-                format!("FROM {}", image)
-            }
-        }
-    }
-}
-
-// =============================================================================
-// Image assembly
-// =============================================================================
 
 /// Assemble the final OCI image layout and store it.
 async fn assemble_image(
@@ -1406,170 +883,4 @@ async fn assemble_image(
         size: stored.size_bytes,
         layer_count: total_layers,
     })
-}
-
-// =============================================================================
-// Helpers
-// =============================================================================
-
-/// Apply base image config to build state.
-fn apply_base_config(state: &mut BuildState, config: &OciImageConfig) {
-    state.env = config.env.clone();
-    state.entrypoint = config.entrypoint.clone();
-    state.cmd = config.cmd.clone();
-    state.user = config.user.clone();
-    state.exposed_ports = config.exposed_ports.clone();
-    state.labels = config.labels.clone();
-    if let Some(ref wd) = config.working_dir {
-        state.workdir = wd.clone();
-    }
-    if let Some(ref sig) = config.stop_signal {
-        state.stop_signal = Some(sig.clone());
-    }
-    if let Some(ref hc) = config.health_check {
-        state.health_check = Some(hc.clone());
-    }
-    // Inherit volumes from base image
-    for v in &config.volumes {
-        if !state.volumes.contains(v) {
-            state.volumes.push(v.clone());
-        }
-    }
-    // Note: onbuild triggers are NOT inherited — they are executed, not stored
-}
-
-/// Resolve a path relative to a working directory.
-///
-/// If `path` is absolute, return it as-is. Otherwise, join with `workdir`.
-fn resolve_path(workdir: &str, path: &str) -> String {
-    if path.starts_with('/') {
-        path.to_string()
-    } else {
-        format!("{}/{}", workdir.trim_end_matches('/'), path)
-    }
-}
-
-/// Expand `${VAR}` and `$VAR` references in a string using build args.
-fn expand_args(s: &str, args: &HashMap<String, String>) -> String {
-    let mut result = s.to_string();
-    for (key, value) in args {
-        result = result.replace(&format!("${{{}}}", key), value);
-        result = result.replace(&format!("${}", key), value);
-    }
-    result
-}
-
-/// Compute the diff_id (SHA256 of uncompressed layer content).
-fn compute_diff_id(layer_path: &Path) -> Result<String> {
-    let data = std::fs::read(layer_path)
-        .map_err(|e| BoxError::BuildError(format!("Failed to read layer for diff_id: {}", e)))?;
-
-    // Decompress gzip to get raw tar
-    use flate2::read::GzDecoder;
-    use std::io::Read;
-
-    let decoder = GzDecoder::new(&data[..]);
-    let mut uncompressed = Vec::new();
-    std::io::BufReader::new(decoder)
-        .read_to_end(&mut uncompressed)
-        .map_err(|e| {
-            BoxError::BuildError(format!("Failed to decompress layer for diff_id: {}", e))
-        })?;
-
-    Ok(sha256_bytes(&uncompressed))
-}
-
-/// Recursively copy a directory.
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
-    std::fs::create_dir_all(dst).map_err(|e| {
-        BoxError::BuildError(format!(
-            "Failed to create directory {}: {}",
-            dst.display(),
-            e
-        ))
-    })?;
-
-    for entry in std::fs::read_dir(src).map_err(|e| {
-        BoxError::BuildError(format!("Failed to read directory {}: {}", src.display(), e))
-    })? {
-        let entry =
-            entry.map_err(|e| BoxError::BuildError(format!("Failed to read entry: {}", e)))?;
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-
-        if src_path.is_dir() {
-            copy_dir_recursive(&src_path, &dst_path)?;
-        } else {
-            std::fs::copy(&src_path, &dst_path).map_err(|e| {
-                BoxError::BuildError(format!(
-                    "Failed to copy {} to {}: {}",
-                    src_path.display(),
-                    dst_path.display(),
-                    e
-                ))
-            })?;
-        }
-    }
-    Ok(())
-}
-
-/// Format a byte size as a human-readable string.
-fn format_size(bytes: u64) -> String {
-    if bytes >= 1024 * 1024 * 1024 {
-        format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
-    } else if bytes >= 1024 * 1024 {
-        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
-    } else if bytes >= 1024 {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
-    } else {
-        format!("{} B", bytes)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_resolve_path_absolute() {
-        assert_eq!(resolve_path("/app", "/usr/bin"), "/usr/bin");
-    }
-
-    #[test]
-    fn test_resolve_path_relative() {
-        assert_eq!(resolve_path("/app", "src"), "/app/src");
-    }
-
-    #[test]
-    fn test_resolve_path_root_workdir() {
-        assert_eq!(resolve_path("/", "app"), "/app");
-    }
-
-    #[test]
-    fn test_expand_args_braces() {
-        let mut args = HashMap::new();
-        args.insert("VERSION".to_string(), "3.19".to_string());
-        assert_eq!(expand_args("alpine:${VERSION}", &args), "alpine:3.19");
-    }
-
-    #[test]
-    fn test_expand_args_dollar() {
-        let mut args = HashMap::new();
-        args.insert("TAG".to_string(), "latest".to_string());
-        assert_eq!(expand_args("image:$TAG", &args), "image:latest");
-    }
-
-    #[test]
-    fn test_expand_args_no_match() {
-        let args = HashMap::new();
-        assert_eq!(expand_args("alpine:3.19", &args), "alpine:3.19");
-    }
-
-    #[test]
-    fn test_format_size() {
-        assert_eq!(format_size(500), "500 B");
-        assert_eq!(format_size(1536), "1.5 KB");
-        assert_eq!(format_size(1_500_000), "1.4 MB");
-        assert_eq!(format_size(1_500_000_000), "1.4 GB");
-    }
 }

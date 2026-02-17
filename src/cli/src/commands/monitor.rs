@@ -281,7 +281,7 @@ mod tests {
         tracker.record_attempt("box-1");
         assert!(!tracker.ready("box-1"));
 
-        tracker.remove("box-1");
+        tracker.entries.remove("box-1");
         assert!(tracker.ready("box-1"));
         assert_eq!(tracker.current_delay("box-1"), MIN_BACKOFF);
     }
