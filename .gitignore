@@ -17,8 +17,8 @@ venv/
 coverage/
 htmlcov/
 *.egg-info/
-dist/
-build/
+/dist/
+/build/
 
 # Node.js
 node_modules/
@@ -26,7 +26,6 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
-dist/
 *.tsbuildinfo
 
 # Cache
