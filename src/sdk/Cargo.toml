@@ -6,6 +6,14 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Embedded MicroVM sandbox SDK — create, exec, stop sandboxes from your code"
+build = "build.rs"
+
+[features]
+default = []
+# Embed the pre-compiled a3s-box-shim binary into the SDK.
+# When enabled, the shim is auto-extracted to ~/.a3s/bin/ on first use.
+# Requires: either `A3S_SHIM_BINARY_PATH` env var or `a3s-box-shim` crate in workspace.
+embed-shim = []
 
 [dependencies]
 a3s-box-core = { path = "../core" }

@@ -3,7 +3,7 @@
 //! Provides create/ls/rm/inspect/connect/disconnect for user-defined
 //! bridge networks that enable container-to-container communication.
 
-use a3s_box_core::network::NetworkConfig;
+use a3s_box_core::network::{IsolationMode, NetworkConfig};
 use a3s_box_runtime::NetworkStore;
 use clap::{Args, Subcommand};
 
@@ -43,6 +43,10 @@ pub struct CreateArgs {
     /// Network driver
     #[arg(long, default_value = "bridge")]
     pub driver: String,
+
+    /// Network isolation mode: none, strict, or custom (default: none)
+    #[arg(long, default_value = "none")]
+    pub isolation: String,
 
     /// Set metadata labels (KEY=VALUE), can be repeated
     #[arg(short = 'l', long = "label")]
@@ -114,6 +118,14 @@ async fn execute_create(args: CreateArgs) -> Result<(), Box<dyn std::error::Erro
 
     config.driver = args.driver;
 
+    // Parse isolation mode
+    config.policy.isolation = match args.isolation.as_str() {
+        "none" => IsolationMode::None,
+        "strict" => IsolationMode::Strict,
+        "custom" => IsolationMode::Custom,
+        other => return Err(format!("Unknown isolation mode '{other}'. Use: none, strict, custom").into()),
+    };
+
     // Parse labels
     for label in &args.labels {
         let (key, value) = label
@@ -146,15 +158,18 @@ async fn execute_ls(args: LsArgs) -> Result<(), Box<dyn std::error::Error>> {
         "DRIVER",
         "SUBNET",
         "GATEWAY",
+        "ISOLATION",
         "ENDPOINTS",
     ]);
 
     for net in &networks {
+        let isolation = format!("{:?}", net.policy.isolation).to_lowercase();
         table.add_row(vec![
             net.name.clone(),
             net.driver.clone(),
             net.subnet.clone(),
             net.gateway.to_string(),
+            isolation,
             net.endpoints.len().to_string(),
         ]);
     }
@@ -213,6 +228,14 @@ async fn execute_connect(args: ConnectArgs) -> Result<(), Box<dyn std::error::Er
     let mut config = store
         .get(&args.network)?
         .ok_or_else(|| format!("network '{}' not found", args.network))?;
+
+    // Enforce network isolation policy before connecting
+    if config.policy.isolation == IsolationMode::Strict {
+        return Err(format!(
+            "network '{}' has strict isolation — no new connections allowed",
+            args.network
+        ).into());
+    }
 
     let endpoint = config
         .connect(&record.id, &record.name)

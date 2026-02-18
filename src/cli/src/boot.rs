@@ -5,7 +5,7 @@
 
 use a3s_box_core::config::{AgentType, BoxConfig, ResourceConfig};
 use a3s_box_core::event::EventEmitter;
-use a3s_box_runtime::VmManager;
+use a3s_box_runtime::{prom::RuntimeMetrics, VmManager};
 
 use crate::state::BoxRecord;
 
@@ -25,6 +25,9 @@ pub async fn boot_from_record(
     let config = config_from_record(record);
     let emitter = EventEmitter::new(256);
     let mut vm = VmManager::with_box_id(config, emitter, record.id.clone());
+
+    // Activate Prometheus metrics collection
+    vm.set_metrics(RuntimeMetrics::new());
 
     vm.boot().await?;
 

@@ -202,6 +202,14 @@ impl VmManager {
         self.pty_socket_path.as_deref()
     }
 
+    /// Inject a custom VMM provider (e.g., a VmController with a known shim path).
+    ///
+    /// If set before `boot()`, the injected provider is used instead of the
+    /// default `VmController::find_shim()` fallback.
+    pub fn set_provider(&mut self, provider: Box<dyn VmmProvider>) {
+        self.provider = Some(provider);
+    }
+
     /// Attach Prometheus metrics to this VM manager.
     pub fn set_metrics(&mut self, metrics: crate::prom::RuntimeMetrics) {
         self.prom = Some(metrics);

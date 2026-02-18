@@ -28,6 +28,7 @@
 mod options;
 mod sandbox;
 mod sdk;
+pub(crate) mod shim_embed;
 
 pub use options::{MountSpec, PortForward, SandboxOptions, WorkspaceConfig};
 pub use sandbox::{ExecResult, Sandbox};

@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use a3s_box_core::config::{AgentType, BoxConfig, ResourceConfig};
 use a3s_box_core::error::{BoxError, Result};
 use a3s_box_core::event::EventEmitter;
+use a3s_box_runtime::vmm::VmController;
 use a3s_box_runtime::VmManager;
 
 use crate::options::SandboxOptions;
@@ -52,7 +53,7 @@ impl BoxSdk {
     }
 
     async fn init(home_dir: PathBuf) -> Result<Self> {
-        let dirs = ["images", "rootfs-cache", "sandboxes", "workspaces"];
+        let dirs = ["bin", "images", "rootfs-cache", "sandboxes", "workspaces"];
         for dir in &dirs {
             let path = home_dir.join(dir);
             std::fs::create_dir_all(&path).map_err(|e| {
@@ -103,6 +104,14 @@ impl BoxSdk {
         // Create VM manager
         let event_emitter = EventEmitter::new(64);
         let mut vm = VmManager::with_box_id(config, event_emitter, sandbox_id.clone());
+
+        // Ensure the shim binary is available and inject it as the VMM provider.
+        // If embed-shim feature is enabled, this extracts the embedded binary to ~/.a3s/bin/.
+        // Otherwise, falls back to VmController::find_shim() during boot().
+        if let Some(shim_path) = crate::shim_embed::ensure_shim(&self.home_dir)? {
+            let controller = VmController::new(shim_path)?;
+            vm.set_provider(Box::new(controller));
+        }
 
         // Boot the VM
         vm.boot().await?;

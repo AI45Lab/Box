@@ -116,7 +116,7 @@ base64 = "0.22"
 ring = "0.17"
 
 # Self-update
-a3s-updater = { version = "0.2", path = "../updater" }
+a3s-updater = { version = "0.2", path = "../../updater" }
 
 # Shared types (transport protocol, privacy, tools)
 a3s-transport = { version = "0.1", path = "../../common", package = "a3s-common" }

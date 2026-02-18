@@ -28,6 +28,12 @@ impl ImagePuller {
         }
     }
 
+    /// Set the signature verification policy for image pulls.
+    pub fn with_signature_policy(mut self, policy: super::signing::SignaturePolicy) -> Self {
+        self.puller = self.puller.with_signature_policy(policy);
+        self
+    }
+
     /// Pull an image, using the local cache if available.
     ///
     /// Returns the loaded OCI image from the store.
