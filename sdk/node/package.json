@@ -1,6 +1,6 @@
 {
   "name": "@a3s-lab/box",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Node.js bindings for A3S Box MicroVM sandbox runtime",
   "main": "index.js",
   "types": "index.d.ts",
