@@ -9,6 +9,7 @@ dependencies = [
  "a3s-box-core",
  "a3s-box-runtime",
  "a3s-common",
+ "a3s-libkrun-sys",
  "base64 0.22.1",
  "chrono",
  "clap",
@@ -17,7 +18,6 @@ dependencies = [
  "dirs",
  "flate2",
  "libc",
- "libkrun-sys",
  "oci-spec",
  "rand",
  "serde",
@@ -103,6 +103,7 @@ version = "0.5.0"
 dependencies = [
  "a3s-box-core",
  "a3s-common",
+ "a3s-libkrun-sys",
  "async-trait",
  "base64 0.22.1",
  "chrono",
@@ -113,7 +114,6 @@ dependencies = [
  "flate2",
  "hex",
  "libc",
- "libkrun-sys",
  "oci-distribution",
  "oci-spec",
  "p384",
@@ -163,9 +163,9 @@ version = "0.5.0"
 dependencies = [
  "a3s-box-core",
  "a3s-box-runtime",
+ "a3s-libkrun-sys",
  "clap",
  "libc",
- "libkrun-sys",
  "serde",
  "serde_json",
  "tracing",
@@ -188,6 +188,15 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "a3s-libkrun-sys"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "num_cpus",
+ "pkg-config",
 ]
 
 [[package]]
@@ -1742,15 +1751,6 @@ name = "libc"
 version = "0.2.182"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6800badb6cb2082ffd7b6a67e6125bb39f18782f793520caee8cb8846be06112"
-
-[[package]]
-name = "libkrun-sys"
-version = "0.1.0"
-dependencies = [
- "libc",
- "num_cpus",
- "pkg-config",
-]
 
 [[package]]
 name = "libredox"

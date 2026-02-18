@@ -1,12 +1,13 @@
 [package]
-name = "libkrun-sys"
+name = "a3s-libkrun-sys"
 version = "0.1.0"
 edition = "2021"
 authors = ["A3S Lab Team"]
-description = "FFI bindings to libkrun"
+description = "FFI bindings to libkrun with vendored build support"
 license = "MIT"
+repository = "https://github.com/A3S-Lab/Box"
 
-links = "krun"
+links = "a3s_krun"
 
 [build-dependencies]
 pkg-config = "0.3"

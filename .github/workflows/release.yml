@@ -185,10 +185,10 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           cd src
-          for crate in a3s-box-core a3s-box-sdk; do
+          for crate in a3s-libkrun-sys a3s-box-core a3s-box-runtime a3s-box-sdk; do
             echo "Publishing $crate..."
             cargo publish -p "$crate" --allow-dirty 2>&1 || echo "Skipped $crate (may already be published)"
-            sleep 10
+            sleep 30
           done
 
   # ── Publish Python SDK to PyPI (native via maturin) ────────────

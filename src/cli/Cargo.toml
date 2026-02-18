@@ -17,7 +17,7 @@ path = "src/lib.rs"
 a3s-box-core = { path = "../core" }
 a3s-box-runtime = { path = "../runtime" }
 a3s-transport = { workspace = true }
-libkrun-sys = { path = "../deps/libkrun-sys" }
+libkrun-sys = { version = "0.1", path = "../deps/libkrun-sys", package = "a3s-libkrun-sys" }
 
 # Async runtime
 tokio = { workspace = true }
