@@ -357,7 +357,7 @@ impl Ipam6 {
             .parse()
             .map_err(|e| format!("invalid prefix length '{}': {}", parts[1], e))?;
 
-        if prefix_len > 120 || prefix_len < 64 {
+        if !(64..=120).contains(&prefix_len) {
             return Err(format!(
                 "IPv6 prefix length {} out of range (64..=120)",
                 prefix_len
