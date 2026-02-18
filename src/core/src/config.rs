@@ -21,6 +21,15 @@ pub enum TeeConfig {
         #[serde(default)]
         simulate: bool,
     },
+
+    /// Intel TDX (Trust Domain Extensions) — stub, not yet implemented at runtime.
+    Tdx {
+        /// Workload identifier for attestation
+        workload_id: String,
+        /// Enable simulation mode (no hardware required, for development)
+        #[serde(default)]
+        simulate: bool,
+    },
 }
 
 /// AMD SEV-SNP CPU generation.
@@ -627,6 +636,40 @@ mod tests {
         let parsed: TeeConfig = serde_json::from_str(&json).unwrap();
 
         assert_eq!(parsed, TeeConfig::None);
+    }
+
+    #[test]
+    fn test_tee_config_tdx() {
+        let tee = TeeConfig::Tdx {
+            workload_id: "tdx-workload".to_string(),
+            simulate: false,
+        };
+        let json = serde_json::to_string(&tee).unwrap();
+        let parsed: TeeConfig = serde_json::from_str(&json).unwrap();
+        match parsed {
+            TeeConfig::Tdx {
+                workload_id,
+                simulate,
+            } => {
+                assert_eq!(workload_id, "tdx-workload");
+                assert!(!simulate);
+            }
+            _ => panic!("Expected Tdx variant"),
+        }
+    }
+
+    #[test]
+    fn test_tee_config_tdx_simulate() {
+        let tee = TeeConfig::Tdx {
+            workload_id: "test".to_string(),
+            simulate: true,
+        };
+        let json = serde_json::to_string(&tee).unwrap();
+        let parsed: TeeConfig = serde_json::from_str(&json).unwrap();
+        match parsed {
+            TeeConfig::Tdx { simulate, .. } => assert!(simulate),
+            _ => panic!("Expected Tdx variant"),
+        }
     }
 
     #[test]

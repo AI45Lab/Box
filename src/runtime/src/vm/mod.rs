@@ -536,8 +536,12 @@ impl VmManager {
 
         if let Some(pid) = self.pid().await {
             // Safety: sending SIGSTOP to pause the process
-            unsafe {
-                libc::kill(pid as i32, libc::SIGSTOP);
+            let ret = unsafe { libc::kill(pid as i32, libc::SIGSTOP) };
+            if ret != 0 {
+                let err = std::io::Error::last_os_error();
+                return Err(BoxError::Other(format!(
+                    "Failed to send SIGSTOP to pid {}: {}", pid, err
+                )));
             }
             tracing::info!(box_id = %self.box_id, pid, "VM paused");
             Ok(())
@@ -552,8 +556,12 @@ impl VmManager {
     pub async fn resume(&self) -> Result<()> {
         if let Some(pid) = self.pid().await {
             // Safety: sending SIGCONT to resume the process
-            unsafe {
-                libc::kill(pid as i32, libc::SIGCONT);
+            let ret = unsafe { libc::kill(pid as i32, libc::SIGCONT) };
+            if ret != 0 {
+                let err = std::io::Error::last_os_error();
+                return Err(BoxError::Other(format!(
+                    "Failed to send SIGCONT to pid {}: {}", pid, err
+                )));
             }
             tracing::info!(box_id = %self.box_id, pid, "VM resumed");
             Ok(())
@@ -622,7 +630,7 @@ fn dirs_home() -> Option<PathBuf> {
 }
 
 /// Simple FNV-1a hash for generating short deterministic hashes from strings.
-pub(crate) fn md5_simple(input: &str) -> u64 {
+pub(crate) fn fnv1a_hash(input: &str) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
     for byte in input.bytes() {
         hash ^= byte as u64;

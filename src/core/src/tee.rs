@@ -27,6 +27,8 @@ pub const ATTEST_VSOCK_PORT: u32 = a3s_transport::ports::TEE_CHANNEL;
 pub enum TeeType {
     /// AMD SEV-SNP (real hardware).
     SevSnp,
+    /// Intel TDX (Trust Domain Extensions).
+    Tdx,
     /// Simulation mode (`A3S_TEE_SIMULATE` env var).
     Simulated,
 }
@@ -67,11 +69,15 @@ pub fn detect_tee() -> TeeCapability {
     let simulated = std::env::var("A3S_TEE_SIMULATE").is_ok();
     let sev_guest_device = std::path::Path::new("/dev/sev-guest").exists();
     let sev_device = std::path::Path::new("/dev/sev").exists();
+    let tdx_guest_device = std::path::Path::new("/dev/tdx_guest").exists()
+        || std::path::Path::new("/dev/tdx-guest").exists();
 
     let (available, tee_type) = if simulated {
         (true, Some(TeeType::Simulated))
     } else if sev_guest_device || sev_device {
         (true, Some(TeeType::SevSnp))
+    } else if tdx_guest_device {
+        (true, Some(TeeType::Tdx))
     } else {
         (false, None)
     };
@@ -187,9 +193,28 @@ mod tests {
             "\"sev_snp\""
         );
         assert_eq!(
+            serde_json::to_string(&TeeType::Tdx).unwrap(),
+            "\"tdx\""
+        );
+        assert_eq!(
             serde_json::to_string(&TeeType::Simulated).unwrap(),
             "\"simulated\""
         );
+    }
+
+    #[test]
+    fn test_tee_type_tdx_roundtrip() {
+        let cap = TeeCapability {
+            available: true,
+            tee_type: Some(TeeType::Tdx),
+            sev_guest_device: false,
+            sev_device: false,
+            simulated: false,
+        };
+        let json = serde_json::to_string(&cap).unwrap();
+        let parsed: TeeCapability = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.tee_type, Some(TeeType::Tdx));
+        assert!(parsed.available);
     }
 
     // -- Attest protocol tests --

@@ -48,6 +48,13 @@ pub struct NamespaceConfig {
     /// Separate network (network namespace)
     /// Usually false to allow agent-business communication
     pub net: bool,
+
+    /// Separate user/group IDs (user namespace)
+    /// Enables rootless containers with UID/GID remapping
+    pub user: bool,
+
+    /// Separate cgroup view (cgroup namespace)
+    pub cgroup: bool,
 }
 
 impl Default for NamespaceConfig {
@@ -58,6 +65,8 @@ impl Default for NamespaceConfig {
             ipc: true,
             uts: true,
             net: false, // Share network for communication
+            user: false, // Disabled by default (requires UID mapping setup)
+            cgroup: false, // Disabled by default
         }
     }
 }
@@ -71,6 +80,8 @@ impl NamespaceConfig {
             ipc: true,
             uts: true,
             net: true,
+            user: true,
+            cgroup: true,
         }
     }
 
@@ -82,6 +93,8 @@ impl NamespaceConfig {
             ipc: false,
             uts: false,
             net: false,
+            user: false,
+            cgroup: false,
         }
     }
 
@@ -104,6 +117,12 @@ impl NamespaceConfig {
         }
         if self.net {
             flags |= CloneFlags::CLONE_NEWNET;
+        }
+        if self.user {
+            flags |= CloneFlags::CLONE_NEWUSER;
+        }
+        if self.cgroup {
+            flags |= CloneFlags::CLONE_NEWCGROUP;
         }
 
         flags
@@ -594,6 +613,8 @@ mod tests {
         assert!(config.ipc);
         assert!(config.uts);
         assert!(!config.net);
+        assert!(!config.user);
+        assert!(!config.cgroup);
     }
 
     #[test]
@@ -604,6 +625,8 @@ mod tests {
         assert!(config.ipc);
         assert!(config.uts);
         assert!(config.net);
+        assert!(config.user);
+        assert!(config.cgroup);
     }
 
     #[test]
@@ -614,6 +637,8 @@ mod tests {
         assert!(!config.ipc);
         assert!(!config.uts);
         assert!(!config.net);
+        assert!(!config.user);
+        assert!(!config.cgroup);
     }
 
     #[test]
@@ -625,6 +650,8 @@ mod tests {
             ipc: false,
             uts: false,
             net: false,
+            user: false,
+            cgroup: false,
         };
 
         let flags = config.to_clone_flags();
@@ -633,6 +660,22 @@ mod tests {
         assert!(!flags.contains(CloneFlags::CLONE_NEWIPC));
         assert!(!flags.contains(CloneFlags::CLONE_NEWUTS));
         assert!(!flags.contains(CloneFlags::CLONE_NEWNET));
+        assert!(!flags.contains(CloneFlags::CLONE_NEWUSER));
+        assert!(!flags.contains(CloneFlags::CLONE_NEWCGROUP));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_namespace_config_to_clone_flags_full() {
+        let config = NamespaceConfig::full_isolation();
+        let flags = config.to_clone_flags();
+        assert!(flags.contains(CloneFlags::CLONE_NEWNS));
+        assert!(flags.contains(CloneFlags::CLONE_NEWPID));
+        assert!(flags.contains(CloneFlags::CLONE_NEWIPC));
+        assert!(flags.contains(CloneFlags::CLONE_NEWUTS));
+        assert!(flags.contains(CloneFlags::CLONE_NEWNET));
+        assert!(flags.contains(CloneFlags::CLONE_NEWUSER));
+        assert!(flags.contains(CloneFlags::CLONE_NEWCGROUP));
     }
 
     // --- Capability mapping tests ---

@@ -201,7 +201,7 @@ impl RotatingWriter {
     }
 
     fn rotate(&mut self) -> std::io::Result<()> {
-        // Shift existing rotated files: .2 → .3, .1 → .2, etc.
+        // Shift existing rotated files: .2.gz → .3.gz, .1.gz → .2.gz, etc.
         for i in (1..self.max_file).rev() {
             let from = rotated_path(&self.path, i);
             let to = rotated_path(&self.path, i + 1);
@@ -216,9 +216,10 @@ impl RotatingWriter {
             std::fs::remove_file(&oldest)?;
         }
 
-        // Current → .1
+        // Current → .1.gz (compress during rotation)
         let rotated = rotated_path(&self.path, 1);
-        std::fs::rename(&self.path, &rotated)?;
+        compress_file(&self.path, &rotated)?;
+        std::fs::remove_file(&self.path)?;
 
         // Open a fresh file
         self.file = std::fs::OpenOptions::new()
@@ -230,10 +231,31 @@ impl RotatingWriter {
     }
 }
 
-/// Generate a rotated file path: container.json → container.json.1
+/// Compress a file with gzip.
+fn compress_file(src: &Path, dst: &Path) -> std::io::Result<()> {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Read;
+
+    let mut input = std::fs::File::open(src)?;
+    let output = std::fs::File::create(dst)?;
+    let mut encoder = GzEncoder::new(output, Compression::fast());
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = input.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        encoder.write_all(&buf[..n])?;
+    }
+    encoder.finish()?;
+    Ok(())
+}
+
+/// Generate a rotated file path: container.json → container.json.1.gz
 fn rotated_path(base: &Path, index: u32) -> PathBuf {
     let mut p = base.as_os_str().to_owned();
-    p.push(format!(".{}", index));
+    p.push(format!(".{}.gz", index));
     PathBuf::from(p)
 }
 
@@ -273,10 +295,33 @@ mod tests {
                 .unwrap();
         }
 
-        // Should have rotated — check .1 exists
+        // Should have rotated — check .1.gz exists (compressed)
         assert!(rotated_path(&path, 1).exists());
-        // .3 should not exist (max_file=2)
+        // .3.gz should not exist (max_file=2)
         assert!(!rotated_path(&path, 3).exists());
+    }
+
+    #[test]
+    fn test_rotating_writer_compressed_readable() {
+        use flate2::read::GzDecoder;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.json");
+        // Very small max_size to force rotation
+        let mut writer = RotatingWriter::new(&path, 30, 2).unwrap();
+
+        writer.write_line(r#"{"log":"first line\n"}"#).unwrap();
+        writer.write_line(r#"{"log":"second line\n"}"#).unwrap();
+
+        let rotated = rotated_path(&path, 1);
+        if rotated.exists() {
+            // Decompress and verify content
+            let gz_file = std::fs::File::open(&rotated).unwrap();
+            let mut decoder = GzDecoder::new(gz_file);
+            let mut content = String::new();
+            decoder.read_to_string(&mut content).unwrap();
+            assert!(content.contains("first line"));
+        }
     }
 
     #[test]

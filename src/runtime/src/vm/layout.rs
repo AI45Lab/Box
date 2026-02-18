@@ -260,6 +260,24 @@ impl VmManager {
                     tee_type: "snp".to_string(),
                 }))
             }
+            TeeConfig::Tdx {
+                workload_id,
+                simulate,
+            } => {
+                if *simulate {
+                    tracing::warn!("TDX simulation mode: skipping hardware check and TEE config");
+                    return Ok(None);
+                }
+
+                // Intel TDX runtime support is not yet implemented.
+                // The config variant exists for forward compatibility, but we
+                // cannot boot a TDX VM today.
+                Err(BoxError::TeeConfig(format!(
+                    "Intel TDX is not yet supported at runtime (workload_id='{}'). \
+                     Use tee=sev-snp or tee=none.",
+                    workload_id
+                )))
+            }
         }
     }
 

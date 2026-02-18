@@ -9,7 +9,7 @@ use crate::oci::OciImageConfig;
 use crate::rootfs::GUEST_WORKDIR;
 use crate::vmm::{Entrypoint, FsMount, InstanceSpec};
 
-use super::{md5_simple, BoxLayout, VmManager};
+use super::{fnv1a_hash, BoxLayout, VmManager};
 
 impl VmManager {
     /// Build InstanceSpec from config and layout.
@@ -48,7 +48,7 @@ impl VmManager {
                 }
 
                 // Generate a deterministic anonymous volume name
-                let path_hash = &format!("{:x}", md5_simple(vol_path))[..8];
+                let path_hash = &format!("{:x}", fnv1a_hash(vol_path))[..8];
                 let short_box_id = &self.box_id[..8.min(self.box_id.len())];
                 let anon_name = format!("anon_{}_{}", short_box_id, path_hash);
 
@@ -230,7 +230,9 @@ impl VmManager {
         }
 
         // Inject TEE simulation env var when simulate mode is enabled
-        if matches!(self.config.tee, TeeConfig::SevSnp { simulate: true, .. }) {
+        if matches!(self.config.tee, TeeConfig::SevSnp { simulate: true, .. })
+            || matches!(self.config.tee, TeeConfig::Tdx { simulate: true, .. })
+        {
             entrypoint
                 .env
                 .push(("A3S_TEE_SIMULATE".to_string(), "1".to_string()));

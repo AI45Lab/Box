@@ -84,9 +84,19 @@ fn parse_tee_config(annotations: &HashMap<String, String>) -> Result<TeeConfig> 
                 simulate: false,
             })
         }
+        Some("tdx") => {
+            let workload_id = annotations
+                .get(ANN_TEE_WORKLOAD_ID)
+                .cloned()
+                .unwrap_or_else(|| "default".to_string());
+            Ok(TeeConfig::Tdx {
+                workload_id,
+                simulate: false,
+            })
+        }
         Some("none") | None => Ok(TeeConfig::None),
         Some(other) => Err(BoxError::ConfigError(format!(
-            "Unknown TEE type: '{}'. Expected: none, sev-snp",
+            "Unknown TEE type: '{}'. Expected: none, sev-snp, tdx",
             other
         ))),
     }

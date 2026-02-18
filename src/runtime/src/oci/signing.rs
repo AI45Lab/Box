@@ -177,55 +177,41 @@ pub async fn verify_image_signature(
         SignaturePolicy::Skip => VerifyResult::Skipped,
 
         SignaturePolicy::CosignKey { public_key } => {
-            // Check that the key file exists
-            if !std::path::Path::new(public_key).exists() {
-                return VerifyResult::Failed(format!("Public key file not found: {}", public_key));
-            }
-
-            // Fetch signature from registry
-            match fetch_cosign_signature(registry, repository, manifest_digest).await {
-                Ok(Some(payload)) => {
-                    // Verify payload digest matches
-                    match verify_cosign_payload(&payload, manifest_digest) {
-                        Ok(_) => {
-                            tracing::info!(
-                                digest = %manifest_digest,
-                                key = %public_key,
-                                "Image signature verified"
-                            );
-                            VerifyResult::Verified
-                        }
-                        Err(e) => VerifyResult::Failed(e.to_string()),
-                    }
-                }
-                Ok(None) => VerifyResult::NoSignature,
-                Err(e) => VerifyResult::Failed(e.to_string()),
-            }
+            // Cryptographic signature verification (ECDSA/RSA against the public key)
+            // is not yet implemented. Returning a false "Verified" would give a
+            // dangerous false sense of security — any payload with a matching digest
+            // field would pass. Reject explicitly until real crypto is wired in.
+            tracing::warn!(
+                digest = %manifest_digest,
+                key = %public_key,
+                "CosignKey verification requested but cryptographic signature \
+                 verification is not yet implemented"
+            );
+            VerifyResult::Failed(
+                "cosign public key verification is not yet implemented: \
+                 cryptographic signature validation (ECDSA/RSA) is required but not available; \
+                 use signature_policy=skip or implement cosign verify"
+                    .to_string(),
+            )
         }
 
         SignaturePolicy::CosignKeyless { issuer, identity } => {
-            // Fetch signature from registry
-            match fetch_cosign_signature(registry, repository, manifest_digest).await {
-                Ok(Some(payload)) => {
-                    match verify_cosign_payload(&payload, manifest_digest) {
-                        Ok(cosign) => {
-                            // For keyless, verify the identity matches
-                            let ref_str = &cosign.critical.identity.docker_reference;
-                            tracing::info!(
-                                digest = %manifest_digest,
-                                issuer = %issuer,
-                                identity = %identity,
-                                reference = %ref_str,
-                                "Image keyless signature verified"
-                            );
-                            VerifyResult::Verified
-                        }
-                        Err(e) => VerifyResult::Failed(e.to_string()),
-                    }
-                }
-                Ok(None) => VerifyResult::NoSignature,
-                Err(e) => VerifyResult::Failed(e.to_string()),
-            }
+            // Keyless verification requires validating the Fulcio certificate chain
+            // and checking the Rekor transparency log. Neither is implemented.
+            // Returning "Verified" without these checks is a security hole.
+            tracing::warn!(
+                digest = %manifest_digest,
+                issuer = %issuer,
+                identity = %identity,
+                "CosignKeyless verification requested but Fulcio/Rekor \
+                 verification is not yet implemented"
+            );
+            VerifyResult::Failed(
+                "cosign keyless verification is not yet implemented: \
+                 Fulcio certificate chain and Rekor transparency log validation are required \
+                 but not available; use signature_policy=skip"
+                    .to_string(),
+            )
         }
     }
 }
@@ -373,14 +359,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_verify_image_signature_missing_key_file() {
+    async fn test_verify_image_signature_cosign_key_not_implemented() {
         let policy = SignaturePolicy::CosignKey {
             public_key: "/nonexistent/cosign.pub".to_string(),
         };
         let result =
             verify_image_signature(&policy, "docker.io", "library/alpine", "sha256:abc").await;
         match result {
-            VerifyResult::Failed(msg) => assert!(msg.contains("not found")),
+            VerifyResult::Failed(msg) => assert!(msg.contains("not yet implemented")),
+            other => panic!("Expected Failed, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_verify_image_signature_cosign_keyless_not_implemented() {
+        let policy = SignaturePolicy::CosignKeyless {
+            issuer: "https://accounts.google.com".to_string(),
+            identity: "user@example.com".to_string(),
+        };
+        let result =
+            verify_image_signature(&policy, "docker.io", "library/alpine", "sha256:abc").await;
+        match result {
+            VerifyResult::Failed(msg) => {
+                assert!(msg.contains("not yet implemented"));
+                assert!(msg.contains("Fulcio"));
+            }
             other => panic!("Expected Failed, got {:?}", other),
         }
     }

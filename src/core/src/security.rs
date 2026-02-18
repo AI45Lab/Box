@@ -101,6 +101,16 @@ impl SecurityConfig {
                 config.no_new_privileges = true;
             } else if opt == "no-new-privileges=false" {
                 config.no_new_privileges = false;
+            } else if opt.starts_with("apparmor=") {
+                tracing::warn!(
+                    opt = %opt,
+                    "AppArmor profiles are not supported in a3s-box; option ignored"
+                );
+            } else if opt.starts_with("label=") {
+                tracing::warn!(
+                    opt = %opt,
+                    "SELinux labels are not supported in a3s-box; option ignored"
+                );
             }
         }
 
@@ -374,5 +384,37 @@ mod tests {
     fn test_validate_privileged_ok() {
         let config = SecurityConfig::from_options(&[], &[], &[], true);
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_from_options_apparmor_ignored() {
+        // AppArmor options should be accepted (not panic) but have no effect
+        let opts = vec!["apparmor=docker-default".to_string()];
+        let config = SecurityConfig::from_options(&opts, &[], &[], false);
+        // Config should still be default — apparmor is ignored
+        assert_eq!(config.seccomp, SeccompMode::Default);
+        assert!(config.no_new_privileges);
+    }
+
+    #[test]
+    fn test_from_options_selinux_ignored() {
+        // SELinux label options should be accepted (not panic) but have no effect
+        let opts = vec!["label=type:container_t".to_string()];
+        let config = SecurityConfig::from_options(&opts, &[], &[], false);
+        assert_eq!(config.seccomp, SeccompMode::Default);
+        assert!(config.no_new_privileges);
+    }
+
+    #[test]
+    fn test_from_options_mixed_with_apparmor_selinux() {
+        let opts = vec![
+            "seccomp=unconfined".to_string(),
+            "apparmor=unconfined".to_string(),
+            "label=disable".to_string(),
+            "no-new-privileges=false".to_string(),
+        ];
+        let config = SecurityConfig::from_options(&opts, &[], &[], false);
+        assert_eq!(config.seccomp, SeccompMode::Unconfined);
+        assert!(!config.no_new_privileges);
     }
 }
