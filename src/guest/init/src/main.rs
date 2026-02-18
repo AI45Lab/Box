@@ -182,13 +182,14 @@ fn run_init() -> Result<(), Box<dyn std::error::Error>> {
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
 
-    let container_pid = namespace::spawn_isolated(
+    let container_pid_raw = namespace::spawn_isolated(
         &namespace_config,
         &exec_config.executable,
         &args_refs,
         &env_refs,
         &exec_config.workdir,
     )?;
+    let container_pid = nix::unistd::Pid::from_raw(container_pid_raw as i32);
 
     info!("Container process started with PID {}", container_pid);
 
@@ -217,7 +218,7 @@ fn run_init() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Step 9: Wait for agent process (reap zombies, handle SIGTERM)
-    wait_for_children()?;
+    wait_for_children(container_pid)?;
 
     Ok(())
 }
@@ -465,12 +466,9 @@ fn remount_rootfs_readonly() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Wait for all child processes and reap zombies.
 ///
-/// When SIGTERM is received (via the global `SHUTDOWN_REQUESTED` flag):
-/// 1. Forward SIGTERM to all child processes
-/// 2. Wait up to 5 seconds for children to exit
-/// 3. Send SIGKILL to any remaining children
-/// 4. Call sync() to flush filesystem buffers
-fn wait_for_children() -> Result<(), Box<dyn std::error::Error>> {
+/// Only exits when `container_pid` exits. Other child processes (e.g., from
+/// exec server) are reaped silently.
+fn wait_for_children(container_pid: nix::unistd::Pid) -> Result<(), Box<dyn std::error::Error>> {
     use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
     use nix::unistd::Pid;
 
@@ -489,23 +487,24 @@ fn wait_for_children() -> Result<(), Box<dyn std::error::Error>> {
 
         match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::Exited(pid, status)) => {
-                info!("Child process {} exited with status {}", pid, status);
-                // Propagate the container's exit code directly.
-                // The VM kernel will reap any remaining processes.
-                process::exit(status);
+                if pid == container_pid {
+                    info!("Container process {} exited with status {}", pid, status);
+                    process::exit(status);
+                } else {
+                    info!("Child process {} exited with status {} (reaped)", pid, status);
+                }
             }
             Ok(WaitStatus::Signaled(pid, signal, _)) => {
-                // If we're shutting down, a child killed by signal is expected
-                if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+                if pid == container_pid {
+                    error!("Container process {} killed by signal {:?}", pid, signal);
+                    process::exit(128 + signal as i32);
+                } else if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
                     info!(
                         "Child process {} terminated by signal {:?} during shutdown",
                         pid, signal
                     );
                 } else {
-                    error!("Child process {} killed by signal {:?}", pid, signal);
-                    return Err(
-                        format!("Child process {} killed by signal {:?}", pid, signal).into(),
-                    );
+                    info!("Child process {} killed by signal {:?} (reaped)", pid, signal);
                 }
             }
             Ok(WaitStatus::StillAlive) => {
