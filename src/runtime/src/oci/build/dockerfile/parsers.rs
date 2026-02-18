@@ -69,7 +69,8 @@ pub(super) fn parse_copy(rest: &str, line_num: usize) -> Result<Instruction> {
         )));
     }
 
-    let dst = parts.last().unwrap().to_string();
+    // parts.len() >= 2 guaranteed by the check above
+    let dst = parts[parts.len() - 1].to_string();
     let src: Vec<String> = parts[..parts.len() - 1]
         .iter()
         .map(|s| s.to_string())
@@ -104,7 +105,7 @@ pub(super) fn parse_env(rest: &str, line_num: usize) -> Result<Instruction> {
     if let Some(eq_pos) = rest.find('=') {
         // Check it's not inside a value after a space
         let space_pos = rest.find(char::is_whitespace);
-        if space_pos.is_none() || eq_pos < space_pos.unwrap() {
+        if space_pos.map_or(true, |sp| eq_pos < sp) {
             let key = rest[..eq_pos].to_string();
             let value = unquote(&rest[eq_pos + 1..]);
             return Ok(Instruction::Env { key, value });
@@ -248,7 +249,8 @@ pub(super) fn parse_add(rest: &str, line_num: usize) -> Result<Instruction> {
         )));
     }
 
-    let dst = parts.last().unwrap().to_string();
+    // parts.len() >= 2 guaranteed by the check above
+    let dst = parts[parts.len() - 1].to_string();
     let src: Vec<String> = parts[..parts.len() - 1]
         .iter()
         .map(|s| s.to_string())

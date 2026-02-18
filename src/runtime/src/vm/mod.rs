@@ -371,8 +371,14 @@ impl VmManager {
 
         // 4. Start VM via provider
         let handler = {
+            let provider = self.provider.as_ref().ok_or_else(|| {
+                BoxError::BoxBootError {
+                    message: "VMM provider not initialized".to_string(),
+                    hint: Some("Ensure VmManager has a provider set before boot".to_string()),
+                }
+            })?;
             let vm_start_span = tracing::info_span!(parent: &boot_span, "vm_start");
-            async { self.provider.as_ref().unwrap().start(&spec).await }
+            async { provider.start(&spec).await }
                 .instrument(vm_start_span)
                 .await?
         };

@@ -31,6 +31,9 @@ pub struct CriServer {
     streaming_addr: SocketAddr,
 }
 
+/// Default streaming server bind address.
+const DEFAULT_STREAMING_ADDR: ([u8; 4], u16) = ([127, 0, 0, 1], 18800);
+
 impl CriServer {
     /// Create a new CRI server.
     pub fn new(socket_path: PathBuf, image_store: Arc<ImageStore>, auth: RegistryAuth) -> Self {
@@ -38,7 +41,7 @@ impl CriServer {
             socket_path,
             image_store,
             auth,
-            streaming_addr: "127.0.0.1:18800".parse().unwrap(),
+            streaming_addr: SocketAddr::from(DEFAULT_STREAMING_ADDR),
         }
     }
 

@@ -75,7 +75,9 @@ pub fn parse_restart_policy(policy: &str) -> Result<(String, u32), String> {
     validate_restart_policy(policy)?;
 
     if let Some(max_str) = policy.strip_prefix("on-failure:") {
-        let max = max_str.parse::<u32>().unwrap(); // safe: validated above
+        let max = max_str
+            .parse::<u32>()
+            .map_err(|_| format!("Invalid restart count: {max_str}"))?;
         Ok(("on-failure".to_string(), max))
     } else {
         Ok((policy.to_string(), 0))

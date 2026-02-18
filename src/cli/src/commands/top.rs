@@ -86,9 +86,7 @@ pub async fn execute(args: TopArgs) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Build the ps command from user-provided arguments or defaults.
-///
-/// Exposed for testing.
-#[allow(dead_code)]
+#[cfg(test)]
 fn build_ps_command(ps_args: &[String]) -> Vec<String> {
     let mut cmd = vec!["ps".to_string()];
     if ps_args.is_empty() {

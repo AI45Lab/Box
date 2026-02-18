@@ -336,7 +336,10 @@ fn resolve_snapshot(
     let by_name: Vec<_> = all.into_iter().filter(|s| s.name == id_or_name).collect();
     match by_name.len() {
         0 => Err(format!("No snapshot found matching '{}'", id_or_name).into()),
-        1 => Ok(by_name.into_iter().next().unwrap()),
+        1 => {
+            // Safe: len() == 1 guarantees next() returns Some
+            Ok(by_name.into_iter().next().expect("len checked"))
+        }
         n => Err(format!(
             "Ambiguous snapshot reference '{}': matches {} snapshots",
             id_or_name, n

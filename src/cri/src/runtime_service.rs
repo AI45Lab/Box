@@ -11,7 +11,7 @@ use tokio::sync::RwLock;
 use tonic::{Request, Response, Status};
 
 use a3s_box_core::event::EventEmitter;
-use a3s_box_runtime::oci::{ImagePuller, ImageStore, RegistryAuth};
+use a3s_box_runtime::oci::{ImageStore, RegistryAuth};
 use a3s_box_runtime::vm::VmManager;
 
 use crate::config_mapper::pod_sandbox_config_to_box_config;
@@ -26,10 +26,6 @@ use crate::streaming::{SessionKind, StreamingHandle, StreamingSession};
 pub struct BoxRuntimeService {
     sandbox_store: Arc<SandboxStore>,
     container_store: Arc<ContainerStore>,
-    #[allow(dead_code)]
-    image_store: Arc<ImageStore>,
-    #[allow(dead_code)]
-    image_puller: Arc<ImagePuller>,
     /// Maps sandbox_id → VmManager for running VMs.
     vm_managers: Arc<RwLock<HashMap<String, VmManager>>>,
     /// Handle for registering CRI streaming sessions.
@@ -39,16 +35,13 @@ pub struct BoxRuntimeService {
 impl BoxRuntimeService {
     /// Create a new BoxRuntimeService.
     pub fn new(
-        image_store: Arc<ImageStore>,
-        auth: RegistryAuth,
+        _image_store: Arc<ImageStore>,
+        _auth: RegistryAuth,
         streaming: StreamingHandle,
     ) -> Self {
-        let image_puller = Arc::new(ImagePuller::new(image_store.clone(), auth));
         Self {
             sandbox_store: Arc::new(SandboxStore::new()),
             container_store: Arc::new(ContainerStore::new()),
-            image_store,
-            image_puller,
             vm_managers: Arc::new(RwLock::new(HashMap::new())),
             streaming,
         }

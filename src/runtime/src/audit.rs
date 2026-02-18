@@ -150,7 +150,10 @@ impl AuditLog {
 
     /// Get the path to the audit log file.
     pub fn path(&self) -> PathBuf {
-        self.inner.lock().unwrap().path.clone()
+        self.inner
+            .lock()
+            .map(|inner| inner.path.clone())
+            .unwrap_or_default()
     }
 }
 

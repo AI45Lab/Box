@@ -404,9 +404,29 @@ async fn execute_down(
         }
     }
 
-    // Optionally remove volumes
+    // Optionally remove named volumes
     if down_args.volumes {
-        println!("  Volume removal not yet implemented (use `a3s-box volume rm`).");
+        let vol_store = a3s_box_runtime::volume::VolumeStore::default_path()?;
+        // Collect all volume names from project services
+        let mut removed = 0u32;
+        for (_box_id, _svc_name, _pid, _status, _box_dir, _network_name, volume_names) in
+            &project_boxes
+        {
+            for vol_name in volume_names {
+                match vol_store.remove(vol_name, true) {
+                    Ok(_) => {
+                        println!("  [-] Volume {} removed", vol_name);
+                        removed += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("  Warning: failed to remove volume {}: {}", vol_name, e);
+                    }
+                }
+            }
+        }
+        if removed > 0 {
+            println!("  Removed {} volume(s).", removed);
+        }
     }
 
     println!("Project '{}' stopped.", project_name);
