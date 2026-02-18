@@ -127,15 +127,36 @@ pub async fn fetch_cosign_signature(
                 let mut buf = Vec::new();
                 match client.pull_blob(&reference, layer, &mut buf).await {
                     Ok(()) => Ok(Some(buf)),
-                    Err(_) => Ok(None),
+                    Err(e) => {
+                        tracing::warn!(
+                            reference = %reference_str,
+                            error = %e,
+                            "Failed to pull cosign signature blob"
+                        );
+                        Ok(None)
+                    }
                 }
             } else {
                 Ok(None)
             }
         }
-        Err(_) => {
-            // No signature manifest found — not an error, just unsigned
-            Ok(None)
+        Err(e) => {
+            // Distinguish between "no signature" (404) and actual errors
+            let err_str = e.to_string();
+            if err_str.contains("404") || err_str.contains("NOT_FOUND") || err_str.contains("manifest unknown") {
+                // No signature manifest found — not an error, just unsigned
+                Ok(None)
+            } else {
+                tracing::warn!(
+                    reference = %reference_str,
+                    error = %e,
+                    "Registry error while fetching cosign signature (not a 404)"
+                );
+                Err(BoxError::RegistryError {
+                    registry: registry.to_string(),
+                    message: format!("Failed to fetch cosign signature: {}", e),
+                })
+            }
         }
     }
 }
@@ -169,8 +190,8 @@ pub fn verify_cosign_payload(payload: &[u8], manifest_digest: &str) -> Result<Co
 /// Verify an image signature according to the given policy.
 pub async fn verify_image_signature(
     policy: &SignaturePolicy,
-    registry: &str,
-    repository: &str,
+    _registry: &str,
+    _repository: &str,
     manifest_digest: &str,
 ) -> VerifyResult {
     match policy {

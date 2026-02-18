@@ -639,29 +639,3 @@ pub(crate) fn fnv1a_hash(input: &str) -> u64 {
     hash
 }
 
-/// VM configuration for libkrun (legacy, kept for compatibility).
-#[derive(Debug, Clone)]
-pub struct VmConfig {
-    /// Number of vCPUs
-    pub vcpus: u32,
-
-    /// Memory in MB
-    pub memory_mb: u32,
-
-    /// Kernel image path
-    pub kernel_path: String,
-
-    /// Init command
-    pub init_cmd: Vec<String>,
-}
-
-impl From<&BoxConfig> for VmConfig {
-    fn from(config: &BoxConfig) -> Self {
-        Self {
-            vcpus: config.resources.vcpus,
-            memory_mb: config.resources.memory_mb,
-            kernel_path: "/path/to/kernel".to_string(),
-            init_cmd: vec!["/sbin/init".to_string()],
-        }
-    }
-}
