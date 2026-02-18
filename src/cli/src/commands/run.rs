@@ -60,11 +60,47 @@ pub struct RunArgs {
     pub tee_simulate: bool,
 }
 
+/// Intermediate state produced by the setup phase, consumed by the run phase.
+struct RunContext {
+    vm: VmManager,
+    box_id: String,
+    box_dir: PathBuf,
+    name: String,
+    volume_names: Vec<String>,
+    health_checker: Option<tokio::task::JoinHandle<()>>,
+    stop_signal: i32,
+    stop_timeout_ms: u64,
+}
+
 pub async fn execute(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let ctx = setup_and_boot(&args).await?;
+
+    if args.detach && args.tty {
+        return Err("Cannot use -t (tty) with -d (detach)".into());
+    }
+    if args.tty && !std::io::stdin().is_terminal() {
+        return Err("The -t flag requires a terminal (stdin is not a TTY)".into());
+    }
+
+    if args.detach {
+        println!("{}", ctx.box_id);
+        return Ok(());
+    }
+
+    if args.tty {
+        return run_tty(ctx, &args).await;
+    }
+
+    run_foreground(ctx, &args).await
+}
+
+// ============================================================================
+// Phase 1: Parse args, build config, boot VM, save state
+// ============================================================================
+
+async fn setup_and_boot(args: &RunArgs) -> Result<RunContext, Box<dyn std::error::Error>> {
     let memory_mb =
         parse_memory(&args.common.memory).map_err(|e| format!("Invalid --memory: {e}"))?;
-
-    // Build resource limits before any partial moves of args
     let resource_limits = common::build_resource_limits(&args.common)?;
 
     // Parse logging config
@@ -79,10 +115,12 @@ pub async fn execute(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         options: log_opts,
     };
 
-    let name = args.common.name.unwrap_or_else(generate_name);
+    let name = args
+        .common
+        .name
+        .clone()
+        .unwrap_or_else(generate_name);
     let mut env = common::parse_env_vars(&args.common.env)?;
-
-    // Load --env-file entries (merged into env, CLI --env takes precedence)
     for env_file in &args.common.env_file {
         let file_env = common::parse_env_file(env_file)?;
         for (k, v) in file_env {
@@ -93,47 +131,22 @@ pub async fn execute(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     let labels = common::parse_env_vars(&args.common.labels)
         .map_err(|e| e.replace("environment variable", "label"))?;
 
-    // Parse health check config (--no-healthcheck disables)
-    let health_check = if args.common.no_healthcheck {
-        None
-    } else {
-        args.common
-            .health_cmd
-            .as_ref()
-            .map(|cmd| crate::state::HealthCheck {
-                cmd: vec!["sh".to_string(), "-c".to_string(), cmd.clone()],
-                interval_secs: args.common.health_interval,
-                timeout_secs: args.common.health_timeout,
-                retries: args.common.health_retries,
-                start_period_secs: args.common.health_start_period,
-            })
-    };
+    let health_check = parse_health_check(&args.common);
     let health_status = if health_check.is_some() {
         "starting".to_string()
     } else {
         "none".to_string()
     };
 
-    // Parse entrypoint override: split string into argv
     let entrypoint_override = args
         .common
         .entrypoint
         .as_ref()
         .map(|ep| ep.split_whitespace().map(String::from).collect::<Vec<_>>());
 
-    // Resolve named volumes (e.g., "mydata:/app/data" → "/home/user/.a3s/volumes/mydata:/app/data")
-    let mut resolved_volumes = Vec::new();
-    let mut volume_names = Vec::new();
-    for vol_spec in &args.common.volumes {
-        let (resolved, vol_name) = super::volume::resolve_named_volume(vol_spec)?;
-        if let Some(name) = vol_name {
-            volume_names.push(name);
-        }
-        resolved_volumes.push(resolved);
-    }
+    let (resolved_volumes, volume_names) = resolve_volumes(&args.common.volumes)?;
 
-    // Parse --shm-size and translate to a tmpfs entry for /dev/shm.
-    // This reuses the existing BOX_TMPFS_* guest init mechanism.
+    // Parse --shm-size → tmpfs entry
     let shm_size = match &args.common.shm_size {
         Some(s) => {
             Some(common::parse_memory_bytes(s).map_err(|e| format!("Invalid --shm-size: {e}"))?)
@@ -145,7 +158,6 @@ pub async fn execute(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         tmpfs.push(format!("/dev/shm:size={}", size_bytes));
     }
 
-    // Determine network mode
     let network_mode = match &args.common.network {
         Some(name) => a3s_box_core::NetworkMode::Bridge {
             network: name.clone(),
@@ -153,7 +165,6 @@ pub async fn execute(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         None => a3s_box_core::NetworkMode::Tsi,
     };
 
-    // Build TEE config
     let tee = if args.tee || args.tee_simulate {
         TeeConfig::SevSnp {
             workload_id: args
@@ -167,7 +178,7 @@ pub async fn execute(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         TeeConfig::None
     };
 
-    // Warn about unimplemented flags that are stored but not enforced
+    // Warn about unimplemented flags
     if !args.common.device.is_empty() {
         eprintln!("Warning: --device is not supported by the libkrun backend (devices are stored but not passed through)");
     }
@@ -175,7 +186,6 @@ pub async fn execute(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Warning: --gpus is not yet implemented (stored but not enforced)");
     }
 
-    // Build BoxConfig
     let config = BoxConfig {
         image: args.common.image.clone(),
         resources: ResourceConfig {
@@ -197,7 +207,7 @@ pub async fn execute(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
 
-    // Create VmManager and boot
+    // Boot VM
     let emitter = EventEmitter::new(256);
     let mut vm = VmManager::new(config, emitter);
     let box_id = vm.box_id().to_string();
@@ -208,7 +218,7 @@ pub async fn execute(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         &BoxRecord::make_short_id(&box_id)
     );
 
-    // Register endpoint in network store BEFORE boot so the VM can find its IP
+    // Register network endpoint before boot
     if let Some(ref net_name) = args.common.network {
         let net_store = a3s_box_runtime::NetworkStore::default_path()?;
         let mut net_config = net_store
@@ -226,15 +236,17 @@ pub async fn execute(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     vm.boot().await?;
 
-    // Get PID from the running VM
     let pid = vm.pid().await;
-
-    // Determine PID from handler metrics (handler holds PID internally)
-    // We use the box directory structure to find PID
     let home = dirs::home_dir()
         .map(|h| h.join(".a3s"))
         .unwrap_or_else(|| PathBuf::from(".a3s"));
     let box_dir = home.join("boxes").join(&box_id);
+
+    // Parse --shm-size for record storage (not the tmpfs-merged version)
+    let shm_size_for_record = match &args.common.shm_size {
+        Some(s) => Some(common::parse_memory_bytes(s)?),
+        None => None,
+    };
 
     // Save box record
     let record = BoxRecord {
@@ -246,7 +258,7 @@ pub async fn execute(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         pid,
         cpus: args.common.cpus,
         memory_mb,
-        volumes: resolved_volumes.clone(),
+        volumes: resolved_volumes,
         env,
         cmd: args.cmd.clone(),
         entrypoint: entrypoint_override.clone(),
@@ -285,7 +297,7 @@ pub async fn execute(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         privileged: args.common.privileged,
         devices: args.common.device.clone(),
         gpus: args.common.gpus.clone(),
-        shm_size,
+        shm_size: shm_size_for_record,
         stop_signal: args.common.stop_signal.clone(),
         stop_timeout: args.common.stop_timeout,
         oom_kill_disable: args.common.oom_kill_disable,
@@ -297,7 +309,7 @@ pub async fn execute(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut state = StateFile::load_default()?;
     state.add(record)?;
 
-    // Spawn structured log processor (json-file driver writes container.json)
+    // Spawn log processor
     let log_dir = box_dir.join("logs");
     let _ = std::fs::create_dir_all(&log_dir);
     let _log_handle = a3s_box_runtime::log::spawn_log_processor(
@@ -306,7 +318,7 @@ pub async fn execute(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         log_config,
     );
 
-    // Spawn health checker if configured
+    // Spawn health checker
     let health_checker = health_check.as_ref().map(|hc| {
         crate::health::spawn_health_checker(
             box_id.clone(),
@@ -315,11 +327,9 @@ pub async fn execute(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         )
     });
 
-    // Attach named volumes to this box
+    // Attach named volumes
     super::volume::attach_volumes(&volume_names, &box_id)?;
 
-    // Resolve stop signal and timeout for the destroy path.
-    // CLI --stop-signal > BoxRecord.stop_signal (which may come from OCI image) > SIGTERM.
     let stop_signal = args
         .common
         .stop_signal
@@ -332,116 +342,108 @@ pub async fn execute(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         .map(|secs| secs * 1000)
         .unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT_MS);
 
-    if args.detach && args.tty {
-        return Err("Cannot use -t (tty) with -d (detach)".into());
+    Ok(RunContext {
+        vm,
+        box_id,
+        box_dir,
+        name,
+        volume_names,
+        health_checker,
+        stop_signal,
+        stop_timeout_ms,
+    })
+}
+
+// ============================================================================
+// Phase 2a: Interactive PTY mode
+// ============================================================================
+
+async fn run_tty(
+    mut ctx: RunContext,
+    args: &RunArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use a3s_box_core::pty::PtyRequest;
+    use a3s_box_runtime::PtyClient;
+    use crossterm::terminal;
+
+    let pty_socket_path = ctx.box_dir.join("sockets").join("pty.sock");
+
+    // Wait for PTY socket to appear
+    for _ in 0..50 {
+        if pty_socket_path.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    if !pty_socket_path.exists() {
+        return Err(format!(
+            "PTY socket not found at {} (guest may not support interactive mode)",
+            pty_socket_path.display()
+        )
+        .into());
     }
 
-    if args.tty && !std::io::stdin().is_terminal() {
-        return Err("The -t flag requires a terminal (stdin is not a TTY)".into());
+    let entrypoint_override = args
+        .common
+        .entrypoint
+        .as_ref()
+        .map(|ep| ep.split_whitespace().map(String::from).collect::<Vec<_>>());
+
+    let pty_cmd = if !args.cmd.is_empty() {
+        args.cmd.clone()
+    } else if let Some(ref ep) = entrypoint_override {
+        ep.clone()
+    } else {
+        vec!["/bin/sh".to_string()]
+    };
+
+    let (cols, rows) = terminal::size().unwrap_or((80, 24));
+    let mut client = PtyClient::connect(&pty_socket_path).await?;
+    client
+        .send_request(&PtyRequest {
+            cmd: pty_cmd,
+            env: args.common.env.clone(),
+            working_dir: args.common.workdir.clone(),
+            user: args.common.user.clone(),
+            cols,
+            rows,
+        })
+        .await?;
+
+    terminal::enable_raw_mode()?;
+    let (read_half, write_half) = client.into_split();
+    let exit_code = super::exec::run_pty_session(read_half, write_half).await;
+    terminal::disable_raw_mode()?;
+
+    // Cleanup
+    cleanup_box(&mut ctx, args.common.network.as_deref(), args.rm).await?;
+
+    if exit_code != 0 {
+        std::process::exit(exit_code);
     }
+    Ok(())
+}
 
-    if args.detach {
-        println!("{box_id}");
-        return Ok(());
-    }
+// ============================================================================
+// Phase 2b: Foreground mode (tail logs, wait for exit or Ctrl-C)
+// ============================================================================
 
-    // Interactive PTY mode: connect to the guest PTY server
-    if args.tty {
-        use a3s_box_core::pty::PtyRequest;
-        use a3s_box_runtime::PtyClient;
-        use crossterm::terminal;
-
-        let pty_socket_path = box_dir.join("sockets").join("pty.sock");
-
-        // Wait for PTY socket to appear (guest init may still be starting)
-        for _ in 0..50 {
-            if pty_socket_path.exists() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        if !pty_socket_path.exists() {
-            return Err(format!(
-                "PTY socket not found at {} (guest may not support interactive mode)",
-                pty_socket_path.display()
-            )
-            .into());
-        }
-
-        // Build the command for the PTY session: use cmd override, entrypoint, or /bin/sh
-        let pty_cmd = if !args.cmd.is_empty() {
-            args.cmd.clone()
-        } else if let Some(ref ep) = entrypoint_override {
-            ep.clone()
-        } else {
-            vec!["/bin/sh".to_string()]
-        };
-
-        let (cols, rows) = terminal::size().unwrap_or((80, 24));
-        let mut client = PtyClient::connect(&pty_socket_path).await?;
-        client
-            .send_request(&PtyRequest {
-                cmd: pty_cmd,
-                env: args.common.env.clone(),
-                working_dir: args.common.workdir.clone(),
-                user: args.common.user.clone(),
-                cols,
-                rows,
-            })
-            .await?;
-
-        terminal::enable_raw_mode()?;
-        let (read_half, write_half) = client.into_split();
-        let exit_code = super::exec::run_pty_session(read_half, write_half).await;
-        terminal::disable_raw_mode()?;
-
-        // Clean up: destroy VM using configured stop signal and timeout
-        if let Some(ref handle) = health_checker {
-            handle.abort();
-        }
-        vm.destroy_with_options(stop_signal, stop_timeout_ms).await?;
-        super::volume::detach_volumes(&volume_names, &box_id);
-        if let Some(ref net_name) = args.common.network {
-            let net_store = a3s_box_runtime::NetworkStore::default_path()?;
-            if let Some(mut net_config) = net_store.get(net_name)? {
-                net_config.disconnect(&box_id).ok();
-                net_store.update(&net_config)?;
-            }
-        }
-
-        let mut state = StateFile::load_default()?;
-        if let Some(rec) = state.find_by_id_mut(&box_id) {
-            rec.status = "stopped".to_string();
-            rec.pid = None;
-        }
-        if args.rm {
-            state.remove(&box_id)?;
-            let _ = std::fs::remove_dir_all(&box_dir);
-        } else {
-            state.save()?;
-        }
-
-        if exit_code != 0 {
-            std::process::exit(exit_code);
-        }
-        return Ok(());
-    }
-
-    // Foreground mode: tail console log and wait for Ctrl-C or natural container exit
+async fn run_foreground(
+    mut ctx: RunContext,
+    args: &RunArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "Box {} ({}) started. Press Ctrl-C to stop.",
-        name,
-        BoxRecord::make_short_id(&box_id)
+        ctx.name,
+        BoxRecord::make_short_id(&ctx.box_id)
     );
 
-    let console_log = box_dir.join("logs").join("console.log");
-
-    // Tail console log in background
+    let console_log = ctx.box_dir.join("logs").join("console.log");
     let log_handle = tokio::spawn(async move {
         super::tail_file(&console_log).await;
     });
 
-    // Poll health_check every 500ms to detect natural container exit.
+    let name = ctx.name.clone();
     let user_interrupted = tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             println!("\nStopping box {}...", name);
@@ -450,7 +452,7 @@ pub async fn execute(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         _ = async {
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                if !vm.health_check().await.unwrap_or(false) {
+                if !ctx.vm.health_check().await.unwrap_or(false) {
                     break;
                 }
             }
@@ -458,57 +460,128 @@ pub async fn execute(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     log_handle.abort();
-    if let Some(ref handle) = health_checker {
+
+    // Destroy VM
+    if let Some(ref handle) = ctx.health_checker {
         handle.abort();
     }
+    ctx.vm
+        .destroy_with_options(ctx.stop_signal, ctx.stop_timeout_ms)
+        .await?;
+    let exit_code = ctx.vm.exit_code();
 
-    // Destroy VM using configured stop signal and timeout (no-op if already stopped naturally)
-    vm.destroy_with_options(stop_signal, stop_timeout_ms).await?;
-    let exit_code = vm.exit_code();
-
-    // Detach named volumes
-    super::volume::detach_volumes(&volume_names, &box_id);
-
-    // Disconnect from network if connected
-    if let Some(ref net_name) = args.common.network {
-        let net_store = a3s_box_runtime::NetworkStore::default_path()?;
-        if let Some(mut net_config) = net_store.get(net_name)? {
-            net_config.disconnect(&box_id).ok();
-            net_store.update(&net_config)?;
-        }
-    }
+    // Detach volumes and disconnect network
+    super::volume::detach_volumes(&ctx.volume_names, &ctx.box_id);
+    disconnect_network(&ctx.box_id, args.common.network.as_deref())?;
 
     // Update state
     let mut state = StateFile::load_default()?;
-    if let Some(rec) = state.find_by_id_mut(&box_id) {
+    if let Some(rec) = state.find_by_id_mut(&ctx.box_id) {
         rec.status = "stopped".to_string();
         rec.pid = None;
     }
 
     if args.rm {
-        state.remove(&box_id)?;
-        let _ = std::fs::remove_dir_all(&box_dir);
+        state.remove(&ctx.box_id)?;
+        let _ = std::fs::remove_dir_all(&ctx.box_dir);
         if !user_interrupted {
-            println!("Box {} exited and was removed.", name);
+            println!("Box {} exited and was removed.", ctx.name);
         } else {
-            println!("Box {} removed.", name);
+            println!("Box {} removed.", ctx.name);
         }
     } else {
         state.save()?;
         if !user_interrupted {
-            println!("Box {} exited.", name);
+            println!("Box {} exited.", ctx.name);
         } else {
-            println!("Box {} stopped.", name);
+            println!("Box {} stopped.", ctx.name);
         }
     }
 
-    // Propagate the container's exit code (mirrors docker run behaviour)
     if let Some(code) = exit_code {
         if code != 0 {
             std::process::exit(code);
         }
     }
 
+    Ok(())
+}
+
+// ============================================================================
+// Shared helpers
+// ============================================================================
+
+/// Parse health check config from common args.
+fn parse_health_check(common: &CommonBoxArgs) -> Option<crate::state::HealthCheck> {
+    if common.no_healthcheck {
+        return None;
+    }
+    common.health_cmd.as_ref().map(|cmd| crate::state::HealthCheck {
+        cmd: vec!["sh".to_string(), "-c".to_string(), cmd.clone()],
+        interval_secs: common.health_interval,
+        timeout_secs: common.health_timeout,
+        retries: common.health_retries,
+        start_period_secs: common.health_start_period,
+    })
+}
+
+/// Resolve named volumes, returning (resolved_specs, volume_names).
+fn resolve_volumes(
+    volume_specs: &[String],
+) -> Result<(Vec<String>, Vec<String>), Box<dyn std::error::Error>> {
+    let mut resolved = Vec::new();
+    let mut names = Vec::new();
+    for spec in volume_specs {
+        let (r, vol_name) = super::volume::resolve_named_volume(spec)?;
+        if let Some(name) = vol_name {
+            names.push(name);
+        }
+        resolved.push(r);
+    }
+    Ok((resolved, names))
+}
+
+/// Disconnect from network if connected.
+fn disconnect_network(
+    box_id: &str,
+    net_name: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(net_name) = net_name {
+        let net_store = a3s_box_runtime::NetworkStore::default_path()?;
+        if let Some(mut net_config) = net_store.get(net_name)? {
+            net_config.disconnect(box_id).ok();
+            net_store.update(&net_config)?;
+        }
+    }
+    Ok(())
+}
+
+/// Shared cleanup: abort health checker, destroy VM, detach volumes, disconnect network, update state.
+async fn cleanup_box(
+    ctx: &mut RunContext,
+    net_name: Option<&str>,
+    auto_remove: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(ref handle) = ctx.health_checker {
+        handle.abort();
+    }
+    ctx.vm
+        .destroy_with_options(ctx.stop_signal, ctx.stop_timeout_ms)
+        .await?;
+    super::volume::detach_volumes(&ctx.volume_names, &ctx.box_id);
+    disconnect_network(&ctx.box_id, net_name)?;
+
+    let mut state = StateFile::load_default()?;
+    if let Some(rec) = state.find_by_id_mut(&ctx.box_id) {
+        rec.status = "stopped".to_string();
+        rec.pid = None;
+    }
+    if auto_remove {
+        state.remove(&ctx.box_id)?;
+        let _ = std::fs::remove_dir_all(&ctx.box_dir);
+    } else {
+        state.save()?;
+    }
     Ok(())
 }
 
@@ -621,5 +694,38 @@ mod tests {
 
         let limits = common::build_resource_limits(&args.common).unwrap();
         assert_eq!(limits.memory_swap, Some(1024 * 1024 * 1024));
+    }
+
+    #[test]
+    fn test_parse_health_check_none() {
+        let args = default_run_args();
+        assert!(parse_health_check(&args.common).is_none());
+    }
+
+    #[test]
+    fn test_parse_health_check_disabled() {
+        let mut args = default_run_args();
+        args.common.health_cmd = Some("curl localhost".to_string());
+        args.common.no_healthcheck = true;
+        assert!(parse_health_check(&args.common).is_none());
+    }
+
+    #[test]
+    fn test_parse_health_check_configured() {
+        let mut args = default_run_args();
+        args.common.health_cmd = Some("curl localhost".to_string());
+        args.common.health_interval = 10;
+        args.common.health_retries = 5;
+        let hc = parse_health_check(&args.common).unwrap();
+        assert_eq!(hc.cmd, vec!["sh", "-c", "curl localhost"]);
+        assert_eq!(hc.interval_secs, 10);
+        assert_eq!(hc.retries, 5);
+    }
+
+    #[test]
+    fn test_resolve_volumes_empty() {
+        let (resolved, names) = resolve_volumes(&[]).unwrap();
+        assert!(resolved.is_empty());
+        assert!(names.is_empty());
     }
 }

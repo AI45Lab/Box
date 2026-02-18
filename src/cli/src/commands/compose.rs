@@ -312,6 +312,17 @@ async fn execute_up(
 // compose down
 // ============================================================================
 
+/// Snapshot of a compose service box for the `down` operation.
+struct ServiceBox {
+    box_id: String,
+    svc_name: String,
+    pid: Option<u32>,
+    status: String,
+    box_dir: PathBuf,
+    network_name: Option<String>,
+    volume_names: Vec<String>,
+}
+
 /// `compose down` — Stop and remove all services, networks, and optionally volumes.
 async fn execute_down(
     project_name: &str,
@@ -320,28 +331,17 @@ async fn execute_down(
     let mut state = StateFile::load_default()?;
 
     // Find all boxes belonging to this project
-    #[allow(clippy::type_complexity)]
-    let project_boxes: Vec<(
-        String,
-        String,
-        Option<u32>,
-        String,
-        PathBuf,
-        Option<String>,
-        Vec<String>,
-    )> = state
+    let project_boxes: Vec<ServiceBox> = state
         .find_by_label(LABEL_PROJECT, project_name)
         .iter()
-        .map(|r| {
-            (
-                r.id.clone(),
-                r.labels.get(LABEL_SERVICE).cloned().unwrap_or_default(),
-                r.pid,
-                r.status.clone(),
-                r.box_dir.clone(),
-                r.network_name.clone(),
-                r.volume_names.clone(),
-            )
+        .map(|r| ServiceBox {
+            box_id: r.id.clone(),
+            svc_name: r.labels.get(LABEL_SERVICE).cloned().unwrap_or_default(),
+            pid: r.pid,
+            status: r.status.clone(),
+            box_dir: r.box_dir.clone(),
+            network_name: r.network_name.clone(),
+            volume_names: r.volume_names.clone(),
         })
         .collect();
 
@@ -357,24 +357,26 @@ async fn execute_down(
     );
 
     // Stop in reverse order (last started = first stopped)
-    for (box_id, svc_name, pid, status, box_dir, network_name, volume_names) in
-        project_boxes.iter().rev()
-    {
-        print!("  [-] Stopping {}...", svc_name);
+    for svc in project_boxes.iter().rev() {
+        print!("  [-] Stopping {}...", svc.svc_name);
 
         // Kill the process if running
-        if status == "running" {
-            if let Some(pid) = pid {
-                crate::process::graceful_stop(*pid, libc::SIGTERM, 10).await;
+        if svc.status == "running" {
+            if let Some(pid) = svc.pid {
+                crate::process::graceful_stop(pid, libc::SIGTERM, 10).await;
             }
         }
 
         // Clean up resources
-        crate::cleanup::cleanup_box_resources(box_id, volume_names, network_name.as_deref());
+        crate::cleanup::cleanup_box_resources(
+            &svc.box_id,
+            &svc.volume_names,
+            svc.network_name.as_deref(),
+        );
 
         // Remove box directory and state record
-        let _ = std::fs::remove_dir_all(box_dir);
-        state.remove(box_id)?;
+        let _ = std::fs::remove_dir_all(&svc.box_dir);
+        state.remove(&svc.box_id)?;
 
         println!(" ✓");
     }
@@ -407,12 +409,9 @@ async fn execute_down(
     // Optionally remove named volumes
     if down_args.volumes {
         let vol_store = a3s_box_runtime::volume::VolumeStore::default_path()?;
-        // Collect all volume names from project services
         let mut removed = 0u32;
-        for (_box_id, _svc_name, _pid, _status, _box_dir, _network_name, volume_names) in
-            &project_boxes
-        {
-            for vol_name in volume_names {
+        for svc in &project_boxes {
+            for vol_name in &svc.volume_names {
                 match vol_store.remove(vol_name, true) {
                     Ok(_) => {
                         println!("  [-] Volume {} removed", vol_name);
