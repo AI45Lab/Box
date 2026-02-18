@@ -53,18 +53,19 @@ A3S Box is application-agnostic. It doesn't know what runs inside — web server
 - **System**: `system-prune`, `container-update`, `version`, `info`, `monitor`, `login`, `logout`, `audit`
 
 ### Security & Isolation
-- **Namespace Isolation** — Separate mount, PID, IPC, UTS namespaces within each VM
+- **Namespace Isolation** — Separate mount, PID, IPC, UTS, user, and cgroup namespaces within each VM
 - **Resource Limits** — CPU shares/quota/pinning, memory reservation/swap, PID limits, ulimits (cgroup v2)
-- **Security Options** — Capabilities (`--cap-add/drop`), seccomp profiles (`--security-opt seccomp=`), no-new-privileges, read-only rootfs, privileged mode, device mapping, GPU access
-- **Image Signing** — Cosign-compatible signature verification via CLI (`--verify-key`, `--verify-issuer`, `--verify-identity`): key-based and keyless modes
+- **Security Options** — Capabilities (`--cap-add/drop`) with bounding + ambient set clearing, seccomp BPF filter with architecture validation (`--security-opt seccomp=`), no-new-privileges, read-only rootfs, privileged mode, device mapping, GPU access
+- **Image Signing** — Cosign-compatible signature verification via CLI (`--verify-key`, `--verify-issuer`, `--verify-identity`): key-based and keyless modes (crypto verification pending, policy enforcement active)
 - **Network Isolation** — Per-network isolation policies (`--isolation none/strict/custom`), ingress/egress rules with port/protocol filtering, policy enforcement on connect
 - **Audit Logging** — Persistent JSON-lines audit trail with rotation, structured events (who/what/when/outcome), queryable via `a3s-box audit` with filters
-- **Restart Policies** — `always`, `on-failure:N`, `unless-stopped` with exponential backoff
-- **Health Checks** — Configurable commands with interval, timeout, retries, start period
-- **Logging** — JSON logging driver with rotation, or `--log-driver none`
+- **Restart Policies** — `always`, `on-failure:N`, `unless-stopped` with exponential backoff and max restart count enforcement
+- **Health Checks** — Configurable commands with interval, timeout, retries, start period; monitor auto-restarts unhealthy boxes
+- **Logging** — JSON logging driver with gzip-compressed rotation, syslog driver (UDP/TCP, RFC 3164), or `--log-driver none`
 
 ### TEE (Confidential Computing)
 - **AMD SEV-SNP** — Hardware-enforced memory encryption
+- **Intel TDX** — Trust Domain Extensions (config support, runtime pending)
 - **Remote Attestation** — SNP report generation, ECDSA-P384 verification, certificate chain validation (VCEK→ASK→ARK)
 - **RA-TLS** — SNP report embedded in X.509 certificate extensions, verified during TLS handshake
 - **Secret Injection** — Inject secrets via RA-TLS into `/run/secrets/` (tmpfs, mode 0400)
@@ -232,6 +233,7 @@ Capabilities:
 - Persistent workspaces that survive sandbox restarts
 - Per-exec metrics (duration, stdout/stderr byte counts)
 - Interactive PTY via `sandbox.pty()`
+- Pause/resume via `sandbox.pause()` / `sandbox.resume()`
 - Optional embedded shim (`--features embed-shim`): compiles and bundles `a3s-box-shim` into the binary, auto-extracts to `~/.a3s/bin/` on first use
 
 ### Multi-Language SDKs
@@ -285,15 +287,15 @@ All SDKs provide: async API, streaming exec, file transfer, sandbox lifecycle ma
 
 | Crate | Binary | Purpose | Tests |
 |-------|--------|---------|------:|
-| `cli` | `a3s-box` | Docker-like CLI (52 commands) | 359 |
-| `core` | — | Config, error types, events | 292 |
-| `runtime` | — | VM lifecycle, OCI, attestation | 711 |
-| `guest/init` | `a3s-box-guest-init` | Guest PID 1, exec/PTY/attestation servers | 63 |
+| `cli` | `a3s-box` | Docker-like CLI (52 commands) | 361 |
+| `core` | — | Config, error types, events | 331 |
+| `runtime` | — | VM lifecycle, OCI, attestation | 678 |
+| `guest/init` | `a3s-box-guest-init` | Guest PID 1, exec/PTY/attestation servers | 25 |
 | `shim` | `a3s-box-shim` | libkrun bridge | 14 |
-| `cri` | `a3s-box-cri` | Kubernetes CRI runtime | 34 |
+| `cri` | `a3s-box-cri` | Kubernetes CRI runtime | 33 |
 | `sdk` | — | Embedded sandbox SDK | 24 |
 
-218 source files, ~1,497 unit tests, 7 integration tests.
+218 source files, ~1,466 unit tests, 7 integration tests.
 
 ### Vsock Port Allocation
 
@@ -323,9 +325,13 @@ let config = BoxConfig {
     tee: TeeConfig::SevSnp {
         workload_id: "my-secure-workload".to_string(),
         generation: SevSnpGeneration::Milan,  // or Genoa
+        simulate: false,
     },
     ..Default::default()
 };
+
+// Intel TDX (config support, runtime pending):
+// tee: TeeConfig::Tdx { workload_id: "my-workload".to_string(), simulate: false }
 ```
 
 ### Hardware Requirements
@@ -360,16 +366,16 @@ All TEE code is implemented and unit-tested. Hardware validation on real AMD SEV
 
 ## Testing
 
-### Unit Tests — 1,497 passed
+### Unit Tests — 1,466 passed
 
 | Crate | Tests | Coverage |
 |-------|------:|----------|
-| `a3s-box-cli` | 359 | State management, name resolution, output formatting, restart policies, compose, audit, snapshot, network isolation |
-| `a3s-box-core` | 292 | Config validation, error types, event serialization, TEE types, security config, compose types, network policies, scale API types, operator CRD types |
-| `a3s-box-runtime` | 711 | OCI parsing, rootfs, health checking, attestation, RA-TLS, sealed storage, Prometheus metrics, tracing spans, image signing, compose orchestrator, audit log, snapshot store, KBS client, re-attestation, rollback protection |
-| `a3s-box-cri` | 34 | CRI sandbox/container lifecycle, config mapping |
-| `a3s-box-guest-init` | 63 | Exec server, attest server frame I/O, secret validation, namespace security |
-| `a3s-box-sdk` | 24 | SDK init, config building, exec result conversion, port forwards, workspaces, serde roundtrip |
+| `a3s-box-cli` | 361 | State management, name resolution, output formatting, restart policies, compose, audit, snapshot, network isolation, max restart count |
+| `a3s-box-core` | 331 | Config validation, error types, event serialization, TEE types (SEV-SNP + TDX), security config (AppArmor/SELinux warnings), compose types, network policies (validation), scale API types, operator CRD types, IPv6 IPAM, volume quota |
+| `a3s-box-runtime` | 678 | OCI parsing, rootfs, health checking, attestation, RA-TLS, sealed storage, Prometheus metrics, tracing spans, image signing (honest verification), compose orchestrator, audit log, snapshot store, KBS client, re-attestation, rollback protection, syslog driver, gzip log compression |
+| `a3s-box-cri` | 33 | CRI sandbox/container lifecycle, config mapping (SEV-SNP + TDX) |
+| `a3s-box-guest-init` | 25 | Exec server, attest server frame I/O, secret validation, namespace security (user + cgroup), seccomp arch validation |
+| `a3s-box-sdk` | 24 | SDK init, config building, exec result conversion, port forwards, workspaces, serde roundtrip, pause/resume |
 | `a3s-box-shim` | 14 | Shim config, cgroup, cpuset, ulimit, TEE config |
 
 All unit tests run without VM, network, or hardware dependencies (`A3S_DEPS_STUB=1` for CI).
