@@ -290,9 +290,18 @@ fn apply_security_before_exec(cmd: &mut Command) -> Result<(), NamespaceError> {
                 SeccompMode::Unconfined => {
                     // No seccomp filter
                 }
-                SeccompMode::Custom(_path) => {
-                    // Custom profiles not yet supported in pre_exec
-                    // (would need to read file before fork)
+                SeccompMode::Custom(path) => {
+                    // Custom seccomp profiles are not yet supported.
+                    // Fail loudly rather than silently falling through to
+                    // no filter, which would give a false sense of security.
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        format!(
+                            "custom seccomp profile '{}' is not supported; \
+                             use seccomp=default or seccomp=unconfined",
+                            path
+                        ),
+                    ));
                 }
             }
 

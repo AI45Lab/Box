@@ -45,6 +45,21 @@ impl Default for SecurityConfig {
 }
 
 impl SecurityConfig {
+    /// Validate that the security configuration can be enforced at runtime.
+    ///
+    /// Returns an error if custom seccomp profiles are specified, since they
+    /// are not yet supported and would silently fall through to no filtering.
+    pub fn validate(&self) -> Result<(), String> {
+        if let SeccompMode::Custom(path) = &self.seccomp {
+            return Err(format!(
+                "custom seccomp profile '{}' is not supported; \
+                 use seccomp=default or seccomp=unconfined",
+                path
+            ));
+        }
+        Ok(())
+    }
+
     /// Parse security config from CLI-style options.
     ///
     /// Accepts the same format as Docker:
@@ -326,5 +341,38 @@ mod tests {
         assert!(!parsed.no_new_privileges);
         assert_eq!(parsed.cap_add, vec!["NET_ADMIN"]);
         assert_eq!(parsed.cap_drop, vec!["ALL"]);
+    }
+
+    // --- SecurityConfig::validate tests ---
+
+    #[test]
+    fn test_validate_default_ok() {
+        let config = SecurityConfig::default();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_unconfined_ok() {
+        let config = SecurityConfig::from_options(&["seccomp=unconfined".to_string()], &[], &[], false);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_custom_rejected() {
+        let config = SecurityConfig::from_options(
+            &["seccomp=/path/to/profile.json".to_string()],
+            &[],
+            &[],
+            false,
+        );
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("custom seccomp profile"));
+        assert!(err.contains("not supported"));
+    }
+
+    #[test]
+    fn test_validate_privileged_ok() {
+        let config = SecurityConfig::from_options(&[], &[], &[], true);
+        assert!(config.validate().is_ok());
     }
 }

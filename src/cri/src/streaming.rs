@@ -334,10 +334,17 @@ async fn handle_attach_stream(
     stream: &mut tokio::net::TcpStream,
     session: &StreamingSession,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Attach uses PTY to connect to a shell in the container
+    // Use the command from the session if available, otherwise try common shells
+    let shell = if !session.cmd.is_empty() {
+        session.cmd.clone()
+    } else {
+        vec!["/bin/sh".to_string(), "-c".to_string(),
+             "exec $(command -v bash || command -v sh || echo /bin/sh)".to_string()]
+    };
+
     let attach_session = StreamingSession {
         kind: SessionKind::Attach,
-        cmd: vec!["/bin/sh".to_string()],
+        cmd: shell,
         tty: true,
         ..session.clone()
     };
@@ -362,9 +369,22 @@ async fn handle_port_forward_stream(
     stream.write_all(upgrade.as_bytes()).await?;
 
     // Connect to the guest port via the exec socket (HTTP CONNECT-style)
-    // We use the exec server to establish a TCP connection inside the guest
+    // We use the exec server to establish a TCP connection inside the guest.
+    // Prefers socat if available, falls back to /bin/sh + /dev/tcp (bash).
     let exec_req = a3s_box_core::exec::ExecRequest {
-        cmd: vec!["socat".to_string(), format!("STDIO TCP:127.0.0.1:{}", port)],
+        cmd: vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!(
+                "if command -v socat >/dev/null 2>&1; then \
+                   socat STDIO TCP:127.0.0.1:{}; \
+                 else \
+                   echo 'WARNING: socat not found, using /dev/tcp fallback' >&2; \
+                   exec 3<>/dev/tcp/127.0.0.1/{} && cat <&3 & cat >&3; \
+                 fi",
+                port, port
+            ),
+        ],
         timeout_ns: 0, // No timeout for port-forward
         env: vec![],
         working_dir: None,

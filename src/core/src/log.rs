@@ -10,6 +10,13 @@ pub enum LogDriver {
     /// Docker-compatible JSON lines format (default).
     #[default]
     JsonFile,
+    /// Forward logs to a syslog endpoint.
+    ///
+    /// Options:
+    /// - `syslog-address`: UDP/TCP address (e.g., "udp://localhost:514")
+    /// - `syslog-facility`: Syslog facility (default: "daemon")
+    /// - `tag`: Log tag template (default: box name)
+    Syslog,
     /// Disable logging entirely.
     None,
 }
@@ -18,6 +25,7 @@ impl std::fmt::Display for LogDriver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::JsonFile => write!(f, "json-file"),
+            Self::Syslog => write!(f, "syslog"),
             Self::None => write!(f, "none"),
         }
     }
@@ -29,9 +37,10 @@ impl std::str::FromStr for LogDriver {
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s {
             "json-file" => Ok(Self::JsonFile),
+            "syslog" => Ok(Self::Syslog),
             "none" => Ok(Self::None),
             _ => Err(format!(
-                "unknown log driver: '{}' (supported: json-file, none)",
+                "unknown log driver: '{}' (supported: json-file, syslog, none)",
                 s
             )),
         }
@@ -72,6 +81,29 @@ impl LogConfig {
             .get("max-file")
             .and_then(|s| s.parse().ok())
             .unwrap_or(3)
+    }
+
+    /// Syslog address (e.g., "udp://localhost:514").
+    /// Only relevant when driver is `Syslog`.
+    pub fn syslog_address(&self) -> &str {
+        self.options
+            .get("syslog-address")
+            .map(|s| s.as_str())
+            .unwrap_or("udp://localhost:514")
+    }
+
+    /// Syslog facility (e.g., "daemon", "local0").
+    /// Only relevant when driver is `Syslog`.
+    pub fn syslog_facility(&self) -> &str {
+        self.options
+            .get("syslog-facility")
+            .map(|s| s.as_str())
+            .unwrap_or("daemon")
+    }
+
+    /// Log tag (used by syslog driver as the program name).
+    pub fn tag(&self) -> Option<&str> {
+        self.options.get("tag").map(|s| s.as_str())
     }
 }
 
@@ -123,6 +155,7 @@ mod tests {
             "json-file".parse::<LogDriver>().unwrap(),
             LogDriver::JsonFile
         );
+        assert_eq!("syslog".parse::<LogDriver>().unwrap(), LogDriver::Syslog);
         assert_eq!("none".parse::<LogDriver>().unwrap(), LogDriver::None);
         assert!("unknown".parse::<LogDriver>().is_err());
     }
@@ -167,5 +200,47 @@ mod tests {
         let json = serde_json::to_string(&entry).unwrap();
         assert!(json.contains("\"log\":\"hello\\n\""));
         assert!(json.contains("\"stream\":\"stdout\""));
+    }
+
+    #[test]
+    fn test_syslog_config_defaults() {
+        let config = LogConfig {
+            driver: LogDriver::Syslog,
+            options: HashMap::new(),
+        };
+        assert_eq!(config.syslog_address(), "udp://localhost:514");
+        assert_eq!(config.syslog_facility(), "daemon");
+        assert_eq!(config.tag(), None);
+    }
+
+    #[test]
+    fn test_syslog_config_custom() {
+        let mut options = HashMap::new();
+        options.insert("syslog-address".to_string(), "tcp://loghost:1514".to_string());
+        options.insert("syslog-facility".to_string(), "local0".to_string());
+        options.insert("tag".to_string(), "myapp".to_string());
+        let config = LogConfig {
+            driver: LogDriver::Syslog,
+            options,
+        };
+        assert_eq!(config.syslog_address(), "tcp://loghost:1514");
+        assert_eq!(config.syslog_facility(), "local0");
+        assert_eq!(config.tag(), Some("myapp"));
+    }
+
+    #[test]
+    fn test_log_driver_display() {
+        assert_eq!(LogDriver::JsonFile.to_string(), "json-file");
+        assert_eq!(LogDriver::Syslog.to_string(), "syslog");
+        assert_eq!(LogDriver::None.to_string(), "none");
+    }
+
+    #[test]
+    fn test_log_driver_serde_roundtrip() {
+        let driver = LogDriver::Syslog;
+        let json = serde_json::to_string(&driver).unwrap();
+        assert_eq!(json, "\"syslog\"");
+        let parsed: LogDriver = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, LogDriver::Syslog);
     }
 }

@@ -165,6 +165,27 @@ fn default_protocol() -> String {
 }
 
 impl NetworkPolicy {
+    /// Validate that the policy can be enforced at runtime.
+    ///
+    /// Currently only `IsolationMode::None` is supported. Strict and Custom
+    /// modes require iptables/nftables integration which is not yet implemented.
+    /// Rejecting early prevents a false sense of security.
+    pub fn validate(&self) -> Result<(), String> {
+        match self.isolation {
+            IsolationMode::None => Ok(()),
+            IsolationMode::Strict => Err(
+                "network policy isolation mode 'strict' is not yet enforced at runtime; \
+                 packets will NOT be filtered. Remove the policy or use isolation=none"
+                    .to_string(),
+            ),
+            IsolationMode::Custom => Err(
+                "network policy isolation mode 'custom' is not yet enforced at runtime; \
+                 ingress/egress rules will NOT be applied. Remove the policy or use isolation=none"
+                    .to_string(),
+            ),
+        }
+    }
+
     /// Check if a box is allowed to communicate with a peer.
     pub fn is_peer_allowed(&self, box_name: &str, peer_name: &str) -> bool {
         match self.isolation {
@@ -307,6 +328,87 @@ impl Ipam {
     }
 }
 
+/// Simple sequential IPAM for IPv6 subnets.
+///
+/// Supports /64 to /120 prefix lengths. Allocates addresses sequentially
+/// starting from network::1 (gateway) + 1.
+#[derive(Debug)]
+pub struct Ipam6 {
+    /// Network address (e.g., fd00::0).
+    network: std::net::Ipv6Addr,
+    /// Prefix length (e.g., 64).
+    prefix_len: u8,
+    /// Gateway (network::1).
+    gateway: std::net::Ipv6Addr,
+}
+
+impl Ipam6 {
+    /// Create a new IPv6 IPAM from a CIDR string (e.g., "fd00::/64").
+    pub fn new(cidr: &str) -> Result<Self, String> {
+        let parts: Vec<&str> = cidr.split('/').collect();
+        if parts.len() != 2 {
+            return Err(format!("invalid IPv6 CIDR notation: {}", cidr));
+        }
+
+        let network: std::net::Ipv6Addr = parts[0]
+            .parse()
+            .map_err(|e| format!("invalid IPv6 network address '{}': {}", parts[0], e))?;
+        let prefix_len: u8 = parts[1]
+            .parse()
+            .map_err(|e| format!("invalid prefix length '{}': {}", parts[1], e))?;
+
+        if prefix_len > 120 || prefix_len < 64 {
+            return Err(format!(
+                "IPv6 prefix length {} out of range (64..=120)",
+                prefix_len
+            ));
+        }
+
+        // Gateway is network + 1
+        let net_u128 = u128::from(network);
+        let gateway = std::net::Ipv6Addr::from(net_u128 + 1);
+
+        Ok(Self {
+            network,
+            prefix_len,
+            gateway,
+        })
+    }
+
+    /// Get the gateway address.
+    pub fn gateway(&self) -> std::net::Ipv6Addr {
+        self.gateway
+    }
+
+    /// Get the subnet CIDR string.
+    pub fn cidr(&self) -> String {
+        format!("{}/{}", self.network, self.prefix_len)
+    }
+
+    /// Allocate the next available IPv6 address, given a set of already-used IPs.
+    pub fn allocate(&self, used: &[std::net::Ipv6Addr]) -> Result<std::net::Ipv6Addr, String> {
+        let net_u128 = u128::from(self.network);
+        let host_bits = 128 - self.prefix_len as u32;
+        let max_host = (1u128 << host_bits) - 1; // broadcast equivalent
+        let gateway_u128 = u128::from(self.gateway);
+
+        // Start from network + 2 (skip network and gateway)
+        let mut offset = 2u128;
+        while offset < max_host {
+            let candidate_u128 = net_u128 + offset;
+            if candidate_u128 != gateway_u128 {
+                let ip = std::net::Ipv6Addr::from(candidate_u128);
+                if !used.contains(&ip) {
+                    return Ok(ip);
+                }
+            }
+            offset += 1;
+        }
+
+        Err("no available IPv6 addresses in subnet".to_string())
+    }
+}
+
 impl NetworkConfig {
     /// Create a new network with the given name and subnet.
     pub fn new(name: &str, subnet: &str) -> Result<Self, String> {
@@ -357,6 +459,16 @@ impl NetworkConfig {
                 box_id, self.name
             )
         })
+    }
+
+    /// Set the network policy, validating that it can be enforced.
+    ///
+    /// Returns an error if the policy uses an isolation mode that is not
+    /// yet implemented at the packet-filtering level.
+    pub fn set_policy(&mut self, policy: NetworkPolicy) -> Result<(), String> {
+        policy.validate()?;
+        self.policy = policy;
+        Ok(())
     }
 
     /// Get all connected endpoints.
@@ -927,5 +1039,110 @@ mod tests {
     #[test]
     fn test_policy_action_default() {
         assert_eq!(PolicyAction::default(), PolicyAction::Allow);
+    }
+
+    // --- NetworkPolicy::validate tests ---
+
+    #[test]
+    fn test_policy_validate_none_ok() {
+        let policy = NetworkPolicy::default();
+        assert!(policy.validate().is_ok());
+    }
+
+    #[test]
+    fn test_policy_validate_strict_rejected() {
+        let policy = NetworkPolicy {
+            isolation: IsolationMode::Strict,
+            ..Default::default()
+        };
+        let err = policy.validate().unwrap_err();
+        assert!(err.contains("strict"));
+        assert!(err.contains("not yet enforced"));
+    }
+
+    #[test]
+    fn test_policy_validate_custom_rejected() {
+        let policy = NetworkPolicy {
+            isolation: IsolationMode::Custom,
+            egress: vec![PolicyRule {
+                from: "web".to_string(),
+                to: "db".to_string(),
+                ports: vec![],
+                protocol: "any".to_string(),
+                action: PolicyAction::Allow,
+            }],
+            ..Default::default()
+        };
+        let err = policy.validate().unwrap_err();
+        assert!(err.contains("custom"));
+        assert!(err.contains("not yet enforced"));
+    }
+
+    // --- NetworkConfig::set_policy tests ---
+
+    #[test]
+    fn test_set_policy_none_ok() {
+        let mut net = NetworkConfig::new("mynet", "10.88.0.0/24").unwrap();
+        assert!(net.set_policy(NetworkPolicy::default()).is_ok());
+    }
+
+    #[test]
+    fn test_set_policy_strict_rejected() {
+        let mut net = NetworkConfig::new("mynet", "10.88.0.0/24").unwrap();
+        let result = net.set_policy(NetworkPolicy {
+            isolation: IsolationMode::Strict,
+            ..Default::default()
+        });
+        assert!(result.is_err());
+    }
+
+    // --- Ipam6 tests ---
+
+    #[test]
+    fn test_ipam6_new_valid() {
+        let ipam = Ipam6::new("fd00::/64").unwrap();
+        assert_eq!(ipam.gateway(), "fd00::1".parse::<std::net::Ipv6Addr>().unwrap());
+        assert_eq!(ipam.cidr(), "fd00::/64");
+    }
+
+    #[test]
+    fn test_ipam6_invalid_cidr() {
+        assert!(Ipam6::new("fd00::").is_err());
+        assert!(Ipam6::new("not-an-ip/64").is_err());
+        assert!(Ipam6::new("fd00::/63").is_err()); // below 64
+        assert!(Ipam6::new("fd00::/121").is_err()); // above 120
+    }
+
+    #[test]
+    fn test_ipam6_allocate_first() {
+        let ipam = Ipam6::new("fd00::/64").unwrap();
+        let ip = ipam.allocate(&[]).unwrap();
+        assert_eq!(ip, "fd00::2".parse::<std::net::Ipv6Addr>().unwrap());
+    }
+
+    #[test]
+    fn test_ipam6_allocate_sequential() {
+        let ipam = Ipam6::new("fd00::/64").unwrap();
+        let ip1 = ipam.allocate(&[]).unwrap();
+        let ip2 = ipam.allocate(&[ip1]).unwrap();
+        let ip3 = ipam.allocate(&[ip1, ip2]).unwrap();
+
+        assert_eq!(ip1, "fd00::2".parse::<std::net::Ipv6Addr>().unwrap());
+        assert_eq!(ip2, "fd00::3".parse::<std::net::Ipv6Addr>().unwrap());
+        assert_eq!(ip3, "fd00::4".parse::<std::net::Ipv6Addr>().unwrap());
+    }
+
+    #[test]
+    fn test_ipam6_allocate_skips_gateway() {
+        let ipam = Ipam6::new("fd00::/64").unwrap();
+        let ip = ipam.allocate(&[]).unwrap();
+        assert_ne!(ip, ipam.gateway());
+    }
+
+    #[test]
+    fn test_ipam6_slash120() {
+        let ipam = Ipam6::new("fd00::/120").unwrap();
+        let ip = ipam.allocate(&[]).unwrap();
+        assert_eq!(ip, "fd00::2".parse::<std::net::Ipv6Addr>().unwrap());
     }
 }

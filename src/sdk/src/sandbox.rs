@@ -273,6 +273,21 @@ impl Sandbox {
         self.vm.destroy().await
     }
 
+    /// Pause the sandbox (SIGSTOP).
+    ///
+    /// The sandbox remains in memory but all processes are frozen.
+    /// Use `resume()` to continue execution.
+    pub async fn pause(&self) -> Result<()> {
+        tracing::info!(sandbox_id = %self.id, "Pausing sandbox");
+        self.vm.pause().await
+    }
+
+    /// Resume a paused sandbox (SIGCONT).
+    pub async fn resume(&self) -> Result<()> {
+        tracing::info!(sandbox_id = %self.id, "Resuming sandbox");
+        self.vm.resume().await
+    }
+
     /// Check if the sandbox is running.
     pub async fn is_running(&self) -> bool {
         matches!(

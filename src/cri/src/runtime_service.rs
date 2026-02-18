@@ -771,24 +771,29 @@ impl RuntimeService for BoxRuntimeService {
             .ok_or_else(|| Status::not_found(format!("Container not found: {}", container_id)))?;
 
         if let Some(ref linux) = req.linux {
-            tracing::info!(
+            tracing::warn!(
                 container_id = %container_id,
                 sandbox_id = %container.sandbox_id,
                 cpu_quota = linux.cpu_quota,
                 cpu_period = linux.cpu_period,
                 memory_limit = linux.memory_limit_in_bytes,
-                "CRI UpdateContainerResources (acknowledged, microVM resources are fixed at boot)"
+                "CRI UpdateContainerResources rejected: microVM resources are fixed at boot"
             );
-        } else {
-            tracing::info!(
-                container_id = %container_id,
-                "CRI UpdateContainerResources (no linux resources specified)"
-            );
+
+            // MicroVM resources (CPU, memory) are fixed at boot time and cannot be
+            // dynamically resized. Return an explicit error so callers (e.g. K8s VPA)
+            // know the operation did NOT take effect, rather than silently succeeding.
+            return Err(Status::unimplemented(
+                "UpdateContainerResources is not supported: microVM resources (CPU, memory) \
+                 are fixed at boot time and cannot be dynamically resized"
+            ));
         }
 
-        // MicroVM resources (CPU, memory) are fixed at boot time and cannot be
-        // dynamically resized. We acknowledge the request to maintain CRI compatibility
-        // but log that the actual resources remain unchanged.
+        // No linux resources specified — nothing to do, acknowledge
+        tracing::info!(
+            container_id = %container_id,
+            "CRI UpdateContainerResources (no linux resources specified)"
+        );
         Ok(Response::new(UpdateContainerResourcesResponse {}))
     }
 

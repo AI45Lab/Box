@@ -28,7 +28,14 @@ pub(crate) fn should_restart(record: &BoxRecord) -> bool {
     }
 
     match policy {
-        "always" => true,
+        "always" => {
+            // Respect max_restart_count even for "always" policy (0 = unlimited)
+            if record.max_restart_count > 0 {
+                record.restart_count < record.max_restart_count
+            } else {
+                true
+            }
+        }
         "on-failure" => {
             if record.stopped_by_user {
                 return false;
@@ -39,7 +46,17 @@ pub(crate) fn should_restart(record: &BoxRecord) -> bool {
                 true
             }
         }
-        "unless-stopped" => !record.stopped_by_user,
+        "unless-stopped" => {
+            if record.stopped_by_user {
+                return false;
+            }
+            // Respect max_restart_count (0 = unlimited)
+            if record.max_restart_count > 0 {
+                record.restart_count < record.max_restart_count
+            } else {
+                true
+            }
+        }
         _ => false, // "no" or unknown
     }
 }

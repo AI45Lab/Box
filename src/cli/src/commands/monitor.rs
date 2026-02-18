@@ -1,8 +1,9 @@
 //! `a3s-box monitor` command — Background daemon that restarts dead boxes.
 //!
 //! Polls `boxes.json` periodically, detects dead VMs via PID liveness checks,
-//! and restarts boxes according to their restart policy. Uses exponential
-//! backoff to prevent crash loops.
+//! and restarts boxes according to their restart policy. Also monitors health
+//! check status and restarts unhealthy boxes. Uses exponential backoff to
+//! prevent crash loops.
 //!
 //! Usage: `a3s-box monitor` (long-running, typically run as a background service)
 
@@ -147,6 +148,7 @@ pub async fn execute(args: MonitorArgs) -> Result<(), Box<dyn std::error::Error>
 }
 
 /// Single poll iteration: load state, find dead boxes, restart eligible ones.
+/// Also checks for unhealthy boxes that have a restart policy.
 async fn poll_once(tracker: &mut BackoffTracker) -> Result<(), Box<dyn std::error::Error>> {
     let mut state = StateFile::load_default()?;
 
@@ -157,8 +159,22 @@ async fn poll_once(tracker: &mut BackoffTracker) -> Result<(), Box<dyn std::erro
         }
     }
 
-    // Find boxes that need restarting
-    let candidates = state.pending_restarts();
+    // Find boxes that need restarting: dead boxes + unhealthy running boxes
+    let mut candidates = state.pending_restarts();
+
+    // Also restart running boxes that are unhealthy and have a restart policy
+    let unhealthy: Vec<String> = state
+        .records()
+        .iter()
+        .filter(|r| {
+            r.status == "running"
+                && r.health_status == "unhealthy"
+                && r.health_check.is_some()
+                && r.restart_policy != "no"
+        })
+        .map(|r| r.id.clone())
+        .collect();
+    candidates.extend(unhealthy);
 
     for box_id in candidates {
         // Check backoff
@@ -172,9 +188,6 @@ async fn poll_once(tracker: &mut BackoffTracker) -> Result<(), Box<dyn std::erro
             continue;
         }
 
-        tracker.mark_dead(&box_id);
-
-        // Attempt restart
         let record = match state.find_by_id(&box_id) {
             Some(r) => r.clone(),
             None => continue,
@@ -182,8 +195,28 @@ async fn poll_once(tracker: &mut BackoffTracker) -> Result<(), Box<dyn std::erro
 
         let name = record.name.clone();
         let short_id = record.short_id.clone();
-        println!("monitor: restarting box {name} ({short_id})...");
+        let is_unhealthy = record.status == "running" && record.health_status == "unhealthy";
 
+        // If unhealthy, kill the process first before restarting
+        if is_unhealthy {
+            println!("monitor: box {name} ({short_id}) is unhealthy, restarting...");
+            if let Some(pid) = record.pid {
+                crate::process::graceful_stop(pid, libc::SIGTERM, 10).await;
+            }
+            // Mark as dead so boot_from_record works
+            if let Some(rec) = state.find_by_id_mut(&box_id) {
+                rec.status = "dead".to_string();
+                rec.pid = None;
+                rec.health_status = "none".to_string();
+                rec.health_retries = 0;
+            }
+            state.save()?;
+        } else {
+            tracker.mark_dead(&box_id);
+            println!("monitor: restarting box {name} ({short_id})...");
+        }
+
+        // Attempt restart
         match boot::boot_from_record(&record).await {
             Ok(result) => {
                 // Update record to running
@@ -193,6 +226,12 @@ async fn poll_once(tracker: &mut BackoffTracker) -> Result<(), Box<dyn std::erro
                     rec.started_at = Some(chrono::Utc::now());
                     rec.restart_count += 1;
                     rec.stopped_by_user = false;
+                    rec.health_status = if rec.health_check.is_some() {
+                        "starting".to_string()
+                    } else {
+                        "none".to_string()
+                    };
+                    rec.health_retries = 0;
                 }
                 state.save()?;
                 tracker.record_attempt(&box_id);

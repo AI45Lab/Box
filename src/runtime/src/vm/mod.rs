@@ -518,6 +518,50 @@ impl VmManager {
         Ok(())
     }
 
+    /// Pause the VM by sending SIGSTOP to the shim process.
+    ///
+    /// The VM must be in Ready, Busy, or Compacting state.
+    pub async fn pause(&self) -> Result<()> {
+        let state = self.state.read().await;
+        match *state {
+            BoxState::Ready | BoxState::Busy | BoxState::Compacting => {}
+            BoxState::Created => {
+                return Err(BoxError::Other("VM not yet booted".to_string()));
+            }
+            BoxState::Stopped => {
+                return Err(BoxError::Other("VM is stopped".to_string()));
+            }
+        }
+        drop(state);
+
+        if let Some(pid) = self.pid().await {
+            // Safety: sending SIGSTOP to pause the process
+            unsafe {
+                libc::kill(pid as i32, libc::SIGSTOP);
+            }
+            tracing::info!(box_id = %self.box_id, pid, "VM paused");
+            Ok(())
+        } else {
+            Err(BoxError::Other("VM has no running process".to_string()))
+        }
+    }
+
+    /// Resume the VM by sending SIGCONT to the shim process.
+    ///
+    /// Can be called on a paused VM to resume execution.
+    pub async fn resume(&self) -> Result<()> {
+        if let Some(pid) = self.pid().await {
+            // Safety: sending SIGCONT to resume the process
+            unsafe {
+                libc::kill(pid as i32, libc::SIGCONT);
+            }
+            tracing::info!(box_id = %self.box_id, pid, "VM resumed");
+            Ok(())
+        } else {
+            Err(BoxError::Other("VM has no running process".to_string()))
+        }
+    }
+
     /// Check if VM is healthy.
     pub async fn health_check(&self) -> Result<bool> {
         let state = self.state.read().await;
