@@ -339,6 +339,8 @@ fn should_drop_caps(cap_drop: &[String]) -> bool {
 
 /// Drop Linux capabilities using prctl.
 ///
+/// Drops capabilities from the bounding set AND clears the effective,
+/// permitted, and inheritable sets to prevent retention of already-held caps.
 /// Supports "ALL" to drop all capabilities, or individual capability names.
 #[cfg(target_os = "linux")]
 fn drop_capabilities(cap_drop: &[String]) -> Result<(), std::io::Error> {
@@ -373,6 +375,29 @@ fn drop_capabilities(cap_drop: &[String]) -> Result<(), std::io::Error> {
         }
     }
 
+    // Also clear the effective, permitted, and inheritable capability sets.
+    // The bounding set only limits future execve() — processes that already
+    // hold capabilities in their effective set retain them without this step.
+    clear_ambient_and_inheritable_caps()?;
+
+    Ok(())
+}
+
+/// Clear ambient and inheritable capability sets.
+///
+/// This ensures that dropped capabilities cannot be re-acquired through
+/// execve() or ambient capability inheritance.
+#[cfg(target_os = "linux")]
+fn clear_ambient_and_inheritable_caps() -> Result<(), std::io::Error> {
+    // PR_CAP_AMBIENT_CLEAR_ALL = 4 (subcommand of PR_CAP_AMBIENT = 47)
+    let ret = unsafe { libc::prctl(47, 4, 0, 0, 0) };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        // EINVAL means kernel doesn't support ambient caps — that's fine
+        if err.raw_os_error() != Some(libc::EINVAL) {
+            return Err(err);
+        }
+    }
     Ok(())
 }
 
@@ -494,6 +519,13 @@ fn build_default_bpf_filter() -> Vec<libc::sock_filter> {
     // SECCOMP return values
     const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
     const SECCOMP_RET_ERRNO_EPERM: u32 = 0x0005_0001; // SECCOMP_RET_ERRNO | EPERM
+    const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
+
+    // Architecture audit value for seccomp_data.arch
+    #[cfg(target_arch = "x86_64")]
+    const AUDIT_ARCH: u32 = 0xC000_003E; // AUDIT_ARCH_X86_64
+    #[cfg(target_arch = "aarch64")]
+    const AUDIT_ARCH: u32 = 0xC000_00B7; // AUDIT_ARCH_AARCH64
 
     // Blocked syscall numbers (x86_64)
     #[cfg(target_arch = "x86_64")]
@@ -538,9 +570,27 @@ fn build_default_bpf_filter() -> Vec<libc::sock_filter> {
     ];
 
     let num_blocked = blocked_syscalls.len();
-    let mut filter = Vec::with_capacity(num_blocked + 3);
+    // +5: arch_load, arch_check, syscall_load, allow, deny
+    let mut filter = Vec::with_capacity(num_blocked + 5);
 
-    // Load syscall number: LD [data[0]] (offset 0 = syscall nr in seccomp_data)
+    // 1. Load architecture: LD [data[4]] (offset 4 = arch in seccomp_data)
+    filter.push(libc::sock_filter {
+        code: BPF_LD | BPF_W | BPF_ABS,
+        jt: 0,
+        jf: 0,
+        k: 4, // offsetof(seccomp_data, arch)
+    });
+
+    // 2. Verify architecture matches — kill process if wrong arch
+    //    JEQ AUDIT_ARCH, next(0), kill(num_blocked + 2)
+    filter.push(libc::sock_filter {
+        code: BPF_JMP | BPF_JEQ | BPF_K,
+        jt: 0,                          // continue to syscall check
+        jf: (num_blocked + 2) as u8,    // jump to kill (past load + all checks + allow)
+        k: AUDIT_ARCH,
+    });
+
+    // 3. Load syscall number: LD [data[0]] (offset 0 = syscall nr in seccomp_data)
     filter.push(libc::sock_filter {
         code: BPF_LD | BPF_W | BPF_ABS,
         jt: 0,
@@ -548,7 +598,7 @@ fn build_default_bpf_filter() -> Vec<libc::sock_filter> {
         k: 0, // offsetof(seccomp_data, nr)
     });
 
-    // For each blocked syscall: JEQ #nr, goto_deny, next
+    // 4. For each blocked syscall: JEQ #nr, goto_deny, next
     for (i, &nr) in blocked_syscalls.iter().enumerate() {
         let remaining = num_blocked - i;
         filter.push(libc::sock_filter {
@@ -559,7 +609,7 @@ fn build_default_bpf_filter() -> Vec<libc::sock_filter> {
         });
     }
 
-    // Allow (default action)
+    // 5. Allow (default action)
     filter.push(libc::sock_filter {
         code: BPF_RET | BPF_K,
         jt: 0,
@@ -567,12 +617,20 @@ fn build_default_bpf_filter() -> Vec<libc::sock_filter> {
         k: SECCOMP_RET_ALLOW,
     });
 
-    // Deny with EPERM
+    // 6. Deny with EPERM (blocked syscall)
     filter.push(libc::sock_filter {
         code: BPF_RET | BPF_K,
         jt: 0,
         jf: 0,
         k: SECCOMP_RET_ERRNO_EPERM,
+    });
+
+    // 7. Kill process (wrong architecture — potential bypass attempt)
+    filter.push(libc::sock_filter {
+        code: BPF_RET | BPF_K,
+        jt: 0,
+        jf: 0,
+        k: SECCOMP_RET_KILL_PROCESS,
     });
 
     filter
@@ -717,17 +775,28 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn test_bpf_filter_structure() {
         let filter = build_default_bpf_filter();
-        // Should have: 1 load + N checks + 1 allow + 1 deny
-        assert!(filter.len() >= 3);
-        // First instruction should be BPF_LD (load syscall number)
+        // Should have: 1 arch_load + 1 arch_check + 1 syscall_load + N checks + 1 allow + 1 deny + 1 kill
+        assert!(filter.len() >= 6);
+        // First instruction should be BPF_LD (load arch)
         assert_eq!(filter[0].code, 0x20); // BPF_LD | BPF_W | BPF_ABS
-                                          // Last instruction should be BPF_RET (deny)
+        assert_eq!(filter[0].k, 4); // offset 4 = arch field
+        // Second instruction should be JEQ (arch check)
+        assert_eq!(filter[1].code, 0x15); // BPF_JMP | BPF_JEQ | BPF_K
+        // Third instruction should be BPF_LD (load syscall nr)
+        assert_eq!(filter[2].code, 0x20);
+        assert_eq!(filter[2].k, 0); // offset 0 = syscall nr
+        // Last instruction should be BPF_RET (kill — wrong arch)
         let last = filter.last().unwrap();
         assert_eq!(last.code, 0x06); // BPF_RET | BPF_K
-                                     // Second to last should be BPF_RET (allow)
+        assert_eq!(last.k, 0x8000_0000); // SECCOMP_RET_KILL_PROCESS
+        // Second to last should be BPF_RET (deny — blocked syscall)
         let second_last = &filter[filter.len() - 2];
         assert_eq!(second_last.code, 0x06);
-        assert_eq!(second_last.k, 0x7fff_0000); // SECCOMP_RET_ALLOW
+        assert_eq!(second_last.k, 0x0005_0001); // SECCOMP_RET_ERRNO_EPERM
+        // Third to last should be BPF_RET (allow)
+        let third_last = &filter[filter.len() - 3];
+        assert_eq!(third_last.code, 0x06);
+        assert_eq!(third_last.k, 0x7fff_0000); // SECCOMP_RET_ALLOW
     }
 
     // --- Namespace error tests ---
