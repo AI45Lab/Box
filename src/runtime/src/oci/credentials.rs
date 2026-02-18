@@ -152,6 +152,20 @@ fn normalize_registry(registry: &str) -> String {
     }
 }
 
+impl a3s_box_core::traits::CredentialProvider for CredentialStore {
+    fn get(&self, registry: &str) -> Result<Option<(String, String)>> {
+        self.get(registry)
+    }
+
+    fn store(&self, registry: &str, username: &str, password: &str) -> Result<()> {
+        self.store(registry, username, password)
+    }
+
+    fn remove(&self, registry: &str) -> Result<bool> {
+        self.remove(registry)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

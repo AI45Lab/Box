@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use a3s_box_core::error::{BoxError, Result};
+use a3s_box_core::traits::{CacheBackend, CacheEntry};
 use serde::{Deserialize, Serialize};
 
 /// Metadata for a cached layer entry.
@@ -285,6 +286,39 @@ pub(crate) fn dir_size(path: &Path) -> std::io::Result<u64> {
         }
     }
     Ok(total)
+}
+
+impl CacheBackend for LayerCache {
+    fn get(&self, key: &str) -> Result<Option<PathBuf>> {
+        self.get(key)
+    }
+
+    fn put(&self, key: &str, source_dir: &Path, _description: &str) -> Result<PathBuf> {
+        self.put(key, source_dir)
+    }
+
+    fn invalidate(&self, key: &str) -> Result<()> {
+        self.invalidate(key)
+    }
+
+    fn prune(&self, _max_entries: usize, max_bytes: u64) -> Result<usize> {
+        self.prune(max_bytes)
+    }
+
+    fn list(&self) -> Result<Vec<CacheEntry>> {
+        self.list_entries().map(|entries| {
+            entries
+                .into_iter()
+                .map(|m| CacheEntry {
+                    key: m.digest,
+                    description: String::new(),
+                    size_bytes: m.size_bytes,
+                    cached_at: m.cached_at,
+                    last_accessed: m.last_accessed,
+                })
+                .collect()
+        })
+    }
 }
 
 #[cfg(test)]

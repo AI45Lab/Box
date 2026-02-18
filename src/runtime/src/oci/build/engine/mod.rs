@@ -105,15 +105,7 @@ pub(super) struct HistoryEntry {
     pub(super) empty_layer: bool,
 }
 
-/// Health check configuration for OCI image config.
-#[derive(Debug, Clone)]
-pub struct OciHealthCheck {
-    pub test: Vec<String>,
-    pub interval: Option<u64>,
-    pub timeout: Option<u64>,
-    pub retries: Option<u32>,
-    pub start_period: Option<u64>,
-}
+pub use crate::oci::image::OciHealthCheck;
 
 impl BuildState {
     fn new(build_args: HashMap<String, String>) -> Self {

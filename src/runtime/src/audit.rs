@@ -250,6 +250,12 @@ pub fn read_audit_log(path: &Path, query: &AuditQuery) -> Result<Vec<AuditEvent>
     Ok(events)
 }
 
+impl a3s_box_core::traits::AuditSink for AuditLog {
+    fn record(&self, event: &AuditEvent) -> Result<()> {
+        self.log(event)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

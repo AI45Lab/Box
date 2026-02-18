@@ -6,7 +6,16 @@ use a3s_box_core::error::{BoxError, Result};
 use oci_spec::image::{ImageConfiguration, ImageIndex, ImageManifest};
 use std::path::{Path, PathBuf};
 
-use super::labels::AgentLabels;
+
+/// Health check configuration from OCI image config.
+#[derive(Debug, Clone)]
+pub struct OciHealthCheck {
+    pub test: Vec<String>,
+    pub interval: Option<u64>,
+    pub timeout: Option<u64>,
+    pub retries: Option<u32>,
+    pub start_period: Option<u64>,
+}
 
 /// Represents an OCI image loaded from disk.
 #[derive(Debug)]
@@ -20,8 +29,6 @@ pub struct OciImage {
     /// Paths to layer blobs (in order, bottom to top)
     layer_paths: Vec<PathBuf>,
 }
-
-use super::build::engine::OciHealthCheck;
 
 /// Parsed OCI image configuration with entrypoint and environment.
 #[derive(Debug, Clone)]
@@ -156,14 +163,6 @@ impl OciImage {
     /// Get a label value by key.
     pub fn label(&self, key: &str) -> Option<&str> {
         self.config.labels.get(key).map(|s| s.as_str())
-    }
-
-    /// Parse agent configuration from image labels.
-    ///
-    /// Returns parsed agent configuration including LLM settings, workspace path,
-    /// and environment variables from `a3s.box.*` labels.
-    pub fn agent_labels(&self) -> AgentLabels {
-        AgentLabels::from_labels(&self.config.labels)
     }
 
     /// Validate that the directory contains a valid OCI layout.

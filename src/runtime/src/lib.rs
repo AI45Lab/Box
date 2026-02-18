@@ -2,70 +2,113 @@
 //!
 //! This module provides the actual runtime implementation for A3S Box,
 //! including VM management, OCI image handling, rootfs building, and gRPC health checks.
+//!
+//! # Feature Flags
+//!
+//! - `pool` — Warm VM pool with autoscaling (enabled by default)
+//! - `scale` — Multi-node scale manager and instance registry (enabled by default)
+//! - `compose` — Multi-container compose orchestration (enabled by default)
+//! - `operator` — Kubernetes CRD autoscaler controller (enabled by default)
+//! - `build` — Dockerfile build engine (enabled by default)
 
 #![allow(clippy::result_large_err)]
 
+// -- Core modules (always compiled) --
 pub mod audit;
 pub mod cache;
-pub mod compose;
 pub mod fs;
 pub mod grpc;
 pub mod host_check;
 pub mod krun;
 pub mod log;
-pub mod metrics;
 pub mod network;
 pub mod oci;
-pub mod operator;
-pub mod pool;
 pub mod prom;
 pub mod rootfs;
-pub mod scale;
 pub mod snapshot;
 pub mod tee;
 pub mod vm;
 pub mod vmm;
 pub mod volume;
 
-// Re-export common types
+// -- Optional modules (feature-gated) --
+#[cfg(feature = "compose")]
+pub mod compose;
+#[cfg(feature = "operator")]
+pub mod operator;
+#[cfg(feature = "pool")]
+pub mod pool;
+#[cfg(feature = "scale")]
+pub mod scale;
+
+// ── Core re-exports (used by CLI, CRI, SDK, shim) ──
+
+// Audit
 pub use audit::{read_audit_log, AuditLog, AuditQuery};
+
+// Cache
 pub use cache::{LayerCache, RootfsCache};
-pub use compose::{ComposeProject, ProjectState};
+
+// gRPC clients
 pub use grpc::{AttestationClient, ExecClient, PtyClient, RaTlsAttestationClient, StreamingExec};
-pub use grpc::{
-    SealClient, SealResult, SecretEntry, SecretInjectionResult, SecretInjector, UnsealResult,
-};
+pub use grpc::{SealClient, SealResult, SecretEntry, SecretInjectionResult, SecretInjector, UnsealResult};
+
+// Host checks
 pub use host_check::{check_virtualization_support, VirtualizationSupport};
+
+// Network
 pub use network::NetworkStore;
-pub use network::PasstManager;
-pub use oci::{BuildConfig, BuildResult, Dockerfile, Instruction};
+
+// OCI images
 pub use oci::{CredentialStore, PushResult, RegistryPusher};
-pub use oci::{ImagePuller, ImageReference, ImageStore, RegistryAuth, RegistryPuller, StoredImage};
-pub use oci::{OciImage, OciImageConfig, OciRootfsBuilder, RootfsComposition};
+pub use oci::{ImagePuller, ImageReference, ImageStore, RegistryAuth, RegistryPuller};
+pub use a3s_box_core::StoredImage;
+pub use oci::{OciImage, OciImageConfig, OciRootfsBuilder};
 pub use oci::{SignaturePolicy, VerifyResult};
-pub use operator::{AutoscalerController, ObservedMetrics, ReconcileResult};
-pub use pool::{PoolStats, WarmPool};
+
+// Metrics
 pub use prom::RuntimeMetrics;
-pub use rootfs::{GuestLayout, RootfsBuilder, GUEST_WORKDIR};
-pub use scale::{InstanceRegistry, ScaleManager, ServiceHealth};
+
+// Snapshot
 pub use snapshot::SnapshotStore;
-pub use tee::{check_sev_snp_support, require_sev_snp_support, SevSnpSupport};
+
+// TEE (only types actually used externally)
 pub use tee::{seal, unseal, SealedData, SealingPolicy};
-pub use tee::{seal_versioned, unseal_versioned, VersionStore, VersionedSealedData};
 pub use tee::{
     verify_attestation, verify_attestation_with_time, AmdKdsClient, AttestationPolicy,
     MinTcbPolicy, PolicyResult, VerificationResult,
 };
 pub use tee::{AttestationReport, AttestationRequest, CertificateChain, PlatformInfo, TcbVersion};
-pub use tee::{FailureAction, ReattestConfig, ReattestState, ReattestSummary};
-pub use tee::{KbsClient, KbsConfig, KbsRequest, KbsResponse, KbsSecret};
 pub use tee::{SnpTeeExtension, TeeExtension};
+
+// VM
 pub use vm::{BoxState, VmManager};
 pub use vmm::{
     Entrypoint, FsMount, InstanceSpec, NetworkInstanceConfig, ShimHandler, TeeInstanceConfig,
     VmController, VmHandler, VmMetrics, VmmProvider,
 };
+
+// Volume
 pub use volume::VolumeStore;
+
+// ── Feature-gated re-exports ──
+
+#[cfg(feature = "build")]
+pub use oci::{BuildConfig, BuildResult, Dockerfile, Instruction};
+
+#[cfg(feature = "compose")]
+pub use compose::{ComposeProject, ProjectState};
+
+#[cfg(feature = "operator")]
+pub use operator::{AutoscalerController, ObservedMetrics, ReconcileResult};
+
+#[cfg(feature = "pool")]
+pub use pool::{PoolStats, WarmPool};
+
+#[cfg(feature = "scale")]
+pub use scale::{InstanceRegistry, ScaleManager, ServiceHealth};
+
+// ── Constants ──
 
 /// A3S Box Runtime version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -458,7 +458,7 @@ unsafe fn configure_and_start_vm(spec: &InstanceSpec) -> Result<()> {
     // (added by vm.rs when simulate mode is on) and passed to the guest init
     // via krun_set_exec's envp parameter. Do NOT call set_env here — libkrun's
     // krun_set_env overwrites (not appends) the environment, which would erase
-    // all A3S_AGENT_* vars set by set_exec.
+    // all BOX_EXEC_* vars set by set_exec.
     if spec
         .entrypoint
         .env
@@ -500,7 +500,7 @@ unsafe fn configure_and_start_vm(spec: &InstanceSpec) -> Result<()> {
 
         // Network env vars (A3S_NET_IP, A3S_NET_GATEWAY, A3S_NET_DNS) are now
         // injected into spec.entrypoint.env by vm.rs, so they are passed via
-        // krun_set_exec's envp alongside all A3S_AGENT_* vars. Do NOT call
+        // krun_set_exec's envp alongside all BOX_EXEC_* vars. Do NOT call
         // ctx.set_env here — libkrun's krun_set_env overwrites (not appends)
         // the environment, which would erase all vars set by set_exec.
     }
@@ -582,9 +582,9 @@ unsafe fn configure_and_start_vm(spec: &InstanceSpec) -> Result<()> {
             hint: None,
         })
     } else {
-        // VM started and guest exited - this is success
+        // VM started and guest exited — propagate the guest exit code to the host.
         tracing::info!(exit_status = status, "VM exited");
-        Ok(())
+        std::process::exit(status);
     }
 }
 

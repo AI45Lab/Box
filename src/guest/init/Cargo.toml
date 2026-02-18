@@ -13,10 +13,6 @@ path = "src/lib.rs"
 name = "a3s-box-guest-init"
 path = "src/main.rs"
 
-[[bin]]
-name = "a3s-box-nsexec"
-path = "src/bin/nsexec.rs"
-
 [dependencies]
 a3s-box-core = { path = "../../core" }
 a3s-transport = { workspace = true }

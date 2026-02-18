@@ -44,64 +44,6 @@ impl SevSnpGeneration {
     }
 }
 
-/// Agent type configuration - specifies how the coding agent is loaded.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum AgentType {
-    /// Built-in A3S Code agent (default)
-    #[default]
-    A3sCode,
-
-    /// OCI image containing the agent
-    OciImage {
-        /// Path to OCI image directory
-        path: PathBuf,
-    },
-
-    /// Local binary agent
-    LocalBinary {
-        /// Path to the binary
-        path: PathBuf,
-        /// Arguments to pass to the binary
-        args: Vec<String>,
-    },
-
-    /// Remote binary (downloaded on first use)
-    RemoteBinary {
-        /// URL to download the binary
-        url: String,
-        /// SHA256 checksum for verification
-        checksum: String,
-    },
-
-    /// OCI image from a container registry (pulled on first use)
-    OciRegistry {
-        /// Image reference (e.g., "ghcr.io/a3s-box/code:v0.1.0")
-        reference: String,
-    },
-}
-
-/// Business code configuration - specifies how business code is loaded.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum BusinessType {
-    /// No business code (default)
-    #[default]
-    None,
-
-    /// OCI image containing business code
-    OciImage {
-        /// Path to OCI image directory
-        path: PathBuf,
-    },
-
-    /// Directory to mount as workspace
-    Directory {
-        /// Path to the directory
-        path: PathBuf,
-    },
-}
-
 /// Cache configuration for cold start optimization.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheConfig {
@@ -301,19 +243,12 @@ pub struct ResourceLimits {
 /// Box configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BoxConfig {
-    /// Agent type (how the coding agent is loaded)
+    /// OCI image reference (e.g., "nginx:alpine", "ghcr.io/org/app:latest")
     #[serde(default)]
-    pub agent: AgentType,
+    pub image: String,
 
-    /// Business code type (how business code is loaded)
-    #[serde(default)]
-    pub business: BusinessType,
-
-    /// Workspace directory (mounted to /a3s/workspace/)
+    /// Workspace directory (mounted to /workspace inside the VM)
     pub workspace: PathBuf,
-
-    /// Skill directories (mounted to /a3s/skills/)
-    pub skills: Vec<PathBuf>,
 
     /// Resource limits
     pub resources: ResourceConfig,
@@ -390,15 +325,22 @@ pub struct BoxConfig {
     /// Run in privileged mode (disables all security restrictions)
     #[serde(default)]
     pub privileged: bool,
+
+    /// Mount the container rootfs as read-only.
+    ///
+    /// Volume mounts (-v host:guest) remain writable by default.
+    /// Requires guest init to be present in the rootfs image.
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 impl Default for BoxConfig {
     fn default() -> Self {
         Self {
-            agent: AgentType::default(),
-            business: BusinessType::default(),
-            workspace: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            skills: vec![PathBuf::from("./skills")],
+            image: String::new(),
+            // Empty path signals the runtime to create a per-box workspace
+            // under ~/.a3s/boxes/<box_id>/workspace/ at boot time.
+            workspace: PathBuf::new(),
             resources: ResourceConfig::default(),
             log_level: LogLevel::Info,
             debug_grpc: false,
@@ -418,6 +360,7 @@ impl Default for BoxConfig {
             cap_drop: vec![],
             security_opt: vec![],
             privileged: false,
+            read_only: false,
         }
     }
 }
@@ -477,12 +420,35 @@ mod tests {
     fn test_box_config_default() {
         let config = BoxConfig::default();
 
-        assert_eq!(config.agent, AgentType::A3sCode);
-        assert_eq!(config.business, BusinessType::None);
-        assert!(!config.workspace.as_os_str().is_empty());
-        assert_eq!(config.skills.len(), 1);
+        assert!(config.image.is_empty());
+        // Empty workspace signals the runtime to use a per-box directory at boot time.
+        assert!(config.workspace.as_os_str().is_empty());
         assert_eq!(config.resources.vcpus, 2);
         assert!(!config.debug_grpc);
+        assert!(!config.read_only);
+    }
+
+    #[test]
+    fn test_box_config_read_only_default_false() {
+        let config = BoxConfig::default();
+        assert!(!config.read_only);
+    }
+
+    #[test]
+    fn test_box_config_read_only_serde() {
+        // read_only defaults to false when absent from JSON
+        let json = r#"{"image":"test","workspace":"","resources":{"vcpus":2,"memory_mb":512,"disk_mb":4096,"timeout":3600},"log_level":"Info","debug_grpc":false}"#;
+        let config: BoxConfig = serde_json::from_str(json).unwrap();
+        assert!(!config.read_only);
+
+        // read_only=true roundtrips correctly
+        let config = BoxConfig {
+            read_only: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: BoxConfig = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.read_only);
     }
 
     #[test]
@@ -530,8 +496,8 @@ mod tests {
     #[test]
     fn test_box_config_deserialization() {
         let json = r#"{
+            "image": "nginx:alpine",
             "workspace": "/tmp/workspace",
-            "skills": ["/tmp/skills"],
             "resources": {
                 "vcpus": 4,
                 "memory_mb": 2048,
@@ -543,6 +509,7 @@ mod tests {
         }"#;
 
         let config: BoxConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.image, "nginx:alpine");
         assert_eq!(config.workspace.to_str().unwrap(), "/tmp/workspace");
         assert_eq!(config.resources.vcpus, 4);
         assert!(config.debug_grpc);
@@ -597,161 +564,6 @@ mod tests {
 
         assert!(debug_str.contains("BoxConfig"));
         assert!(debug_str.contains("workspace"));
-    }
-
-    #[test]
-    fn test_agent_type_default() {
-        let agent = AgentType::default();
-        assert_eq!(agent, AgentType::A3sCode);
-    }
-
-    #[test]
-    fn test_agent_type_oci_image() {
-        let agent = AgentType::OciImage {
-            path: PathBuf::from("/path/to/agent-image"),
-        };
-
-        match agent {
-            AgentType::OciImage { path } => {
-                assert_eq!(path, PathBuf::from("/path/to/agent-image"));
-            }
-            _ => panic!("Expected OciImage variant"),
-        }
-    }
-
-    #[test]
-    fn test_agent_type_local_binary() {
-        let agent = AgentType::LocalBinary {
-            path: PathBuf::from("/usr/bin/agent"),
-            args: vec!["--port".to_string(), "8080".to_string()],
-        };
-
-        match agent {
-            AgentType::LocalBinary { path, args } => {
-                assert_eq!(path, PathBuf::from("/usr/bin/agent"));
-                assert_eq!(args.len(), 2);
-            }
-            _ => panic!("Expected LocalBinary variant"),
-        }
-    }
-
-    #[test]
-    fn test_agent_type_remote_binary() {
-        let agent = AgentType::RemoteBinary {
-            url: "https://example.com/agent".to_string(),
-            checksum: "abc123".to_string(),
-        };
-
-        match agent {
-            AgentType::RemoteBinary { url, checksum } => {
-                assert_eq!(url, "https://example.com/agent");
-                assert_eq!(checksum, "abc123");
-            }
-            _ => panic!("Expected RemoteBinary variant"),
-        }
-    }
-
-    #[test]
-    fn test_agent_type_oci_registry() {
-        let agent = AgentType::OciRegistry {
-            reference: "ghcr.io/a3s-box/code:v0.1.0".to_string(),
-        };
-
-        match agent {
-            AgentType::OciRegistry { reference } => {
-                assert_eq!(reference, "ghcr.io/a3s-box/code:v0.1.0");
-            }
-            _ => panic!("Expected OciRegistry variant"),
-        }
-    }
-
-    #[test]
-    fn test_agent_type_oci_registry_serialization() {
-        let agent = AgentType::OciRegistry {
-            reference: "docker.io/library/nginx:latest".to_string(),
-        };
-
-        let json = serde_json::to_string(&agent).unwrap();
-        let parsed: AgentType = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(parsed, agent);
-    }
-
-    #[test]
-    fn test_business_type_default() {
-        let business = BusinessType::default();
-        assert_eq!(business, BusinessType::None);
-    }
-
-    #[test]
-    fn test_business_type_oci_image() {
-        let business = BusinessType::OciImage {
-            path: PathBuf::from("/path/to/business-image"),
-        };
-
-        match business {
-            BusinessType::OciImage { path } => {
-                assert_eq!(path, PathBuf::from("/path/to/business-image"));
-            }
-            _ => panic!("Expected OciImage variant"),
-        }
-    }
-
-    #[test]
-    fn test_business_type_directory() {
-        let business = BusinessType::Directory {
-            path: PathBuf::from("/path/to/app"),
-        };
-
-        match business {
-            BusinessType::Directory { path } => {
-                assert_eq!(path, PathBuf::from("/path/to/app"));
-            }
-            _ => panic!("Expected Directory variant"),
-        }
-    }
-
-    #[test]
-    fn test_agent_type_serialization() {
-        let agent = AgentType::OciImage {
-            path: PathBuf::from("/images/agent"),
-        };
-
-        let json = serde_json::to_string(&agent).unwrap();
-        let parsed: AgentType = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(parsed, agent);
-    }
-
-    #[test]
-    fn test_business_type_serialization() {
-        let business = BusinessType::OciImage {
-            path: PathBuf::from("/images/business"),
-        };
-
-        let json = serde_json::to_string(&business).unwrap();
-        let parsed: BusinessType = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(parsed, business);
-    }
-
-    #[test]
-    fn test_box_config_with_oci_images() {
-        let config = BoxConfig {
-            agent: AgentType::OciImage {
-                path: PathBuf::from("/images/agent"),
-            },
-            business: BusinessType::OciImage {
-                path: PathBuf::from("/images/business"),
-            },
-            ..Default::default()
-        };
-
-        let json = serde_json::to_string(&config).unwrap();
-        let parsed: BoxConfig = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(parsed.agent, config.agent);
-        assert_eq!(parsed.business, config.business);
     }
 
     #[test]
@@ -988,7 +800,6 @@ mod tests {
         // JSON without cache/pool fields should still deserialize with defaults
         let json = r#"{
             "workspace": "/tmp/workspace",
-            "skills": ["/tmp/skills"],
             "resources": {
                 "vcpus": 2,
                 "memory_mb": 1024,
@@ -1088,7 +899,6 @@ mod tests {
         // Old configs without resource_limits should deserialize with defaults
         let json = r#"{
             "workspace": "/tmp/workspace",
-            "skills": ["/tmp/skills"],
             "resources": {
                 "vcpus": 2,
                 "memory_mb": 1024,

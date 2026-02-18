@@ -5,23 +5,11 @@
 /// Working directory inside the guest VM.
 pub const GUEST_WORKDIR: &str = "/workspace";
 
-/// Skills directory inside the guest VM.
-pub const GUEST_SKILLS_DIR: &str = "/skills";
-
 /// Guest filesystem layout.
 #[derive(Debug, Clone)]
 pub struct GuestLayout {
-    /// Base directory for A3S files inside guest.
-    pub base_dir: &'static str,
-
-    /// Directory for agent binaries.
-    pub agent_dir: &'static str,
-
     /// Workspace mount point (virtio-fs).
     pub workspace_dir: &'static str,
-
-    /// Skills mount point (virtio-fs).
-    pub skills_dir: &'static str,
 
     /// Temporary directory.
     pub tmp_dir: &'static str,
@@ -33,10 +21,7 @@ pub struct GuestLayout {
 impl Default for GuestLayout {
     fn default() -> Self {
         Self {
-            base_dir: "/a3s",
-            agent_dir: "/a3s/agent",
             workspace_dir: "/workspace",
-            skills_dir: "/skills",
             tmp_dir: "/tmp",
             run_dir: "/run",
         }
@@ -52,10 +37,7 @@ impl GuestLayout {
     /// Get all directories that need to be created in the rootfs.
     pub fn required_dirs(&self) -> Vec<&str> {
         vec![
-            self.base_dir,
-            self.agent_dir,
             self.workspace_dir,
-            self.skills_dir,
             self.tmp_dir,
             self.run_dir,
             "/dev",
@@ -76,10 +58,7 @@ mod tests {
     #[test]
     fn test_guest_layout_defaults() {
         let layout = GuestLayout::default();
-        assert_eq!(layout.base_dir, "/a3s");
-        assert_eq!(layout.agent_dir, "/a3s/agent");
         assert_eq!(layout.workspace_dir, "/workspace");
-        assert_eq!(layout.skills_dir, "/skills");
         assert_eq!(layout.tmp_dir, "/tmp");
         assert_eq!(layout.run_dir, "/run");
     }
@@ -88,9 +67,8 @@ mod tests {
     fn test_guest_layout_standard_equals_default() {
         let standard = GuestLayout::standard();
         let default = GuestLayout::default();
-        assert_eq!(standard.base_dir, default.base_dir);
-        assert_eq!(standard.agent_dir, default.agent_dir);
         assert_eq!(standard.workspace_dir, default.workspace_dir);
+        assert_eq!(standard.tmp_dir, default.tmp_dir);
     }
 
     #[test]
@@ -98,11 +76,7 @@ mod tests {
         let layout = GuestLayout::standard();
         let dirs = layout.required_dirs();
 
-        // Verify all layout directories are included
-        assert!(dirs.contains(&layout.base_dir));
-        assert!(dirs.contains(&layout.agent_dir));
         assert!(dirs.contains(&layout.workspace_dir));
-        assert!(dirs.contains(&layout.skills_dir));
         assert!(dirs.contains(&layout.tmp_dir));
         assert!(dirs.contains(&layout.run_dir));
     }
@@ -112,7 +86,6 @@ mod tests {
         let layout = GuestLayout::standard();
         let dirs = layout.required_dirs();
 
-        // Verify system directories are included
         assert!(dirs.contains(&"/dev"));
         assert!(dirs.contains(&"/proc"));
         assert!(dirs.contains(&"/sys"));
@@ -125,24 +98,15 @@ mod tests {
     #[test]
     fn test_guest_workdir_constant() {
         assert_eq!(GUEST_WORKDIR, "/workspace");
-        // Should match layout workspace_dir
         let layout = GuestLayout::default();
         assert_eq!(GUEST_WORKDIR, layout.workspace_dir);
-    }
-
-    #[test]
-    fn test_guest_skills_dir_constant() {
-        assert_eq!(GUEST_SKILLS_DIR, "/skills");
-        // Should match layout skills_dir
-        let layout = GuestLayout::default();
-        assert_eq!(GUEST_SKILLS_DIR, layout.skills_dir);
     }
 
     #[test]
     fn test_guest_layout_clone() {
         let layout = GuestLayout::default();
         let cloned = layout.clone();
-        assert_eq!(layout.base_dir, cloned.base_dir);
         assert_eq!(layout.workspace_dir, cloned.workspace_dir);
+        assert_eq!(layout.tmp_dir, cloned.tmp_dir);
     }
 }

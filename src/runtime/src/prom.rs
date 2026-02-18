@@ -277,6 +277,44 @@ impl Default for RuntimeMetrics {
     }
 }
 
+impl a3s_box_core::traits::MetricsCollector for RuntimeMetrics {
+    fn record_vm_boot(&self, duration_secs: f64) {
+        self.vm_boot_duration.observe(duration_secs);
+    }
+
+    fn inc_vm_state(&self, state: &str) {
+        self.vm_count.with_label_values(&[state]).inc();
+    }
+
+    fn dec_vm_state(&self, state: &str) {
+        self.vm_count.with_label_values(&[state]).dec();
+    }
+
+    fn inc_vm_created(&self) {
+        self.vm_created_total.inc();
+    }
+
+    fn inc_vm_destroyed(&self) {
+        self.vm_destroyed_total.inc();
+    }
+
+    fn record_exec(&self, duration_secs: f64, success: bool) {
+        self.exec_total.inc();
+        self.exec_duration.observe(duration_secs);
+        if !success {
+            self.exec_errors_total.inc();
+        }
+    }
+
+    fn inc_cache_hit(&self) {
+        self.rootfs_cache_hits.inc();
+    }
+
+    fn inc_cache_miss(&self) {
+        self.rootfs_cache_misses.inc();
+    }
+}
+
 impl std::fmt::Debug for RuntimeMetrics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RuntimeMetrics").finish()

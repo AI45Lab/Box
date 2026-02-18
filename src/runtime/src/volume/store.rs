@@ -221,6 +221,32 @@ fn dirs_path() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".a3s"))
 }
 
+impl a3s_box_core::traits::VolumeStoreBackend for VolumeStore {
+    fn get(&self, name: &str) -> Result<Option<VolumeConfig>> {
+        self.get(name)
+    }
+
+    fn create(&self, config: VolumeConfig) -> Result<VolumeConfig> {
+        self.create(config)
+    }
+
+    fn remove(&self, name: &str, force: bool) -> Result<VolumeConfig> {
+        self.remove(name, force)
+    }
+
+    fn list(&self) -> Result<Vec<VolumeConfig>> {
+        self.list()
+    }
+
+    fn update(&self, config: &VolumeConfig) -> Result<()> {
+        self.update(config)
+    }
+
+    fn prune(&self) -> Result<Vec<String>> {
+        self.prune()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

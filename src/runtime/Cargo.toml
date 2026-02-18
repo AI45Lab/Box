@@ -9,6 +9,14 @@ license.workspace = true
 name = "a3s_box_runtime"
 path = "src/lib.rs"
 
+[features]
+default = ["pool", "scale", "compose", "operator", "build"]
+pool = []
+scale = []
+compose = []
+operator = []
+build = []
+
 [dependencies]
 a3s-box-core = { path = "../core" }
 a3s-transport = { workspace = true }

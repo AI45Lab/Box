@@ -19,6 +19,8 @@ pub mod scale;
 pub mod security;
 pub mod snapshot;
 pub mod tee;
+pub mod traits;
+pub mod vmm;
 pub mod volume;
 
 // Re-export commonly used types
@@ -42,6 +44,15 @@ pub use security::{SeccompMode, SecurityConfig};
 pub use snapshot::{SnapshotConfig, SnapshotMetadata};
 pub use tee::ATTEST_VSOCK_PORT;
 pub use tee::{detect_tee, is_tee_available, TeeCapability, TeeType};
+pub use traits::{
+    AuditSink, CacheBackend, CacheEntry, CacheStats, CredentialProvider, EventBus, ImageRegistry,
+    ImageStoreBackend, MetricsCollector, NetworkStoreBackend, NoopMetrics, PulledImage,
+    SnapshotStoreBackend, StoredImage, VolumeStoreBackend,
+};
+pub use vmm::{
+    DEFAULT_SHUTDOWN_TIMEOUT_MS, Entrypoint, FsMount, InstanceSpec, NetworkInstanceConfig,
+    TeeInstanceConfig, VmHandler, VmMetrics, VmmProvider,
+};
 pub use volume::VolumeConfig;
 
 /// A3S Box version

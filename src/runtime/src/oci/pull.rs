@@ -76,6 +76,29 @@ impl ImagePuller {
         self.store.get(&parsed.full_reference()).await.is_some()
     }
 
+    /// Remove a cached image by reference.
+    pub async fn remove_cached(&self, reference: &str) -> Result<bool> {
+        let parsed = ImageReference::parse(reference)?;
+        let full_ref = parsed.full_reference();
+        if self.store.get(&full_ref).await.is_some() {
+            self.store.remove(&full_ref).await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// List all cached image references.
+    pub async fn list_cached(&self) -> Result<Vec<String>> {
+        Ok(self
+            .store
+            .list()
+            .await
+            .into_iter()
+            .map(|img| img.reference)
+            .collect())
+    }
+
     /// Pull from registry and store locally.
     async fn pull_and_store(&self, reference: &ImageReference) -> Result<OciImage> {
         let full_ref = reference.full_reference();
@@ -126,6 +149,41 @@ impl ImagePuller {
         }
 
         OciImage::from_path(&stored.path)
+    }
+}
+
+#[async_trait::async_trait]
+impl a3s_box_core::traits::ImageRegistry for ImagePuller {
+    async fn pull(&self, reference: &str) -> Result<a3s_box_core::traits::PulledImage> {
+        let image = self.pull(reference).await?;
+        let parsed = ImageReference::parse(reference)?;
+        Ok(a3s_box_core::traits::PulledImage {
+            path: image.root_dir().to_path_buf(),
+            digest: String::new(), // digest not exposed by OciImage
+            reference: parsed.full_reference(),
+        })
+    }
+
+    async fn force_pull(&self, reference: &str) -> Result<a3s_box_core::traits::PulledImage> {
+        let image = self.force_pull(reference).await?;
+        let parsed = ImageReference::parse(reference)?;
+        Ok(a3s_box_core::traits::PulledImage {
+            path: image.root_dir().to_path_buf(),
+            digest: String::new(),
+            reference: parsed.full_reference(),
+        })
+    }
+
+    async fn is_cached(&self, reference: &str) -> bool {
+        self.is_cached(reference).await
+    }
+
+    async fn remove(&self, reference: &str) -> Result<bool> {
+        self.remove_cached(reference).await
+    }
+
+    async fn list_cached(&self) -> Result<Vec<String>> {
+        self.list_cached().await
     }
 }
 

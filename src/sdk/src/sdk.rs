@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use a3s_box_core::config::{AgentType, BoxConfig, ResourceConfig};
+use a3s_box_core::config::{BoxConfig, ResourceConfig};
 use a3s_box_core::error::{BoxError, Result};
 use a3s_box_core::event::EventEmitter;
 use a3s_box_runtime::vmm::VmController;
@@ -193,9 +193,7 @@ impl BoxSdk {
             .collect();
 
         Ok(BoxConfig {
-            agent: AgentType::OciRegistry {
-                reference: options.image.clone(),
-            },
+            image: options.image.clone(),
             resources,
             extra_env: env,
             volumes,
@@ -242,10 +240,7 @@ mod tests {
         };
 
         let config = sdk.build_config(&options).unwrap();
-        assert!(matches!(
-            config.agent,
-            AgentType::OciRegistry { ref reference } if reference == "python:3.12-slim"
-        ));
+        assert_eq!(config.image, "python:3.12-slim");
         assert_eq!(config.resources.vcpus, 4);
         assert_eq!(config.resources.memory_mb, 2048);
     }

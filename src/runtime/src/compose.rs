@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use a3s_box_core::compose::ComposeConfig;
-use a3s_box_core::config::{AgentType, BoxConfig, ResourceConfig};
+use a3s_box_core::config::{BoxConfig, ResourceConfig};
 use a3s_box_core::error::{BoxError, Result};
 use a3s_box_core::network::NetworkMode;
 
@@ -135,9 +135,7 @@ impl ComposeProject {
         });
 
         let config = BoxConfig {
-            agent: AgentType::OciRegistry {
-                reference: image.to_string(),
-            },
+            image: image.to_string(),
             resources: ResourceConfig {
                 vcpus: svc.cpus.unwrap_or(2),
                 memory_mb,
@@ -381,9 +379,7 @@ networks:
             .build_box_config("db", Some("myapp_default"))
             .unwrap();
 
-        assert!(
-            matches!(box_config.agent, AgentType::OciRegistry { ref reference } if reference == "postgres:16")
-        );
+        assert_eq!(box_config.image, "postgres:16");
         assert_eq!(box_config.resources.vcpus, 2);
         assert_eq!(box_config.resources.memory_mb, 1024);
         assert_eq!(box_config.volumes, vec!["pgdata:/var/lib/postgresql/data"]);

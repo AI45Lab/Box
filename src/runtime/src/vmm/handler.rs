@@ -1,44 +1,11 @@
-//! VmHandler - Runtime operations on a running VM.
+//! ShimHandler — concrete VmHandler for a libkrun shim subprocess.
+
+pub use a3s_box_core::vmm::{DEFAULT_SHUTDOWN_TIMEOUT_MS, VmHandler, VmMetrics};
 
 use a3s_box_core::error::Result;
 use std::process::Child;
 use std::sync::Mutex;
 use sysinfo::{Pid, System};
-
-/// VM resource metrics.
-#[derive(Debug, Clone, Default)]
-pub struct VmMetrics {
-    /// CPU usage percentage (0-100 per core)
-    pub cpu_percent: Option<f32>,
-    /// Memory usage in bytes
-    pub memory_bytes: Option<u64>,
-}
-
-/// Default shutdown timeout in milliseconds (10 seconds).
-///
-/// Matches the CLI's default `--timeout` for `a3s-box stop`.
-pub const DEFAULT_SHUTDOWN_TIMEOUT_MS: u64 = 10_000;
-
-/// Trait for runtime operations on a running VM.
-///
-/// Separates runtime operations (stop, metrics) from spawning operations (VmController).
-/// This allows reconnection to existing VMs by creating a handler directly from PID.
-pub trait VmHandler: Send + Sync {
-    /// Stop the VM with a timeout for graceful shutdown.
-    ///
-    /// Sends SIGTERM first, waits up to `timeout_ms` for the process to exit,
-    /// then sends SIGKILL if it hasn't stopped.
-    fn stop(&mut self, timeout_ms: u64) -> Result<()>;
-
-    /// Get VM metrics (CPU, memory usage).
-    fn metrics(&self) -> VmMetrics;
-
-    /// Check if the VM is still running.
-    fn is_running(&self) -> bool;
-
-    /// Get the process ID of the running VM.
-    fn pid(&self) -> u32;
-}
 
 /// Handler for a running VM subprocess (shim process).
 ///
@@ -53,6 +20,8 @@ pub struct ShimHandler {
     /// Shared System instance for CPU metrics calculation across calls.
     /// CPU usage requires comparing snapshots over time, so we must reuse the same System.
     metrics_sys: Mutex<System>,
+    /// Exit code of the shim process, set when stop() collects the exit status.
+    exit_code: Option<i32>,
 }
 
 impl ShimHandler {
@@ -67,6 +36,7 @@ impl ShimHandler {
             box_id,
             process: Some(process),
             metrics_sys: Mutex::new(System::new()),
+            exit_code: None,
         }
     }
 
@@ -80,6 +50,7 @@ impl ShimHandler {
             box_id,
             process: None,
             metrics_sys: Mutex::new(System::new()),
+            exit_code: None,
         }
     }
 
@@ -94,16 +65,16 @@ impl VmHandler for ShimHandler {
         self.pid
     }
 
-    fn stop(&mut self, timeout_ms: u64) -> Result<()> {
-        // Graceful shutdown: SIGTERM first, wait, then SIGKILL if needed.
+    fn stop(&mut self, signal: i32, timeout_ms: u64) -> Result<()> {
+        // Graceful shutdown: send configured signal first, wait, then SIGKILL if needed.
         // This gives libkrun time to flush its virtio-blk buffers to disk.
 
         if let Some(mut process) = self.process.take() {
-            // Step 1: Send SIGTERM for graceful shutdown
+            // Step 1: Send configured stop signal for graceful shutdown
             let pid = process.id();
-            tracing::debug!(pid, box_id = %self.box_id, "Sending SIGTERM to VM process");
+            tracing::debug!(pid, box_id = %self.box_id, signal, "Sending stop signal to VM process");
             unsafe {
-                libc::kill(pid as i32, libc::SIGTERM);
+                libc::kill(pid as i32, signal);
             }
 
             // Step 2: Wait with timeout for process to exit
@@ -112,6 +83,7 @@ impl VmHandler for ShimHandler {
                 match process.try_wait() {
                     Ok(Some(status)) => {
                         tracing::debug!(pid, ?status, "VM process exited gracefully");
+                        self.exit_code = status.code();
                         return Ok(());
                     }
                     Ok(None) => {
@@ -123,7 +95,9 @@ impl VmHandler for ShimHandler {
                                 "VM process did not exit gracefully, sending SIGKILL"
                             );
                             let _ = process.kill();
-                            let _ = process.wait();
+                            if let Ok(status) = process.wait() {
+                                self.exit_code = status.code();
+                            }
                             return Ok(());
                         }
                         // Brief sleep before checking again
@@ -138,10 +112,10 @@ impl VmHandler for ShimHandler {
                 }
             }
         } else {
-            // Attached mode: use SIGTERM then SIGKILL with polling
-            tracing::debug!(pid = self.pid, box_id = %self.box_id, "Sending SIGTERM to attached VM process");
+            // Attached mode: use configured signal then SIGKILL with polling
+            tracing::debug!(pid = self.pid, box_id = %self.box_id, signal, "Sending stop signal to attached VM process");
             unsafe {
-                libc::kill(self.pid as i32, libc::SIGTERM);
+                libc::kill(self.pid as i32, signal);
             }
 
             // Poll for exit with timeout
@@ -210,6 +184,10 @@ impl VmHandler for ShimHandler {
         // Check if process exists by sending signal 0
         unsafe { libc::kill(self.pid as i32, 0) == 0 }
     }
+
+    fn exit_code(&self) -> Option<i32> {
+        self.exit_code
+    }
 }
 
 #[cfg(test)]
@@ -239,6 +217,7 @@ mod tests {
         let handler = ShimHandler::from_pid(12345, "box-abc".to_string());
         assert_eq!(handler.pid(), 12345);
         assert_eq!(handler.box_id(), "box-abc");
+        assert_eq!(handler.exit_code(), None);
     }
 
     #[test]

@@ -5,13 +5,13 @@ use std::path::{Path, PathBuf};
 use crate::cache::RootfsCache;
 use crate::oci::OciRootfsBuilder;
 use crate::vmm::TeeInstanceConfig;
-use a3s_box_core::config::{AgentType, BusinessType, TeeConfig};
+use a3s_box_core::config::TeeConfig;
 use a3s_box_core::error::{BoxError, Result};
 
 use super::{BoxLayout, VmManager};
 
 impl VmManager {
-    pub(crate) fn prepare_layout(&self) -> Result<BoxLayout> {
+    pub(crate) async fn prepare_layout(&self) -> Result<BoxLayout> {
         // Create box-specific directories
         let box_dir = self.home_dir.join("boxes").join(&self.box_id);
         let socket_dir = box_dir.join("sockets");
@@ -27,34 +27,20 @@ impl VmManager {
             hint: None,
         })?;
 
-        // Resolve paths from config
-        let workspace_path = PathBuf::from(&self.config.workspace);
-
-        // Use first skills directory, or create a default one
-        let skills_path = self
-            .config
-            .skills
-            .first()
-            .cloned()
-            .unwrap_or_else(|| self.home_dir.join("skills"));
-
-        // Ensure workspace exists
+        // Resolve workspace path: empty config means use a per-box directory so the
+        // host CWD is never accidentally exposed to the guest.
+        let workspace_path = if self.config.workspace.as_os_str().is_empty() {
+            box_dir.join("workspace")
+        } else {
+            PathBuf::from(&self.config.workspace)
+        };
         if !workspace_path.exists() {
             std::fs::create_dir_all(&workspace_path).map_err(|e| BoxError::BoxBootError {
                 message: format!("Failed to create workspace directory: {}", e),
                 hint: None,
             })?;
         }
-
-        // Ensure skills directory exists
-        if !skills_path.exists() {
-            std::fs::create_dir_all(&skills_path).map_err(|e| BoxError::BoxBootError {
-                message: format!("Failed to create skills directory: {}", e),
-                hint: None,
-            })?;
-        }
-
-        // Canonicalize paths to absolute (libkrun requires absolute paths for virtiofs)
+        // Canonicalize to absolute path (libkrun requires absolute paths for virtiofs)
         let workspace_path = workspace_path
             .canonicalize()
             .map_err(|e| BoxError::BoxBootError {
@@ -65,192 +51,62 @@ impl VmManager {
                 ),
                 hint: None,
             })?;
-        let skills_path = skills_path
-            .canonicalize()
-            .map_err(|e| BoxError::BoxBootError {
-                message: format!(
-                    "Failed to resolve skills path {}: {}",
-                    skills_path.display(),
-                    e
-                ),
-                hint: None,
-            })?;
 
-        // Prepare rootfs based on agent type
-        let (rootfs_path, agent_oci_config, has_guest_init, image_at_root) = match &self
-            .config
-            .agent
-        {
-            AgentType::OciImage { path: agent_path } => {
-                // Use OCI image for agent (extracted under /agent)
-                let rootfs_path = box_dir.join("rootfs");
+        // Pull OCI image from registry and extract at rootfs root.
+        // Extracting at root preserves absolute symlinks and dynamic linker paths.
+        let reference = &self.config.image;
+        let images_dir = self.home_dir.join("images");
+        let store = crate::oci::ImageStore::new(&images_dir, crate::DEFAULT_IMAGE_CACHE_SIZE)?;
+        let puller = crate::oci::ImagePuller::new(
+            std::sync::Arc::new(store),
+            crate::oci::RegistryAuth::from_env(),
+        );
 
-                // Try rootfs cache first
-                let cache_key =
-                    RootfsCache::compute_key(&agent_path.display().to_string(), &[], &[], &[]);
-                if let Some(cached) = self.try_rootfs_cache(&cache_key, &rootfs_path)? {
-                    tracing::info!(
-                        cache_key = %&cache_key[..12],
-                        "Rootfs cache hit, skipping OCI extraction"
-                    );
-                    let builder = OciRootfsBuilder::new(&rootfs_path)
-                        .with_agent_image(agent_path)
-                        .with_agent_target("/agent")
-                        .with_business_target("/workspace");
-                    let agent_config = builder.agent_config()?;
-                    let has_guest_init = cached.join("sbin/init").exists();
-                    (rootfs_path, Some(agent_config), has_guest_init, false)
-                } else {
-                    tracing::info!(
-                        agent_image = %agent_path.display(),
-                        rootfs = %rootfs_path.display(),
-                        "Building rootfs from OCI images"
-                    );
+        tracing::info!(reference = %reference, "Pulling OCI image from registry");
 
-                    // Build rootfs using OciRootfsBuilder
-                    let mut builder = OciRootfsBuilder::new(&rootfs_path)
-                        .with_agent_image(agent_path)
-                        .with_agent_target("/agent")
-                        .with_business_target("/workspace");
+        let oci_image = puller.pull(reference).await?;
 
-                    // Add business image if specified
-                    if let BusinessType::OciImage {
-                        path: business_path,
-                    } = &self.config.business
-                    {
-                        builder = builder.with_business_image(business_path);
-                    }
+        let image_path = oci_image.root_dir().to_path_buf();
+        let rootfs_path = box_dir.join("rootfs");
 
-                    // Add guest init if available
-                    let has_guest_init = if let Ok(guest_init_path) = Self::find_guest_init() {
-                        tracing::info!(
-                            guest_init = %guest_init_path.display(),
-                            "Using guest init for namespace isolation"
-                        );
-                        builder = builder.with_guest_init(guest_init_path);
+        // Try rootfs cache first
+        let cache_key = RootfsCache::compute_key(reference, &[], &[], &[]);
+        let oci_config = if let Some(_cached) = self.try_rootfs_cache(&cache_key, &rootfs_path)? {
+            tracing::info!(
+                cache_key = %&cache_key[..12],
+                reference = %reference,
+                "Rootfs cache hit, skipping OCI extraction"
+            );
+            let builder = OciRootfsBuilder::new(&rootfs_path).with_image(&image_path);
+            Some(builder.image_config()?)
+        } else {
+            tracing::info!(
+                image = %image_path.display(),
+                rootfs = %rootfs_path.display(),
+                "Building rootfs from pulled OCI image"
+            );
 
-                        // Also add nsexec if available
-                        if let Ok(nsexec_path) = Self::find_nsexec() {
-                            tracing::info!(
-                                nsexec = %nsexec_path.display(),
-                                "Installing nsexec for business code execution"
-                            );
-                            builder = builder.with_nsexec(nsexec_path);
-                        }
+            let mut builder = OciRootfsBuilder::new(&rootfs_path).with_image(&image_path);
 
-                        true
-                    } else {
-                        false
-                    };
-
-                    // Build the rootfs
-                    builder.build()?;
-
-                    // Get agent OCI config for entrypoint/env extraction
-                    let agent_config = builder.agent_config()?;
-
-                    // Store in cache for next time
-                    self.store_rootfs_cache(
-                        &cache_key,
-                        &rootfs_path,
-                        &agent_path.display().to_string(),
-                    );
-
-                    (rootfs_path, Some(agent_config), has_guest_init, false)
-                }
-            }
-            AgentType::OciRegistry { reference } => {
-                // Pull image from registry and extract at rootfs root.
-                // This preserves absolute symlinks and dynamic linker paths.
-                let images_dir = self.home_dir.join("images");
-                let store =
-                    crate::oci::ImageStore::new(&images_dir, crate::DEFAULT_IMAGE_CACHE_SIZE)?;
-                let puller = crate::oci::ImagePuller::new(
-                    std::sync::Arc::new(store),
-                    crate::oci::RegistryAuth::from_env(),
-                );
-
+            // Install guest init if available (runs as PID 1, mounts virtiofs shares,
+            // then execs the container entrypoint)
+            if let Ok(guest_init_path) = Self::find_guest_init() {
                 tracing::info!(
-                    reference = %reference,
-                    "Pulling OCI image from registry"
+                    guest_init = %guest_init_path.display(),
+                    "Installing guest init"
                 );
-
-                let oci_image = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(puller.pull(reference))
-                })?;
-
-                let agent_path = oci_image.root_dir().to_path_buf();
-                let rootfs_path = box_dir.join("rootfs");
-
-                // Try rootfs cache first
-                let cache_key = RootfsCache::compute_key(reference, &[], &[], &[]);
-                if let Some(cached) = self.try_rootfs_cache(&cache_key, &rootfs_path)? {
-                    tracing::info!(
-                        cache_key = %&cache_key[..12],
-                        reference = %reference,
-                        "Rootfs cache hit, skipping OCI extraction"
-                    );
-                    let builder = OciRootfsBuilder::new(&rootfs_path)
-                        .with_agent_image(&agent_path)
-                        .with_agent_target("/")
-                        .with_business_target("/workspace");
-                    let agent_config = builder.agent_config()?;
-                    let has_guest_init = cached.join("sbin/init").exists();
-                    (rootfs_path, Some(agent_config), has_guest_init, true)
-                } else {
-                    tracing::info!(
-                        agent_image = %agent_path.display(),
-                        rootfs = %rootfs_path.display(),
-                        "Building rootfs from pulled OCI image"
-                    );
-
-                    // Extract at root ("/") so absolute symlinks and library paths work
-                    let mut builder = OciRootfsBuilder::new(&rootfs_path)
-                        .with_agent_image(&agent_path)
-                        .with_agent_target("/")
-                        .with_business_target("/workspace");
-
-                    if let BusinessType::OciImage {
-                        path: business_path,
-                    } = &self.config.business
-                    {
-                        builder = builder.with_business_image(business_path);
-                    }
-
-                    let has_guest_init = if let Ok(guest_init_path) = Self::find_guest_init() {
-                        tracing::info!(
-                            guest_init = %guest_init_path.display(),
-                            "Using guest init for namespace isolation"
-                        );
-                        builder = builder.with_guest_init(guest_init_path);
-
-                        if let Ok(nsexec_path) = Self::find_nsexec() {
-                            tracing::info!(
-                                nsexec = %nsexec_path.display(),
-                                "Installing nsexec for business code execution"
-                            );
-                            builder = builder.with_nsexec(nsexec_path);
-                        }
-
-                        true
-                    } else {
-                        false
-                    };
-
-                    builder.build()?;
-                    let agent_config = builder.agent_config()?;
-
-                    // Store in cache for next time
-                    self.store_rootfs_cache(&cache_key, &rootfs_path, reference);
-
-                    (rootfs_path, Some(agent_config), has_guest_init, true)
-                }
+                builder = builder.with_guest_init(guest_init_path);
+            } else {
+                tracing::warn!("Guest init binary not found; container entrypoint will run as PID 1");
             }
-            AgentType::A3sCode | AgentType::LocalBinary { .. } | AgentType::RemoteBinary { .. } => {
-                // Use default guest-rootfs (must be set up separately)
-                let rootfs_path = self.home_dir.join("guest-rootfs");
-                (rootfs_path, None, false, false)
-            }
+
+            builder.build()?;
+            let config = builder.image_config()?;
+
+            // Store in cache for next time
+            self.store_rootfs_cache(&cache_key, &rootfs_path, reference);
+
+            Some(config)
         };
 
         // Generate TEE configuration if enabled
@@ -262,12 +118,9 @@ impl VmManager {
             pty_socket_path: socket_dir.join("pty.sock"),
             attest_socket_path: socket_dir.join("attest.sock"),
             workspace_path,
-            skills_path,
             console_output: Some(logs_dir.join("console.log")),
-            agent_oci_config,
-            has_guest_init,
+            oci_config,
             tee_instance_config,
-            image_at_root,
         })
     }
 
@@ -439,35 +292,6 @@ impl VmManager {
         })
     }
 
-    /// Find the nsexec binary in common locations.
-    ///
-    /// Searches in order:
-    /// 1. Same directory as current executable
-    /// 2. target/debug or target/release (for development)
-    /// 3. PATH
-    ///
-    /// The binary must be a Linux ELF executable since it runs inside the VM.
-    pub(crate) fn find_nsexec() -> Result<PathBuf> {
-        let candidates = Self::find_binary_candidates("a3s-box-nsexec");
-        for path in candidates {
-            if Self::is_linux_elf(&path) {
-                return Ok(path);
-            }
-            tracing::debug!(
-                path = %path.display(),
-                "Skipping nsexec (not a Linux ELF binary)"
-            );
-        }
-
-        Err(BoxError::BoxBootError {
-            message: "Linux nsexec binary not found".to_string(),
-            hint: Some(
-                "Cross-compile with: cargo build -p a3s-box-guest-init --bin a3s-box-nsexec --target aarch64-unknown-linux-musl"
-                    .to_string(),
-            ),
-        })
-    }
-
     /// Search common locations for a binary by name.
     fn find_binary_candidates(name: &str) -> Vec<PathBuf> {
         let mut candidates = Vec::new();
@@ -579,6 +403,7 @@ mod tests {
             exec_socket_path: None,
             pty_socket_path: None,
             prom: None,
+            shim_exit_code: None,
         }
     }
 

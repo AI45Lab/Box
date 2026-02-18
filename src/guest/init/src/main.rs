@@ -1,59 +1,60 @@
 //! Guest init process for a3s-box VM.
 //!
 //! This process runs as PID 1 inside the MicroVM and is responsible for:
-//! - Setting up the guest environment
-//! - Creating isolated namespaces for agent and business code
-//! - Launching the agent process
-//! - Managing process lifecycle
-//! - Handling SIGTERM for graceful shutdown
+//! - Mounting essential filesystems (/proc, /sys, /dev)
+//! - Mounting virtio-fs shares (workspace, user volumes)
+//! - Mounting tmpfs volumes
+//! - Configuring the guest network
+//! - Launching the container entrypoint process
+//! - Reaping zombie processes and handling SIGTERM for graceful shutdown
 
 use a3s_box_guest_init::{attest_server, exec_server, namespace, network, pty_server};
 use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{error, info, warn};
 
-/// Agent configuration parsed from environment variables.
-struct AgentConfig {
-    /// Agent executable path
+/// Container entrypoint configuration parsed from environment variables.
+struct ExecConfig {
+    /// Container executable path
     executable: String,
-    /// Agent arguments
+    /// Container arguments
     args: Vec<String>,
-    /// Agent environment variables
+    /// Container environment variables
     env: Vec<(String, String)>,
     /// Working directory
     workdir: String,
 }
 
-impl AgentConfig {
-    /// Parse agent configuration from environment variables.
+impl ExecConfig {
+    /// Parse container entrypoint configuration from environment variables.
     ///
     /// Expected environment variables:
-    /// - A3S_AGENT_EXEC: agent executable path
-    /// - A3S_AGENT_ARGC: number of arguments
-    /// - A3S_AGENT_ARG_<n>: individual argument values
-    /// - A3S_AGENT_ENV_*: agent environment variables
-    /// - A3S_AGENT_WORKDIR: working directory (defaults to "/")
+    /// - BOX_EXEC_EXEC: container executable path
+    /// - BOX_EXEC_ARGC: number of arguments
+    /// - BOX_EXEC_ARG_<n>: individual argument values
+    /// - BOX_EXEC_ENV_*: container environment variables
+    /// - BOX_EXEC_WORKDIR: working directory (defaults to "/")
     fn from_env() -> Self {
         let executable =
-            std::env::var("A3S_AGENT_EXEC").unwrap_or_else(|_| "/agent/bin/agent".to_string());
+            std::env::var("BOX_EXEC_EXEC").unwrap_or_else(|_| "/sbin/init".to_string());
 
-        // Parse args from individual env vars (A3S_AGENT_ARGC + A3S_AGENT_ARG_0..N)
-        let args: Vec<String> = match std::env::var("A3S_AGENT_ARGC")
+        // Parse args from individual env vars (BOX_EXEC_ARGC + BOX_EXEC_ARG_0..N)
+        let args: Vec<String> = match std::env::var("BOX_EXEC_ARGC")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
         {
             Some(argc) => (0..argc)
-                .filter_map(|i| std::env::var(format!("A3S_AGENT_ARG_{}", i)).ok())
+                .filter_map(|i| std::env::var(format!("BOX_EXEC_ARG_{}", i)).ok())
                 .collect(),
             None => vec![],
         };
 
-        let workdir = std::env::var("A3S_AGENT_WORKDIR").unwrap_or_else(|_| "/".to_string());
+        let workdir = std::env::var("BOX_EXEC_WORKDIR").unwrap_or_else(|_| "/".to_string());
 
-        // Collect A3S_AGENT_ENV_* variables
+        // Collect BOX_EXEC_ENV_* variables
         let env: Vec<(String, String)> = std::env::vars()
             .filter_map(|(key, value)| {
-                key.strip_prefix("A3S_AGENT_ENV_")
+                key.strip_prefix("BOX_EXEC_ENV_")
                     .map(|stripped| (stripped.to_string(), value))
             })
             .collect();
@@ -136,27 +137,30 @@ fn run_init() -> Result<(), Box<dyn std::error::Error>> {
     // Step 2.5: Mount tmpfs volumes
     mount_tmpfs_volumes()?;
 
-    // Step 3: Configure guest network (if passt mode is active)
+    // Step 3: Configure guest network (if passt mode is active).
+    // Network setup may write /etc/resolv.conf — must run before read-only remount.
     network::configure_guest_network()?;
+
+    // Step 3.5: Remount rootfs read-only if BOX_READONLY=1.
+    // All writes to / (mount point creation, resolv.conf) must complete first.
+    remount_rootfs_readonly()?;
 
     // Step 4: Register SIGTERM handler before spawning any children
     register_sigterm_handler()?;
 
-    // Step 5: Parse agent configuration from environment
-    let agent_config = AgentConfig::from_env();
+    // Step 5: Parse container entrypoint configuration from environment
+    let exec_config = ExecConfig::from_env();
     info!(
-        executable = %agent_config.executable,
-        args = ?agent_config.args,
-        workdir = %agent_config.workdir,
-        env_count = agent_config.env.len(),
-        "Agent configuration loaded"
+        executable = %exec_config.executable,
+        args = ?exec_config.args,
+        workdir = %exec_config.workdir,
+        env_count = exec_config.env.len(),
+        "Container entrypoint configuration loaded"
     );
 
-    // Step 6: Create namespace config for agent
-    // Disable namespace isolation inside the MicroVM — the VM itself provides
-    // isolation, and unshare can interfere with the lightweight kernel's
-    // limited namespace support.
-    info!("Creating namespace config for agent");
+    // Step 6: Create namespace config (isolation disabled inside the MicroVM —
+    // the VM boundary itself provides isolation, and unshare can interfere with
+    // the lightweight kernel's limited namespace support)
     let namespace_config = namespace::NamespaceConfig {
         mount: false,
         pid: false,
@@ -165,26 +169,26 @@ fn run_init() -> Result<(), Box<dyn std::error::Error>> {
         net: false,
     };
 
-    // Step 7: Launch agent in isolated namespace
-    info!("Launching agent process");
+    // Step 7: Launch container entrypoint
+    info!("Launching container entrypoint");
 
     // Convert args to &str for spawn_isolated
-    let args_refs: Vec<&str> = agent_config.args.iter().map(|s| s.as_str()).collect();
-    let env_refs: Vec<(&str, &str)> = agent_config
+    let args_refs: Vec<&str> = exec_config.args.iter().map(|s| s.as_str()).collect();
+    let env_refs: Vec<(&str, &str)> = exec_config
         .env
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
 
-    let agent_pid = namespace::spawn_isolated(
+    let container_pid = namespace::spawn_isolated(
         &namespace_config,
-        &agent_config.executable,
+        &exec_config.executable,
         &args_refs,
         &env_refs,
-        &agent_config.workdir,
+        &exec_config.workdir,
     )?;
 
-    info!("Agent started with PID {}", agent_pid);
+    info!("Container process started with PID {}", container_pid);
 
     // Step 8: Start exec server in background thread
     std::thread::spawn(|| {
@@ -285,7 +289,7 @@ fn mount_essential_filesystems() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Mount virtio-fs shares for workspace, skills, and user volumes.
+/// Mount virtio-fs shares for workspace and user volumes.
 fn mount_virtio_fs_shares() -> Result<(), Box<dyn std::error::Error>> {
     info!("Mounting virtio-fs shares");
 
@@ -293,9 +297,8 @@ fn mount_virtio_fs_shares() -> Result<(), Box<dyn std::error::Error>> {
     {
         use nix::mount::{mount, MsFlags};
 
-        // Ensure mount points exist
+        // Ensure workspace mount point exists
         std::fs::create_dir_all("/workspace").ok();
-        std::fs::create_dir_all("/skills").ok();
 
         // Mount workspace share
         mount(
@@ -306,17 +309,8 @@ fn mount_virtio_fs_shares() -> Result<(), Box<dyn std::error::Error>> {
             None::<&str>,
         )?;
 
-        // Mount skills share
-        mount(
-            Some("skills"),
-            "/skills",
-            Some("virtiofs"),
-            MsFlags::MS_RDONLY,
-            None::<&str>,
-        )?;
-
-        // Mount user-defined volumes from environment variables
-        // Format: A3S_VOL_<index>=<tag>:<guest_path>[:ro]
+        // Mount user-defined volumes from environment variables.
+        // Format: BOX_VOL_<index>=<tag>:<guest_path>[:ro]
         mount_user_volumes()?;
     }
 
@@ -328,7 +322,7 @@ fn mount_virtio_fs_shares() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Mount user-defined volumes passed via A3S_VOL_* environment variables.
+/// Mount user-defined volumes passed via BOX_VOL_* environment variables.
 ///
 /// Each variable has the format: `<tag>:<guest_path>[:ro]`
 #[cfg(target_os = "linux")]
@@ -337,7 +331,7 @@ fn mount_user_volumes() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut index = 0;
     loop {
-        let env_key = format!("A3S_VOL_{}", index);
+        let env_key = format!("BOX_VOL_{}", index);
         match std::env::var(&env_key) {
             Ok(value) => {
                 let parts: Vec<&str> = value.split(':').collect();
@@ -381,7 +375,7 @@ fn mount_user_volumes() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Mount tmpfs volumes passed via A3S_TMPFS_* environment variables.
+/// Mount tmpfs volumes passed via BOX_TMPFS_* environment variables.
 ///
 /// Each variable has the format: `<path>[:<options>]`
 /// Options are passed directly to mount (e.g., "size=100m").
@@ -392,7 +386,7 @@ fn mount_tmpfs_volumes() -> Result<(), Box<dyn std::error::Error>> {
 
         let mut index = 0;
         loop {
-            let env_key = format!("A3S_TMPFS_{}", index);
+            let env_key = format!("BOX_TMPFS_{}", index);
             match std::env::var(&env_key) {
                 Ok(value) => {
                     // Format: "/path" or "/path:options"
@@ -437,6 +431,36 @@ fn mount_tmpfs_volumes() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Remount the container rootfs as read-only if `BOX_READONLY=1` is set.
+///
+/// Called after all filesystem setup (mounts, network config) so that no
+/// further writes to `/` are needed before the container process launches.
+/// Virtiofs and tmpfs shares are separate mountpoints and remain writable.
+#[cfg(target_os = "linux")]
+fn remount_rootfs_readonly() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::var("BOX_READONLY").as_deref() != Ok("1") {
+        return Ok(());
+    }
+
+    use nix::mount::{mount, MsFlags};
+
+    info!("Remounting rootfs as read-only (--read-only)");
+    mount(
+        None::<&str>,
+        "/",
+        None::<&str>,
+        MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY,
+        None::<&str>,
+    )?;
+    info!("Rootfs remounted read-only");
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn remount_rootfs_readonly() -> Result<(), Box<dyn std::error::Error>> {
+    Ok(())
+}
+
 /// Wait for all child processes and reap zombies.
 ///
 /// When SIGTERM is received (via the global `SHUTDOWN_REQUESTED` flag):
@@ -464,12 +488,9 @@ fn wait_for_children() -> Result<(), Box<dyn std::error::Error>> {
         match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::Exited(pid, status)) => {
                 info!("Child process {} exited with status {}", pid, status);
-                if status != 0 {
-                    error!("Child process failed");
-                    return Err(
-                        format!("Child process {} failed with status {}", pid, status).into(),
-                    );
-                }
+                // Propagate the container's exit code directly.
+                // The VM kernel will reap any remaining processes.
+                process::exit(status);
             }
             Ok(WaitStatus::Signaled(pid, signal, _)) => {
                 // If we're shutting down, a child killed by signal is expected

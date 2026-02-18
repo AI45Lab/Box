@@ -276,6 +276,39 @@ impl RootfsCache {
     }
 }
 
+impl a3s_box_core::traits::CacheBackend for RootfsCache {
+    fn get(&self, key: &str) -> Result<Option<PathBuf>> {
+        self.get(key)
+    }
+
+    fn put(&self, key: &str, source_dir: &Path, description: &str) -> Result<PathBuf> {
+        self.put(key, source_dir, description)
+    }
+
+    fn invalidate(&self, key: &str) -> Result<()> {
+        self.invalidate(key)
+    }
+
+    fn prune(&self, max_entries: usize, max_bytes: u64) -> Result<usize> {
+        self.prune(max_entries, max_bytes)
+    }
+
+    fn list(&self) -> Result<Vec<a3s_box_core::traits::CacheEntry>> {
+        self.list_entries().map(|entries| {
+            entries
+                .into_iter()
+                .map(|m| a3s_box_core::traits::CacheEntry {
+                    key: m.key,
+                    description: m.description,
+                    size_bytes: m.size_bytes,
+                    cached_at: m.cached_at,
+                    last_accessed: m.last_accessed,
+                })
+                .collect()
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

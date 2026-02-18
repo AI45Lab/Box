@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::Instrument;
 
+use libc;
+
 use crate::grpc::ExecClient;
 use crate::network::PasstManager;
 use crate::tee::TeeExtension;
@@ -26,7 +28,7 @@ pub enum BoxState {
     /// Config captured, no VM started
     Created,
 
-    /// VM booted, agent initialized, gRPC healthy
+    /// VM booted, container initialized, gRPC healthy
     Ready,
 
     /// A session is actively processing a prompt
@@ -51,19 +53,12 @@ pub(crate) struct BoxLayout {
     pub(crate) attest_socket_path: PathBuf,
     /// Path to the workspace directory
     pub(crate) workspace_path: PathBuf,
-    /// Path to the skills directory
-    pub(crate) skills_path: PathBuf,
     /// Path to console output file (optional)
     pub(crate) console_output: Option<PathBuf>,
-    /// OCI image config for agent (if using OCI image)
-    pub(crate) agent_oci_config: Option<crate::oci::OciImageConfig>,
-    /// Whether guest init is installed for namespace isolation
-    pub(crate) has_guest_init: bool,
+    /// OCI image config (entrypoint, env, working dir, volumes)
+    pub(crate) oci_config: Option<crate::oci::OciImageConfig>,
     /// TEE instance configuration (if TEE is enabled)
     pub(crate) tee_instance_config: Option<crate::vmm::TeeInstanceConfig>,
-    /// Whether the OCI image is extracted at rootfs root (true) or under /agent (false).
-    /// Images from OCI registries are extracted at root so absolute symlinks work.
-    pub(crate) image_at_root: bool,
 }
 
 /// VM manager - orchestrates VM lifecycle.
@@ -109,6 +104,9 @@ pub struct VmManager {
 
     /// Prometheus metrics (optional, for instrumented deployments).
     pub(crate) prom: Option<crate::prom::RuntimeMetrics>,
+
+    /// Exit code captured from the shim process after it exits.
+    pub(crate) shim_exit_code: Option<i32>,
 }
 
 impl VmManager {
@@ -132,6 +130,7 @@ impl VmManager {
             exec_socket_path: None,
             pty_socket_path: None,
             prom: None,
+            shim_exit_code: None,
         }
     }
 
@@ -154,6 +153,7 @@ impl VmManager {
             exec_socket_path: None,
             pty_socket_path: None,
             prom: None,
+            shim_exit_code: None,
         }
     }
 
@@ -180,6 +180,7 @@ impl VmManager {
             exec_socket_path: None,
             pty_socket_path: None,
             prom: None,
+            shim_exit_code: None,
         }
     }
 
@@ -232,6 +233,15 @@ impl VmManager {
     /// for cleanup when the box is removed.
     pub fn anonymous_volumes(&self) -> &[String] {
         &self.anonymous_volumes
+    }
+
+    /// Get the exit code of the container, if it has exited.
+    ///
+    /// Returns `Some(code)` after `destroy()` has been called and the shim
+    /// process exited naturally (not killed). Returns `None` if the VM has not
+    /// yet stopped or the exit code could not be determined.
+    pub fn exit_code(&self) -> Option<i32> {
+        self.shim_exit_code
     }
 
     /// Execute a command in the guest VM.
@@ -302,10 +312,10 @@ impl VmManager {
         tracing::info!(parent: &boot_span, box_id = %self.box_id, "Booting VM");
 
         // 1. Prepare filesystem layout
-        let layout = {
-            let _span = tracing::info_span!(parent: &boot_span, "prepare_layout").entered();
-            self.prepare_layout()?
-        };
+        let layout = self
+            .prepare_layout()
+            .instrument(tracing::info_span!(parent: &boot_span, "prepare_layout"))
+            .await?;
 
         // 1.5. Override /etc/resolv.conf with configured DNS
         let resolv_content = a3s_box_core::dns::generate_resolv_conf(&self.config.dns);
@@ -415,28 +425,35 @@ impl VmManager {
         Ok(())
     }
 
-    /// Destroy the VM with the default shutdown timeout.
+    /// Destroy the VM with the default shutdown timeout and SIGTERM.
     pub async fn destroy(&mut self) -> Result<()> {
-        self.destroy_with_timeout(DEFAULT_SHUTDOWN_TIMEOUT_MS).await
+        self.destroy_with_options(libc::SIGTERM, DEFAULT_SHUTDOWN_TIMEOUT_MS)
+            .await
     }
 
-    /// Destroy the VM with a custom shutdown timeout.
+    /// Destroy the VM with a custom shutdown timeout and SIGTERM.
+    pub async fn destroy_with_timeout(&mut self, timeout_ms: u64) -> Result<()> {
+        self.destroy_with_options(libc::SIGTERM, timeout_ms).await
+    }
+
+    /// Destroy the VM with a specific stop signal and timeout.
     ///
-    /// Sends SIGTERM to the shim process and waits up to `timeout_ms` for it
+    /// Sends `signal` to the shim process and waits up to `timeout_ms` for it
     /// to exit gracefully before sending SIGKILL.
     #[tracing::instrument(skip(self), fields(box_id = %self.box_id))]
-    pub async fn destroy_with_timeout(&mut self, timeout_ms: u64) -> Result<()> {
+    pub async fn destroy_with_options(&mut self, signal: i32, timeout_ms: u64) -> Result<()> {
         let mut state = self.state.write().await;
 
         if *state == BoxState::Stopped {
             return Ok(());
         }
 
-        tracing::info!(box_id = %self.box_id, timeout_ms, "Destroying VM");
+        tracing::info!(box_id = %self.box_id, signal, timeout_ms, "Destroying VM");
 
-        // Stop the VM handler
+        // Stop the VM handler and capture its exit code before it's dropped.
         if let Some(mut handler) = self.handler.write().await.take() {
-            handler.stop(timeout_ms)?;
+            handler.stop(signal, timeout_ms)?;
+            self.shim_exit_code = handler.exit_code();
         }
 
         // Stop passt daemon if running

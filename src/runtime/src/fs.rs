@@ -46,21 +46,13 @@ impl FsManager {
     pub fn setup_default_mounts(
         &mut self,
         workspace: impl AsRef<Path>,
-        skills: &[PathBuf],
         cache: impl AsRef<Path>,
     ) -> Result<()> {
         // Workspace mount (read-write)
-        self.add_mount(workspace, "/a3s/workspace", false);
-
-        // Skills mounts (read-only)
-        for (i, skill_dir) in skills.iter().enumerate() {
-            if skill_dir.exists() {
-                self.add_mount(skill_dir, format!("/a3s/skills/{}", i), true);
-            }
-        }
+        self.add_mount(workspace, "/workspace", false);
 
         // Cache mount (read-write, persistent)
-        self.add_mount(cache, "/a3s/cache", false);
+        self.add_mount(cache, "/cache", false);
 
         Ok(())
     }
@@ -187,47 +179,23 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let workspace = tmp.path().join("workspace");
         let cache = tmp.path().join("cache");
-        let skill1 = tmp.path().join("skill1");
-        let skill2 = tmp.path().join("skill2");
 
-        std::fs::create_dir_all(&workspace).unwrap();
-        std::fs::create_dir_all(&cache).unwrap();
-        std::fs::create_dir_all(&skill1).unwrap();
-        // skill2 does NOT exist — should be skipped
-
-        let mut mgr = FsManager::new();
-        mgr.setup_default_mounts(&workspace, &[skill1, skill2], &cache)
-            .unwrap();
-
-        // workspace + 1 skill (skill2 skipped) + cache = 3
-        assert_eq!(mgr.mounts().len(), 3);
-
-        // Workspace is read-write
-        assert!(!mgr.mounts()[0].readonly);
-        assert_eq!(mgr.mounts()[0].guest_path, PathBuf::from("/a3s/workspace"));
-
-        // Skill is read-only
-        assert!(mgr.mounts()[1].readonly);
-        assert_eq!(mgr.mounts()[1].guest_path, PathBuf::from("/a3s/skills/0"));
-
-        // Cache is read-write
-        assert!(!mgr.mounts()[2].readonly);
-        assert_eq!(mgr.mounts()[2].guest_path, PathBuf::from("/a3s/cache"));
-    }
-
-    #[test]
-    fn test_setup_default_mounts_no_skills() {
-        let tmp = TempDir::new().unwrap();
-        let workspace = tmp.path().join("ws");
-        let cache = tmp.path().join("cache");
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::create_dir_all(&cache).unwrap();
 
         let mut mgr = FsManager::new();
-        mgr.setup_default_mounts(&workspace, &[], &cache).unwrap();
+        mgr.setup_default_mounts(&workspace, &cache).unwrap();
 
         // workspace + cache = 2
         assert_eq!(mgr.mounts().len(), 2);
+
+        // Workspace is read-write
+        assert!(!mgr.mounts()[0].readonly);
+        assert_eq!(mgr.mounts()[0].guest_path, PathBuf::from("/workspace"));
+
+        // Cache is read-write
+        assert!(!mgr.mounts()[1].readonly);
+        assert_eq!(mgr.mounts()[1].guest_path, PathBuf::from("/cache"));
     }
 
     #[tokio::test]

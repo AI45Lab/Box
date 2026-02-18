@@ -7,4 +7,4 @@ mod builder;
 mod layout;
 
 pub use builder::RootfsBuilder;
-pub use layout::{GuestLayout, GUEST_SKILLS_DIR, GUEST_WORKDIR};
+pub use layout::{GuestLayout, GUEST_WORKDIR};

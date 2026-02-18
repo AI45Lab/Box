@@ -225,7 +225,7 @@ impl KrunContext {
     /// Add a virtiofs mount, sharing a host directory with the guest.
     ///
     /// # Arguments
-    /// * `mount_tag` - Tag used by guest to mount this share (e.g., "workspace", "skills")
+    /// * `mount_tag` - Tag used by guest to mount this share (e.g., "workspace", "vol0")
     /// * `host_path` - Path to directory on host to share
     pub unsafe fn add_virtiofs(&self, mount_tag: &str, host_path: &str) -> Result<()> {
         tracing::debug!(mount_tag, host_path, "Adding virtiofs mount");

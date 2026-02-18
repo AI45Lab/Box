@@ -9,26 +9,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use a3s_box_core::error::{BoxError, Result};
-use chrono::{DateTime, Utc};
+use a3s_box_core::{ImageStoreBackend, StoredImage};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-
-/// Metadata for a stored OCI image.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StoredImage {
-    /// Image reference string (e.g., "ghcr.io/a3s-box/code:v0.1.0")
-    pub reference: String,
-    /// Content digest (e.g., "sha256:abc123...")
-    pub digest: String,
-    /// Total size in bytes
-    pub size_bytes: u64,
-    /// When the image was pulled
-    pub pulled_at: DateTime<Utc>,
-    /// When the image was last used
-    pub last_used: DateTime<Utc>,
-    /// Path to the OCI image layout on disk
-    pub path: PathBuf,
-}
 
 /// Persistent index stored as JSON on disk.
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -270,6 +254,37 @@ impl ImageStore {
     /// Get the store directory path.
     pub fn store_dir(&self) -> &Path {
         &self.store_dir
+    }
+}
+
+#[async_trait::async_trait]
+impl ImageStoreBackend for ImageStore {
+    async fn get(&self, reference: &str) -> Option<StoredImage> {
+        self.get(reference).await
+    }
+
+    async fn get_by_digest(&self, digest: &str) -> Option<StoredImage> {
+        self.get_by_digest(digest).await
+    }
+
+    async fn put(&self, reference: &str, digest: &str, source_dir: &Path) -> Result<StoredImage> {
+        self.put(reference, digest, source_dir).await
+    }
+
+    async fn remove(&self, reference: &str) -> Result<()> {
+        self.remove(reference).await
+    }
+
+    async fn list(&self) -> Vec<StoredImage> {
+        self.list().await
+    }
+
+    async fn evict(&self) -> Result<Vec<String>> {
+        self.evict().await
+    }
+
+    async fn total_size(&self) -> u64 {
+        self.total_size().await
     }
 }
 
