@@ -27,10 +27,6 @@ mod snp;
 #[cfg(target_os = "linux")]
 mod tests;
 
-// Re-export handler functions for internal use
-#[cfg(target_os = "linux")]
-pub(crate) use handlers::*;
-
 /// Vsock port for the attestation server.
 pub const ATTEST_VSOCK_PORT: u32 = a3s_transport::ports::TEE_CHANNEL;
 
@@ -151,6 +147,7 @@ fn run_ratls_server() -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// Returns (ServerConfig, cert_der, report_bytes).
 #[cfg(target_os = "linux")]
+#[allow(clippy::type_complexity)]
 fn generate_ratls_config(
 ) -> Result<(rustls::ServerConfig, Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
     use rcgen::{

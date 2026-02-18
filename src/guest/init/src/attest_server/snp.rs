@@ -1,8 +1,5 @@
 //! SNP hardware interaction and attestation report retrieval.
 
-#[cfg(target_os = "linux")]
-use std::io::Read;
-
 /// SNP attestation report size (AMD SEV-SNP ABI spec v1.52).
 #[cfg(target_os = "linux")]
 const SNP_REPORT_SIZE: usize = 1184;

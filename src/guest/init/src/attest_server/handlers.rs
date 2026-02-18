@@ -3,8 +3,7 @@
 use std::io::Write;
 use tracing::{debug, info, warn};
 
-use super::frame::{read_frame, send_data_response, send_error_response, write_frame};
-use super::snp;
+use super::frame::{read_frame, send_data_response, send_error_response};
 
 /// Directory where injected secrets are stored (tmpfs, never persisted to disk).
 pub(super) const SECRETS_DIR: &str = "/run/secrets";
