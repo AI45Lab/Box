@@ -116,7 +116,7 @@ jobs:
         run: |
           TAG="${GITHUB_REF#refs/tags/}"
           DIR="a3s-box-${TAG}-${{ matrix.target }}"
-          mkdir -p "$DIR"
+          mkdir -p "$DIR/lib"
 
           cp src/target/release/a3s-box "$DIR/"
           cp src/target/release/a3s-box-shim "$DIR/"
@@ -127,8 +127,37 @@ jobs:
 
           cp "src/target/${{ matrix.guest_target }}/release/a3s-box-guest-init" "$DIR/"
 
+          # Find and copy libkrun/libkrunfw shared libraries from build output
+          BUILD_DIR=$(find src/target/release/build -name "out" -path "*libkrun*" -type d | head -1)
+          if [ -n "$BUILD_DIR" ]; then
+            find "$BUILD_DIR" -name "libkrun*" \( -name "*.dylib" -o -name "*.so*" \) -exec cp {} "$DIR/lib/" \;
+            find "$BUILD_DIR" -name "libkrunfw*" \( -name "*.dylib" -o -name "*.so*" \) -exec cp {} "$DIR/lib/" \;
+          fi
+
+          # Fix rpath for macOS binaries to look in ../lib relative to bin
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            for bin in "$DIR/a3s-box" "$DIR/a3s-box-shim"; do
+              install_name_tool -add_rpath @executable_path/../lib "$bin" 2>/dev/null || true
+              install_name_tool -add_rpath @executable_path/lib "$bin" 2>/dev/null || true
+            done
+          fi
+
+          # Fix rpath for Linux binaries
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            for bin in "$DIR/a3s-box" "$DIR/a3s-box-shim"; do
+              patchelf --set-rpath '$ORIGIN/lib' "$bin" 2>/dev/null || true
+            done
+            if [ "${{ matrix.build_cri }}" = "true" ]; then
+              patchelf --set-rpath '$ORIGIN/lib' "$DIR/a3s-box-cri" 2>/dev/null || true
+            fi
+          fi
+
           cp README.md "$DIR/" 2>/dev/null || true
           cp LICENSE "$DIR/" 2>/dev/null || true
+
+          # List package contents
+          echo "Package contents:"
+          ls -lhR "$DIR/"
 
           tar czf "${DIR}.tar.gz" "$DIR"
           echo "ASSET=${DIR}.tar.gz" >> "$GITHUB_ENV"
@@ -381,6 +410,7 @@ jobs:
               bin.install "a3s-box-shim"
               bin.install "a3s-box-guest-init"
               bin.install "a3s-box-cri" if File.exist?("a3s-box-cri")
+              lib.install Dir["lib/*"] if Dir.exist?("lib")
             end
 
             test do
