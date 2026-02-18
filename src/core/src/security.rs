@@ -363,7 +363,8 @@ mod tests {
 
     #[test]
     fn test_validate_unconfined_ok() {
-        let config = SecurityConfig::from_options(&["seccomp=unconfined".to_string()], &[], &[], false);
+        let config =
+            SecurityConfig::from_options(&["seccomp=unconfined".to_string()], &[], &[], false);
         assert!(config.validate().is_ok());
     }
 

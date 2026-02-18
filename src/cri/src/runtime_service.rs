@@ -785,7 +785,7 @@ impl RuntimeService for BoxRuntimeService {
             // know the operation did NOT take effect, rather than silently succeeding.
             return Err(Status::unimplemented(
                 "UpdateContainerResources is not supported: microVM resources (CPU, memory) \
-                 are fixed at boot time and cannot be dynamically resized"
+                 are fixed at boot time and cannot be dynamically resized",
             ));
         }
 

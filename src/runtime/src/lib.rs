@@ -51,7 +51,9 @@ pub use cache::{LayerCache, RootfsCache};
 
 // gRPC clients
 pub use grpc::{AttestationClient, ExecClient, PtyClient, RaTlsAttestationClient, StreamingExec};
-pub use grpc::{SealClient, SealResult, SecretEntry, SecretInjectionResult, SecretInjector, UnsealResult};
+pub use grpc::{
+    SealClient, SealResult, SecretEntry, SecretInjectionResult, SecretInjector, UnsealResult,
+};
 
 // Host checks
 pub use host_check::{check_virtualization_support, VirtualizationSupport};
@@ -60,9 +62,9 @@ pub use host_check::{check_virtualization_support, VirtualizationSupport};
 pub use network::NetworkStore;
 
 // OCI images
+pub use a3s_box_core::StoredImage;
 pub use oci::{CredentialStore, PushResult, RegistryPusher};
 pub use oci::{ImagePuller, ImageReference, ImageStore, RegistryAuth, RegistryPuller};
-pub use a3s_box_core::StoredImage;
 pub use oci::{OciImage, OciImageConfig, OciRootfsBuilder};
 pub use oci::{SignaturePolicy, VerifyResult};
 

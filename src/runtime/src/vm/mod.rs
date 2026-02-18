@@ -371,12 +371,13 @@ impl VmManager {
 
         // 4. Start VM via provider
         let handler = {
-            let provider = self.provider.as_ref().ok_or_else(|| {
-                BoxError::BoxBootError {
+            let provider = self
+                .provider
+                .as_ref()
+                .ok_or_else(|| BoxError::BoxBootError {
                     message: "VMM provider not initialized".to_string(),
                     hint: Some("Ensure VmManager has a provider set before boot".to_string()),
-                }
-            })?;
+                })?;
             let vm_start_span = tracing::info_span!(parent: &boot_span, "vm_start");
             async { provider.start(&spec).await }
                 .instrument(vm_start_span)
@@ -540,7 +541,8 @@ impl VmManager {
             if ret != 0 {
                 let err = std::io::Error::last_os_error();
                 return Err(BoxError::Other(format!(
-                    "Failed to send SIGSTOP to pid {}: {}", pid, err
+                    "Failed to send SIGSTOP to pid {}: {}",
+                    pid, err
                 )));
             }
             tracing::info!(box_id = %self.box_id, pid, "VM paused");
@@ -560,7 +562,8 @@ impl VmManager {
             if ret != 0 {
                 let err = std::io::Error::last_os_error();
                 return Err(BoxError::Other(format!(
-                    "Failed to send SIGCONT to pid {}: {}", pid, err
+                    "Failed to send SIGCONT to pid {}: {}",
+                    pid, err
                 )));
             }
             tracing::info!(box_id = %self.box_id, pid, "VM resumed");
@@ -638,4 +641,3 @@ pub(crate) fn fnv1a_hash(input: &str) -> u64 {
     }
     hash
 }
-

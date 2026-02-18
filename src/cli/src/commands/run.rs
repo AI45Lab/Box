@@ -115,11 +115,7 @@ async fn setup_and_boot(args: &RunArgs) -> Result<RunContext, Box<dyn std::error
         options: log_opts,
     };
 
-    let name = args
-        .common
-        .name
-        .clone()
-        .unwrap_or_else(generate_name);
+    let name = args.common.name.clone().unwrap_or_else(generate_name);
     let mut env = common::parse_env_vars(&args.common.env)?;
     for env_file in &args.common.env_file {
         let file_env = common::parse_env_file(env_file)?;
@@ -358,10 +354,7 @@ async fn setup_and_boot(args: &RunArgs) -> Result<RunContext, Box<dyn std::error
 // Phase 2a: Interactive PTY mode
 // ============================================================================
 
-async fn run_tty(
-    mut ctx: RunContext,
-    args: &RunArgs,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_tty(mut ctx: RunContext, args: &RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     use a3s_box_core::pty::PtyRequest;
     use a3s_box_runtime::PtyClient;
     use crossterm::terminal;
@@ -516,13 +509,16 @@ fn parse_health_check(common: &CommonBoxArgs) -> Option<crate::state::HealthChec
     if common.no_healthcheck {
         return None;
     }
-    common.health_cmd.as_ref().map(|cmd| crate::state::HealthCheck {
-        cmd: vec!["sh".to_string(), "-c".to_string(), cmd.clone()],
-        interval_secs: common.health_interval,
-        timeout_secs: common.health_timeout,
-        retries: common.health_retries,
-        start_period_secs: common.health_start_period,
-    })
+    common
+        .health_cmd
+        .as_ref()
+        .map(|cmd| crate::state::HealthCheck {
+            cmd: vec!["sh".to_string(), "-c".to_string(), cmd.clone()],
+            interval_secs: common.health_interval,
+            timeout_secs: common.health_timeout,
+            retries: common.health_retries,
+            start_period_secs: common.health_start_period,
+        })
 }
 
 /// Resolve named volumes, returning (resolved_specs, volume_names).

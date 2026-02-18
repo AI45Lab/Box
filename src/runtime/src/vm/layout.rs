@@ -97,7 +97,9 @@ impl VmManager {
                 );
                 builder = builder.with_guest_init(guest_init_path);
             } else {
-                tracing::warn!("Guest init binary not found; container entrypoint will run as PID 1");
+                tracing::warn!(
+                    "Guest init binary not found; container entrypoint will run as PID 1"
+                );
             }
 
             builder.build()?;

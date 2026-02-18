@@ -213,10 +213,7 @@ mod tests {
         let config = config_from_record(&record);
 
         assert!(config.tmpfs.contains(&"/tmp".to_string()));
-        assert!(config
-            .tmpfs
-            .iter()
-            .any(|t| t == "/dev/shm:size=67108864"));
+        assert!(config.tmpfs.iter().any(|t| t == "/dev/shm:size=67108864"));
     }
 
     #[test]

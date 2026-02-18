@@ -1101,7 +1101,10 @@ mod tests {
     #[test]
     fn test_ipam6_new_valid() {
         let ipam = Ipam6::new("fd00::/64").unwrap();
-        assert_eq!(ipam.gateway(), "fd00::1".parse::<std::net::Ipv6Addr>().unwrap());
+        assert_eq!(
+            ipam.gateway(),
+            "fd00::1".parse::<std::net::Ipv6Addr>().unwrap()
+        );
         assert_eq!(ipam.cidr(), "fd00::/64");
     }
 

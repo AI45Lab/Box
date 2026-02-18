@@ -619,5 +619,4 @@ mod tests {
         assert_eq!(exec, "/bin/sh");
         assert_eq!(args, vec!["echo", "hello"]);
     }
-
 }

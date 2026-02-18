@@ -338,8 +338,11 @@ async fn handle_attach_stream(
     let shell = if !session.cmd.is_empty() {
         session.cmd.clone()
     } else {
-        vec!["/bin/sh".to_string(), "-c".to_string(),
-             "exec $(command -v bash || command -v sh || echo /bin/sh)".to_string()]
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "exec $(command -v bash || command -v sh || echo /bin/sh)".to_string(),
+        ]
     };
 
     let attach_session = StreamingSession {

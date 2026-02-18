@@ -68,9 +68,7 @@ async fn stop_one(
         .unwrap_or(libc::SIGTERM);
 
     // Resolve timeout: CLI -t > BoxRecord.stop_timeout > 10s
-    let effective_timeout = timeout
-        .or(record.stop_timeout)
-        .unwrap_or(10);
+    let effective_timeout = timeout.or(record.stop_timeout).unwrap_or(10);
 
     // Send stop signal, then SIGKILL after timeout
     if let Some(pid) = pid {

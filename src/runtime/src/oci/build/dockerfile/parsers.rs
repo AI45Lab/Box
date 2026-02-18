@@ -105,7 +105,7 @@ pub(super) fn parse_env(rest: &str, line_num: usize) -> Result<Instruction> {
     if let Some(eq_pos) = rest.find('=') {
         // Check it's not inside a value after a space
         let space_pos = rest.find(char::is_whitespace);
-        if space_pos.map_or(true, |sp| eq_pos < sp) {
+        if space_pos.is_none_or(|sp| eq_pos < sp) {
             let key = rest[..eq_pos].to_string();
             let value = unquote(&rest[eq_pos + 1..]);
             return Ok(Instruction::Env { key, value });

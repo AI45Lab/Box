@@ -6,7 +6,6 @@ use a3s_box_core::error::{BoxError, Result};
 use oci_spec::image::{ImageConfiguration, ImageIndex, ImageManifest};
 use std::path::{Path, PathBuf};
 
-
 /// Health check configuration from OCI image config.
 #[derive(Debug, Clone)]
 pub struct OciHealthCheck {

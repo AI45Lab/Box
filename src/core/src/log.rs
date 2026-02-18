@@ -216,7 +216,10 @@ mod tests {
     #[test]
     fn test_syslog_config_custom() {
         let mut options = HashMap::new();
-        options.insert("syslog-address".to_string(), "tcp://loghost:1514".to_string());
+        options.insert(
+            "syslog-address".to_string(),
+            "tcp://loghost:1514".to_string(),
+        );
         options.insert("syslog-facility".to_string(), "local0".to_string());
         options.insert("tag".to_string(), "myapp".to_string());
         let config = LogConfig {

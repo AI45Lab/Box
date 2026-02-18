@@ -64,8 +64,8 @@ impl Default for NamespaceConfig {
             pid: true,
             ipc: true,
             uts: true,
-            net: false, // Share network for communication
-            user: false, // Disabled by default (requires UID mapping setup)
+            net: false,    // Share network for communication
+            user: false,   // Disabled by default (requires UID mapping setup)
             cgroup: false, // Disabled by default
         }
     }
@@ -585,8 +585,8 @@ fn build_default_bpf_filter() -> Vec<libc::sock_filter> {
     //    JEQ AUDIT_ARCH, next(0), kill(num_blocked + 2)
     filter.push(libc::sock_filter {
         code: BPF_JMP | BPF_JEQ | BPF_K,
-        jt: 0,                          // continue to syscall check
-        jf: (num_blocked + 2) as u8,    // jump to kill (past load + all checks + allow)
+        jt: 0,                       // continue to syscall check
+        jf: (num_blocked + 2) as u8, // jump to kill (past load + all checks + allow)
         k: AUDIT_ARCH,
     });
 
@@ -780,20 +780,20 @@ mod tests {
         // First instruction should be BPF_LD (load arch)
         assert_eq!(filter[0].code, 0x20); // BPF_LD | BPF_W | BPF_ABS
         assert_eq!(filter[0].k, 4); // offset 4 = arch field
-        // Second instruction should be JEQ (arch check)
+                                    // Second instruction should be JEQ (arch check)
         assert_eq!(filter[1].code, 0x15); // BPF_JMP | BPF_JEQ | BPF_K
-        // Third instruction should be BPF_LD (load syscall nr)
+                                          // Third instruction should be BPF_LD (load syscall nr)
         assert_eq!(filter[2].code, 0x20);
         assert_eq!(filter[2].k, 0); // offset 0 = syscall nr
-        // Last instruction should be BPF_RET (kill — wrong arch)
+                                    // Last instruction should be BPF_RET (kill — wrong arch)
         let last = filter.last().unwrap();
         assert_eq!(last.code, 0x06); // BPF_RET | BPF_K
         assert_eq!(last.k, 0x8000_0000); // SECCOMP_RET_KILL_PROCESS
-        // Second to last should be BPF_RET (deny — blocked syscall)
+                                         // Second to last should be BPF_RET (deny — blocked syscall)
         let second_last = &filter[filter.len() - 2];
         assert_eq!(second_last.code, 0x06);
         assert_eq!(second_last.k, 0x0005_0001); // SECCOMP_RET_ERRNO_EPERM
-        // Third to last should be BPF_RET (allow)
+                                                // Third to last should be BPF_RET (allow)
         let third_last = &filter[filter.len() - 3];
         assert_eq!(third_last.code, 0x06);
         assert_eq!(third_last.k, 0x7fff_0000); // SECCOMP_RET_ALLOW

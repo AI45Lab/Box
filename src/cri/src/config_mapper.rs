@@ -24,15 +24,9 @@ const ANN_TEE_WORKLOAD_ID: &str = "a3s.box/tee-workload-id";
 pub fn pod_sandbox_config_to_box_config(config: &PodSandboxConfig) -> Result<BoxConfig> {
     let annotations = &config.annotations;
 
-    let image = annotations
-        .get(ANN_AGENT_IMAGE)
-        .cloned()
-        .ok_or_else(|| {
-            BoxError::ConfigError(format!(
-                "Annotation '{}' is required",
-                ANN_AGENT_IMAGE
-            ))
-        })?;
+    let image = annotations.get(ANN_AGENT_IMAGE).cloned().ok_or_else(|| {
+        BoxError::ConfigError(format!("Annotation '{}' is required", ANN_AGENT_IMAGE))
+    })?;
 
     let resources = parse_resources(annotations);
     let tee = parse_tee_config(annotations)?;

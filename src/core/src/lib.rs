@@ -50,8 +50,8 @@ pub use traits::{
     SnapshotStoreBackend, StoredImage, VolumeStoreBackend,
 };
 pub use vmm::{
-    DEFAULT_SHUTDOWN_TIMEOUT_MS, Entrypoint, FsMount, InstanceSpec, NetworkInstanceConfig,
-    TeeInstanceConfig, VmHandler, VmMetrics, VmmProvider,
+    Entrypoint, FsMount, InstanceSpec, NetworkInstanceConfig, TeeInstanceConfig, VmHandler,
+    VmMetrics, VmmProvider, DEFAULT_SHUTDOWN_TIMEOUT_MS,
 };
 pub use volume::VolumeConfig;
 

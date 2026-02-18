@@ -355,7 +355,10 @@ mod tests {
             options: {
                 let mut m = std::collections::HashMap::new();
                 // Use a non-routable address so send_to fails silently
-                m.insert("syslog-address".to_string(), "udp://192.0.2.1:514".to_string());
+                m.insert(
+                    "syslog-address".to_string(),
+                    "udp://192.0.2.1:514".to_string(),
+                );
                 m
             },
         };

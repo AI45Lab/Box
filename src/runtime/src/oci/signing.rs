@@ -143,7 +143,10 @@ pub async fn fetch_cosign_signature(
         Err(e) => {
             // Distinguish between "no signature" (404) and actual errors
             let err_str = e.to_string();
-            if err_str.contains("404") || err_str.contains("NOT_FOUND") || err_str.contains("manifest unknown") {
+            if err_str.contains("404")
+                || err_str.contains("NOT_FOUND")
+                || err_str.contains("manifest unknown")
+            {
                 // No signature manifest found — not an error, just unsigned
                 Ok(None)
             } else {

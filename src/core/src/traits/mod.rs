@@ -18,4 +18,6 @@ pub use credential::CredentialProvider;
 pub use event::EventBus;
 pub use metrics::{MetricsCollector, NoopMetrics};
 pub use registry::{ImageRegistry, PulledImage};
-pub use store::{ImageStoreBackend, NetworkStoreBackend, SnapshotStoreBackend, StoredImage, VolumeStoreBackend};
+pub use store::{
+    ImageStoreBackend, NetworkStoreBackend, SnapshotStoreBackend, StoredImage, VolumeStoreBackend,
+};

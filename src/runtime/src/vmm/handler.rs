@@ -1,6 +1,6 @@
 //! ShimHandler — concrete VmHandler for a libkrun shim subprocess.
 
-pub use a3s_box_core::vmm::{DEFAULT_SHUTDOWN_TIMEOUT_MS, VmHandler, VmMetrics};
+pub use a3s_box_core::vmm::{VmHandler, VmMetrics, DEFAULT_SHUTDOWN_TIMEOUT_MS};
 
 use a3s_box_core::error::Result;
 use std::process::Child;

@@ -83,7 +83,16 @@ impl OciRootfsBuilder {
     /// Create the base directory structure.
     fn create_base_structure(&self) -> Result<()> {
         let dirs = [
-            "dev", "proc", "sys", "tmp", "run", "etc", "var", "var/tmp", "var/log", "workspace",
+            "dev",
+            "proc",
+            "sys",
+            "tmp",
+            "run",
+            "etc",
+            "var",
+            "var/tmp",
+            "var/log",
+            "workspace",
         ];
 
         for dir in dirs {
@@ -186,7 +195,10 @@ impl OciRootfsBuilder {
         self.ensure_group_entries(&[("root", "root:x:0:"), ("nogroup", "nogroup:x:65534:")])?;
 
         self.write_file("etc/hosts", "127.0.0.1\tlocalhost\n::1\t\tlocalhost\n")?;
-        self.write_file("etc/resolv.conf", "nameserver 8.8.8.8\nnameserver 8.8.4.4\n")?;
+        self.write_file(
+            "etc/resolv.conf",
+            "nameserver 8.8.8.8\nnameserver 8.8.4.4\n",
+        )?;
         self.write_file(
             "etc/nsswitch.conf",
             "passwd: files\ngroup: files\nhosts: files dns\n",
@@ -343,7 +355,10 @@ mod tests {
         let result = OciRootfsBuilder::new(&rootfs_path).build();
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("image path not set"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("image path not set"));
     }
 
     // Helper: create a minimal test OCI image

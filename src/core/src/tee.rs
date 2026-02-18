@@ -192,10 +192,7 @@ mod tests {
             serde_json::to_string(&TeeType::SevSnp).unwrap(),
             "\"sev_snp\""
         );
-        assert_eq!(
-            serde_json::to_string(&TeeType::Tdx).unwrap(),
-            "\"tdx\""
-        );
+        assert_eq!(serde_json::to_string(&TeeType::Tdx).unwrap(), "\"tdx\"");
         assert_eq!(
             serde_json::to_string(&TeeType::Simulated).unwrap(),
             "\"simulated\""
