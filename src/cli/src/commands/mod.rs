@@ -178,8 +178,6 @@ pub enum Command {
     Info(info::InfoArgs),
     /// Background daemon that monitors and restarts dead boxes
     Monitor(monitor::MonitorArgs),
-    /// Update a3s-box to the latest version
-    Update,
 }
 
 /// Return the path to the image store directory (~/.a3s/images).
@@ -297,14 +295,5 @@ pub async fn dispatch(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Version(args) => version::execute(args).await,
         Command::Info(args) => info::execute(args).await,
         Command::Monitor(args) => monitor::execute(args).await,
-        Command::Update => a3s_updater::run_update(&a3s_updater::UpdateConfig {
-            binary_name: "a3s-box",
-            crate_name: "a3s-box-cli",
-            current_version: env!("CARGO_PKG_VERSION"),
-            github_owner: "a3s-lab",
-            github_repo: "a3s",
-        })
-        .await
-        .map_err(|e| e.into()),
     }
 }

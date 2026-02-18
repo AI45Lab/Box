@@ -50,9 +50,6 @@ sysinfo = { workspace = true }
 # Table formatting
 comfy-table = { workspace = true }
 
-# Self-update
-a3s-updater = { workspace = true }
-
 # Random (for name generation)
 rand = { workspace = true }
 
