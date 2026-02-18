@@ -380,5 +380,4 @@ mod tests {
         // mtime should be unchanged (file not rewritten)
         assert_eq!(first_mtime, second_mtime);
     }
-
 }

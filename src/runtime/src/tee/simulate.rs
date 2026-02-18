@@ -41,10 +41,10 @@ pub fn build_simulated_report(report_data: &[u8; 64]) -> Vec<u8> {
     report[0x08..0x10].copy_from_slice(&0u64.to_le_bytes());
 
     // current_tcb at 0x38 (8 bytes)
-    report[0x38] = 3;   // boot_loader
-    report[0x39] = 0;   // tee
-    report[0x3E] = 8;   // snp
-    report[0x3F] = 115;  // microcode
+    report[0x38] = 3; // boot_loader
+    report[0x39] = 0; // tee
+    report[0x3E] = 8; // snp
+    report[0x3F] = 115; // microcode
 
     // report_data at 0x50 (64 bytes)
     report[0x50..0x90].copy_from_slice(report_data);
@@ -116,8 +116,8 @@ mod tests {
     fn test_build_simulated_report_tcb() {
         let data = [0u8; 64];
         let report = build_simulated_report(&data);
-        assert_eq!(report[0x38], 3);   // boot_loader
-        assert_eq!(report[0x3E], 8);   // snp
+        assert_eq!(report[0x38], 3); // boot_loader
+        assert_eq!(report[0x3E], 8); // snp
         assert_eq!(report[0x3F], 115); // microcode
     }
 

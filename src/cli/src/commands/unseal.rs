@@ -4,7 +4,7 @@
 //! then decrypts a sealed blob using the TEE-bound key. Only succeeds if the
 //! TEE identity matches the one that sealed the data.
 
-use a3s_box_runtime::{SealClient, tee::AttestationPolicy};
+use a3s_box_runtime::{tee::AttestationPolicy, SealClient};
 use clap::Args;
 
 use crate::resolve;
@@ -83,14 +83,13 @@ pub async fn execute(args: UnsealArgs) -> Result<(), Box<dyn std::error::Error>>
         use std::io::Write;
         std::io::stdout().write_all(&plaintext)?;
     } else {
-        let data_str = String::from_utf8(plaintext)
-            .unwrap_or_else(|e| {
-                use base64::Engine;
-                format!(
-                    "(binary, base64): {}",
-                    base64::engine::general_purpose::STANDARD.encode(e.as_bytes())
-                )
-            });
+        let data_str = String::from_utf8(plaintext).unwrap_or_else(|e| {
+            use base64::Engine;
+            format!(
+                "(binary, base64): {}",
+                base64::engine::general_purpose::STANDARD.encode(e.as_bytes())
+            )
+        });
 
         let output = UnsealOutput {
             box_name: record.name.clone(),

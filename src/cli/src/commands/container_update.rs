@@ -85,7 +85,8 @@ pub async fn execute(args: ContainerUpdateArgs) -> Result<(), Box<dyn std::error
         let val = if swap == "-1" {
             -1i64
         } else {
-            common::parse_memory_bytes(swap).map_err(|e| format!("Invalid --memory-swap: {e}"))? as i64
+            common::parse_memory_bytes(swap).map_err(|e| format!("Invalid --memory-swap: {e}"))?
+                as i64
         };
         record.resource_limits.memory_swap = Some(val);
         updated.push(format!("memory-swap={swap}"));

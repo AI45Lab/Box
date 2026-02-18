@@ -87,9 +87,7 @@ impl Platform {
     ///
     /// Example: "linux/amd64,linux/arm64"
     pub fn parse_list(s: &str) -> Result<Vec<Self>, String> {
-        s.split(',')
-            .map(|p| Self::parse(p.trim()))
-            .collect()
+        s.split(',').map(|p| Self::parse(p.trim())).collect()
     }
 
     /// Check if this platform matches the host architecture.

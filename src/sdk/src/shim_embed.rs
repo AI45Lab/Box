@@ -101,7 +101,13 @@ pub fn ensure_shim(home_dir: &Path) -> Result<Option<PathBuf>> {
 fn set_executable(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let mut perms = std::fs::metadata(path)
-        .map_err(|e| BoxError::Other(format!("Failed to read permissions for {}: {}", path.display(), e)))?
+        .map_err(|e| {
+            BoxError::Other(format!(
+                "Failed to read permissions for {}: {}",
+                path.display(),
+                e
+            ))
+        })?
         .permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(path, perms).map_err(|e| {
@@ -132,12 +138,8 @@ fn sign_with_entitlement(shim_path: &Path, home_dir: &Path) -> Result<()> {
     <true/>
 </dict>
 </plist>"#;
-        std::fs::write(&entitlements_path, plist).map_err(|e| {
-            BoxError::Other(format!(
-                "Failed to write entitlements plist: {}",
-                e
-            ))
-        })?;
+        std::fs::write(&entitlements_path, plist)
+            .map_err(|e| BoxError::Other(format!("Failed to write entitlements plist: {}", e)))?;
     }
 
     // Check if already signed
@@ -158,17 +160,12 @@ fn sign_with_entitlement(shim_path: &Path, home_dir: &Path) -> Result<()> {
 
     tracing::info!(path = %shim_path.display(), "Signing shim with hypervisor entitlement");
     let status = std::process::Command::new("codesign")
-        .args([
-            "--sign", "-",
-            "--entitlements",
-        ])
+        .args(["--sign", "-", "--entitlements"])
         .arg(&entitlements_path)
         .arg("--force")
         .arg(shim_path)
         .status()
-        .map_err(|e| {
-            BoxError::Other(format!("Failed to run codesign: {}", e))
-        })?;
+        .map_err(|e| BoxError::Other(format!("Failed to run codesign: {}", e)))?;
 
     if !status.success() {
         tracing::warn!(
@@ -211,10 +208,7 @@ mod tests {
 
         let shim_path = result.unwrap();
         assert!(shim_path.exists());
-        assert_eq!(
-            std::fs::read(&shim_path).unwrap().len(),
-            SHIM_BINARY.len()
-        );
+        assert_eq!(std::fs::read(&shim_path).unwrap().len(), SHIM_BINARY.len());
 
         // Version file should exist
         let version_path = tmp.path().join("bin").join("a3s-box-shim.version");

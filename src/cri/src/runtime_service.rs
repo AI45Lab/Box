@@ -38,7 +38,11 @@ pub struct BoxRuntimeService {
 
 impl BoxRuntimeService {
     /// Create a new BoxRuntimeService.
-    pub fn new(image_store: Arc<ImageStore>, auth: RegistryAuth, streaming: StreamingHandle) -> Self {
+    pub fn new(
+        image_store: Arc<ImageStore>,
+        auth: RegistryAuth,
+        streaming: StreamingHandle,
+    ) -> Self {
         let image_puller = Arc::new(ImagePuller::new(image_store.clone(), auth));
         Self {
             sandbox_store: Arc::new(SandboxStore::new()),

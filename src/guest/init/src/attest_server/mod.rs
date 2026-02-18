@@ -58,7 +58,10 @@ const OID_CERT_CHAIN: &[u64] = &[1, 3, 6, 1, 4, 1, 58270, 1, 2];
 ///
 /// On non-Linux platforms, this is a no-op (development stub).
 pub fn run_attest_server() -> Result<(), Box<dyn std::error::Error>> {
-    info!("Starting RA-TLS attestation server on vsock port {}", ATTEST_VSOCK_PORT);
+    info!(
+        "Starting RA-TLS attestation server on vsock port {}",
+        ATTEST_VSOCK_PORT
+    );
 
     #[cfg(target_os = "linux")]
     {
@@ -110,7 +113,10 @@ fn run_ratls_server() -> Result<(), Box<dyn std::error::Error>> {
     bind(sock_fd.as_raw_fd(), &addr)?;
     listen(&sock_fd, Backlog::new(4)?)?;
 
-    info!("RA-TLS attestation server listening on vsock port {}", ATTEST_VSOCK_PORT);
+    info!(
+        "RA-TLS attestation server listening on vsock port {}",
+        ATTEST_VSOCK_PORT
+    );
 
     // Step 3: Accept loop
     loop {
@@ -145,7 +151,8 @@ fn run_ratls_server() -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// Returns (ServerConfig, cert_der, report_bytes).
 #[cfg(target_os = "linux")]
-fn generate_ratls_config() -> Result<(rustls::ServerConfig, Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
+fn generate_ratls_config(
+) -> Result<(rustls::ServerConfig, Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
     use rcgen::{
         CertificateParams, CustomExtension, DistinguishedName, DnType, KeyPair,
         PKCS_ECDSA_P384_SHA384,
@@ -174,8 +181,7 @@ fn generate_ratls_config() -> Result<(rustls::ServerConfig, Vec<u8>, Vec<u8>), B
         info!("Requesting hardware SNP report for RA-TLS certificate");
         let resp = snp::get_snp_report(&report_data)
             .map_err(|e| format!("Failed to get SNP report: {}", e))?;
-        let chain_json = serde_json::to_vec(&resp.cert_chain)
-            .unwrap_or_else(|_| b"{}".to_vec());
+        let chain_json = serde_json::to_vec(&resp.cert_chain).unwrap_or_else(|_| b"{}".to_vec());
         (resp.report, chain_json)
     };
 
@@ -196,7 +202,8 @@ fn generate_ratls_config() -> Result<(rustls::ServerConfig, Vec<u8>, Vec<u8>), B
     params.custom_extensions.push(chain_ext);
 
     // Self-sign
-    let cert = params.self_signed(&key_pair)
+    let cert = params
+        .self_signed(&key_pair)
         .map_err(|e| format!("Failed to generate RA-TLS certificate: {}", e))?;
 
     let cert_der = cert.der().to_vec();

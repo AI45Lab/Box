@@ -158,11 +158,7 @@ pub fn unseal(report: &[u8], sealed: &SealedData) -> Result<Vec<u8>> {
 // ============================================================================
 
 /// Derive a 256-bit sealing key from the SNP report using HKDF-SHA256.
-fn derive_sealing_key(
-    report: &[u8],
-    context: &str,
-    policy: SealingPolicy,
-) -> Result<[u8; 32]> {
+fn derive_sealing_key(report: &[u8], context: &str, policy: SealingPolicy) -> Result<[u8; 32]> {
     // Extract measurement (0x90, 48 bytes) and chip_id (0x1A0, 64 bytes)
     if report.len() < 0x1E0 {
         return Err(BoxError::AttestationError(
@@ -380,7 +376,10 @@ mod tests {
         let plaintext = b"hello";
         let sealed = seal(&report, plaintext, "ctx", SealingPolicy::default()).unwrap();
         // blob = nonce (12) + ciphertext (5) + tag (16) = 33
-        assert_eq!(sealed.blob.len(), NONCE_LEN + plaintext.len() + aead::AES_256_GCM.tag_len());
+        assert_eq!(
+            sealed.blob.len(),
+            NONCE_LEN + plaintext.len() + aead::AES_256_GCM.tag_len()
+        );
     }
 
     #[test]

@@ -72,10 +72,7 @@ impl SnapshotStore {
             copy_dir_recursive(rootfs_source, &rootfs_dest)?;
         } else {
             std::fs::create_dir_all(&rootfs_dest).map_err(|e| {
-                BoxError::Other(format!(
-                    "Failed to create snapshot rootfs directory: {}",
-                    e
-                ))
+                BoxError::Other(format!("Failed to create snapshot rootfs directory: {}", e))
             })?;
         }
 
@@ -112,9 +109,8 @@ impl SnapshotStore {
                 e
             ))
         })?;
-        let metadata: SnapshotMetadata = serde_json::from_str(&data).map_err(|e| {
-            BoxError::Other(format!("Failed to parse snapshot metadata: {}", e))
-        })?;
+        let metadata: SnapshotMetadata = serde_json::from_str(&data)
+            .map_err(|e| BoxError::Other(format!("Failed to parse snapshot metadata: {}", e)))?;
         Ok(Some(metadata))
     }
 
@@ -139,9 +135,8 @@ impl SnapshotStore {
         };
 
         for entry in entries {
-            let entry = entry.map_err(|e| {
-                BoxError::Other(format!("Failed to read snapshot entry: {}", e))
-            })?;
+            let entry = entry
+                .map_err(|e| BoxError::Other(format!("Failed to read snapshot entry: {}", e)))?;
             let meta_path = entry.path().join("metadata.json");
             if meta_path.exists() {
                 if let Ok(data) = std::fs::read_to_string(&meta_path) {
@@ -164,12 +159,8 @@ impl SnapshotStore {
             return Ok(false);
         }
 
-        std::fs::remove_dir_all(&snap_dir).map_err(|e| {
-            BoxError::Other(format!(
-                "Failed to delete snapshot {}: {}",
-                id, e
-            ))
-        })?;
+        std::fs::remove_dir_all(&snap_dir)
+            .map_err(|e| BoxError::Other(format!("Failed to delete snapshot {}: {}", id, e)))?;
         Ok(true)
     }
 
@@ -223,15 +214,10 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     })?;
 
     for entry in std::fs::read_dir(src).map_err(|e| {
-        BoxError::Other(format!(
-            "Failed to read directory {}: {}",
-            src.display(),
-            e
-        ))
+        BoxError::Other(format!("Failed to read directory {}: {}", src.display(), e))
     })? {
-        let entry = entry.map_err(|e| {
-            BoxError::Other(format!("Failed to read directory entry: {}", e))
-        })?;
+        let entry =
+            entry.map_err(|e| BoxError::Other(format!("Failed to read directory entry: {}", e)))?;
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
 
@@ -459,7 +445,12 @@ mod tests {
         let rootfs = make_rootfs(&tmp);
 
         for i in 0..3 {
-            store.save(make_metadata(&format!("s{}", i), &format!("s{}", i)), &rootfs).unwrap();
+            store
+                .save(
+                    make_metadata(&format!("s{}", i), &format!("s{}", i)),
+                    &rootfs,
+                )
+                .unwrap();
         }
 
         let removed = store.prune(0, 0).unwrap();
@@ -528,6 +519,9 @@ mod tests {
         assert!(dst.join("a.txt").exists());
         assert!(dst.join("sub/b.txt").exists());
         assert_eq!(std::fs::read_to_string(dst.join("a.txt")).unwrap(), "hello");
-        assert_eq!(std::fs::read_to_string(dst.join("sub/b.txt")).unwrap(), "world");
+        assert_eq!(
+            std::fs::read_to_string(dst.join("sub/b.txt")).unwrap(),
+            "world"
+        );
     }
 }

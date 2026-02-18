@@ -11,9 +11,10 @@ use oci_distribution::{Client, Reference};
 use serde::{Deserialize, Serialize};
 
 /// Image signature verification policy.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum SignaturePolicy {
     /// Skip signature verification (default for backward compatibility).
+    #[default]
     Skip,
     /// Require a valid cosign signature verified against a public key.
     CosignKey {
@@ -27,12 +28,6 @@ pub enum SignaturePolicy {
         /// Expected certificate identity (e.g., "user@example.com").
         identity: String,
     },
-}
-
-impl Default for SignaturePolicy {
-    fn default() -> Self {
-        Self::Skip
-    }
 }
 
 /// Result of a signature verification check.
@@ -130,10 +125,7 @@ pub async fn fetch_cosign_signature(
             // Pull the first layer (the signature payload) into a Vec<u8>
             if let Some(layer) = manifest.layers.first() {
                 let mut buf = Vec::new();
-                match client
-                    .pull_blob(&reference, layer, &mut buf)
-                    .await
-                {
+                match client.pull_blob(&reference, layer, &mut buf).await {
                     Ok(()) => Ok(Some(buf)),
                     Err(_) => Ok(None),
                 }
@@ -152,10 +144,7 @@ pub async fn fetch_cosign_signature(
 ///
 /// The payload is a JSON SimpleSigning document. The signature is
 /// verified using the provided PEM-encoded public key (ECDSA P-256 or RSA).
-pub fn verify_cosign_payload(
-    payload: &[u8],
-    manifest_digest: &str,
-) -> Result<CosignPayload> {
+pub fn verify_cosign_payload(payload: &[u8], manifest_digest: &str) -> Result<CosignPayload> {
     // Parse the payload
     let cosign_payload: CosignPayload =
         serde_json::from_slice(payload).map_err(|e| BoxError::RegistryError {
@@ -190,10 +179,7 @@ pub async fn verify_image_signature(
         SignaturePolicy::CosignKey { public_key } => {
             // Check that the key file exists
             if !std::path::Path::new(public_key).exists() {
-                return VerifyResult::Failed(format!(
-                    "Public key file not found: {}",
-                    public_key
-                ));
+                return VerifyResult::Failed(format!("Public key file not found: {}", public_key));
             }
 
             // Fetch signature from registry
@@ -366,16 +352,23 @@ mod tests {
     fn test_verify_cosign_payload_invalid_json() {
         let result = verify_cosign_payload(b"not json", "sha256:abc");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Invalid cosign payload"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid cosign payload"));
     }
 
     // --- Async verification tests ---
 
     #[tokio::test]
     async fn test_verify_image_signature_skip() {
-        let result =
-            verify_image_signature(&SignaturePolicy::Skip, "docker.io", "library/alpine", "sha256:abc")
-                .await;
+        let result = verify_image_signature(
+            &SignaturePolicy::Skip,
+            "docker.io",
+            "library/alpine",
+            "sha256:abc",
+        )
+        .await;
         assert_eq!(result, VerifyResult::Skipped);
     }
 

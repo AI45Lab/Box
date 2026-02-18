@@ -106,10 +106,12 @@ fn make_test_report() -> Vec<u8> {
 #[test]
 fn test_derive_guest_sealing_key_measurement_and_chip() {
     let report = make_test_report();
-    let key = handlers::derive_guest_sealing_key(&report, "test-ctx", "MeasurementAndChip").unwrap();
+    let key =
+        handlers::derive_guest_sealing_key(&report, "test-ctx", "MeasurementAndChip").unwrap();
     assert_eq!(key.len(), 32);
     // Key should be deterministic
-    let key2 = handlers::derive_guest_sealing_key(&report, "test-ctx", "MeasurementAndChip").unwrap();
+    let key2 =
+        handlers::derive_guest_sealing_key(&report, "test-ctx", "MeasurementAndChip").unwrap();
     assert_eq!(key, key2);
 }
 
@@ -130,8 +132,10 @@ fn test_derive_guest_sealing_key_chip_only() {
 #[test]
 fn test_derive_guest_sealing_key_different_contexts() {
     let report = make_test_report();
-    let key_a = handlers::derive_guest_sealing_key(&report, "context-a", "MeasurementAndChip").unwrap();
-    let key_b = handlers::derive_guest_sealing_key(&report, "context-b", "MeasurementAndChip").unwrap();
+    let key_a =
+        handlers::derive_guest_sealing_key(&report, "context-a", "MeasurementAndChip").unwrap();
+    let key_b =
+        handlers::derive_guest_sealing_key(&report, "context-b", "MeasurementAndChip").unwrap();
     assert_ne!(key_a, key_b);
 }
 
@@ -158,7 +162,8 @@ fn test_derive_guest_sealing_key_unknown_policy_defaults() {
     let report = make_test_report();
     // Unknown policy falls back to MeasurementAndChip
     let key_unknown = handlers::derive_guest_sealing_key(&report, "ctx", "Unknown").unwrap();
-    let key_default = handlers::derive_guest_sealing_key(&report, "ctx", "MeasurementAndChip").unwrap();
+    let key_default =
+        handlers::derive_guest_sealing_key(&report, "ctx", "MeasurementAndChip").unwrap();
     assert_eq!(key_unknown, key_default);
 }
 

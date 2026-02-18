@@ -286,13 +286,11 @@ mod tests {
             },
             min_replicas: 1,
             max_replicas: 10,
-            metrics: vec![
-                MetricSpec {
-                    metric_type: MetricType::Cpu,
-                    target: 70,
-                    tolerance_percent: 10,
-                },
-            ],
+            metrics: vec![MetricSpec {
+                metric_type: MetricType::Cpu,
+                target: 70,
+                tolerance_percent: 10,
+            }],
             behavior: ScalingBehavior::default(),
             cooldown_secs: 60,
         }

@@ -1,6 +1,5 @@
 //! Network setup for VM instances (bridge networking and DNS).
 
-
 use a3s_box_core::error::{BoxError, Result};
 
 use crate::network::PasstManager;
@@ -11,7 +10,10 @@ use super::VmManager;
 impl VmManager {
     /// Set up bridge networking by looking up the network, spawning passt,
     /// and building the NetworkInstanceConfig for the VM spec.
-    pub(crate) fn setup_bridge_network(&mut self, network_name: &str) -> Result<NetworkInstanceConfig> {
+    pub(crate) fn setup_bridge_network(
+        &mut self,
+        network_name: &str,
+    ) -> Result<NetworkInstanceConfig> {
         use crate::network::NetworkStore;
 
         let store = NetworkStore::default_path()?;
@@ -87,7 +89,11 @@ impl VmManager {
     ///
     /// Looks up the box's own endpoint and all peer endpoints in the network,
     /// then generates a hosts file mapping IPs to box names.
-    pub(crate) fn write_hosts_file(&self, layout: &super::BoxLayout, network_name: &str) -> Result<()> {
+    pub(crate) fn write_hosts_file(
+        &self,
+        layout: &super::BoxLayout,
+        network_name: &str,
+    ) -> Result<()> {
         use crate::network::NetworkStore;
 
         let store = NetworkStore::default_path()?;

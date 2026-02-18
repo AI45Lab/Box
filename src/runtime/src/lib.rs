@@ -28,37 +28,39 @@ pub mod vmm;
 pub mod volume;
 
 // Re-export common types
-pub use audit::{AuditLog, AuditQuery, read_audit_log};
-pub use compose::{ComposeProject, ProjectState};
+pub use audit::{read_audit_log, AuditLog, AuditQuery};
 pub use cache::{LayerCache, RootfsCache};
+pub use compose::{ComposeProject, ProjectState};
 pub use grpc::{AttestationClient, ExecClient, PtyClient, RaTlsAttestationClient, StreamingExec};
-pub use grpc::{SealClient, SealResult, SecretEntry, SecretInjectionResult, SecretInjector, UnsealResult};
+pub use grpc::{
+    SealClient, SealResult, SecretEntry, SecretInjectionResult, SecretInjector, UnsealResult,
+};
 pub use host_check::{check_virtualization_support, VirtualizationSupport};
 pub use network::NetworkStore;
 pub use network::PasstManager;
-pub use operator::{AutoscalerController, ObservedMetrics, ReconcileResult};
 pub use oci::{BuildConfig, BuildResult, Dockerfile, Instruction};
 pub use oci::{CredentialStore, PushResult, RegistryPusher};
 pub use oci::{ImagePuller, ImageReference, ImageStore, RegistryAuth, RegistryPuller, StoredImage};
 pub use oci::{OciImage, OciImageConfig, OciRootfsBuilder, RootfsComposition};
 pub use oci::{SignaturePolicy, VerifyResult};
+pub use operator::{AutoscalerController, ObservedMetrics, ReconcileResult};
 pub use pool::{PoolStats, WarmPool};
 pub use prom::RuntimeMetrics;
+pub use rootfs::{GuestLayout, RootfsBuilder, GUEST_WORKDIR};
 pub use scale::{InstanceRegistry, ScaleManager, ServiceHealth};
 pub use snapshot::SnapshotStore;
-pub use rootfs::{GuestLayout, RootfsBuilder, GUEST_WORKDIR};
 pub use tee::{check_sev_snp_support, require_sev_snp_support, SevSnpSupport};
+pub use tee::{seal, unseal, SealedData, SealingPolicy};
+pub use tee::{seal_versioned, unseal_versioned, VersionStore, VersionedSealedData};
 pub use tee::{
     verify_attestation, verify_attestation_with_time, AmdKdsClient, AttestationPolicy,
     MinTcbPolicy, PolicyResult, VerificationResult,
 };
 pub use tee::{AttestationReport, AttestationRequest, CertificateChain, PlatformInfo, TcbVersion};
-pub use tee::{seal, unseal, SealedData, SealingPolicy};
-pub use tee::{KbsClient, KbsConfig, KbsRequest, KbsResponse, KbsSecret};
 pub use tee::{FailureAction, ReattestConfig, ReattestState, ReattestSummary};
-pub use tee::{VersionStore, VersionedSealedData, seal_versioned, unseal_versioned};
-pub use vm::{BoxState, VmManager};
+pub use tee::{KbsClient, KbsConfig, KbsRequest, KbsResponse, KbsSecret};
 pub use tee::{SnpTeeExtension, TeeExtension};
+pub use vm::{BoxState, VmManager};
 pub use vmm::{
     Entrypoint, FsMount, InstanceSpec, NetworkInstanceConfig, ShimHandler, TeeInstanceConfig,
     VmController, VmHandler, VmMetrics, VmmProvider,

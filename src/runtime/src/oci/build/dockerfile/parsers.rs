@@ -2,8 +2,8 @@
 
 use a3s_box_core::error::{BoxError, Result};
 
-use super::utils::{parse_json_array, shell_split, unquote, parse_duration_secs};
-use super::{Instruction, split_first_word};
+use super::utils::{parse_duration_secs, parse_json_array, shell_split, unquote};
+use super::{split_first_word, Instruction};
 
 pub(super) fn parse_from(rest: &str, line_num: usize) -> Result<Instruction> {
     if rest.is_empty() {

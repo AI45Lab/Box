@@ -182,8 +182,14 @@ mod tests {
 
     #[test]
     fn test_tee_type_serde() {
-        assert_eq!(serde_json::to_string(&TeeType::SevSnp).unwrap(), "\"sev_snp\"");
-        assert_eq!(serde_json::to_string(&TeeType::Simulated).unwrap(), "\"simulated\"");
+        assert_eq!(
+            serde_json::to_string(&TeeType::SevSnp).unwrap(),
+            "\"sev_snp\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TeeType::Simulated).unwrap(),
+            "\"simulated\""
+        );
     }
 
     // -- Attest protocol tests --

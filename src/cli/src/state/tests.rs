@@ -940,12 +940,16 @@ fn test_find_by_label() {
     let mut state = file::StateFile::load(&path).unwrap();
 
     let mut r1 = sample_record("id-1", "web", "running");
-    r1.labels.insert("com.a3s.compose.project".to_string(), "myapp".to_string());
-    r1.labels.insert("com.a3s.compose.service".to_string(), "web".to_string());
+    r1.labels
+        .insert("com.a3s.compose.project".to_string(), "myapp".to_string());
+    r1.labels
+        .insert("com.a3s.compose.service".to_string(), "web".to_string());
 
     let mut r2 = sample_record("id-2", "db", "running");
-    r2.labels.insert("com.a3s.compose.project".to_string(), "myapp".to_string());
-    r2.labels.insert("com.a3s.compose.service".to_string(), "db".to_string());
+    r2.labels
+        .insert("com.a3s.compose.project".to_string(), "myapp".to_string());
+    r2.labels
+        .insert("com.a3s.compose.service".to_string(), "db".to_string());
 
     let r3 = sample_record("id-3", "other", "running");
 

@@ -2,11 +2,11 @@
 
 use std::path::{Path, PathBuf};
 
-use a3s_box_core::config::{AgentType, BusinessType, TeeConfig};
-use a3s_box_core::error::{BoxError, Result};
 use crate::cache::RootfsCache;
 use crate::oci::OciRootfsBuilder;
 use crate::vmm::TeeInstanceConfig;
+use a3s_box_core::config::{AgentType, BusinessType, TeeConfig};
+use a3s_box_core::error::{BoxError, Result};
 
 use super::{BoxLayout, VmManager};
 
@@ -275,7 +275,11 @@ impl VmManager {
     ///
     /// Returns `Some(target_path)` if cache hit, `None` if cache miss.
     /// If caching is disabled in config, always returns `None`.
-    pub(crate) fn try_rootfs_cache(&self, cache_key: &str, target_path: &Path) -> Result<Option<PathBuf>> {
+    pub(crate) fn try_rootfs_cache(
+        &self,
+        cache_key: &str,
+        target_path: &Path,
+    ) -> Result<Option<PathBuf>> {
         if !self.config.cache.enabled {
             return Ok(None);
         }
@@ -302,7 +306,12 @@ impl VmManager {
     /// Store a built rootfs in the cache for future reuse.
     ///
     /// Errors are logged but not propagated — caching is best-effort.
-    pub(crate) fn store_rootfs_cache(&self, cache_key: &str, rootfs_path: &Path, description: &str) {
+    pub(crate) fn store_rootfs_cache(
+        &self,
+        cache_key: &str,
+        rootfs_path: &Path,
+        description: &str,
+    ) {
         if !self.config.cache.enabled {
             return;
         }
@@ -543,13 +552,13 @@ impl VmManager {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::sync::Arc;
-    use tokio::sync::RwLock;
-    use tempfile::TempDir;
-    use a3s_box_core::config::BoxConfig;
-    use crate::cache::RootfsCache;
     use super::super::BoxState;
+    use super::*;
+    use crate::cache::RootfsCache;
+    use a3s_box_core::config::BoxConfig;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use tokio::sync::RwLock;
 
     fn make_vm_manager_with_home(home_dir: &Path) -> VmManager {
         use a3s_box_core::event::EventEmitter;

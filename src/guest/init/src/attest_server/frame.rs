@@ -21,7 +21,11 @@ pub(super) fn read_frame(r: &mut impl Read) -> std::io::Result<Option<(u8, Vec<u
 }
 
 /// Write a frame to a synchronous stream.
-pub(super) fn write_frame(w: &mut impl Write, frame_type: u8, payload: &[u8]) -> std::io::Result<()> {
+pub(super) fn write_frame(
+    w: &mut impl Write,
+    frame_type: u8,
+    payload: &[u8],
+) -> std::io::Result<()> {
     let len = payload.len() as u32;
     let mut header = [0u8; 5];
     header[0] = frame_type;

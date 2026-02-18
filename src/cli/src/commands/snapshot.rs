@@ -84,9 +84,9 @@ pub async fn execute(args: SnapshotArgs) -> Result<(), Box<dyn std::error::Error
 
 /// Create a snapshot from a box.
 async fn execute_create(args: SnapshotCreateArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::state::StateFile;
     use a3s_box_core::snapshot::SnapshotMetadata;
     use a3s_box_runtime::SnapshotStore;
-    use crate::state::StateFile;
 
     let state = StateFile::load_default()?;
 
@@ -98,17 +98,13 @@ async fn execute_create(args: SnapshotCreateArgs) -> Result<(), Box<dyn std::err
         "snap-{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
     );
-    let snap_name = args.name.unwrap_or_else(|| {
-        format!("{}-snapshot", record.name)
-    });
+    let snap_name = args
+        .name
+        .unwrap_or_else(|| format!("{}-snapshot", record.name));
 
     // Build metadata from box record
-    let mut meta = SnapshotMetadata::new(
-        snap_id,
-        snap_name,
-        record.id.clone(),
-        record.image.clone(),
-    );
+    let mut meta =
+        SnapshotMetadata::new(snap_id, snap_name, record.id.clone(), record.image.clone());
     meta.vcpus = record.cpus;
     meta.memory_mb = record.memory_mb;
     meta.volumes = record.volumes.clone();
@@ -133,8 +129,8 @@ async fn execute_create(args: SnapshotCreateArgs) -> Result<(), Box<dyn std::err
 
 /// Restore a box from a snapshot.
 async fn execute_restore(args: SnapshotRestoreArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::state::{generate_name, BoxRecord, StateFile};
     use a3s_box_runtime::SnapshotStore;
-    use crate::state::{BoxRecord, StateFile, generate_name};
 
     let store = SnapshotStore::default_path()?;
 
@@ -245,8 +241,8 @@ async fn execute_ls(args: SnapshotLsArgs) -> Result<(), Box<dyn std::error::Erro
     }
 
     println!(
-        "{:<30} {:<20} {:<15} {:<12} {:<10} {}",
-        "SNAPSHOT ID", "NAME", "SOURCE BOX", "IMAGE", "SIZE", "CREATED"
+        "{:<30} {:<20} {:<15} {:<12} {:<10} CREATED",
+        "SNAPSHOT ID", "NAME", "SOURCE BOX", "IMAGE", "SIZE"
     );
     for snap in &snapshots {
         let size = format_size(snap.size_bytes);
@@ -292,9 +288,9 @@ async fn execute_inspect(args: SnapshotInspectArgs) -> Result<(), Box<dyn std::e
     use a3s_box_runtime::SnapshotStore;
 
     let store = SnapshotStore::default_path()?;
-    let meta = store.get(&args.id)?.ok_or_else(|| {
-        format!("Snapshot '{}' not found", args.id)
-    })?;
+    let meta = store
+        .get(&args.id)?
+        .ok_or_else(|| format!("Snapshot '{}' not found", args.id))?;
 
     println!("{}", serde_json::to_string_pretty(&meta)?);
     Ok(())
@@ -363,10 +359,7 @@ fn format_size(bytes: u64) -> String {
 }
 
 /// Simple recursive directory copy (std::io version for CLI).
-fn copy_dir_recursive_io(
-    src: &std::path::Path,
-    dst: &std::path::Path,
-) -> std::io::Result<()> {
+fn copy_dir_recursive_io(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;

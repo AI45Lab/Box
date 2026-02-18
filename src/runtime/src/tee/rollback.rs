@@ -139,9 +139,8 @@ impl VersionStore {
 
     /// Save the version store atomically.
     fn save(&self) -> Result<()> {
-        let data = serde_json::to_string_pretty(&self.versions).map_err(|e| {
-            BoxError::Other(format!("Failed to serialize version store: {}", e))
-        })?;
+        let data = serde_json::to_string_pretty(&self.versions)
+            .map_err(|e| BoxError::Other(format!("Failed to serialize version store: {}", e)))?;
         let tmp = self.path.with_extension("json.tmp");
         std::fs::write(&tmp, &data).map_err(|e| {
             BoxError::Other(format!(
@@ -150,12 +149,8 @@ impl VersionStore {
                 e
             ))
         })?;
-        std::fs::rename(&tmp, &self.path).map_err(|e| {
-            BoxError::Other(format!(
-                "Failed to rename version store: {}",
-                e
-            ))
-        })?;
+        std::fs::rename(&tmp, &self.path)
+            .map_err(|e| BoxError::Other(format!("Failed to rename version store: {}", e)))?;
         Ok(())
     }
 }
@@ -229,8 +224,8 @@ mod base64_serde {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::sealed::SealingPolicy;
+    use super::*;
     use tempfile::TempDir;
 
     fn make_test_report() -> Vec<u8> {
@@ -308,7 +303,10 @@ mod tests {
         // Blob version < stored version → rollback
         let result = store.check_version("ctx", 1);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Rollback detected"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Rollback detected"));
     }
 
     #[test]
@@ -363,8 +361,10 @@ mod tests {
         let mut store = test_version_store(&tmp);
         let report = make_test_report();
 
-        let s1 = seal_versioned(&report, b"v1", "ctx", SealingPolicy::default(), &mut store).unwrap();
-        let s2 = seal_versioned(&report, b"v2", "ctx", SealingPolicy::default(), &mut store).unwrap();
+        let s1 =
+            seal_versioned(&report, b"v1", "ctx", SealingPolicy::default(), &mut store).unwrap();
+        let s2 =
+            seal_versioned(&report, b"v2", "ctx", SealingPolicy::default(), &mut store).unwrap();
 
         assert_eq!(s1.version, 1);
         assert_eq!(s2.version, 2);
@@ -376,8 +376,10 @@ mod tests {
         let mut store = test_version_store(&tmp);
         let report = make_test_report();
 
-        let old = seal_versioned(&report, b"old", "ctx", SealingPolicy::default(), &mut store).unwrap();
-        let _new = seal_versioned(&report, b"new", "ctx", SealingPolicy::default(), &mut store).unwrap();
+        let old =
+            seal_versioned(&report, b"old", "ctx", SealingPolicy::default(), &mut store).unwrap();
+        let _new =
+            seal_versioned(&report, b"new", "ctx", SealingPolicy::default(), &mut store).unwrap();
 
         // Try to unseal the old blob — should fail (rollback)
         let result = unseal_versioned(&report, &old, &mut store);
@@ -391,7 +393,14 @@ mod tests {
         let mut store = test_version_store(&tmp);
         let report = make_test_report();
 
-        let sealed = seal_versioned(&report, b"data", "ctx", SealingPolicy::default(), &mut store).unwrap();
+        let sealed = seal_versioned(
+            &report,
+            b"data",
+            "ctx",
+            SealingPolicy::default(),
+            &mut store,
+        )
+        .unwrap();
 
         // Unseal same version twice — should work
         let p1 = unseal_versioned(&report, &sealed, &mut store).unwrap();
@@ -406,7 +415,14 @@ mod tests {
         let mut store = test_version_store(&tmp);
         let report = make_test_report();
 
-        let sealed = seal_versioned(&report, b"serde-test", "ctx", SealingPolicy::default(), &mut store).unwrap();
+        let sealed = seal_versioned(
+            &report,
+            b"serde-test",
+            "ctx",
+            SealingPolicy::default(),
+            &mut store,
+        )
+        .unwrap();
         let json = serde_json::to_string(&sealed).unwrap();
         let parsed: VersionedSealedData = serde_json::from_str(&json).unwrap();
 
@@ -424,8 +440,10 @@ mod tests {
         let mut store = test_version_store(&tmp);
         let report = make_test_report();
 
-        let s1 = seal_versioned(&report, b"a", "ctx-a", SealingPolicy::default(), &mut store).unwrap();
-        let s2 = seal_versioned(&report, b"b", "ctx-b", SealingPolicy::default(), &mut store).unwrap();
+        let s1 =
+            seal_versioned(&report, b"a", "ctx-a", SealingPolicy::default(), &mut store).unwrap();
+        let s2 =
+            seal_versioned(&report, b"b", "ctx-b", SealingPolicy::default(), &mut store).unwrap();
 
         // Each context has independent versioning
         assert_eq!(s1.version, 1);

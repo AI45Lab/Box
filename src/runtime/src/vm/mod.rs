@@ -166,14 +166,20 @@ impl VmManager {
         let box_id = uuid::Uuid::new_v4().to_string();
         let home_dir = dirs_home().unwrap_or_else(|| PathBuf::from(".a3s"));
         Self {
-            config, box_id,
+            config,
+            box_id,
             state: Arc::new(RwLock::new(BoxState::Created)),
             event_emitter,
             provider: Some(provider),
             handler: Arc::new(RwLock::new(None)),
-            exec_client: None, passt_manager: None,
-            home_dir, anonymous_volumes: Vec::new(), tee: None,
-            exec_socket_path: None, pty_socket_path: None, prom: None,
+            exec_client: None,
+            passt_manager: None,
+            home_dir,
+            anonymous_volumes: Vec::new(),
+            tee: None,
+            exec_socket_path: None,
+            pty_socket_path: None,
+            prom: None,
         }
     }
 
@@ -270,7 +276,8 @@ impl VmManager {
         // Record Prometheus metrics
         if let Some(ref prom) = self.prom {
             prom.exec_total.inc();
-            prom.exec_duration.observe(exec_start.elapsed().as_secs_f64());
+            prom.exec_duration
+                .observe(exec_start.elapsed().as_secs_f64());
             if result.is_err() || result.as_ref().is_ok_and(|o| o.exit_code != 0) {
                 prom.exec_errors_total.inc();
             }
@@ -325,7 +332,9 @@ impl VmManager {
             // Inject network env vars into entrypoint so they are passed via
             // krun_set_exec's envp (not krun_set_env which overwrites all vars).
             let ip_cidr = format!("{}/{}", net_config.ip_address, net_config.prefix_len);
-            spec.entrypoint.env.push(("A3S_NET_IP".to_string(), ip_cidr));
+            spec.entrypoint
+                .env
+                .push(("A3S_NET_IP".to_string(), ip_cidr));
             spec.entrypoint.env.push((
                 "A3S_NET_GATEWAY".to_string(),
                 net_config.gateway.to_string(),
@@ -353,11 +362,9 @@ impl VmManager {
         // 4. Start VM via provider
         let handler = {
             let vm_start_span = tracing::info_span!(parent: &boot_span, "vm_start");
-            async {
-                self.provider.as_ref().unwrap().start(&spec).await
-            }
-            .instrument(vm_start_span)
-            .await?
+            async { self.provider.as_ref().unwrap().start(&spec).await }
+                .instrument(vm_start_span)
+                .await?
         };
 
         // Store handler

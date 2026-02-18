@@ -59,12 +59,7 @@ pub struct SnapshotMetadata {
 
 impl SnapshotMetadata {
     /// Create a new snapshot metadata with required fields.
-    pub fn new(
-        id: String,
-        name: String,
-        source_box_id: String,
-        image: String,
-    ) -> Self {
+    pub fn new(id: String, name: String, source_box_id: String, image: String) -> Self {
         Self {
             id,
             name,
@@ -207,7 +202,10 @@ mod tests {
         assert_eq!(parsed.volumes, vec!["/data:/data"]);
         assert_eq!(parsed.env.get("FOO").unwrap(), "bar");
         assert_eq!(parsed.cmd, vec!["nginx", "-g"]);
-        assert_eq!(parsed.entrypoint, Some(vec!["/docker-entrypoint.sh".to_string()]));
+        assert_eq!(
+            parsed.entrypoint,
+            Some(vec!["/docker-entrypoint.sh".to_string()])
+        );
         assert_eq!(parsed.workdir, Some("/app".to_string()));
         assert_eq!(parsed.port_map, vec!["8080:80"]);
         assert_eq!(parsed.labels.get("env").unwrap(), "prod");
@@ -263,7 +261,10 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let parsed: SnapshotConfig = serde_json::from_str(&json).unwrap();
         assert!(parsed.enabled);
-        assert_eq!(parsed.snapshot_dir, Some(PathBuf::from("/custom/snapshots")));
+        assert_eq!(
+            parsed.snapshot_dir,
+            Some(PathBuf::from("/custom/snapshots"))
+        );
         assert_eq!(parsed.max_snapshots, 10);
         assert_eq!(parsed.max_total_bytes, 5 * 1024 * 1024 * 1024);
     }

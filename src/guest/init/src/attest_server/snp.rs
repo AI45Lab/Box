@@ -29,7 +29,9 @@ pub(super) struct AttestResponse {
 
 /// Get an SNP attestation report from the hardware via `/dev/sev-guest`.
 #[cfg(target_os = "linux")]
-pub(super) fn get_snp_report(report_data: &[u8; super::SNP_USER_DATA_SIZE]) -> Result<AttestResponse, String> {
+pub(super) fn get_snp_report(
+    report_data: &[u8; super::SNP_USER_DATA_SIZE],
+) -> Result<AttestResponse, String> {
     use std::fs::OpenOptions;
     use std::os::fd::AsRawFd;
 
@@ -37,12 +39,7 @@ pub(super) fn get_snp_report(report_data: &[u8; super::SNP_USER_DATA_SIZE]) -> R
         .read(true)
         .write(true)
         .open("/dev/sev-guest")
-        .or_else(|_| {
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open("/dev/sev")
-        })
+        .or_else(|_| OpenOptions::new().read(true).write(true).open("/dev/sev"))
         .map_err(|e| format!("Cannot open SEV device: {} (is this a SEV-SNP VM?)", e))?;
 
     let fd = dev.as_raw_fd();
@@ -51,7 +48,10 @@ pub(super) fn get_snp_report(report_data: &[u8; super::SNP_USER_DATA_SIZE]) -> R
     match snp_get_ext_report(fd, report_data) {
         Ok(resp) => return Ok(resp),
         Err(e) => {
-            tracing::debug!("SNP_GET_EXT_REPORT failed ({}), falling back to SNP_GET_REPORT", e);
+            tracing::debug!(
+                "SNP_GET_EXT_REPORT failed ({}), falling back to SNP_GET_REPORT",
+                e
+            );
         }
     }
 
@@ -134,7 +134,11 @@ fn snp_get_report(
     };
 
     let ret = unsafe {
-        libc::ioctl(fd, SNP_GET_REPORT_IOCTL as libc::Ioctl, &mut ioctl_req as *mut _)
+        libc::ioctl(
+            fd,
+            SNP_GET_REPORT_IOCTL as libc::Ioctl,
+            &mut ioctl_req as *mut _,
+        )
     };
 
     if ret != 0 {
@@ -189,7 +193,11 @@ fn snp_get_ext_report(
     };
 
     let ret = unsafe {
-        libc::ioctl(fd, SNP_GET_EXT_REPORT_IOCTL as libc::Ioctl, &mut ioctl_req as *mut _)
+        libc::ioctl(
+            fd,
+            SNP_GET_EXT_REPORT_IOCTL as libc::Ioctl,
+            &mut ioctl_req as *mut _,
+        )
     };
 
     if ret != 0 {
@@ -201,7 +209,10 @@ fn snp_get_ext_report(
     }
 
     if resp.status != 0 {
-        return Err(format!("SNP_GET_EXT_REPORT firmware error: {:#x}", resp.status));
+        return Err(format!(
+            "SNP_GET_EXT_REPORT firmware error: {:#x}",
+            resp.status
+        ));
     }
 
     let cert_chain = parse_cert_table(&certs_buf, ext_req.certs_len as usize);
@@ -231,8 +242,10 @@ fn parse_cert_table(buf: &[u8], len: usize) -> CertChain {
             break;
         }
 
-        let offset = u32::from_le_bytes(buf[pos + 16..pos + 20].try_into().unwrap_or([0; 4])) as usize;
-        let cert_len = u32::from_le_bytes(buf[pos + 20..pos + 24].try_into().unwrap_or([0; 4])) as usize;
+        let offset =
+            u32::from_le_bytes(buf[pos + 16..pos + 20].try_into().unwrap_or([0; 4])) as usize;
+        let cert_len =
+            u32::from_le_bytes(buf[pos + 20..pos + 24].try_into().unwrap_or([0; 4])) as usize;
 
         if offset + cert_len <= len {
             let cert_data = buf[offset..offset + cert_len].to_vec();

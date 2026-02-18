@@ -16,10 +16,12 @@ pub struct CreateArgs {
 
 pub async fn execute(args: CreateArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Validate restart policy
-    let (restart_policy, max_restart_count) = crate::state::parse_restart_policy(&args.common.restart)
-        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    let (restart_policy, max_restart_count) =
+        crate::state::parse_restart_policy(&args.common.restart)
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
-    let memory_mb = parse_memory(&args.common.memory).map_err(|e| format!("Invalid --memory: {e}"))?;
+    let memory_mb =
+        parse_memory(&args.common.memory).map_err(|e| format!("Invalid --memory: {e}"))?;
 
     // Build resource limits before any partial moves of args
     let resource_limits = common::build_resource_limits(&args.common)?;
@@ -35,14 +37,15 @@ pub async fn execute(args: CreateArgs) -> Result<(), Box<dyn std::error::Error>>
         }
     }
 
-    let labels =
-        common::parse_env_vars(&args.common.labels).map_err(|e| e.replace("environment variable", "label"))?;
+    let labels = common::parse_env_vars(&args.common.labels)
+        .map_err(|e| e.replace("environment variable", "label"))?;
 
     // Parse health check config (--no-healthcheck disables)
     let health_check = if args.common.no_healthcheck {
         None
     } else {
-        args.common.health_cmd
+        args.common
+            .health_cmd
             .as_ref()
             .map(|cmd| crate::state::HealthCheck {
                 cmd: vec!["sh".to_string(), "-c".to_string(), cmd.clone()],
@@ -55,7 +58,9 @@ pub async fn execute(args: CreateArgs) -> Result<(), Box<dyn std::error::Error>>
 
     // Parse --shm-size
     let shm_size = match &args.common.shm_size {
-        Some(s) => Some(common::parse_memory_bytes(s).map_err(|e| format!("Invalid --shm-size: {e}"))?),
+        Some(s) => {
+            Some(common::parse_memory_bytes(s).map_err(|e| format!("Invalid --shm-size: {e}"))?)
+        }
         None => None,
     };
 

@@ -101,12 +101,7 @@ impl ScaleManager {
     }
 
     /// Register a new instance for a service.
-    pub fn register_instance(
-        &mut self,
-        service: &str,
-        instance_id: &str,
-        endpoint: Option<&str>,
-    ) {
+    pub fn register_instance(&mut self, service: &str, instance_id: &str, endpoint: Option<&str>) {
         let svc = self
             .services
             .entry(service.to_string())
@@ -156,12 +151,7 @@ impl ScaleManager {
     }
 
     /// Update an instance's health metrics.
-    pub fn update_health(
-        &mut self,
-        service: &str,
-        instance_id: &str,
-        health: InstanceHealth,
-    ) {
+    pub fn update_health(&mut self, service: &str, instance_id: &str, health: InstanceHealth) {
         if let Some(svc) = self.services.get_mut(service) {
             if let Some(inst) = svc.instances.iter_mut().find(|i| i.id == instance_id) {
                 inst.health = health;
@@ -170,12 +160,7 @@ impl ScaleManager {
     }
 
     /// Update an instance's endpoint.
-    pub fn update_endpoint(
-        &mut self,
-        service: &str,
-        instance_id: &str,
-        endpoint: &str,
-    ) {
+    pub fn update_endpoint(&mut self, service: &str, instance_id: &str, endpoint: &str) {
         if let Some(svc) = self.services.get_mut(service) {
             if let Some(inst) = svc.instances.iter_mut().find(|i| i.id == instance_id) {
                 inst.endpoint = Some(endpoint.to_string());
@@ -214,7 +199,15 @@ impl ScaleManager {
             let active: Vec<&TrackedInstance> = svc
                 .instances
                 .iter()
-                .filter(|i| !matches!(i.state, InstanceState::Stopped | InstanceState::Failed | InstanceState::Stopping | InstanceState::Draining))
+                .filter(|i| {
+                    !matches!(
+                        i.state,
+                        InstanceState::Stopped
+                            | InstanceState::Failed
+                            | InstanceState::Stopping
+                            | InstanceState::Draining
+                    )
+                })
                 .collect();
 
             let excess = (active.len() as u32).saturating_sub(svc.target_replicas);
@@ -265,7 +258,10 @@ impl ScaleManager {
 
     /// Get the total number of instances across all services.
     pub fn total_instances(&self) -> u32 {
-        self.services.values().map(|s| s.instances.len() as u32).sum()
+        self.services
+            .values()
+            .map(|s| s.instances.len() as u32)
+            .sum()
     }
 
     /// Get the number of instances for a specific service.
@@ -316,8 +312,14 @@ impl ScaleManager {
             };
         }
 
-        let ready_count = active.iter().filter(|i| i.state == InstanceState::Ready).count() as u32;
-        let busy_count = active.iter().filter(|i| i.state == InstanceState::Busy).count() as u32;
+        let ready_count = active
+            .iter()
+            .filter(|i| i.state == InstanceState::Ready)
+            .count() as u32;
+        let busy_count = active
+            .iter()
+            .filter(|i| i.state == InstanceState::Busy)
+            .count() as u32;
 
         let mut total_cpu = 0.0f64;
         let mut total_mem = 0u64;
@@ -360,11 +362,7 @@ impl ScaleManager {
     /// 1. Stop routing new requests to this instance
     /// 2. Wait for in-flight requests to complete (or timeout)
     /// 3. Call `complete_drain()` to transition to `Stopping`
-    pub fn start_drain(
-        &mut self,
-        service: &str,
-        instance_id: &str,
-    ) -> Option<InstanceEvent> {
+    pub fn start_drain(&mut self, service: &str, instance_id: &str) -> Option<InstanceEvent> {
         let svc = self.services.get_mut(service)?;
         let inst = svc.instances.iter_mut().find(|i| i.id == instance_id)?;
 
@@ -376,8 +374,9 @@ impl ScaleManager {
         let old_state = inst.state;
         inst.state = InstanceState::Draining;
 
-        let event = InstanceEvent::transition(instance_id, service, old_state, InstanceState::Draining)
-            .with_message("Graceful drain initiated");
+        let event =
+            InstanceEvent::transition(instance_id, service, old_state, InstanceState::Draining)
+                .with_message("Graceful drain initiated");
         self.push_event(event.clone());
         Some(event)
     }
@@ -385,11 +384,7 @@ impl ScaleManager {
     /// Complete a drain and transition to Stopping.
     ///
     /// Called after in-flight requests have completed or the drain timeout expired.
-    pub fn complete_drain(
-        &mut self,
-        service: &str,
-        instance_id: &str,
-    ) -> Option<InstanceEvent> {
+    pub fn complete_drain(&mut self, service: &str, instance_id: &str) -> Option<InstanceEvent> {
         let svc = self.services.get_mut(service)?;
         let inst = svc.instances.iter_mut().find(|i| i.id == instance_id)?;
 
@@ -399,8 +394,13 @@ impl ScaleManager {
 
         inst.state = InstanceState::Stopping;
 
-        let event = InstanceEvent::transition(instance_id, service, InstanceState::Draining, InstanceState::Stopping)
-            .with_message("Drain complete, stopping instance");
+        let event = InstanceEvent::transition(
+            instance_id,
+            service,
+            InstanceState::Draining,
+            InstanceState::Stopping,
+        )
+        .with_message("Drain complete, stopping instance");
         self.push_event(event.clone());
         Some(event)
     }
@@ -409,8 +409,7 @@ impl ScaleManager {
     pub fn is_drain_complete(&self, service: &str, instance_id: &str) -> bool {
         if let Some(svc) = self.services.get(service) {
             if let Some(inst) = svc.instances.iter().find(|i| i.id == instance_id) {
-                return inst.state == InstanceState::Draining
-                    && inst.health.inflight_requests == 0;
+                return inst.state == InstanceState::Draining && inst.health.inflight_requests == 0;
             }
         }
         false

@@ -35,7 +35,10 @@ impl VmManager {
     /// is healthy via a Frame Heartbeat round-trip. This is best-effort:
     /// if the exec socket never appears (e.g., older guest init without
     /// exec server), the VM still boots successfully.
-    pub(crate) async fn wait_for_exec_ready(&mut self, exec_socket_path: &std::path::Path) -> Result<()> {
+    pub(crate) async fn wait_for_exec_ready(
+        &mut self,
+        exec_socket_path: &std::path::Path,
+    ) -> Result<()> {
         const MAX_WAIT_MS: u64 = 10000;
         const POLL_INTERVAL_MS: u64 = 200;
 

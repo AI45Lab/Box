@@ -144,7 +144,11 @@ async fn execute_up(
         return Err(format!(
             "Project '{}' already has running services: {}. Run `compose down` first.",
             project_name,
-            names.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+            names
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         )
         .into());
     }
@@ -169,7 +173,11 @@ async fn execute_up(
         .map(|h| h.join(".a3s"))
         .unwrap_or_else(|| PathBuf::from(".a3s"));
 
-    println!("Starting project '{}' ({} services)...", project_name, project.service_order.len());
+    println!(
+        "Starting project '{}' ({} services)...",
+        project_name,
+        project.service_order.len()
+    );
 
     for svc_name in &project.service_order {
         let box_config = project.build_box_config(svc_name, Some(&default_net))?;
@@ -193,13 +201,16 @@ async fn execute_up(
         if let Ok(Some(mut net_config)) = net_store.get(&default_net) {
             if let Ok(endpoint) = net_config.connect(&box_id, &box_name) {
                 net_store.update(&net_config)?;
-                print!("  [+] {} (image={}, ip={})", svc_name, image, endpoint.ip_address);
+                print!(
+                    "  [+] {} (image={}, ip={})",
+                    svc_name, image, endpoint.ip_address
+                );
             }
         }
 
-        vm.boot().await.map_err(|e| {
-            format!("Failed to start service '{}': {}", svc_name, e)
-        })?;
+        vm.boot()
+            .await
+            .map_err(|e| format!("Failed to start service '{}': {}", svc_name, e))?;
 
         let pid = vm.pid().await;
 
@@ -234,9 +245,7 @@ async fn execute_up(
                 .and_then(|s| s.command.as_ref())
                 .map(|c| c.to_vec())
                 .unwrap_or_default(),
-            entrypoint: svc
-                .and_then(|s| s.entrypoint.as_ref())
-                .map(|e| e.to_vec()),
+            entrypoint: svc.and_then(|s| s.entrypoint.as_ref()).map(|e| e.to_vec()),
             box_dir: box_dir.clone(),
             exec_socket_path: box_dir.join("sockets").join("exec.sock"),
             console_log: box_dir.join("logs").join("console.log"),
@@ -315,7 +324,16 @@ async fn execute_down(
     let mut state = StateFile::load_default()?;
 
     // Find all boxes belonging to this project
-    let project_boxes: Vec<(String, String, Option<u32>, String, PathBuf, Option<String>, Vec<String>)> = state
+    #[allow(clippy::type_complexity)]
+    let project_boxes: Vec<(
+        String,
+        String,
+        Option<u32>,
+        String,
+        PathBuf,
+        Option<String>,
+        Vec<String>,
+    )> = state
         .find_by_label(LABEL_PROJECT, project_name)
         .iter()
         .map(|r| {
@@ -336,10 +354,16 @@ async fn execute_down(
         return Ok(());
     }
 
-    println!("Stopping project '{}' ({} services)...", project_name, project_boxes.len());
+    println!(
+        "Stopping project '{}' ({} services)...",
+        project_name,
+        project_boxes.len()
+    );
 
     // Stop in reverse order (last started = first stopped)
-    for (box_id, svc_name, pid, status, box_dir, network_name, volume_names) in project_boxes.iter().rev() {
+    for (box_id, svc_name, pid, status, box_dir, network_name, volume_names) in
+        project_boxes.iter().rev()
+    {
         print!("  [-] Stopping {}...", svc_name);
 
         // Kill the process if running
@@ -407,7 +431,10 @@ async fn execute_ps(project_name: &str) -> Result<(), Box<dyn std::error::Error>
         return Ok(());
     }
 
-    println!("{:<20} {:<30} {:<12} {:<10}", "SERVICE", "IMAGE", "STATUS", "PID");
+    println!(
+        "{:<20} {:<30} {:<12} {:<10}",
+        "SERVICE", "IMAGE", "STATUS", "PID"
+    );
     println!("{}", "-".repeat(72));
 
     for record in &boxes {

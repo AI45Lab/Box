@@ -1,6 +1,7 @@
 //! Tests for the build engine.
 
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 mod tests {
     use super::super::utils::*;
     use std::collections::HashMap;

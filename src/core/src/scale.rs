@@ -284,17 +284,15 @@ mod tests {
             accepted: true,
             current_replicas: 2,
             target_replicas: 3,
-            instances: vec![
-                InstanceInfo {
-                    id: "box-1".to_string(),
-                    state: InstanceState::Ready,
-                    service: "svc".to_string(),
-                    created_at: Utc::now(),
-                    ready_at: Some(Utc::now()),
-                    endpoint: Some("10.0.0.2:8080".to_string()),
-                    health: InstanceHealth::default(),
-                },
-            ],
+            instances: vec![InstanceInfo {
+                id: "box-1".to_string(),
+                state: InstanceState::Ready,
+                service: "svc".to_string(),
+                created_at: Utc::now(),
+                ready_at: Some(Utc::now()),
+                endpoint: Some("10.0.0.2:8080".to_string()),
+                health: InstanceHealth::default(),
+            }],
             error: None,
         };
         let json = serde_json::to_string(&resp).unwrap();

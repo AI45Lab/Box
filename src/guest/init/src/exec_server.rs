@@ -385,7 +385,11 @@ mod tests {
     fn test_execute_command_echo() {
         let output = execute_command(
             &["echo".to_string(), "hello".to_string()],
-            0, &[], None, None, None,
+            0,
+            &[],
+            None,
+            None,
+            None,
         );
         assert_eq!(output.exit_code, 0);
         assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hello");
@@ -396,7 +400,11 @@ mod tests {
     fn test_execute_command_nonexistent() {
         let output = execute_command(
             &["this_command_does_not_exist_a3s_test".to_string()],
-            0, &[], None, None, None,
+            0,
+            &[],
+            None,
+            None,
+            None,
         );
         assert_ne!(output.exit_code, 0);
         assert!(!output.stderr.is_empty());
@@ -413,7 +421,11 @@ mod tests {
     fn test_execute_command_non_zero_exit() {
         let output = execute_command(
             &["sh".to_string(), "-c".to_string(), "exit 42".to_string()],
-            0, &[], None, None, None,
+            0,
+            &[],
+            None,
+            None,
+            None,
         );
         assert_eq!(output.exit_code, 42);
     }
@@ -421,13 +433,22 @@ mod tests {
     #[test]
     fn test_execute_command_with_env() {
         let output = execute_command(
-            &["sh".to_string(), "-c".to_string(), "echo $TEST_VAR".to_string()],
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo $TEST_VAR".to_string(),
+            ],
             0,
             &["TEST_VAR=hello_from_env".to_string()],
-            None, None, None,
+            None,
+            None,
+            None,
         );
         assert_eq!(output.exit_code, 0);
-        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hello_from_env");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "hello_from_env"
+        );
     }
 
     #[test]
@@ -447,7 +468,11 @@ mod tests {
     fn test_execute_command_with_stdin() {
         let output = execute_command(
             &["cat".to_string()],
-            0, &[], None, Some(b"hello from stdin"), None,
+            0,
+            &[],
+            None,
+            Some(b"hello from stdin"),
+            None,
         );
         assert_eq!(output.exit_code, 0);
         assert_eq!(String::from_utf8_lossy(&output.stdout), "hello from stdin");

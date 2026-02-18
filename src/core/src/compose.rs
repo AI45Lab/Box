@@ -356,7 +356,10 @@ impl ComposeConfig {
     ) -> Result<(), String> {
         match state.get(name) {
             Some(1) => {
-                return Err(format!("Dependency cycle detected involving service '{}'", name));
+                return Err(format!(
+                    "Dependency cycle detected involving service '{}'",
+                    name
+                ));
             }
             Some(2) => return Ok(()), // already fully visited
             _ => {}
@@ -434,7 +437,10 @@ networks:
         let config = ComposeConfig::from_yaml_str(yaml).unwrap();
         assert_eq!(config.services.len(), 2);
         assert_eq!(config.volumes.len(), 2);
-        assert!(config.services["web"].depends_on.services().contains(&"db".to_string()));
+        assert!(config.services["web"]
+            .depends_on
+            .services()
+            .contains(&"db".to_string()));
         assert_eq!(config.services["web"].ports, vec!["8080:80"]);
         assert_eq!(config.services["db"].cpus, Some(2));
         assert_eq!(config.services["db"].mem_limit.as_deref(), Some("1g"));

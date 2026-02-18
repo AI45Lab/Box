@@ -88,9 +88,10 @@ impl PtyClient {
             frame_type: ft,
             payload: payload.to_vec(),
         };
-        self.writer.write_frame(&frame).await.map_err(|e| {
-            BoxError::ExecError(format!("PTY frame write failed: {}", e))
-        })
+        self.writer
+            .write_frame(&frame)
+            .await
+            .map_err(|e| BoxError::ExecError(format!("PTY frame write failed: {}", e)))
     }
 }
 

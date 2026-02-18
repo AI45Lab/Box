@@ -107,12 +107,16 @@ fn test_update_health() {
     mgr.register_instance("web", "box-1", None);
     mgr.update_state("web", "box-1", InstanceState::Ready);
 
-    mgr.update_health("web", "box-1", InstanceHealth {
-        cpu_percent: Some(50.0),
-        memory_bytes: Some(256 * 1024 * 1024),
-        inflight_requests: 2,
-        healthy: true,
-    });
+    mgr.update_health(
+        "web",
+        "box-1",
+        InstanceHealth {
+            cpu_percent: Some(50.0),
+            memory_bytes: Some(256 * 1024 * 1024),
+            inflight_requests: 2,
+            healthy: true,
+        },
+    );
 
     let ready = mgr.ready_instances("web");
     assert_eq!(ready.len(), 1);
@@ -307,24 +311,36 @@ fn test_service_health_with_instances() {
     mgr.update_state("web", "b2", InstanceState::Ready);
     mgr.update_state("web", "b3", InstanceState::Busy);
 
-    mgr.update_health("web", "b1", InstanceHealth {
-        cpu_percent: Some(30.0),
-        memory_bytes: Some(100),
-        inflight_requests: 0,
-        healthy: true,
-    });
-    mgr.update_health("web", "b2", InstanceHealth {
-        cpu_percent: Some(50.0),
-        memory_bytes: Some(200),
-        inflight_requests: 1,
-        healthy: true,
-    });
-    mgr.update_health("web", "b3", InstanceHealth {
-        cpu_percent: Some(80.0),
-        memory_bytes: Some(300),
-        inflight_requests: 5,
-        healthy: false,
-    });
+    mgr.update_health(
+        "web",
+        "b1",
+        InstanceHealth {
+            cpu_percent: Some(30.0),
+            memory_bytes: Some(100),
+            inflight_requests: 0,
+            healthy: true,
+        },
+    );
+    mgr.update_health(
+        "web",
+        "b2",
+        InstanceHealth {
+            cpu_percent: Some(50.0),
+            memory_bytes: Some(200),
+            inflight_requests: 1,
+            healthy: true,
+        },
+    );
+    mgr.update_health(
+        "web",
+        "b3",
+        InstanceHealth {
+            cpu_percent: Some(80.0),
+            memory_bytes: Some(300),
+            inflight_requests: 5,
+            healthy: false,
+        },
+    );
 
     let health = mgr.service_health("web");
     assert_eq!(health.active_instances, 3);
@@ -416,10 +432,14 @@ fn test_is_drain_complete() {
     mgr.update_state("web", "b1", InstanceState::Ready);
 
     // Set inflight to 0
-    mgr.update_health("web", "b1", InstanceHealth {
-        inflight_requests: 0,
-        ..Default::default()
-    });
+    mgr.update_health(
+        "web",
+        "b1",
+        InstanceHealth {
+            inflight_requests: 0,
+            ..Default::default()
+        },
+    );
     mgr.start_drain("web", "b1");
 
     assert!(mgr.is_drain_complete("web", "b1"));
@@ -431,10 +451,14 @@ fn test_is_drain_complete_with_inflight() {
     mgr.register_instance("web", "b1", None);
     mgr.update_state("web", "b1", InstanceState::Ready);
 
-    mgr.update_health("web", "b1", InstanceHealth {
-        inflight_requests: 3,
-        ..Default::default()
-    });
+    mgr.update_health(
+        "web",
+        "b1",
+        InstanceHealth {
+            inflight_requests: 3,
+            ..Default::default()
+        },
+    );
     mgr.start_drain("web", "b1");
 
     assert!(!mgr.is_drain_complete("web", "b1"));

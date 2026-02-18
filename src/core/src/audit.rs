@@ -136,7 +136,11 @@ impl AuditEvent {
     }
 
     /// Add a metadata key-value pair.
-    pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<serde_json::Value>) -> Self {
+    pub fn with_metadata(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<serde_json::Value>,
+    ) -> Self {
         self.metadata.insert(key.into(), value.into());
         self
     }
@@ -273,7 +277,7 @@ mod tests {
         };
         let json = serde_json::to_string(&config).unwrap();
         let parsed: AuditConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.enabled, false);
+        assert!(!parsed.enabled);
         assert_eq!(parsed.max_size, 100 * 1024 * 1024);
         assert_eq!(parsed.max_files, 5);
     }

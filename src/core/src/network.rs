@@ -189,7 +189,11 @@ impl NetworkPolicy {
     }
 
     /// Get the list of allowed peers for a box, given all peer names.
-    pub fn allowed_peers<'a>(&self, box_name: &str, peers: &'a [(String, String)]) -> Vec<&'a (String, String)> {
+    pub fn allowed_peers<'a>(
+        &self,
+        box_name: &str,
+        peers: &'a [(String, String)],
+    ) -> Vec<&'a (String, String)> {
         peers
             .iter()
             .filter(|(_, peer_name)| self.is_peer_allowed(box_name, peer_name))

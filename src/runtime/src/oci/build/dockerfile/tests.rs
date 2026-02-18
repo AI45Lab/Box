@@ -1,6 +1,7 @@
 //! Tests for Dockerfile parser.
 
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 mod tests {
     use super::super::*;
 
@@ -627,7 +628,8 @@ CMD ["app.py"]
 
     #[test]
     fn test_parse_healthcheck_json_cmd() {
-        let result = parsers::parse_healthcheck(r#"CMD ["curl", "-f", "http://localhost/"]"#, 1).unwrap();
+        let result =
+            parsers::parse_healthcheck(r#"CMD ["curl", "-f", "http://localhost/"]"#, 1).unwrap();
         if let Instruction::HealthCheck { cmd, .. } = &result {
             assert_eq!(
                 cmd.as_ref().unwrap(),

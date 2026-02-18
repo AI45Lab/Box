@@ -221,10 +221,14 @@ fn test_alpine_full_lifecycle() {
     // ---- Step 2: Run alpine with sleep (long-running process) ----
     println!("==> Step 2: Running alpine box...");
     run_ok(&[
-        "run", "-d",
-        "--name", box_name,
+        "run",
+        "-d",
+        "--name",
+        box_name,
         "docker.io/library/alpine:latest",
-        "--", "sleep", "3600",
+        "--",
+        "sleep",
+        "3600",
     ]);
     println!("    ✓ Box created");
 
@@ -281,8 +285,7 @@ fn test_alpine_full_lifecycle() {
     wait_for(
         || {
             let (stdout, _, _) = run_cmd_quiet(&["ps", "-a"]);
-            stdout.contains(box_name)
-                && (stdout.contains("stopped") || stdout.contains("exited"))
+            stdout.contains(box_name) && (stdout.contains("stopped") || stdout.contains("exited"))
         },
         Duration::from_secs(15),
         "box to appear as stopped",
@@ -316,10 +319,14 @@ fn test_exec_commands() {
 
     // Run alpine
     run_ok(&[
-        "run", "-d",
-        "--name", box_name,
+        "run",
+        "-d",
+        "--name",
+        box_name,
         "docker.io/library/alpine:latest",
-        "--", "sleep", "3600",
+        "--",
+        "sleep",
+        "3600",
     ]);
 
     wait_for_running(box_name, Duration::from_secs(30));
@@ -348,11 +355,16 @@ fn test_exec_commands() {
 
     // Test: write and read a file
     let (_, _, success) = run_cmd_capture(&[
-        "exec", box_name, "--",
-        "sh", "-c", "echo hello-a3s > /tmp/test.txt",
+        "exec",
+        box_name,
+        "--",
+        "sh",
+        "-c",
+        "echo hello-a3s > /tmp/test.txt",
     ]);
     if success {
-        let (stdout, _, success) = run_cmd_capture(&["exec", box_name, "--", "cat", "/tmp/test.txt"]);
+        let (stdout, _, success) =
+            run_cmd_capture(&["exec", box_name, "--", "cat", "/tmp/test.txt"]);
         if success {
             assert!(
                 stdout.trim() == "hello-a3s",
@@ -380,14 +392,22 @@ fn test_env_and_labels() {
 
     // Run with env vars and labels
     run_ok(&[
-        "run", "-d",
-        "--name", box_name,
-        "-e", "MY_APP=a3s-test",
-        "-e", "MY_VERSION=1.0",
-        "-l", "app=test",
-        "-l", "env=integration",
+        "run",
+        "-d",
+        "--name",
+        box_name,
+        "-e",
+        "MY_APP=a3s-test",
+        "-e",
+        "MY_VERSION=1.0",
+        "-l",
+        "app=test",
+        "-l",
+        "env=integration",
         "docker.io/library/alpine:latest",
-        "--", "sleep", "3600",
+        "--",
+        "sleep",
+        "3600",
     ]);
 
     wait_for_running(box_name, Duration::from_secs(30));
@@ -399,9 +419,8 @@ fn test_env_and_labels() {
 
     // Verify env vars inside the box
     std::thread::sleep(Duration::from_secs(2));
-    let (stdout, _, success) = run_cmd_capture(&[
-        "exec", box_name, "--", "sh", "-c", "echo $MY_APP",
-    ]);
+    let (stdout, _, success) =
+        run_cmd_capture(&["exec", box_name, "--", "sh", "-c", "echo $MY_APP"]);
     if success {
         assert!(
             stdout.trim() == "a3s-test",
@@ -411,9 +430,8 @@ fn test_env_and_labels() {
         println!("    ✓ Environment variable MY_APP set correctly");
     }
 
-    let (stdout, _, success) = run_cmd_capture(&[
-        "exec", box_name, "--", "sh", "-c", "echo $MY_VERSION",
-    ]);
+    let (stdout, _, success) =
+        run_cmd_capture(&["exec", box_name, "--", "sh", "-c", "echo $MY_VERSION"]);
     if success {
         assert!(
             stdout.trim() == "1.0",
@@ -453,9 +471,12 @@ fn test_nginx_image_pull_and_run() {
     // Run nginx (may fail due to backlog limitation)
     println!("==> Running nginx (may exit due to TSI backlog limitation)...");
     let (_, _, success) = run_cmd(&[
-        "run", "-d",
-        "--name", box_name,
-        "-p", "8088:80",
+        "run",
+        "-d",
+        "--name",
+        box_name,
+        "-p",
+        "8088:80",
         "docker.io/library/nginx:alpine",
     ]);
 

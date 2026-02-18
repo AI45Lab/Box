@@ -370,10 +370,7 @@ fn verify_cert_chain(vcek_der: &[u8], ask_der: &[u8], ark_der: &[u8]) -> bool {
 /// Extracts the tbsCertificate DER bytes from `cert`, the signature from
 /// `cert.signature`, and the public key from `issuer`, then performs
 /// ECDSA-P384-SHA384 verification.
-fn verify_cert_signature(
-    cert: &x509_cert::Certificate,
-    issuer: &x509_cert::Certificate,
-) -> bool {
+fn verify_cert_signature(cert: &x509_cert::Certificate, issuer: &x509_cert::Certificate) -> bool {
     use der::Encode;
     use p384::ecdsa::{signature::Verifier, DerSignature, VerifyingKey};
 
@@ -677,8 +674,8 @@ mod tests {
     /// Returns (vcek_der, ask_der, ark_der).
     fn make_test_cert_chain() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         use rcgen::{
-            CertificateParams, DistinguishedName, DnType, IsCa, BasicConstraints,
-            KeyPair, KeyUsagePurpose, PKCS_ECDSA_P384_SHA384,
+            BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair,
+            KeyUsagePurpose, PKCS_ECDSA_P384_SHA384,
         };
 
         // ARK (root CA, self-signed)
@@ -712,7 +709,9 @@ mod tests {
         vcek_params.distinguished_name = vcek_dn;
         vcek_params.is_ca = IsCa::NoCa;
         vcek_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
-        let vcek_cert = vcek_params.signed_by(&vcek_key, &ask_cert, &ask_key).unwrap();
+        let vcek_cert = vcek_params
+            .signed_by(&vcek_key, &ask_cert, &ask_key)
+            .unwrap();
 
         (
             vcek_cert.der().to_vec(),
@@ -1034,7 +1033,11 @@ mod tests {
             ..Default::default()
         };
         let mut failures = Vec::new();
-        assert!(check_report_age(&policy, Some(now_secs() - 9999), &mut failures));
+        assert!(check_report_age(
+            &policy,
+            Some(now_secs() - 9999),
+            &mut failures
+        ));
         assert!(failures.is_empty());
     }
 
@@ -1060,7 +1063,11 @@ mod tests {
         };
         let mut failures = Vec::new();
         // Issued 5 seconds ago
-        assert!(check_report_age(&policy, Some(now_secs() - 5), &mut failures));
+        assert!(check_report_age(
+            &policy,
+            Some(now_secs() - 5),
+            &mut failures
+        ));
         assert!(failures.is_empty());
     }
 
@@ -1073,7 +1080,11 @@ mod tests {
         };
         let mut failures = Vec::new();
         // Issued 120 seconds ago, max is 60
-        assert!(!check_report_age(&policy, Some(now_secs() - 120), &mut failures));
+        assert!(!check_report_age(
+            &policy,
+            Some(now_secs() - 120),
+            &mut failures
+        ));
         assert!(failures.len() == 1);
         assert!(failures[0].contains("too old"));
     }
@@ -1087,7 +1098,11 @@ mod tests {
         };
         let mut failures = Vec::new();
         // Issued in the future (clock skew)
-        assert!(!check_report_age(&policy, Some(now_secs() + 3600), &mut failures));
+        assert!(!check_report_age(
+            &policy,
+            Some(now_secs() + 3600),
+            &mut failures
+        ));
         assert!(failures[0].contains("future"));
     }
 
@@ -1100,7 +1115,11 @@ mod tests {
         };
         let mut failures = Vec::new();
         // Issued exactly at the boundary — age == max, should pass (not strictly greater)
-        assert!(check_report_age(&policy, Some(now_secs() - 60), &mut failures));
+        assert!(check_report_age(
+            &policy,
+            Some(now_secs() - 60),
+            &mut failures
+        ));
         assert!(failures.is_empty());
     }
 
@@ -1120,9 +1139,9 @@ mod tests {
             max_report_age_secs: Some(60),
             ..Default::default()
         };
-        let result = verify_attestation_with_time(
-            &report, &nonce, &policy, true, Some(now_secs() - 5),
-        ).unwrap();
+        let result =
+            verify_attestation_with_time(&report, &nonce, &policy, true, Some(now_secs() - 5))
+                .unwrap();
         assert!(result.verified);
         assert!(result.report_age_valid);
     }
@@ -1143,9 +1162,9 @@ mod tests {
             max_report_age_secs: Some(30),
             ..Default::default()
         };
-        let result = verify_attestation_with_time(
-            &report, &nonce, &policy, true, Some(now_secs() - 120),
-        ).unwrap();
+        let result =
+            verify_attestation_with_time(&report, &nonce, &policy, true, Some(now_secs() - 120))
+                .unwrap();
         assert!(!result.verified);
         assert!(!result.report_age_valid);
     }

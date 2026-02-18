@@ -207,7 +207,9 @@ pub(crate) fn parse_env_vars(vars: &[String]) -> Result<HashMap<String, String>,
 /// Load environment variables from a file.
 ///
 /// Each line should be KEY=VALUE. Empty lines and lines starting with '#' are skipped.
-pub(crate) fn parse_env_file(path: &str) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
+pub(crate) fn parse_env_file(
+    path: &str,
+) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read env file '{}': {}", path, e))?;
     let mut map = HashMap::new();
@@ -260,7 +262,9 @@ pub(crate) fn parse_memory_bytes(s: &str) -> Result<u64, String> {
 }
 
 /// Build ResourceLimits from common box args.
-pub(crate) fn build_resource_limits(args: &CommonBoxArgs) -> Result<ResourceLimits, Box<dyn std::error::Error>> {
+pub(crate) fn build_resource_limits(
+    args: &CommonBoxArgs,
+) -> Result<ResourceLimits, Box<dyn std::error::Error>> {
     let memory_reservation = match &args.memory_reservation {
         Some(s) => {
             Some(parse_memory_bytes(s).map_err(|e| format!("Invalid --memory-reservation: {e}"))?)

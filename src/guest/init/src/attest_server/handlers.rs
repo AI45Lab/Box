@@ -71,19 +71,13 @@ pub(super) fn handle_tls_connection(
                                 handle_process_request(&req.payload, &mut tls);
                             }
                             AttestRoute::Status => {
-                                send_data_response(
-                                    &mut tls,
-                                    b"{\"status\":\"ok\",\"tee\":true}",
-                                );
+                                send_data_response(&mut tls, b"{\"status\":\"ok\",\"tee\":true}");
                             }
                         }
                     }
                     Err(e) => {
                         debug!("RA-TLS invalid request JSON: {}", e);
-                        send_error_response(
-                            &mut tls,
-                            &format!("Invalid request JSON: {}", e),
-                        );
+                        send_error_response(&mut tls, &format!("Invalid request JSON: {}", e));
                     }
                 }
             }
@@ -206,7 +200,9 @@ pub(super) fn is_valid_secret_name(name: &str) -> bool {
         && !name.contains('/')
         && !name.contains('\0')
         && !name.starts_with('.')
-        && name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.')
+        && name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.')
 }
 
 // ============================================================================
@@ -288,9 +284,8 @@ fn handle_process_request(payload: &serde_json::Value, tls: &mut impl Write) {
         }
     };
 
-    let body = serde_json::to_vec(&response).unwrap_or_else(|_| {
-        b"{\"success\":false,\"error\":\"serialize\"}".to_vec()
-    });
+    let body = serde_json::to_vec(&response)
+        .unwrap_or_else(|_| b"{\"success\":false,\"error\":\"serialize\"}".to_vec());
     if response.success {
         send_data_response(tls, &body);
     } else {
@@ -310,9 +305,8 @@ fn forward_to_agent(req: &ProcessRequest) -> std::result::Result<String, String>
 
     let agent_addr = "127.0.0.1:8080";
 
-    let mut stream = TcpStream::connect(agent_addr).map_err(|e| {
-        format!("Cannot connect to agent at {}: {}", agent_addr, e)
-    })?;
+    let mut stream = TcpStream::connect(agent_addr)
+        .map_err(|e| format!("Cannot connect to agent at {}: {}", agent_addr, e))?;
 
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
@@ -354,8 +348,8 @@ fn forward_to_agent(req: &ProcessRequest) -> std::result::Result<String, String>
         .unwrap_or(&response_str);
 
     // Extract content from agent response JSON
-    let agent_resp: serde_json::Value = serde_json::from_str(body)
-        .map_err(|e| format!("Invalid agent response JSON: {}", e))?;
+    let agent_resp: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("Invalid agent response JSON: {}", e))?;
 
     agent_resp
         .get("content")
@@ -472,7 +466,10 @@ fn handle_seal_request(payload: &serde_json::Value, snp_report: &[u8], tls: &mut
     struct SingleNonce(Option<[u8; 12]>);
     impl NonceSequence for SingleNonce {
         fn advance(&mut self) -> std::result::Result<Nonce, ring::error::Unspecified> {
-            self.0.take().map(Nonce::assume_unique_for_key).ok_or(ring::error::Unspecified)
+            self.0
+                .take()
+                .map(Nonce::assume_unique_for_key)
+                .ok_or(ring::error::Unspecified)
         }
     }
 
@@ -496,7 +493,8 @@ fn handle_seal_request(payload: &serde_json::Value, snp_report: &[u8], tls: &mut
         context: req.context,
     };
 
-    let body = serde_json::to_vec(&response).unwrap_or_else(|_| b"{\"error\":\"serialize\"}".to_vec());
+    let body =
+        serde_json::to_vec(&response).unwrap_or_else(|_| b"{\"error\":\"serialize\"}".to_vec());
     send_data_response(tls, &body);
     info!("Sealed {} bytes of data", blob.len());
 }
@@ -560,15 +558,22 @@ fn handle_unseal_request(payload: &serde_json::Value, snp_report: &[u8], tls: &m
     struct SingleNonce(Option<[u8; 12]>);
     impl NonceSequence for SingleNonce {
         fn advance(&mut self) -> std::result::Result<Nonce, ring::error::Unspecified> {
-            self.0.take().map(Nonce::assume_unique_for_key).ok_or(ring::error::Unspecified)
+            self.0
+                .take()
+                .map(Nonce::assume_unique_for_key)
+                .ok_or(ring::error::Unspecified)
         }
     }
 
     let mut opening_key = aead::OpeningKey::new(unbound_key, SingleNonce(Some(nonce_bytes)));
-    let plaintext = match opening_key.open_in_place(Aad::from(req.context.as_bytes()), &mut in_out) {
+    let plaintext = match opening_key.open_in_place(Aad::from(req.context.as_bytes()), &mut in_out)
+    {
         Ok(pt) => pt,
         Err(_) => {
-            send_error_response(tls, "Unseal failed: TEE identity mismatch or data corrupted");
+            send_error_response(
+                tls,
+                "Unseal failed: TEE identity mismatch or data corrupted",
+            );
             return;
         }
     };
@@ -577,7 +582,8 @@ fn handle_unseal_request(payload: &serde_json::Value, snp_report: &[u8], tls: &m
         data: base64::engine::general_purpose::STANDARD.encode(plaintext),
     };
 
-    let body = serde_json::to_vec(&response).unwrap_or_else(|_| b"{\"error\":\"serialize\"}".to_vec());
+    let body =
+        serde_json::to_vec(&response).unwrap_or_else(|_| b"{\"error\":\"serialize\"}".to_vec());
     send_data_response(tls, &body);
     info!("Unsealed data successfully");
 }
@@ -659,11 +665,11 @@ pub(super) fn build_simulated_report(report_data: &[u8; super::SNP_USER_DATA_SIZ
     // policy at 0x08
     report[0x08..0x10].copy_from_slice(&0u64.to_le_bytes());
     // current_tcb at 0x38
-    report[0x38] = 3;   // boot_loader
-    report[0x39] = 0;   // tee
-    report[0x3E] = 8;   // snp
+    report[0x38] = 3; // boot_loader
+    report[0x39] = 0; // tee
+    report[0x3E] = 8; // snp
     report[0x3F] = 115; // microcode
-    // report_data at 0x50
+                        // report_data at 0x50
     report[0x50..0x90].copy_from_slice(report_data);
     // measurement at 0x90 (deterministic fake)
     for i in 0..48 {

@@ -24,7 +24,10 @@ mod utils;
 #[cfg(test)]
 mod tests;
 
-use handlers::{apply_base_config, execute_onbuild_trigger, handle_add, handle_copy, handle_run, instruction_to_string};
+use handlers::{
+    apply_base_config, execute_onbuild_trigger, handle_add, handle_copy, handle_run,
+    instruction_to_string,
+};
 use stages::{resolve_stage_rootfs, split_into_stages};
 use utils::{compute_diff_id, expand_args, format_size, resolve_path};
 

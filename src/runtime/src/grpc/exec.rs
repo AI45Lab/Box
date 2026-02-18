@@ -73,12 +73,14 @@ impl ExecClient {
             .read_frame()
             .await
             .map_err(|e| BoxError::ExecError(format!("Exec response read failed: {}", e)))?
-            .ok_or_else(|| BoxError::ExecError("Exec server closed without response".to_string()))?;
+            .ok_or_else(|| {
+                BoxError::ExecError("Exec server closed without response".to_string())
+            })?;
 
         match frame.frame_type {
             a3s_transport::FrameType::Data => {
-                let output: a3s_box_core::exec::ExecOutput =
-                    serde_json::from_slice(&frame.payload).map_err(|e| {
+                let output: a3s_box_core::exec::ExecOutput = serde_json::from_slice(&frame.payload)
+                    .map_err(|e| {
                         BoxError::ExecError(format!("Failed to parse exec response: {}", e))
                     })?;
                 Ok(output)
@@ -174,7 +176,9 @@ impl ExecClient {
             .read_frame()
             .await
             .map_err(|e| BoxError::ExecError(format!("File response read failed: {}", e)))?
-            .ok_or_else(|| BoxError::ExecError("Exec server closed without response".to_string()))?;
+            .ok_or_else(|| {
+                BoxError::ExecError("Exec server closed without response".to_string())
+            })?;
 
         match frame.frame_type {
             a3s_transport::FrameType::Data => {
@@ -303,7 +307,12 @@ impl StreamingExec {
     /// Collect all remaining output and return the final result with metrics.
     ///
     /// Consumes the stream, buffering all stdout/stderr until the command exits.
-    pub async fn collect(mut self) -> Result<(a3s_box_core::exec::ExecOutput, a3s_box_core::exec::ExecMetrics)> {
+    pub async fn collect(
+        mut self,
+    ) -> Result<(
+        a3s_box_core::exec::ExecOutput,
+        a3s_box_core::exec::ExecMetrics,
+    )> {
         use a3s_box_core::exec::{ExecEvent, ExecMetrics, ExecOutput};
 
         let mut stdout = Vec::new();

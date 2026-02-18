@@ -4,7 +4,7 @@
 //! then encrypts data using a key derived from the TEE's measurement and chip_id.
 //! The sealed blob can only be decrypted by the same TEE.
 
-use a3s_box_runtime::{SealClient, tee::AttestationPolicy};
+use a3s_box_runtime::{tee::AttestationPolicy, SealClient};
 use clap::Args;
 
 use crate::resolve;
@@ -67,8 +67,9 @@ pub async fn execute(args: SealArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // Read data from file or --data
     let data = match &args.file {
-        Some(path) => std::fs::read(path)
-            .map_err(|e| format!("Failed to read file '{}': {}", path, e))?,
+        Some(path) => {
+            std::fs::read(path).map_err(|e| format!("Failed to read file '{}': {}", path, e))?
+        }
         None => args.data.as_bytes().to_vec(),
     };
 
@@ -141,10 +142,7 @@ mod tests {
             normalize_policy("Measurement-And-Chip").unwrap(),
             "MeasurementAndChip"
         );
-        assert_eq!(
-            normalize_policy("CHIP-ONLY").unwrap(),
-            "ChipOnly"
-        );
+        assert_eq!(normalize_policy("CHIP-ONLY").unwrap(), "ChipOnly");
     }
 
     #[test]

@@ -69,9 +69,10 @@ impl AuditLog {
 
     /// Append an audit event to the log.
     pub fn log(&self, event: &AuditEvent) -> Result<()> {
-        let mut inner = self.inner.lock().map_err(|_| {
-            BoxError::Other("Audit log lock poisoned".to_string())
-        })?;
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| BoxError::Other("Audit log lock poisoned".to_string()))?;
 
         if !inner.config.enabled {
             return Ok(());
@@ -99,19 +100,16 @@ impl AuditLog {
         }
 
         // Serialize and write
-        let mut line = serde_json::to_string(event).map_err(|e| {
-            BoxError::Other(format!("Failed to serialize audit event: {}", e))
-        })?;
+        let mut line = serde_json::to_string(event)
+            .map_err(|e| BoxError::Other(format!("Failed to serialize audit event: {}", e)))?;
         line.push('\n');
 
         let bytes = line.as_bytes();
         if let Some(ref mut file) = inner.file {
-            file.write_all(bytes).map_err(|e| {
-                BoxError::Other(format!("Failed to write audit event: {}", e))
-            })?;
-            file.flush().map_err(|e| {
-                BoxError::Other(format!("Failed to flush audit log: {}", e))
-            })?;
+            file.write_all(bytes)
+                .map_err(|e| BoxError::Other(format!("Failed to write audit event: {}", e)))?;
+            file.flush()
+                .map_err(|e| BoxError::Other(format!("Failed to flush audit log: {}", e)))?;
         }
 
         inner.current_size += bytes.len() as u64;
@@ -190,16 +188,19 @@ pub fn read_audit_log(path: &Path, query: &AuditQuery) -> Result<Vec<AuditEvent>
     }
 
     let file = File::open(path).map_err(|e| {
-        BoxError::Other(format!("Failed to open audit log {}: {}", path.display(), e))
+        BoxError::Other(format!(
+            "Failed to open audit log {}: {}",
+            path.display(),
+            e
+        ))
     })?;
 
     let reader = BufReader::new(file);
     let mut events = Vec::new();
 
     for line in reader.lines() {
-        let line = line.map_err(|e| {
-            BoxError::Other(format!("Failed to read audit log line: {}", e))
-        })?;
+        let line =
+            line.map_err(|e| BoxError::Other(format!("Failed to read audit log line: {}", e)))?;
 
         if line.trim().is_empty() {
             continue;
@@ -296,9 +297,21 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let log = test_log(dir.path());
 
-        log.log(&AuditEvent::new(AuditAction::BoxCreate, AuditOutcome::Success)).unwrap();
-        log.log(&AuditEvent::new(AuditAction::BoxStop, AuditOutcome::Success)).unwrap();
-        log.log(&AuditEvent::new(AuditAction::BoxCreate, AuditOutcome::Failure)).unwrap();
+        log.log(&AuditEvent::new(
+            AuditAction::BoxCreate,
+            AuditOutcome::Success,
+        ))
+        .unwrap();
+        log.log(&AuditEvent::new(
+            AuditAction::BoxStop,
+            AuditOutcome::Success,
+        ))
+        .unwrap();
+        log.log(&AuditEvent::new(
+            AuditAction::BoxCreate,
+            AuditOutcome::Failure,
+        ))
+        .unwrap();
 
         let query = AuditQuery {
             action: Some(AuditAction::BoxCreate),
@@ -313,8 +326,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let log = test_log(dir.path());
 
-        log.log(&AuditEvent::new(AuditAction::BoxCreate, AuditOutcome::Success).with_box_id("a")).unwrap();
-        log.log(&AuditEvent::new(AuditAction::BoxCreate, AuditOutcome::Success).with_box_id("b")).unwrap();
+        log.log(&AuditEvent::new(AuditAction::BoxCreate, AuditOutcome::Success).with_box_id("a"))
+            .unwrap();
+        log.log(&AuditEvent::new(AuditAction::BoxCreate, AuditOutcome::Success).with_box_id("b"))
+            .unwrap();
 
         let query = AuditQuery {
             box_id: Some("a".to_string()),
@@ -330,9 +345,21 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let log = test_log(dir.path());
 
-        log.log(&AuditEvent::new(AuditAction::ImagePull, AuditOutcome::Success)).unwrap();
-        log.log(&AuditEvent::new(AuditAction::ImagePull, AuditOutcome::Failure)).unwrap();
-        log.log(&AuditEvent::new(AuditAction::ImagePull, AuditOutcome::Denied)).unwrap();
+        log.log(&AuditEvent::new(
+            AuditAction::ImagePull,
+            AuditOutcome::Success,
+        ))
+        .unwrap();
+        log.log(&AuditEvent::new(
+            AuditAction::ImagePull,
+            AuditOutcome::Failure,
+        ))
+        .unwrap();
+        log.log(&AuditEvent::new(
+            AuditAction::ImagePull,
+            AuditOutcome::Denied,
+        ))
+        .unwrap();
 
         let query = AuditQuery {
             outcome: Some(AuditOutcome::Failure),
@@ -348,7 +375,11 @@ mod tests {
         let log = test_log(dir.path());
 
         for _ in 0..10 {
-            log.log(&AuditEvent::new(AuditAction::ExecCommand, AuditOutcome::Success)).unwrap();
+            log.log(&AuditEvent::new(
+                AuditAction::ExecCommand,
+                AuditOutcome::Success,
+            ))
+            .unwrap();
         }
 
         let query = AuditQuery {
@@ -377,7 +408,11 @@ mod tests {
         };
         let log = AuditLog::new(&path, config).unwrap();
 
-        log.log(&AuditEvent::new(AuditAction::BoxCreate, AuditOutcome::Success)).unwrap();
+        log.log(&AuditEvent::new(
+            AuditAction::BoxCreate,
+            AuditOutcome::Success,
+        ))
+        .unwrap();
 
         // File should not exist or be empty
         let events = read_audit_log(&path, &AuditQuery::default()).unwrap();
@@ -411,8 +446,14 @@ mod tests {
     #[test]
     fn test_rotated_path() {
         let base = PathBuf::from("/var/log/audit.jsonl");
-        assert_eq!(rotated_path(&base, 1), PathBuf::from("/var/log/audit.jsonl.1"));
-        assert_eq!(rotated_path(&base, 10), PathBuf::from("/var/log/audit.jsonl.10"));
+        assert_eq!(
+            rotated_path(&base, 1),
+            PathBuf::from("/var/log/audit.jsonl.1")
+        );
+        assert_eq!(
+            rotated_path(&base, 10),
+            PathBuf::from("/var/log/audit.jsonl.10")
+        );
     }
 
     #[test]

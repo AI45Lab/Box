@@ -102,10 +102,7 @@ impl StreamingHandle {
             SessionKind::Attach => "attach",
             SessionKind::PortForward => "portforward",
         };
-        self.sessions
-            .write()
-            .await
-            .insert(token.clone(), session);
+        self.sessions.write().await.insert(token.clone(), session);
         format!("http://{}/{}/{}", self.addr, kind, token)
     }
 }
@@ -221,8 +218,8 @@ async fn handle_exec_oneshot(
         .map(|pos| &response_str[pos + 4..])
         .unwrap_or("");
 
-    let output: a3s_box_core::exec::ExecOutput = serde_json::from_str(body_str)
-        .unwrap_or(a3s_box_core::exec::ExecOutput {
+    let output: a3s_box_core::exec::ExecOutput =
+        serde_json::from_str(body_str).unwrap_or(a3s_box_core::exec::ExecOutput {
             stdout: vec![],
             stderr: b"Failed to parse exec response".to_vec(),
             exit_code: 1,
@@ -252,7 +249,8 @@ async fn handle_pty_stream(
     session: &StreamingSession,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Send HTTP 101 Switching Protocols
-    let upgrade = "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: SPDY/3.1\r\n\r\n";
+    let upgrade =
+        "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: SPDY/3.1\r\n\r\n";
     stream.write_all(upgrade.as_bytes()).await?;
 
     // Connect to guest PTY server
@@ -268,7 +266,12 @@ async fn handle_pty_stream(
         rows: 24,
     };
     let payload = serde_json::to_vec(&pty_req)?;
-    write_pty_frame(&mut pty_stream, a3s_box_core::pty::FRAME_PTY_REQUEST, &payload).await?;
+    write_pty_frame(
+        &mut pty_stream,
+        a3s_box_core::pty::FRAME_PTY_REQUEST,
+        &payload,
+    )
+    .await?;
 
     // Bidirectional copy between TCP stream and PTY Unix socket
     let (mut tcp_read, mut tcp_write) = tokio::io::split(stream);
@@ -283,7 +286,9 @@ async fn handle_pty_stream(
             }
             // Wrap as PTY data frame
             let len = n as u32;
-            pty_write.write_all(&[a3s_box_core::pty::FRAME_PTY_DATA]).await?;
+            pty_write
+                .write_all(&[a3s_box_core::pty::FRAME_PTY_DATA])
+                .await?;
             pty_write.write_all(&len.to_be_bytes()).await?;
             pty_write.write_all(&buf[..n]).await?;
         }
@@ -352,16 +357,14 @@ async fn handle_port_forward_stream(
     let port = session.ports[0];
 
     // Send HTTP 101 Switching Protocols
-    let upgrade = "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: SPDY/3.1\r\n\r\n";
+    let upgrade =
+        "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: SPDY/3.1\r\n\r\n";
     stream.write_all(upgrade.as_bytes()).await?;
 
     // Connect to the guest port via the exec socket (HTTP CONNECT-style)
     // We use the exec server to establish a TCP connection inside the guest
     let exec_req = a3s_box_core::exec::ExecRequest {
-        cmd: vec![
-            "socat".to_string(),
-            format!("STDIO TCP:127.0.0.1:{}", port),
-        ],
+        cmd: vec!["socat".to_string(), format!("STDIO TCP:127.0.0.1:{}", port)],
         timeout_ns: 0, // No timeout for port-forward
         env: vec![],
         working_dir: None,
@@ -432,7 +435,7 @@ async fn write_pty_frame(
 /// Simple base64 encoding for JSON output.
 fn base64_encode(data: &[u8]) -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut result = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut result = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };

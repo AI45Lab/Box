@@ -186,11 +186,16 @@ fn test_tee_seal_unseal_lifecycle() {
     // ---- Step 2: Run alpine with TEE simulation ----
     println!("==> Step 2: Running alpine box with --tee-simulate...");
     run_ok(&[
-        "run", "-d",
-        "--name", box_name,
-        "--tee", "--tee-simulate",
+        "run",
+        "-d",
+        "--name",
+        box_name,
+        "--tee",
+        "--tee-simulate",
         "docker.io/library/alpine:latest",
-        "--", "sleep", "3600",
+        "--",
+        "sleep",
+        "3600",
     ]);
     println!("    ✓ TEE box created");
 
@@ -204,10 +209,7 @@ fn test_tee_seal_unseal_lifecycle() {
 
     // ---- Step 4: Verify TEE attestation ----
     println!("==> Step 4: Verifying TEE attestation via RA-TLS...");
-    let stdout = run_ok_capture(&[
-        "attest", box_name,
-        "--ratls", "--allow-simulated",
-    ]);
+    let stdout = run_ok_capture(&["attest", box_name, "--ratls", "--allow-simulated"]);
     assert!(
         stdout.contains("\"verified\"") || stdout.contains("true"),
         "Attestation should succeed"
@@ -218,34 +220,45 @@ fn test_tee_seal_unseal_lifecycle() {
     println!("==> Step 5: Sealing sensitive data...");
     let sensitive_data = "API_KEY=sk-secret-12345-production";
     let seal_output = run_ok_capture(&[
-        "seal", box_name,
-        "--data", sensitive_data,
-        "--context", "api-keys",
-        "--policy", "measurement-and-chip",
+        "seal",
+        box_name,
+        "--data",
+        sensitive_data,
+        "--context",
+        "api-keys",
+        "--policy",
+        "measurement-and-chip",
         "--allow-simulated",
     ]);
 
     // Parse the sealed blob from JSON output
-    let seal_json: serde_json::Value = serde_json::from_str(&seal_output)
-        .expect("seal output should be valid JSON");
+    let seal_json: serde_json::Value =
+        serde_json::from_str(&seal_output).expect("seal output should be valid JSON");
     let sealed_blob = seal_json["blob"]
         .as_str()
         .expect("seal output should contain blob");
     assert!(!sealed_blob.is_empty(), "Sealed blob should not be empty");
-    println!("    ✓ Data sealed (blob length: {} chars)", sealed_blob.len());
+    println!(
+        "    ✓ Data sealed (blob length: {} chars)",
+        sealed_blob.len()
+    );
 
     // ---- Step 6: Unseal the data inside the same TEE ----
     println!("==> Step 6: Unsealing data inside TEE...");
     let unseal_output = run_ok_capture(&[
-        "unseal", box_name,
-        "--blob", sealed_blob,
-        "--context", "api-keys",
-        "--policy", "measurement-and-chip",
+        "unseal",
+        box_name,
+        "--blob",
+        sealed_blob,
+        "--context",
+        "api-keys",
+        "--policy",
+        "measurement-and-chip",
         "--allow-simulated",
     ]);
 
-    let unseal_json: serde_json::Value = serde_json::from_str(&unseal_output)
-        .expect("unseal output should be valid JSON");
+    let unseal_json: serde_json::Value =
+        serde_json::from_str(&unseal_output).expect("unseal output should be valid JSON");
     let unsealed_data = unseal_json["data"]
         .as_str()
         .expect("unseal output should contain data");
@@ -258,16 +271,17 @@ fn test_tee_seal_unseal_lifecycle() {
     // ---- Step 7: Verify wrong context fails ----
     println!("==> Step 7: Verifying wrong context fails...");
     let (_, _, success) = run_cmd_quiet(&[
-        "unseal", box_name,
-        "--blob", sealed_blob,
-        "--context", "wrong-context",
-        "--policy", "measurement-and-chip",
+        "unseal",
+        box_name,
+        "--blob",
+        sealed_blob,
+        "--context",
+        "wrong-context",
+        "--policy",
+        "measurement-and-chip",
         "--allow-simulated",
     ]);
-    assert!(
-        !success,
-        "Unseal with wrong context should fail"
-    );
+    assert!(!success, "Unseal with wrong context should fail");
     println!("    ✓ Wrong context correctly rejected");
 
     // ---- Step 8: Cleanup ----
@@ -293,11 +307,16 @@ fn test_tee_secret_injection() {
     // Run alpine with TEE simulation
     println!("==> Running alpine box with TEE simulation...");
     run_ok(&[
-        "run", "-d",
-        "--name", box_name,
-        "--tee", "--tee-simulate",
+        "run",
+        "-d",
+        "--name",
+        box_name,
+        "--tee",
+        "--tee-simulate",
         "docker.io/library/alpine:latest",
-        "--", "sleep", "3600",
+        "--",
+        "sleep",
+        "3600",
     ]);
 
     wait_for_running(box_name, Duration::from_secs(30));
@@ -307,15 +326,18 @@ fn test_tee_secret_injection() {
     // Inject secrets
     println!("==> Injecting secrets via RA-TLS...");
     let inject_output = run_ok_capture(&[
-        "inject-secret", box_name,
-        "--secret", "DB_PASSWORD=super-secret-db-pass",
-        "--secret", "API_TOKEN=tok-abc123",
+        "inject-secret",
+        box_name,
+        "--secret",
+        "DB_PASSWORD=super-secret-db-pass",
+        "--secret",
+        "API_TOKEN=tok-abc123",
         "--set-env",
         "--allow-simulated",
     ]);
 
-    let inject_json: serde_json::Value = serde_json::from_str(&inject_output)
-        .expect("inject output should be valid JSON");
+    let inject_json: serde_json::Value =
+        serde_json::from_str(&inject_output).expect("inject output should be valid JSON");
     let injected = inject_json["injected"]
         .as_u64()
         .expect("inject output should contain injected count");
@@ -326,13 +348,12 @@ fn test_tee_secret_injection() {
     println!("==> Verifying secrets inside guest...");
     std::thread::sleep(Duration::from_secs(1));
 
-    let (stdout, _, success) = run_cmd_quiet(&[
-        "exec", box_name, "--",
-        "cat", "/run/secrets/DB_PASSWORD",
-    ]);
+    let (stdout, _, success) =
+        run_cmd_quiet(&["exec", box_name, "--", "cat", "/run/secrets/DB_PASSWORD"]);
     if success {
         assert_eq!(
-            stdout.trim(), "super-secret-db-pass",
+            stdout.trim(),
+            "super-secret-db-pass",
             "Secret file should contain the injected value"
         );
         println!("    ✓ /run/secrets/DB_PASSWORD accessible");
@@ -340,10 +361,8 @@ fn test_tee_secret_injection() {
         println!("    ⚠ exec not available, skipping file verification");
     }
 
-    let (stdout, _, success) = run_cmd_quiet(&[
-        "exec", box_name, "--",
-        "cat", "/run/secrets/API_TOKEN",
-    ]);
+    let (stdout, _, success) =
+        run_cmd_quiet(&["exec", box_name, "--", "cat", "/run/secrets/API_TOKEN"]);
     if success {
         assert_eq!(stdout.trim(), "tok-abc123");
         println!("    ✓ /run/secrets/API_TOKEN accessible");
@@ -368,31 +387,36 @@ fn test_tee_seal_policies() {
     cleanup(box_name);
 
     run_ok(&[
-        "run", "-d",
-        "--name", box_name,
-        "--tee", "--tee-simulate",
+        "run",
+        "-d",
+        "--name",
+        box_name,
+        "--tee",
+        "--tee-simulate",
         "docker.io/library/alpine:latest",
-        "--", "sleep", "3600",
+        "--",
+        "sleep",
+        "3600",
     ]);
 
     wait_for_running(box_name, Duration::from_secs(30));
     std::thread::sleep(Duration::from_secs(3));
 
-    let policies = [
-        "measurement-and-chip",
-        "measurement-only",
-        "chip-only",
-    ];
+    let policies = ["measurement-and-chip", "measurement-only", "chip-only"];
 
     for policy in &policies {
         println!("==> Testing seal with policy: {}", policy);
         let data = format!("secret-for-{}", policy);
 
         let seal_output = run_ok_capture(&[
-            "seal", box_name,
-            "--data", &data,
-            "--context", "policy-test",
-            "--policy", policy,
+            "seal",
+            box_name,
+            "--data",
+            &data,
+            "--context",
+            "policy-test",
+            "--policy",
+            policy,
             "--allow-simulated",
         ]);
 
@@ -400,10 +424,14 @@ fn test_tee_seal_policies() {
         let blob = seal_json["blob"].as_str().unwrap();
 
         let unseal_output = run_ok_capture(&[
-            "unseal", box_name,
-            "--blob", blob,
-            "--context", "policy-test",
-            "--policy", policy,
+            "unseal",
+            box_name,
+            "--blob",
+            blob,
+            "--context",
+            "policy-test",
+            "--policy",
+            policy,
             "--allow-simulated",
         ]);
 

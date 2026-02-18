@@ -50,7 +50,9 @@ impl PressureWindow {
 
     /// Remove events outside the window.
     fn prune(&mut self) {
-        let cutoff = Instant::now().checked_sub(self.window).unwrap_or_else(Instant::now);
+        let cutoff = Instant::now()
+            .checked_sub(self.window)
+            .unwrap_or_else(Instant::now);
         while let Some(&(ts, _)) = self.events.front() {
             if ts < cutoff {
                 self.events.pop_front();
@@ -188,7 +190,7 @@ impl PoolScaler {
             None => return ScaleDecision::Hold,
         };
 
-        let decision = if miss_rate > self.policy.scale_up_threshold {
+        if miss_rate > self.policy.scale_up_threshold {
             // High miss rate → scale up
             let new_min = (self.current_min_idle + 1).min(self.max_min_idle);
             if new_min > self.current_min_idle {
@@ -210,9 +212,7 @@ impl PoolScaler {
             }
         } else {
             ScaleDecision::Hold
-        };
-
-        decision
+        }
     }
 }
 

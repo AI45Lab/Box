@@ -50,6 +50,12 @@ pub struct AutoscalerController {
     last_scale_down: Option<Instant>,
 }
 
+impl Default for AutoscalerController {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AutoscalerController {
     /// Create a new controller.
     pub fn new() -> Self {
@@ -113,7 +119,8 @@ impl AutoscalerController {
             );
 
             // Take the maximum across all metrics (most aggressive)
-            computed_desired = Some(computed_desired.map_or(desired, |prev: u32| prev.max(desired)));
+            computed_desired =
+                Some(computed_desired.map_or(desired, |prev: u32| prev.max(desired)));
 
             if desired > current_replicas {
                 reasons.push(format!(
@@ -211,7 +218,14 @@ impl AutoscalerController {
                 condition_type: "ScalingActive".to_string(),
                 status: "True".to_string(),
                 last_transition_time: Some(Utc::now()),
-                reason: format!("Scale{}", if result.direction == "up" { "Up" } else { "Down" }),
+                reason: format!(
+                    "Scale{}",
+                    if result.direction == "up" {
+                        "Up"
+                    } else {
+                        "Down"
+                    }
+                ),
                 message: format!(
                     "{} → {} replicas",
                     current_replicas, result.desired_replicas
@@ -445,8 +459,8 @@ mod tests {
         ];
 
         let metrics = ObservedMetrics {
-            avg_cpu_percent: Some(65.0),  // Within tolerance
-            total_inflight: Some(200),     // Way above target
+            avg_cpu_percent: Some(65.0), // Within tolerance
+            total_inflight: Some(200),   // Way above target
             ..Default::default()
         };
 

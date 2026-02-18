@@ -54,9 +54,9 @@ impl ComposeProject {
         }
 
         // Compute topological order
-        let service_order = config.service_order().map_err(|e| {
-            BoxError::Other(format!("Invalid compose config: {}", e))
-        })?;
+        let service_order = config
+            .service_order()
+            .map_err(|e| BoxError::Other(format!("Invalid compose config: {}", e)))?;
 
         Ok(Self {
             name,
@@ -87,12 +87,16 @@ impl ComposeProject {
         default_network: Option<&str>,
     ) -> Result<BoxConfig> {
         let svc = self.config.services.get(service_name).ok_or_else(|| {
-            BoxError::Other(format!("Service '{}' not found in compose config", service_name))
+            BoxError::Other(format!(
+                "Service '{}' not found in compose config",
+                service_name
+            ))
         })?;
 
-        let image = svc.image.as_deref().ok_or_else(|| {
-            BoxError::Other(format!("Service '{}' has no image", service_name))
-        })?;
+        let image = svc
+            .image
+            .as_deref()
+            .ok_or_else(|| BoxError::Other(format!("Service '{}' has no image", service_name)))?;
 
         // Parse memory limit
         let memory_mb = match &svc.mem_limit {
@@ -123,7 +127,11 @@ impl ComposeProject {
         let cmd = svc.command.as_ref().map(|c| c.to_vec()).unwrap_or_default();
         let entrypoint_override = svc.entrypoint.as_ref().and_then(|e| {
             let v = e.to_vec();
-            if v.is_empty() { None } else { Some(v) }
+            if v.is_empty() {
+                None
+            } else {
+                Some(v)
+            }
         });
 
         let config = BoxConfig {
@@ -219,13 +227,13 @@ fn parse_compose_memory(s: &str) -> Result<u32> {
         // KB → MB (round up)
         return n
             .parse::<u64>()
-            .map(|v| ((v + 1023) / 1024) as u32)
+            .map(|v| v.div_ceil(1024) as u32)
             .map_err(|_| BoxError::Other(format!("Invalid memory value: {}", s)));
     } else {
         // Assume bytes
         return s
             .parse::<u64>()
-            .map(|v| ((v + 1024 * 1024 - 1) / (1024 * 1024)) as u32)
+            .map(|v| v.div_ceil(1024 * 1024) as u32)
             .map_err(|_| BoxError::Other(format!("Invalid memory value: {}", s)));
     };
 
@@ -274,9 +282,21 @@ volumes:
         assert_eq!(project.name, "myapp");
         assert_eq!(project.service_order.len(), 3);
         // db must come before api, api before web
-        let db_pos = project.service_order.iter().position(|s| s == "db").unwrap();
-        let api_pos = project.service_order.iter().position(|s| s == "api").unwrap();
-        let web_pos = project.service_order.iter().position(|s| s == "web").unwrap();
+        let db_pos = project
+            .service_order
+            .iter()
+            .position(|s| s == "db")
+            .unwrap();
+        let api_pos = project
+            .service_order
+            .iter()
+            .position(|s| s == "api")
+            .unwrap();
+        let web_pos = project
+            .service_order
+            .iter()
+            .position(|s| s == "web")
+            .unwrap();
         assert!(db_pos < api_pos);
         assert!(api_pos < web_pos);
     }
@@ -361,7 +381,9 @@ networks:
             .build_box_config("db", Some("myapp_default"))
             .unwrap();
 
-        assert!(matches!(box_config.agent, AgentType::OciRegistry { ref reference } if reference == "postgres:16"));
+        assert!(
+            matches!(box_config.agent, AgentType::OciRegistry { ref reference } if reference == "postgres:16")
+        );
         assert_eq!(box_config.resources.vcpus, 2);
         assert_eq!(box_config.resources.memory_mb, 1024);
         assert_eq!(box_config.volumes, vec!["pgdata:/var/lib/postgresql/data"]);

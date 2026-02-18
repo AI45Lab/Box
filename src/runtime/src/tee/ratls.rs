@@ -53,11 +53,10 @@ const PUBKEY_HASH_SIZE: usize = 32;
 /// identity to the TEE attestation.
 ///
 /// Returns `(cert_der, private_key_der)`.
-pub fn generate_ratls_certificate(
-    report: &AttestationReport,
-) -> Result<(Vec<u8>, Vec<u8>)> {
+pub fn generate_ratls_certificate(report: &AttestationReport) -> Result<(Vec<u8>, Vec<u8>)> {
     use rcgen::{
-        CertificateParams, CustomExtension, DistinguishedName, DnType, KeyPair, PKCS_ECDSA_P384_SHA384,
+        CertificateParams, CustomExtension, DistinguishedName, DnType, KeyPair,
+        PKCS_ECDSA_P384_SHA384,
     };
 
     // Generate a new P-384 key pair for this certificate
@@ -74,20 +73,15 @@ pub fn generate_ratls_certificate(
     params.distinguished_name = dn;
 
     // Add SNP report as custom extension (non-critical)
-    let report_ext = CustomExtension::from_oid_content(
-        &oid_to_asn1(OID_SNP_REPORT),
-        report.report.clone(),
-    );
+    let report_ext =
+        CustomExtension::from_oid_content(&oid_to_asn1(OID_SNP_REPORT), report.report.clone());
     params.custom_extensions.push(report_ext);
 
     // Add certificate chain as custom extension (JSON-encoded)
     let chain_json = serde_json::to_vec(&report.cert_chain).map_err(|e| {
         BoxError::AttestationError(format!("Failed to serialize cert chain: {}", e))
     })?;
-    let chain_ext = CustomExtension::from_oid_content(
-        &oid_to_asn1(OID_CERT_CHAIN),
-        chain_json,
-    );
+    let chain_ext = CustomExtension::from_oid_content(&oid_to_asn1(OID_CERT_CHAIN), chain_json);
     params.custom_extensions.push(chain_ext);
 
     // Generate the self-signed certificate
@@ -117,13 +111,16 @@ fn compute_cert_pubkey_hash(cert_der: &[u8]) -> Result<[u8; PUBKEY_HASH_SIZE]> {
     use x509_cert::Certificate;
 
     let cert = Certificate::from_der(cert_der).map_err(|e| {
-        BoxError::AttestationError(format!("Failed to parse certificate for key binding: {}", e))
+        BoxError::AttestationError(format!(
+            "Failed to parse certificate for key binding: {}",
+            e
+        ))
     })?;
 
     let spki = &cert.tbs_certificate.subject_public_key_info;
-    let pub_key_der = spki.to_der().map_err(|e| {
-        BoxError::AttestationError(format!("Failed to encode SPKI to DER: {}", e))
-    })?;
+    let pub_key_der = spki
+        .to_der()
+        .map_err(|e| BoxError::AttestationError(format!("Failed to encode SPKI to DER: {}", e)))?;
 
     let hash = Sha256::digest(&pub_key_der);
     let mut out = [0u8; PUBKEY_HASH_SIZE];
@@ -182,7 +179,9 @@ pub fn extract_report_from_cert(cert_der: &[u8]) -> Result<AttestationReport> {
             } else if ext_oid == oid_der_to_dotted(&chain_oid)
                 || ext.extn_id.as_bytes() == chain_oid
             {
-                if let Ok(chain) = serde_json::from_slice::<CertificateChain>(ext.extn_value.as_bytes()) {
+                if let Ok(chain) =
+                    serde_json::from_slice::<CertificateChain>(ext.extn_value.as_bytes())
+                {
                     cert_chain = chain;
                 }
             }
@@ -196,8 +195,7 @@ pub fn extract_report_from_cert(cert_der: &[u8]) -> Result<AttestationReport> {
     })?;
 
     // Parse platform info from the report
-    let platform = super::attestation::parse_platform_info(&report)
-        .unwrap_or_default();
+    let platform = super::attestation::parse_platform_info(&report).unwrap_or_default();
 
     Ok(AttestationReport {
         report,
@@ -231,10 +229,7 @@ pub fn verify_ratls_certificate(
 ///
 /// The server presents the RA-TLS certificate (containing the SNP report)
 /// to connecting clients during the TLS handshake.
-pub fn create_server_config(
-    cert_der: &[u8],
-    key_der: &[u8],
-) -> Result<rustls::ServerConfig> {
+pub fn create_server_config(cert_der: &[u8], key_der: &[u8]) -> Result<rustls::ServerConfig> {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
     let cert = CertificateDer::from(cert_der.to_vec());
@@ -503,8 +498,7 @@ mod tests {
 
         let chain = CertificateChain::default();
         let chain_json = serde_json::to_vec(&chain).unwrap();
-        let chain_ext =
-            CustomExtension::from_oid_content(&oid_to_asn1(OID_CERT_CHAIN), chain_json);
+        let chain_ext = CustomExtension::from_oid_content(&oid_to_asn1(OID_CERT_CHAIN), chain_json);
         params.custom_extensions.push(chain_ext);
 
         let cert = params.self_signed(&key_pair).unwrap();
@@ -547,8 +541,7 @@ mod tests {
 
         let chain = CertificateChain::default();
         let chain_json = serde_json::to_vec(&chain).unwrap();
-        let chain_ext =
-            CustomExtension::from_oid_content(&oid_to_asn1(OID_CERT_CHAIN), chain_json);
+        let chain_ext = CustomExtension::from_oid_content(&oid_to_asn1(OID_CERT_CHAIN), chain_json);
         params.custom_extensions.push(chain_ext);
 
         let cert = params.self_signed(&key_pair).unwrap();

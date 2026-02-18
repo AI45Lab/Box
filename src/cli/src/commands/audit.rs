@@ -36,8 +36,13 @@ pub async fn execute(args: AuditArgs) -> Result<(), Box<dyn std::error::Error>> 
     // Parse action filter
     let action = match &args.action {
         Some(a) => {
-            let parsed: AuditAction = serde_json::from_str(&format!("\"{}\"", a))
-                .map_err(|_| format!("Unknown action '{}'. Examples: box_create, exec_command, image_pull", a))?;
+            let parsed: AuditAction =
+                serde_json::from_str(&format!("\"{}\"", a)).map_err(|_| {
+                    format!(
+                        "Unknown action '{}'. Examples: box_create, exec_command, image_pull",
+                        a
+                    )
+                })?;
             Some(parsed)
         }
         None => None,
@@ -74,8 +79,8 @@ pub async fn execute(args: AuditArgs) -> Result<(), Box<dyn std::error::Error>> 
         }
     } else {
         println!(
-            "{:<24} {:<18} {:<12} {:<10} {}",
-            "TIMESTAMP", "ACTION", "BOX", "OUTCOME", "MESSAGE"
+            "{:<24} {:<18} {:<12} {:<10} MESSAGE",
+            "TIMESTAMP", "ACTION", "BOX", "OUTCOME"
         );
         println!("{}", "-".repeat(80));
 
@@ -96,7 +101,10 @@ pub async fn execute(args: AuditArgs) -> Result<(), Box<dyn std::error::Error>> 
                 .to_string();
             let message = event.message.as_deref().unwrap_or("");
 
-            println!("{:<24} {:<18} {:<12} {:<10} {}", ts, action, box_id, outcome, message);
+            println!(
+                "{:<24} {:<18} {:<12} {:<10} {}",
+                ts, action, box_id, outcome, message
+            );
         }
 
         println!("\n{} event(s)", events.len());

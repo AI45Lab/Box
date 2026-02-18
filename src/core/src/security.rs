@@ -6,20 +6,15 @@
 use serde::{Deserialize, Serialize};
 
 /// Seccomp filter mode for the guest process.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SeccompMode {
     /// Apply the default seccomp profile (blocks dangerous syscalls).
+    #[default]
     Default,
     /// Disable seccomp filtering entirely.
     Unconfined,
     /// Use a custom seccomp profile from a JSON file path.
     Custom(String),
-}
-
-impl Default for SeccompMode {
-    fn default() -> Self {
-        Self::Default
-    }
 }
 
 /// Parsed security configuration for guest process enforcement.
@@ -73,9 +68,11 @@ impl SecurityConfig {
             };
         }
 
-        let mut config = Self::default();
-        config.cap_add = cap_add.to_vec();
-        config.cap_drop = cap_drop.to_vec();
+        let mut config = Self {
+            cap_add: cap_add.to_vec(),
+            cap_drop: cap_drop.to_vec(),
+            ..Self::default()
+        };
 
         for opt in security_opt {
             let opt = opt.trim();
@@ -322,7 +319,10 @@ mod tests {
         };
         let json = serde_json::to_string(&config).unwrap();
         let parsed: SecurityConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.seccomp, SeccompMode::Custom("/my/profile.json".to_string()));
+        assert_eq!(
+            parsed.seccomp,
+            SeccompMode::Custom("/my/profile.json".to_string())
+        );
         assert!(!parsed.no_new_privileges);
         assert_eq!(parsed.cap_add, vec!["NET_ADMIN"]);
         assert_eq!(parsed.cap_drop, vec!["ALL"]);

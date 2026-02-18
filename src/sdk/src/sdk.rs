@@ -136,7 +136,13 @@ impl BoxSdk {
                     .join("pty.sock")
             });
 
-        Ok(Sandbox::new(sandbox_id, sandbox_name, vm, exec_socket, pty_socket))
+        Ok(Sandbox::new(
+            sandbox_id,
+            sandbox_name,
+            vm,
+            exec_socket,
+            pty_socket,
+        ))
     }
 
     /// Build a BoxConfig from SandboxOptions.
@@ -194,11 +200,7 @@ impl BoxSdk {
             extra_env: env,
             volumes,
             port_map,
-            cmd: options
-                .workdir
-                .as_ref()
-                .map(|_| vec![])
-                .unwrap_or_default(),
+            cmd: options.workdir.as_ref().map(|_| vec![]).unwrap_or_default(),
             ..BoxConfig::default()
         })
     }

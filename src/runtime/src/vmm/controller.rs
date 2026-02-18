@@ -229,7 +229,6 @@ impl VmController {
             hint: Some("Build the shim with: cargo build -p a3s-box-shim".to_string()),
         })
     }
-
 }
 
 #[async_trait]

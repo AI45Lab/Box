@@ -101,11 +101,7 @@ impl KbsClient {
     }
 
     /// Build the attestation request payload.
-    pub fn build_request(
-        &self,
-        resource_path: &str,
-        evidence: &[u8],
-    ) -> KbsRequest {
+    pub fn build_request(&self, resource_path: &str, evidence: &[u8]) -> KbsRequest {
         use base64::Engine;
         KbsRequest {
             resource_path: resource_path.to_string(),
@@ -116,11 +112,7 @@ impl KbsClient {
     }
 
     /// Parse a KBS response and extract the secret.
-    pub fn parse_response(
-        &self,
-        resource_path: &str,
-        response: &KbsResponse,
-    ) -> Result<KbsSecret> {
+    pub fn parse_response(&self, resource_path: &str, response: &KbsResponse) -> Result<KbsSecret> {
         if !response.verified {
             return Err(BoxError::AttestationError(format!(
                 "KBS attestation verification failed: {}",
@@ -129,19 +121,14 @@ impl KbsClient {
         }
 
         let payload = response.payload.as_ref().ok_or_else(|| {
-            BoxError::AttestationError(
-                "KBS response verified but no payload returned".to_string(),
-            )
+            BoxError::AttestationError("KBS response verified but no payload returned".to_string())
         })?;
 
         use base64::Engine;
         let secret = base64::engine::general_purpose::STANDARD
             .decode(payload)
             .map_err(|e| {
-                BoxError::AttestationError(format!(
-                    "Failed to decode KBS payload: {}",
-                    e
-                ))
+                BoxError::AttestationError(format!("Failed to decode KBS payload: {}", e))
             })?;
 
         Ok(KbsSecret {
@@ -250,7 +237,9 @@ mod tests {
             token: Some("session-token".to_string()),
         };
 
-        let secret = client.parse_response("default/keys/test", &response).unwrap();
+        let secret = client
+            .parse_response("default/keys/test", &response)
+            .unwrap();
         assert_eq!(secret.resource_path, "default/keys/test");
         assert_eq!(secret.secret, secret_data);
         assert_eq!(secret.token, Some("session-token".to_string()));
@@ -270,7 +259,10 @@ mod tests {
 
         let result = client.parse_response("default/keys/test", &response);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("measurement mismatch"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("measurement mismatch"));
     }
 
     #[test]
@@ -340,10 +332,7 @@ mod tests {
             ..Default::default()
         };
         let client = KbsClient::new(config);
-        assert_eq!(
-            client.attest_url(),
-            "https://kbs.example.com/kbs/v0/attest"
-        );
+        assert_eq!(client.attest_url(), "https://kbs.example.com/kbs/v0/attest");
     }
 
     #[test]

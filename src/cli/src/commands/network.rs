@@ -123,7 +123,11 @@ async fn execute_create(args: CreateArgs) -> Result<(), Box<dyn std::error::Erro
         "none" => IsolationMode::None,
         "strict" => IsolationMode::Strict,
         "custom" => IsolationMode::Custom,
-        other => return Err(format!("Unknown isolation mode '{other}'. Use: none, strict, custom").into()),
+        other => {
+            return Err(
+                format!("Unknown isolation mode '{other}'. Use: none, strict, custom").into(),
+            )
+        }
     };
 
     // Parse labels
@@ -234,7 +238,8 @@ async fn execute_connect(args: ConnectArgs) -> Result<(), Box<dyn std::error::Er
         return Err(format!(
             "network '{}' has strict isolation — no new connections allowed",
             args.network
-        ).into());
+        )
+        .into());
     }
 
     let endpoint = config

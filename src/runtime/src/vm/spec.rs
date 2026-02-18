@@ -102,11 +102,7 @@ impl VmManager {
                     );
                     (exec, args, oci_config.env.clone())
                 }
-                None => (
-                    "/sbin/init".to_string(),
-                    vec![],
-                    vec![],
-                ),
+                None => ("/sbin/init".to_string(), vec![], vec![]),
             };
 
             // Build environment for guest init

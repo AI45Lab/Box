@@ -7,8 +7,7 @@ use a3s_box_core::error::{BoxError, Result};
 use super::super::dockerfile::Instruction;
 use super::super::layer::{create_layer, create_layer_from_dir, LayerInfo};
 use super::utils::{
-    copy_dir_recursive, expand_args, extract_tar_to_dst, is_tar_archive,
-    resolve_path,
+    copy_dir_recursive, expand_args, extract_tar_to_dst, is_tar_archive, resolve_path,
 };
 use super::BuildState;
 

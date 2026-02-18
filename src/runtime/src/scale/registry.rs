@@ -26,6 +26,12 @@ pub(super) struct RegistryEntry {
     pub(super) last_heartbeat: DateTime<Utc>,
 }
 
+impl Default for InstanceRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl InstanceRegistry {
     /// Create a new empty registry.
     pub fn new() -> Self {
@@ -128,11 +134,7 @@ impl InstanceRegistry {
 
     /// List all unique services in the registry.
     pub fn services(&self) -> Vec<String> {
-        let mut svcs: Vec<String> = self
-            .entries
-            .values()
-            .map(|e| e.service.clone())
-            .collect();
+        let mut svcs: Vec<String> = self.entries.values().map(|e| e.service.clone()).collect();
         svcs.sort();
         svcs.dedup();
         svcs

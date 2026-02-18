@@ -669,10 +669,10 @@ mod tests {
         assert!(filter.len() >= 3);
         // First instruction should be BPF_LD (load syscall number)
         assert_eq!(filter[0].code, 0x20); // BPF_LD | BPF_W | BPF_ABS
-        // Last instruction should be BPF_RET (deny)
+                                          // Last instruction should be BPF_RET (deny)
         let last = filter.last().unwrap();
         assert_eq!(last.code, 0x06); // BPF_RET | BPF_K
-        // Second to last should be BPF_RET (allow)
+                                     // Second to last should be BPF_RET (allow)
         let second_last = &filter[filter.len() - 2];
         assert_eq!(second_last.code, 0x06);
         assert_eq!(second_last.k, 0x7fff_0000); // SECCOMP_RET_ALLOW

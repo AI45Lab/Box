@@ -144,9 +144,10 @@ async fn connect_ratls(
     let server_name = rustls::pki_types::ServerName::try_from("localhost")
         .map_err(|e| BoxError::AttestationError(format!("Invalid server name: {}", e)))?;
 
-    connector.connect(server_name, stream).await.map_err(|e| {
-        BoxError::AttestationError(format!("RA-TLS handshake failed: {}", e))
-    })
+    connector
+        .connect(server_name, stream)
+        .await
+        .map_err(|e| BoxError::AttestationError(format!("RA-TLS handshake failed: {}", e)))
 }
 
 /// Client for verifying TEE attestation via RA-TLS handshake.
@@ -232,7 +233,10 @@ impl RaTlsAttestationClient {
         Ok(crate::tee::VerificationResult {
             verified: true,
             platform: crate::tee::PlatformInfo::default(),
-            policy_result: crate::tee::PolicyResult { passed: true, violations: vec![] },
+            policy_result: crate::tee::PolicyResult {
+                passed: true,
+                violations: vec![],
+            },
             signature_valid: true,
             cert_chain_valid: true,
             nonce_valid: true,
@@ -339,10 +343,7 @@ impl SecretInjector {
 
         let result: SecretInjectionResult =
             serde_json::from_slice(&response_data).map_err(|e| {
-                BoxError::AttestationError(format!(
-                    "Failed to parse injection response: {}",
-                    e
-                ))
+                BoxError::AttestationError(format!("Failed to parse injection response: {}", e))
             })?;
 
         Ok(result)
@@ -521,9 +522,10 @@ where
     let mut header = [0u8; 5];
     header[0] = frame_type;
     header[1..5].copy_from_slice(&len.to_be_bytes());
-    stream.write_all(&header).await.map_err(|e| {
-        BoxError::AttestationError(format!("TLS frame header write failed: {}", e))
-    })?;
+    stream
+        .write_all(&header)
+        .await
+        .map_err(|e| BoxError::AttestationError(format!("TLS frame header write failed: {}", e)))?;
     if !payload.is_empty() {
         stream.write_all(payload).await.map_err(|e| {
             BoxError::AttestationError(format!("TLS frame payload write failed: {}", e))

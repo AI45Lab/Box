@@ -4,7 +4,7 @@
 //! then injects secrets over the encrypted channel. Secrets are stored in
 //! `/run/secrets/<name>` inside the guest (tmpfs, mode 0600).
 
-use a3s_box_runtime::{SecretEntry, SecretInjector, tee::AttestationPolicy};
+use a3s_box_runtime::{tee::AttestationPolicy, SecretEntry, SecretInjector};
 use clap::Args;
 
 use crate::resolve;

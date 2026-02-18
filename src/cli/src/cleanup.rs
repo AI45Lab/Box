@@ -1,11 +1,7 @@
 //! Shared cleanup utilities for box resource teardown.
 
 /// Detach named volumes and disconnect from network for a box.
-pub fn cleanup_box_resources(
-    box_id: &str,
-    volume_names: &[String],
-    network_name: Option<&str>,
-) {
+pub fn cleanup_box_resources(box_id: &str, volume_names: &[String], network_name: Option<&str>) {
     // Detach named volumes
     super::commands::volume::detach_volumes(volume_names, box_id);
 

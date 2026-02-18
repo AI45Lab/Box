@@ -234,13 +234,9 @@ impl Sandbox {
             )));
         }
 
-        let data = response
-            .data
-            .ok_or_else(|| {
-                a3s_box_core::error::BoxError::ExecError(
-                    "Download response missing data".to_string(),
-                )
-            })?;
+        let data = response.data.ok_or_else(|| {
+            a3s_box_core::error::BoxError::ExecError("Download response missing data".to_string())
+        })?;
 
         base64::engine::general_purpose::STANDARD
             .decode(&data)
