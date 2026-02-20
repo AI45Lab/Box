@@ -34,8 +34,8 @@ A3S Box is application-agnostic. It doesn't know what runs inside — web server
 
 ### VM Runtime
 - **~200ms Cold Start** — MicroVM boot via libkrun (Apple HVF / Linux KVM)
-- **OCI Images** — Pull, push, build, tag, inspect, prune from any OCI registry with local LRU cache
-- **Dockerfile Build** — `a3s-box build` with multi-stage builds, all Dockerfile instructions
+- **OCI Images** — Pull, push, build, tag, inspect, prune from any OCI registry with local LRU cache; manifest digest exposed on every pulled image
+- **Dockerfile Build** — `a3s-box build` with multi-stage builds, all Dockerfile instructions, `ADD <url>` HTTP download, `ONBUILD` trigger inheritance
 - **Multi-Platform Build** — `--platform linux/amd64,linux/arm64` with OCI Image Index output
 - **Compose** — Multi-container orchestration via YAML (`compose up/down/ps/config`), dependency-ordered boot, shared networks
 - **Snapshot/Restore** — Configuration-based VM snapshots (`snapshot create/restore/ls/rm/inspect`), rootfs preservation
@@ -75,7 +75,7 @@ A3S Box is application-agnostic. It doesn't know what runs inside — web server
 - **Simulation Mode** — Full TEE workflow on any machine via `A3S_TEE_SIMULATE=1`
 
 ### Observability
-- **Prometheus Metrics** — 18 metrics auto-activated on every box boot: VM boot duration/count, CPU/memory, exec total/duration/errors, image pull, rootfs cache, warm pool
+- **Prometheus Metrics** — 19 metrics auto-activated on every box boot: VM boot duration/count, CPU/memory, exec total/duration/errors, image pull/build, rootfs cache, warm pool size/capacity/hits
 - **Tracing Spans** — OpenTelemetry-compatible spans for VM lifecycle (`vm_boot`, `prepare_layout`, `vm_start`, `wait_for_ready`), exec, and destroy
 
 ### Kubernetes Integration
@@ -307,13 +307,13 @@ All SDKs provide: async API, streaming exec, file transfer, sandbox lifecycle ma
 |-------|--------|---------|---------|------:|
 | `cli` | `a3s-box` | Docker-like CLI (52 commands) | 0.5.0 | 361 |
 | `core` | — | Config, error types, events | 0.5.0 | 331 |
-| `runtime` | — | VM lifecycle, OCI, attestation | 0.5.0 | 678 |
+| `runtime` | — | VM lifecycle, OCI, attestation | 0.5.0 | 711 |
 | `guest/init` | `a3s-box-guest-init` | Guest PID 1, exec/PTY/attestation servers | 0.5.0 | 25 |
 | `shim` | `a3s-box-shim` | libkrun bridge | 0.5.0 | 14 |
 | `cri` | `a3s-box-cri` | Kubernetes CRI runtime | 0.5.0 | 33 |
 | `sdk` | — | Embedded sandbox SDK | 0.5.0 | 24 |
 
-218 source files, ~1,466 unit tests, 7 integration tests.
+218 source files, ~1,499 unit tests, 7 integration tests.
 
 ### Vsock Port Allocation
 
@@ -391,13 +391,13 @@ All TEE code is implemented and unit-tested. Hardware validation on real AMD SEV
 
 ## Testing
 
-### Unit Tests — 1,466 passed
+### Unit Tests — 1,499 passed
 
 | Crate | Tests | Coverage |
 |-------|------:|----------|
 | `a3s-box-cli` | 361 | State management, name resolution, output formatting, restart policies, compose, audit, snapshot, network isolation, max restart count |
 | `a3s-box-core` | 331 | Config validation, error types, event serialization, TEE types (SEV-SNP + TDX), security config (AppArmor/SELinux warnings), compose types, network policies (validation), scale API types, operator CRD types, IPv6 IPAM, volume quota |
-| `a3s-box-runtime` | 678 | OCI parsing, rootfs, health checking, attestation, RA-TLS, sealed storage, Prometheus metrics, tracing spans, image signing (honest verification), compose orchestrator, audit log, snapshot store, KBS client, re-attestation, rollback protection, syslog driver, gzip log compression |
+| `a3s-box-runtime` | 711 | OCI parsing, rootfs, health checking, attestation, RA-TLS, sealed storage, Prometheus metrics, tracing spans, image signing (honest verification), compose orchestrator, audit log, snapshot store, KBS client, re-attestation, rollback protection, syslog driver, gzip log compression, manifest digest, ONBUILD trigger parsing |
 | `a3s-box-cri` | 33 | CRI sandbox/container lifecycle, config mapping (SEV-SNP + TDX) |
 | `a3s-box-guest-init` | 25 | Exec server, attest server frame I/O, secret validation, namespace security (user + cgroup), seccomp arch validation |
 | `a3s-box-sdk` | 24 | SDK init, config building, exec result conversion, port forwards, workspaces, serde roundtrip, pause/resume |
