@@ -238,7 +238,8 @@ mod tests {
         let store = Arc::new(ImageStore::new(tmp.path(), 10 * 1024 * 1024).unwrap());
         let metrics = crate::prom::RuntimeMetrics::new();
         // Verify set_metrics() returns Self (builder pattern) and metrics start at zero
-        let puller = ImagePuller::new(store, RegistryAuth::anonymous()).set_metrics(metrics.clone());
+        let puller =
+            ImagePuller::new(store, RegistryAuth::anonymous()).set_metrics(metrics.clone());
         assert!(puller.metrics.is_some());
         assert_eq!(metrics.image_pull_total.get(), 0);
         assert_eq!(metrics.image_pull_duration.get_sample_count(), 0);

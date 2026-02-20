@@ -47,6 +47,8 @@ pub struct BuildConfig {
     /// Target platforms for multi-platform builds.
     /// Empty means build for the host platform only.
     pub platforms: Vec<Platform>,
+    /// Prometheus metrics (optional).
+    pub metrics: Option<crate::prom::RuntimeMetrics>,
 }
 
 /// Result of a successful build.
@@ -612,6 +614,10 @@ pub async fn build(config: BuildConfig, store: Arc<ImageStore>) -> Result<BuildR
             format_size(result.size),
             target_platform,
         );
+    }
+
+    if let Some(ref m) = config.metrics {
+        m.image_build_total.inc();
     }
 
     Ok(result)

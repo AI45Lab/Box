@@ -151,6 +151,7 @@ impl WarmPool {
 
     /// Attach Prometheus metrics to this pool.
     pub fn set_metrics(&mut self, metrics: crate::prom::RuntimeMetrics) {
+        metrics.warm_pool_capacity.set(self.config.max_size as i64);
         self.metrics = Some(metrics);
     }
 

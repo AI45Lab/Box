@@ -86,6 +86,7 @@ pub async fn execute(args: BuildArgs) -> Result<(), Box<dyn std::error::Error>> 
         build_args,
         quiet: args.quiet,
         platforms,
+        metrics: None,
     };
 
     let result = a3s_box_runtime::oci::build::engine::build(config, store).await?;
