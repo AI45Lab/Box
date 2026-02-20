@@ -249,8 +249,14 @@ impl OciImage {
         let oci_config: ImageConfiguration = serde_json::from_str(&content)
             .map_err(|e| BoxError::OciImageError(format!("Failed to parse config: {}", e)))?;
 
-        // Convert to our config type
-        Ok(OciImageConfig::from_oci_config(&oci_config))
+        // oci-spec 0.6 does not model OnBuild — parse it directly from raw JSON.
+        let onbuild: Vec<String> = serde_json::from_str::<serde_json::Value>(&content)
+            .ok()
+            .and_then(|v| v.get("config").and_then(|c| c.get("OnBuild")).cloned())
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default();
+
+        Ok(OciImageConfig::from_oci_config(&oci_config, onbuild))
     }
 
     /// Get the path to a blob by digest.
@@ -269,7 +275,7 @@ impl OciImage {
 
 impl OciImageConfig {
     /// Create from OCI spec ImageConfiguration.
-    fn from_oci_config(oci_config: &ImageConfiguration) -> Self {
+    fn from_oci_config(oci_config: &ImageConfiguration, onbuild: Vec<String>) -> Self {
         let config = oci_config.config();
 
         let entrypoint = config.as_ref().and_then(|c| c.entrypoint().clone());
@@ -319,9 +325,8 @@ impl OciImageConfig {
         // Parse stop signal
         let stop_signal = config.as_ref().and_then(|c| c.stop_signal().clone());
 
-        // Parse ONBUILD triggers
-        // oci_spec doesn't expose OnBuild directly, parse from raw JSON
-        let onbuild = Vec::new(); // Will be populated from raw config if needed
+        // Parse ONBUILD triggers — passed in from load_config which reads raw JSON
+        // because oci-spec 0.6 does not model the OnBuild field.
 
         // Parse health check from raw config JSON
         // oci_spec doesn't expose Healthcheck directly, so we leave it None
@@ -577,7 +582,7 @@ mod tests {
         }"#;
         let oci_config: oci_spec::image::ImageConfiguration =
             serde_json::from_str(config_json).unwrap();
-        let config = OciImageConfig::from_oci_config(&oci_config);
+        let config = OciImageConfig::from_oci_config(&oci_config, Vec::new());
         assert_eq!(config.volumes.len(), 2);
         assert!(config.volumes.contains(&"/data".to_string()));
         assert!(config.volumes.contains(&"/var/log".to_string()));
@@ -597,8 +602,47 @@ mod tests {
         }"#;
         let oci_config: oci_spec::image::ImageConfiguration =
             serde_json::from_str(config_json).unwrap();
-        let config = OciImageConfig::from_oci_config(&oci_config);
+        let config = OciImageConfig::from_oci_config(&oci_config, Vec::new());
         assert!(config.volumes.is_empty());
+    }
+
+    #[test]
+    fn test_load_config_parses_onbuild_triggers() {
+        // Verify that OnBuild entries in the raw OCI config JSON are parsed
+        // and surfaced in OciImageConfig.onbuild (oci-spec 0.6 doesn't model this field).
+        let temp_dir = TempDir::new().unwrap();
+        fs::create_dir_all(temp_dir.path().join("blobs/sha256")).unwrap();
+        fs::write(temp_dir.path().join("oci-layout"), r#"{"imageLayoutVersion":"1.0.0"}"#).unwrap();
+
+        let config_content = r#"{
+            "architecture": "amd64",
+            "os": "linux",
+            "config": {
+                "OnBuild": ["RUN echo hello", "COPY . /app"]
+            },
+            "rootfs": {"type": "layers", "diff_ids": []},
+            "history": []
+        }"#;
+        let config_hash = "onbuildcfg001";
+        fs::write(temp_dir.path().join("blobs/sha256").join(config_hash), config_content).unwrap();
+
+        let manifest_content = format!(
+            r#"{{"schemaVersion":2,"config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:{}","size":{}}},"layers":[]}}"#,
+            config_hash,
+            config_content.len()
+        );
+        let manifest_hash = "onbuildmfst001";
+        fs::write(temp_dir.path().join("blobs/sha256").join(manifest_hash), &manifest_content).unwrap();
+
+        let index_content = format!(
+            r#"{{"schemaVersion":2,"manifests":[{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:{}","size":{}}}]}}"#,
+            manifest_hash,
+            manifest_content.len()
+        );
+        fs::write(temp_dir.path().join("index.json"), index_content).unwrap();
+
+        let image = OciImage::from_path(temp_dir.path()).unwrap();
+        assert_eq!(image.config().onbuild, vec!["RUN echo hello", "COPY . /app"]);
     }
 
     // Helper function to create a test layer (minimal tar.gz)
