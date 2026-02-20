@@ -22,6 +22,9 @@ pub struct OciImage {
     /// Root directory of the OCI image layout
     root_dir: PathBuf,
 
+    /// Manifest digest (e.g. "sha256:abc123...")
+    manifest_digest: String,
+
     /// Image configuration
     config: OciImageConfig,
 
@@ -117,6 +120,7 @@ impl OciImage {
 
         Ok(Self {
             root_dir,
+            manifest_digest,
             config,
             layer_paths,
         })
@@ -135,6 +139,11 @@ impl OciImage {
     /// Get the root directory of the OCI image.
     pub fn root_dir(&self) -> &Path {
         &self.root_dir
+    }
+
+    /// Get the manifest digest (e.g. `"sha256:abc123..."`).
+    pub fn manifest_digest(&self) -> &str {
+        &self.manifest_digest
     }
 
     /// Get the entrypoint command.
@@ -439,6 +448,14 @@ mod tests {
 
         // Verify layer paths
         assert_eq!(image.layer_paths().len(), 1);
+    }
+
+    #[test]
+    fn test_from_path_exposes_manifest_digest() {
+        let temp_dir = TempDir::new().unwrap();
+        create_complete_oci_image(temp_dir.path());
+        let image = OciImage::from_path(temp_dir.path()).unwrap();
+        assert_eq!(image.manifest_digest(), "sha256:manifestxyz789");
     }
 
     #[test]

@@ -175,7 +175,7 @@ impl a3s_box_core::traits::ImageRegistry for ImagePuller {
         let parsed = ImageReference::parse(reference)?;
         Ok(a3s_box_core::traits::PulledImage {
             path: image.root_dir().to_path_buf(),
-            digest: String::new(), // digest not exposed by OciImage
+            digest: image.manifest_digest().to_string(),
             reference: parsed.full_reference(),
         })
     }
@@ -185,7 +185,7 @@ impl a3s_box_core::traits::ImageRegistry for ImagePuller {
         let parsed = ImageReference::parse(reference)?;
         Ok(a3s_box_core::traits::PulledImage {
             path: image.root_dir().to_path_buf(),
-            digest: String::new(),
+            digest: image.manifest_digest().to_string(),
             reference: parsed.full_reference(),
         })
     }
