@@ -17,6 +17,7 @@ use super::store::ImageStore;
 pub struct ImagePuller {
     store: Arc<ImageStore>,
     puller: RegistryPuller,
+    metrics: Option<crate::prom::RuntimeMetrics>,
 }
 
 impl ImagePuller {
@@ -25,7 +26,14 @@ impl ImagePuller {
         Self {
             store,
             puller: RegistryPuller::with_auth(auth),
+            metrics: None,
         }
+    }
+
+    /// Attach Prometheus metrics to this puller.
+    pub fn set_metrics(mut self, metrics: crate::prom::RuntimeMetrics) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Set the signature verification policy for image pulls.
@@ -130,7 +138,13 @@ impl ImagePuller {
             })?;
         }
 
+        let pull_start = std::time::Instant::now();
         self.puller.pull(reference, &tmp_dir).await?;
+        if let Some(ref m) = self.metrics {
+            m.image_pull_total.inc();
+            m.image_pull_duration
+                .observe(pull_start.elapsed().as_secs_f64());
+        }
 
         // Store in the image store
         let stored = self.store.put(&full_ref, &digest, &tmp_dir).await?;
@@ -216,5 +230,17 @@ mod tests {
         let store = Arc::new(ImageStore::new(tmp.path(), 10 * 1024 * 1024).unwrap());
         let puller = ImagePuller::new(store, RegistryAuth::anonymous());
         assert!(!puller.is_cached("").await);
+    }
+
+    #[test]
+    fn test_set_metrics_attaches_to_puller() {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(ImageStore::new(tmp.path(), 10 * 1024 * 1024).unwrap());
+        let metrics = crate::prom::RuntimeMetrics::new();
+        // Verify set_metrics() returns Self (builder pattern) and metrics start at zero
+        let puller = ImagePuller::new(store, RegistryAuth::anonymous()).set_metrics(metrics.clone());
+        assert!(puller.metrics.is_some());
+        assert_eq!(metrics.image_pull_total.get(), 0);
+        assert_eq!(metrics.image_pull_duration.get_sample_count(), 0);
     }
 }

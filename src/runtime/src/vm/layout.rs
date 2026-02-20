@@ -57,10 +57,13 @@ impl VmManager {
         let reference = &self.config.image;
         let images_dir = self.home_dir.join("images");
         let store = crate::oci::ImageStore::new(&images_dir, crate::DEFAULT_IMAGE_CACHE_SIZE)?;
-        let puller = crate::oci::ImagePuller::new(
+        let mut puller = crate::oci::ImagePuller::new(
             std::sync::Arc::new(store),
             crate::oci::RegistryAuth::from_env(),
         );
+        if let Some(ref m) = self.prom {
+            puller = puller.set_metrics(m.clone());
+        }
 
         tracing::info!(reference = %reference, "Pulling OCI image from registry");
 
@@ -78,6 +81,9 @@ impl VmManager {
                     provider = self.rootfs_provider.name(),
                     "Rootfs cache hit"
                 );
+                if let Some(ref prom) = self.prom {
+                    prom.rootfs_cache_hits.inc();
+                }
                 let rootfs_path = self.rootfs_provider.prepare(&box_dir, &cached_path)?;
                 let builder = OciRootfsBuilder::new(&rootfs_path).with_image(&image_path);
                 (rootfs_path, Some(builder.image_config()?))
@@ -86,6 +92,9 @@ impl VmManager {
                     image = %image_path.display(),
                     "Building rootfs from pulled OCI image (cache miss)"
                 );
+                if let Some(ref prom) = self.prom {
+                    prom.rootfs_cache_misses.inc();
+                }
 
                 let rootfs_path = box_dir.join("rootfs");
                 let mut builder = OciRootfsBuilder::new(&rootfs_path).with_image(&image_path);

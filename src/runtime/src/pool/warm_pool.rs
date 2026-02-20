@@ -73,6 +73,8 @@ pub struct WarmPool {
     shutdown_rx: watch::Receiver<bool>,
     /// Autoscaler for dynamic min_idle adjustment (None if scaling disabled).
     scaler: Option<Arc<Mutex<PoolScaler>>>,
+    /// Prometheus metrics (optional).
+    metrics: Option<crate::prom::RuntimeMetrics>,
 }
 
 impl WarmPool {
@@ -127,6 +129,7 @@ impl WarmPool {
             shutdown_tx,
             shutdown_rx,
             scaler,
+            metrics: None,
         };
 
         // Initial fill
@@ -146,6 +149,11 @@ impl WarmPool {
         Ok(pool)
     }
 
+    /// Attach Prometheus metrics to this pool.
+    pub fn set_metrics(&mut self, metrics: crate::prom::RuntimeMetrics) {
+        self.metrics = Some(metrics);
+    }
+
     /// Acquire a ready VM from the pool.
     ///
     /// If an idle VM is available, returns it immediately.
@@ -162,6 +170,11 @@ impl WarmPool {
                 // Record hit for autoscaler
                 if let Some(ref scaler) = self.scaler {
                     scaler.lock().await.record_acquire(true);
+                }
+
+                if let Some(ref m) = self.metrics {
+                    m.warm_pool_hits.inc();
+                    m.warm_pool_size.set(idle.len() as i64);
                 }
 
                 self.event_emitter.emit(BoxEvent::with_string(
@@ -185,6 +198,10 @@ impl WarmPool {
         // Record miss for autoscaler
         if let Some(ref scaler) = self.scaler {
             scaler.lock().await.record_acquire(false);
+        }
+
+        if let Some(ref m) = self.metrics {
+            m.warm_pool_misses.inc();
         }
 
         let vm = self.boot_new_vm().await?;
@@ -223,6 +240,10 @@ impl WarmPool {
         let mut stats = self.stats.lock().await;
         stats.total_released += 1;
         stats.idle_count = idle.len();
+
+        if let Some(ref m) = self.metrics {
+            m.warm_pool_size.set(idle.len() as i64);
+        }
 
         self.event_emitter.emit(BoxEvent::with_string(
             "pool.vm.released",
@@ -826,4 +847,25 @@ mod tests {
     // in integration tests with the full box environment. The unit tests here
     // validate configuration, statistics, error handling, and pool lifecycle
     // with min_idle=0 (no VM boot required).
+
+    #[tokio::test]
+    async fn test_pool_set_metrics_attaches() {
+        let config = test_pool_config(0, 5);
+        let result = WarmPool::start(config, BoxConfig::default(), test_event_emitter()).await;
+        match result {
+            Ok(mut pool) => {
+                let metrics = crate::prom::RuntimeMetrics::new();
+                pool.set_metrics(metrics.clone());
+                assert!(pool.metrics.is_some());
+                // Metrics start at zero
+                assert_eq!(metrics.warm_pool_hits.get(), 0);
+                assert_eq!(metrics.warm_pool_misses.get(), 0);
+                assert_eq!(metrics.warm_pool_size.get(), 0);
+                let _ = pool.drain().await;
+            }
+            Err(_) => {
+                // Boot failure is acceptable in unit test environment
+            }
+        }
+    }
 }

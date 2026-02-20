@@ -625,11 +625,24 @@ impl VmManager {
 
     /// Get VM metrics.
     pub async fn metrics(&self) -> Option<crate::vmm::VmMetrics> {
-        self.handler
+        let vm_metrics = self
+            .handler
             .read()
             .await
             .as_ref()
-            .map(|handler| handler.metrics())
+            .map(|handler| handler.metrics())?;
+
+        // Update per-VM Prometheus gauges if metrics are attached
+        if let Some(ref prom) = self.prom {
+            prom.vm_cpu_percent
+                .with_label_values(&[&self.box_id])
+                .set(vm_metrics.cpu_percent.unwrap_or(0.0) as f64);
+            prom.vm_memory_bytes
+                .with_label_values(&[&self.box_id])
+                .set(vm_metrics.memory_bytes.unwrap_or(0) as f64);
+        }
+
+        Some(vm_metrics)
     }
 
     /// Get the PID of the VM shim process.
