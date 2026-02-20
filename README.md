@@ -258,9 +258,9 @@ Capabilities:
 
 | SDK | Package | Version | Tests |
 |-----|---------|---------|------:|
-| Python | `pip install a3s-box` | 0.5.0 | 25 |
-| TypeScript | `npm install @a3s-lab/box` | 0.5.0 | 21 |
-| Rust | `a3s-box-sdk` crate | 0.5.0 | 24 |
+| Python | `pip install a3s-box` | 0.5.3 | 25 |
+| TypeScript | `npm install @a3s-lab/box` | 0.5.3 | 21 |
+| Rust | `a3s-box-sdk` crate | 0.5.3 | 24 |
 
 All SDKs provide: async API, streaming exec, file transfer, sandbox lifecycle management.
 
@@ -305,13 +305,13 @@ All SDKs provide: async API, streaming exec, file transfer, sandbox lifecycle ma
 
 | Crate | Binary | Purpose | Version | Tests |
 |-------|--------|---------|---------|------:|
-| `cli` | `a3s-box` | Docker-like CLI (52 commands) | 0.5.0 | 361 |
-| `core` | — | Config, error types, events | 0.5.0 | 331 |
-| `runtime` | — | VM lifecycle, OCI, attestation | 0.5.0 | 711 |
-| `guest/init` | `a3s-box-guest-init` | Guest PID 1, exec/PTY/attestation servers | 0.5.0 | 25 |
-| `shim` | `a3s-box-shim` | libkrun bridge | 0.5.0 | 14 |
-| `cri` | `a3s-box-cri` | Kubernetes CRI runtime | 0.5.0 | 33 |
-| `sdk` | — | Embedded sandbox SDK | 0.5.0 | 24 |
+| `cli` | `a3s-box` | Docker-like CLI (52 commands) | 0.5.3 | 361 |
+| `core` | — | Config, error types, events | 0.5.3 | 331 |
+| `runtime` | — | VM lifecycle, OCI, attestation | 0.5.3 | 711 |
+| `guest/init` | `a3s-box-guest-init` | Guest PID 1, exec/PTY/attestation servers | 0.5.3 | 25 |
+| `shim` | `a3s-box-shim` | libkrun bridge | 0.5.3 | 14 |
+| `cri` | `a3s-box-cri` | Kubernetes CRI runtime | 0.5.3 | 33 |
+| `sdk` | — | Embedded sandbox SDK | 0.5.3 | 24 |
 
 218 source files, ~1,499 unit tests, 7 integration tests.
 
@@ -476,7 +476,7 @@ helm install a3s-box deploy/helm/a3s-box/ -n a3s-box-system --create-namespace
 
 # Custom values
 helm install a3s-box deploy/helm/a3s-box/ -n a3s-box-system --create-namespace \
-  --set image.tag=v0.5.0 \
+  --set image.tag=v0.5.3 \
   --set config.logLevel=debug \
   --set config.imageCacheSize=21474836480 \
   --set resources.limits.memory=1Gi

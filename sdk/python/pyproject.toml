@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "a3s-box"
-version = "0.5.2"
+version = "0.5.3"
 description = "Python bindings for A3S Box MicroVM sandbox runtime"
 license = "MIT"
 requires-python = ">=3.9"
