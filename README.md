@@ -601,6 +601,10 @@ box/
 
 Testing without VM → `A3S_DEPS_STUB=1 cargo check -p a3s-box-runtime`
 
+## Community
+
+Join us on [Discord](https://discord.gg/XVg6Hu6H) for questions, discussions, and updates.
+
 ## License
 
 MIT
