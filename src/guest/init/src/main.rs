@@ -13,6 +13,9 @@ use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{error, info, warn};
 
+/// Global flag set by the SIGTERM handler to request graceful shutdown.
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
 /// Container entrypoint configuration parsed from environment variables.
 struct ExecConfig {
     /// Container executable path
@@ -68,8 +71,51 @@ impl ExecConfig {
     }
 }
 
-/// Global flag set by the SIGTERM handler to request graceful shutdown.
-static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// Sidecar process configuration parsed from environment variables.
+struct SidecarConfig {
+    /// Sidecar image name (informational only inside the VM — binary is already in rootfs)
+    image: String,
+    /// Vsock port the sidecar listens on
+    vsock_port: u32,
+    /// Environment variables for the sidecar
+    env: Vec<(String, String)>,
+}
+
+impl SidecarConfig {
+    /// Parse sidecar configuration from environment variables.
+    ///
+    /// Returns `None` if `BOX_SIDECAR_IMAGE` is not set.
+    fn from_env() -> Option<Self> {
+        let image = std::env::var("BOX_SIDECAR_IMAGE").ok()?;
+        if image.is_empty() {
+            return None;
+        }
+
+        let vsock_port = std::env::var("BOX_SIDECAR_VSOCK_PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4092u32);
+
+        let env_count: usize = std::env::var("BOX_SIDECAR_ENV_COUNT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
+        let env: Vec<(String, String)> = (0..env_count)
+            .filter_map(|i| {
+                let raw = std::env::var(format!("BOX_SIDECAR_ENV_{}", i)).ok()?;
+                let (key, value) = raw.split_once('=')?;
+                Some((key.to_string(), value.to_string()))
+            })
+            .collect();
+
+        Some(Self {
+            image,
+            vsock_port,
+            env,
+        })
+    }
+}
 
 /// Register a SIGTERM handler that sets the shutdown flag.
 ///
@@ -171,6 +217,19 @@ fn run_init() -> Result<(), Box<dyn std::error::Error>> {
         cgroup: false,
     };
 
+    // Step 6.5: Launch sidecar process (if configured)
+    // The sidecar runs before the main container so it is ready to intercept
+    // traffic when the agent starts. It is not waited on — it runs for the
+    // lifetime of the VM and is reaped by the zombie-reaper loop.
+    if let Some(sidecar) = SidecarConfig::from_env() {
+        info!(
+            image = %sidecar.image,
+            vsock_port = sidecar.vsock_port,
+            "Launching sidecar process"
+        );
+        launch_sidecar(&sidecar)?;
+    }
+
     // Step 7: Launch container entrypoint
     info!("Launching container entrypoint");
 
@@ -221,6 +280,64 @@ fn run_init() -> Result<(), Box<dyn std::error::Error>> {
     wait_for_children(container_pid)?;
 
     Ok(())
+}
+
+/// Launch the sidecar process as a background co-process.
+///
+/// The sidecar binary is expected to be present in the rootfs at a well-known
+/// path. It is spawned with its configured environment variables and runs
+/// independently of the main container process.
+///
+/// The sidecar is NOT waited on — it runs for the lifetime of the VM and is
+/// reaped by the zombie-reaper loop in `wait_for_children`.
+fn launch_sidecar(config: &SidecarConfig) -> Result<(), Box<dyn std::error::Error>> {
+    // The sidecar binary path: conventionally /usr/bin/sidecar or derived from image name.
+    // Inside the VM the sidecar image is already extracted into the rootfs by the runtime.
+    // We look for the binary at /usr/bin/<basename> where basename is the last component
+    // of the image reference (e.g., "safeclaw" from "ghcr.io/a3s-lab/safeclaw:latest").
+    let binary_name = config
+        .image
+        .split('/')
+        .last()
+        .and_then(|s| s.split(':').next())
+        .unwrap_or("sidecar");
+
+    let binary_path = format!("/usr/bin/{}", binary_name);
+
+    let mut cmd = std::process::Command::new(&binary_path);
+
+    // Inject sidecar-specific env vars
+    for (key, value) in &config.env {
+        cmd.env(key, value);
+    }
+
+    // Pass vsock port so the sidecar knows where to listen
+    cmd.env("SIDECAR_VSOCK_PORT", config.vsock_port.to_string());
+
+    match cmd.spawn() {
+        Ok(child) => {
+            info!(
+                binary = %binary_path,
+                pid = child.id(),
+                vsock_port = config.vsock_port,
+                "Sidecar process launched"
+            );
+            // Intentionally leak the Child handle — the zombie-reaper loop
+            // in wait_for_children will reap it when it exits.
+            std::mem::forget(child);
+            Ok(())
+        }
+        Err(e) => {
+            // Non-fatal: log and continue. The main container should still start
+            // even if the sidecar binary is missing (e.g., in development).
+            warn!(
+                binary = %binary_path,
+                error = %e,
+                "Failed to launch sidecar — continuing without it"
+            );
+            Ok(())
+        }
+    }
 }
 
 /// Mount essential filesystems (/proc, /sys, /dev).
@@ -602,4 +719,79 @@ fn graceful_shutdown(timeout_ms: u64) {
     }
 
     info!("Graceful shutdown complete");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set_sidecar_env(image: &str, vsock_port: u32, env: &[(&str, &str)]) {
+        std::env::set_var("BOX_SIDECAR_IMAGE", image);
+        std::env::set_var("BOX_SIDECAR_VSOCK_PORT", vsock_port.to_string());
+        std::env::set_var("BOX_SIDECAR_ENV_COUNT", env.len().to_string());
+        for (i, (k, v)) in env.iter().enumerate() {
+            std::env::set_var(format!("BOX_SIDECAR_ENV_{}", i), format!("{}={}", k, v));
+        }
+    }
+
+    fn clear_sidecar_env() {
+        std::env::remove_var("BOX_SIDECAR_IMAGE");
+        std::env::remove_var("BOX_SIDECAR_VSOCK_PORT");
+        std::env::remove_var("BOX_SIDECAR_ENV_COUNT");
+        for i in 0..10 {
+            std::env::remove_var(format!("BOX_SIDECAR_ENV_{}", i));
+        }
+    }
+
+    /// All sidecar env tests run sequentially in a single test to avoid
+    /// env var race conditions (env vars are process-global).
+    #[test]
+    fn test_sidecar_config_from_env() {
+        // Subtest 1: no env vars → None
+        clear_sidecar_env();
+        assert!(SidecarConfig::from_env().is_none());
+
+        // Subtest 2: empty image → None
+        std::env::set_var("BOX_SIDECAR_IMAGE", "");
+        assert!(SidecarConfig::from_env().is_none());
+        std::env::remove_var("BOX_SIDECAR_IMAGE");
+
+        // Subtest 3: basic config
+        set_sidecar_env("safeclaw:latest", 4092, &[]);
+        let config = SidecarConfig::from_env().unwrap();
+        assert_eq!(config.image, "safeclaw:latest");
+        assert_eq!(config.vsock_port, 4092);
+        assert!(config.env.is_empty());
+        clear_sidecar_env();
+
+        // Subtest 4: with env vars
+        set_sidecar_env(
+            "ghcr.io/a3s-lab/safeclaw:latest",
+            4092,
+            &[("LOG_LEVEL", "debug"), ("MODE", "proxy")],
+        );
+        let config = SidecarConfig::from_env().unwrap();
+        assert_eq!(config.image, "ghcr.io/a3s-lab/safeclaw:latest");
+        assert_eq!(config.env.len(), 2);
+        assert_eq!(
+            config.env[0],
+            ("LOG_LEVEL".to_string(), "debug".to_string())
+        );
+        assert_eq!(config.env[1], ("MODE".to_string(), "proxy".to_string()));
+        clear_sidecar_env();
+
+        // Subtest 5: default vsock port
+        std::env::set_var("BOX_SIDECAR_IMAGE", "safeclaw:latest");
+        std::env::remove_var("BOX_SIDECAR_VSOCK_PORT");
+        std::env::remove_var("BOX_SIDECAR_ENV_COUNT");
+        let config = SidecarConfig::from_env().unwrap();
+        assert_eq!(config.vsock_port, 4092);
+        clear_sidecar_env();
+
+        // Subtest 6: custom vsock port
+        set_sidecar_env("safeclaw:latest", 5000, &[]);
+        let config = SidecarConfig::from_env().unwrap();
+        assert_eq!(config.vsock_port, 5000);
+        clear_sidecar_env();
+    }
 }

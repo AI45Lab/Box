@@ -5,10 +5,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 /// Container lifecycle state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ContainerState {
     /// Container has been created but not started.
     Created,
@@ -19,7 +20,7 @@ pub enum ContainerState {
 }
 
 /// Represents a container (session) within a pod sandbox (Box).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Container {
     /// Unique container identifier.
     pub id: String,

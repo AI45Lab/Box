@@ -14,13 +14,17 @@ pub(super) fn is_tar_archive(name: &str) -> bool {
         || lower.ends_with(".tar.gz")
         || lower.ends_with(".tgz")
         || lower.ends_with(".tar.bz2")
+        || lower.ends_with(".tbz2")
         || lower.ends_with(".tar.xz")
+        || lower.ends_with(".txz")
 }
 
 /// Extract a tar archive to a destination directory.
 pub(super) fn extract_tar_to_dst(archive_path: &Path, dst: &Path) -> Result<()> {
+    use bzip2::read::BzDecoder;
     use flate2::read::GzDecoder;
     use std::io::BufReader;
+    use xz2::read::XzDecoder;
 
     std::fs::create_dir_all(dst).map_err(|e| {
         BoxError::BuildError(format!(
@@ -50,6 +54,26 @@ pub(super) fn extract_tar_to_dst(archive_path: &Path, dst: &Path) -> Result<()> 
                 e
             ))
         })?;
+    } else if name.ends_with(".tar.bz2") || name.ends_with(".tbz2") {
+        let decoder = BzDecoder::new(BufReader::new(file));
+        let mut archive = tar::Archive::new(decoder);
+        archive.unpack(dst).map_err(|e| {
+            BoxError::BuildError(format!(
+                "Failed to extract tar.bz2 {}: {}",
+                archive_path.display(),
+                e
+            ))
+        })?;
+    } else if name.ends_with(".tar.xz") || name.ends_with(".txz") {
+        let decoder = XzDecoder::new(BufReader::new(file));
+        let mut archive = tar::Archive::new(decoder);
+        archive.unpack(dst).map_err(|e| {
+            BoxError::BuildError(format!(
+                "Failed to extract tar.xz {}: {}",
+                archive_path.display(),
+                e
+            ))
+        })?;
     } else if name.ends_with(".tar") {
         let mut archive = tar::Archive::new(BufReader::new(file));
         archive.unpack(dst).map_err(|e| {
@@ -60,18 +84,10 @@ pub(super) fn extract_tar_to_dst(archive_path: &Path, dst: &Path) -> Result<()> 
             ))
         })?;
     } else {
-        // .tar.bz2, .tar.xz — not supported yet, fall back to plain copy
-        tracing::warn!(
-            path = archive_path.to_str().unwrap_or(""),
-            "Unsupported archive format for auto-extraction, copying as-is"
-        );
-        let target = dst.join(
-            archive_path
-                .file_name()
-                .unwrap_or_else(|| std::ffi::OsStr::new("archive")),
-        );
-        std::fs::copy(archive_path, &target)
-            .map_err(|e| BoxError::BuildError(format!("Failed to copy archive: {}", e)))?;
+        return Err(BoxError::BuildError(format!(
+            "Unsupported archive format: {}",
+            archive_path.display()
+        )));
     }
 
     Ok(())
@@ -162,5 +178,233 @@ pub(super) fn format_size(bytes: u64) -> String {
         format!("{:.1} KB", bytes as f64 / 1024.0)
     } else {
         format!("{} B", bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- is_tar_archive tests ---
+
+    #[test]
+    fn test_is_tar_archive_tar() {
+        assert!(is_tar_archive("file.tar"));
+    }
+
+    #[test]
+    fn test_is_tar_archive_tar_gz() {
+        assert!(is_tar_archive("file.tar.gz"));
+        assert!(is_tar_archive("file.tgz"));
+    }
+
+    #[test]
+    fn test_is_tar_archive_tar_bz2() {
+        assert!(is_tar_archive("file.tar.bz2"));
+        assert!(is_tar_archive("file.tbz2"));
+    }
+
+    #[test]
+    fn test_is_tar_archive_tar_xz() {
+        assert!(is_tar_archive("file.tar.xz"));
+        assert!(is_tar_archive("file.txz"));
+    }
+
+    #[test]
+    fn test_is_tar_archive_case_insensitive() {
+        assert!(is_tar_archive("FILE.TAR.GZ"));
+        assert!(is_tar_archive("Data.Tar.Bz2"));
+        assert!(is_tar_archive("ARCHIVE.TAR.XZ"));
+    }
+
+    #[test]
+    fn test_is_tar_archive_non_archive() {
+        assert!(!is_tar_archive("file.txt"));
+        assert!(!is_tar_archive("file.zip"));
+        assert!(!is_tar_archive("file.gz"));
+        assert!(!is_tar_archive("file.bz2"));
+        assert!(!is_tar_archive("file.xz"));
+    }
+
+    // --- extract_tar_to_dst tests ---
+
+    /// Helper: create a tar archive with a single file.
+    fn create_test_tar(
+        dir: &std::path::Path,
+        filename: &str,
+        content: &[u8],
+    ) -> std::path::PathBuf {
+        let tar_path = dir.join(filename);
+        let file = std::fs::File::create(&tar_path).unwrap();
+        let mut builder = tar::Builder::new(file);
+
+        let mut header = tar::Header::new_gnu();
+        header.set_size(content.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "test.txt", content)
+            .unwrap();
+        builder.finish().unwrap();
+
+        tar_path
+    }
+
+    #[test]
+    fn test_extract_plain_tar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tar_path = create_test_tar(tmp.path(), "test.tar", b"hello tar");
+
+        let dst = tmp.path().join("out");
+        extract_tar_to_dst(&tar_path, &dst).unwrap();
+        assert!(dst.join("test.txt").exists());
+    }
+
+    #[test]
+    fn test_extract_tar_gz() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Create a tar in memory
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            let mut header = tar::Header::new_gnu();
+            let content = b"hello gzip";
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "test.txt", &content[..])
+                .unwrap();
+            builder.finish().unwrap();
+        }
+
+        // Gzip compress
+        let gz_path = tmp.path().join("test.tar.gz");
+        let gz_file = std::fs::File::create(&gz_path).unwrap();
+        let mut encoder = GzEncoder::new(gz_file, Compression::default());
+        encoder.write_all(&tar_data).unwrap();
+        encoder.finish().unwrap();
+
+        let dst = tmp.path().join("out");
+        extract_tar_to_dst(&gz_path, &dst).unwrap();
+        assert!(dst.join("test.txt").exists());
+    }
+
+    #[test]
+    fn test_extract_tar_bz2() {
+        use bzip2::write::BzEncoder;
+        use bzip2::Compression;
+        use std::io::Write;
+
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Create a tar in memory
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            let mut header = tar::Header::new_gnu();
+            let content = b"hello bzip2";
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "test.txt", &content[..])
+                .unwrap();
+            builder.finish().unwrap();
+        }
+
+        // Bzip2 compress
+        let bz2_path = tmp.path().join("test.tar.bz2");
+        let bz2_file = std::fs::File::create(&bz2_path).unwrap();
+        let mut encoder = BzEncoder::new(bz2_file, Compression::default());
+        encoder.write_all(&tar_data).unwrap();
+        encoder.finish().unwrap();
+
+        let dst = tmp.path().join("out");
+        extract_tar_to_dst(&bz2_path, &dst).unwrap();
+        assert!(dst.join("test.txt").exists());
+    }
+
+    #[test]
+    fn test_extract_tar_xz() {
+        use std::io::Write;
+        use xz2::write::XzEncoder;
+
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Create a tar in memory
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            let mut header = tar::Header::new_gnu();
+            let content = b"hello xz";
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "test.txt", &content[..])
+                .unwrap();
+            builder.finish().unwrap();
+        }
+
+        // XZ compress
+        let xz_path = tmp.path().join("test.tar.xz");
+        let xz_file = std::fs::File::create(&xz_path).unwrap();
+        let mut encoder = XzEncoder::new(xz_file, 6);
+        encoder.write_all(&tar_data).unwrap();
+        encoder.finish().unwrap();
+
+        let dst = tmp.path().join("out");
+        extract_tar_to_dst(&xz_path, &dst).unwrap();
+        assert!(dst.join("test.txt").exists());
+    }
+
+    #[test]
+    fn test_extract_nonexistent_file_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = extract_tar_to_dst(
+            &tmp.path().join("nonexistent.tar.gz"),
+            &tmp.path().join("out"),
+        );
+        assert!(result.is_err());
+    }
+
+    // --- resolve_path tests ---
+
+    #[test]
+    fn test_resolve_path_absolute() {
+        assert_eq!(resolve_path("/work", "/etc/config"), "/etc/config");
+    }
+
+    #[test]
+    fn test_resolve_path_relative() {
+        assert_eq!(resolve_path("/work", "src/main.rs"), "/work/src/main.rs");
+    }
+
+    // --- format_size tests ---
+
+    #[test]
+    fn test_format_size_bytes() {
+        assert_eq!(format_size(42), "42 B");
+    }
+
+    #[test]
+    fn test_format_size_kb() {
+        assert_eq!(format_size(2048), "2.0 KB");
+    }
+
+    #[test]
+    fn test_format_size_mb() {
+        assert_eq!(format_size(5 * 1024 * 1024), "5.0 MB");
+    }
+
+    #[test]
+    fn test_format_size_gb() {
+        assert_eq!(format_size(2 * 1024 * 1024 * 1024), "2.0 GB");
     }
 }

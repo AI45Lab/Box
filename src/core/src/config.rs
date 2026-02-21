@@ -341,6 +341,14 @@ pub struct BoxConfig {
     /// Requires guest init to be present in the rootfs image.
     #[serde(default)]
     pub read_only: bool,
+
+    /// Optional sidecar process to run alongside the main container inside the VM.
+    ///
+    /// The sidecar is launched before the main container entrypoint and runs
+    /// as a co-process inside the same MicroVM. Intended for security proxies
+    /// such as SafeClaw that intercept and classify agent traffic.
+    #[serde(default)]
+    pub sidecar: Option<SidecarConfig>,
 }
 
 impl Default for BoxConfig {
@@ -370,6 +378,49 @@ impl Default for BoxConfig {
             security_opt: vec![],
             privileged: false,
             read_only: false,
+            sidecar: None,
+        }
+    }
+}
+
+/// Sidecar process configuration.
+///
+/// A sidecar runs as a co-process inside the same MicroVM alongside the main
+/// container. It is launched before the main entrypoint and communicates with
+/// the host via a dedicated vsock port.
+///
+/// Primary use case: SafeClaw security proxy that intercepts and classifies
+/// agent traffic before it reaches the LLM.
+///
+/// # Data flow
+///
+/// ```text
+/// Agent → SafeClaw (vsock 4092) → classified/sanitized → LLM
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SidecarConfig {
+    /// OCI image reference for the sidecar (e.g., "ghcr.io/a3s-lab/safeclaw:latest")
+    pub image: String,
+
+    /// Vsock port the sidecar listens on for host-side control (default: 4092)
+    #[serde(default = "default_sidecar_vsock_port")]
+    pub vsock_port: u32,
+
+    /// Extra environment variables for the sidecar process
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
+}
+
+fn default_sidecar_vsock_port() -> u32 {
+    4092
+}
+
+impl Default for SidecarConfig {
+    fn default() -> Self {
+        Self {
+            image: String::new(),
+            vsock_port: default_sidecar_vsock_port(),
+            env: vec![],
         }
     }
 }
@@ -955,5 +1006,74 @@ mod tests {
         let config: BoxConfig = serde_json::from_str(json).unwrap();
         assert!(config.resource_limits.pids_limit.is_none());
         assert!(config.resource_limits.ulimits.is_empty());
+    }
+
+    // ── SidecarConfig tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_sidecar_config_default() {
+        let s = SidecarConfig::default();
+        assert!(s.image.is_empty());
+        assert_eq!(s.vsock_port, 4092);
+        assert!(s.env.is_empty());
+    }
+
+    #[test]
+    fn test_sidecar_config_roundtrip() {
+        let s = SidecarConfig {
+            image: "ghcr.io/a3s-lab/safeclaw:latest".to_string(),
+            vsock_port: 4092,
+            env: vec![
+                ("LOG_LEVEL".to_string(), "debug".to_string()),
+                ("MODE".to_string(), "proxy".to_string()),
+            ],
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let parsed: SidecarConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.image, "ghcr.io/a3s-lab/safeclaw:latest");
+        assert_eq!(parsed.vsock_port, 4092);
+        assert_eq!(parsed.env.len(), 2);
+        assert_eq!(
+            parsed.env[0],
+            ("LOG_LEVEL".to_string(), "debug".to_string())
+        );
+    }
+
+    #[test]
+    fn test_sidecar_config_default_vsock_port_from_json() {
+        let json = r#"{"image":"safeclaw:latest"}"#;
+        let s: SidecarConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(s.vsock_port, 4092);
+        assert!(s.env.is_empty());
+    }
+
+    #[test]
+    fn test_box_config_default_has_no_sidecar() {
+        let config = BoxConfig::default();
+        assert!(config.sidecar.is_none());
+    }
+
+    #[test]
+    fn test_box_config_with_sidecar_roundtrip() {
+        let mut config = BoxConfig::default();
+        config.sidecar = Some(SidecarConfig {
+            image: "safeclaw:latest".to_string(),
+            vsock_port: 4092,
+            env: vec![],
+        });
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: BoxConfig = serde_json::from_str(&json).unwrap();
+        let sidecar = parsed.sidecar.unwrap();
+        assert_eq!(sidecar.image, "safeclaw:latest");
+        assert_eq!(sidecar.vsock_port, 4092);
+    }
+
+    #[test]
+    fn test_box_config_without_sidecar_deserializes_as_none() {
+        // Old configs without sidecar field should deserialize with sidecar=None
+        let config = BoxConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: BoxConfig = serde_json::from_str(&json).unwrap();
+        assert!(parsed.sidecar.is_none());
     }
 }

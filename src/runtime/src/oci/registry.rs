@@ -335,6 +335,8 @@ pub struct PushResult {
     pub config_url: String,
     /// URL of the pushed manifest.
     pub manifest_url: String,
+    /// Digest of the pushed manifest (e.g., "sha256:abc123...").
+    pub manifest_digest: String,
 }
 
 /// Pushes OCI images to container registries.
@@ -454,6 +456,7 @@ impl RegistryPusher {
         Ok(PushResult {
             config_url: response.config_url,
             manifest_url: response.manifest_url,
+            manifest_digest: manifest_digest.to_string(),
         })
     }
 

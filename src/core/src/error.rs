@@ -74,6 +74,10 @@ pub enum BoxError {
     #[error("Audit error: {0}")]
     AuditError(String),
 
+    /// Resource resize error (hot-resize not supported or failed)
+    #[error("Resize error: {0}")]
+    ResizeError(String),
+
     /// Generic error
     #[error("{0}")]
     Other(String),
@@ -226,6 +230,12 @@ mod tests {
 
         assert_eq!(returns_ok().unwrap(), 42);
         assert!(returns_err().is_err());
+    }
+
+    #[test]
+    fn test_resize_error_display() {
+        let error = BoxError::ResizeError("Cannot change vCPU count".to_string());
+        assert_eq!(error.to_string(), "Resize error: Cannot change vCPU count");
     }
 
     #[test]

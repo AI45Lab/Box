@@ -12,7 +12,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.5.3"
+version = "0.6.0"
 edition = "2021"
 authors = ["A3S Lab Team"]
 license = "MIT"
@@ -59,7 +59,7 @@ sha2 = "0.10"
 hex = "0.4"
 
 # Cryptography (for TEE attestation verification)
-p256 = { version = "0.13", features = ["ecdsa"] }
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
 p384 = { version = "0.13", features = ["ecdsa"] }
 ecdsa = { version = "0.16", features = ["verifying"] }
 x509-cert = { version = "0.2", features = ["std"] }

@@ -665,6 +665,69 @@ impl VmManager {
             BoxError::AttestationError("TEE is not configured for this box".to_string())
         })
     }
+
+    /// Apply a live resource update to the running VM.
+    ///
+    /// Tier 1 changes (vCPU count, memory size) are rejected with a clear error
+    /// because libkrun does not expose a hot-resize API.
+    ///
+    /// Tier 2 changes (cgroup-based limits) are applied by executing shell
+    /// commands inside the guest that write to cgroup v2 control files.
+    pub async fn update_resources(
+        &self,
+        update: &crate::resize::ResourceUpdate,
+    ) -> Result<crate::resize::ResizeResult> {
+        // Reject Tier 1 changes upfront
+        crate::resize::validate_update(update)?;
+
+        let mut result = crate::resize::ResizeResult {
+            applied: Vec::new(),
+            rejected: Vec::new(),
+        };
+
+        if !update.has_tier2_changes() {
+            return Ok(result);
+        }
+
+        // Build cgroup commands and execute them inside the guest
+        let commands = update.build_cgroup_commands();
+        for cmd_str in &commands {
+            let shell_cmd = vec!["sh".to_string(), "-c".to_string(), cmd_str.clone()];
+
+            match self.exec_command(shell_cmd, 5_000_000_000).await {
+                Ok(output) if output.exit_code == 0 => {
+                    result.applied.push(cmd_str.clone());
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let reason = if stderr.trim().is_empty() {
+                        format!("exit code {}", output.exit_code)
+                    } else {
+                        stderr.trim().to_string()
+                    };
+                    tracing::warn!(
+                        box_id = %self.box_id,
+                        cmd = %cmd_str,
+                        exit_code = output.exit_code,
+                        stderr = %stderr,
+                        "Cgroup update failed inside guest"
+                    );
+                    result.rejected.push((cmd_str.clone(), reason));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        box_id = %self.box_id,
+                        cmd = %cmd_str,
+                        error = %e,
+                        "Failed to exec cgroup update in guest"
+                    );
+                    result.rejected.push((cmd_str.clone(), e.to_string()));
+                }
+            }
+        }
+
+        Ok(result)
+    }
 }
 
 /// Simple FNV-1a hash for generating short deterministic hashes from strings.

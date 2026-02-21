@@ -5,10 +5,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 /// Sandbox lifecycle state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SandboxState {
     /// Sandbox is running and ready.
     Ready,
@@ -19,7 +20,7 @@ pub enum SandboxState {
 }
 
 /// Represents a pod sandbox backed by a Box microVM.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PodSandbox {
     /// Unique sandbox identifier.
     pub id: String,

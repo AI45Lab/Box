@@ -8,9 +8,11 @@ pub mod config_mapper;
 pub mod container;
 pub mod error;
 pub mod image_service;
+pub mod persistent_store;
 pub mod runtime_service;
 pub mod sandbox;
 pub mod server;
+pub mod state;
 pub mod streaming;
 
 /// Generated CRI v1 protobuf types.

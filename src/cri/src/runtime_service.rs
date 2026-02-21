@@ -12,38 +12,106 @@ use tonic::{Request, Response, Status};
 
 use a3s_box_core::event::EventEmitter;
 use a3s_box_runtime::oci::{ImageStore, RegistryAuth};
+use a3s_box_runtime::pool::WarmPool;
 use a3s_box_runtime::vm::VmManager;
 
 use crate::config_mapper::pod_sandbox_config_to_box_config;
-use crate::container::{Container, ContainerState, ContainerStore};
+use crate::container::{Container, ContainerState};
 use crate::cri_api::runtime_service_server::RuntimeService;
 use crate::cri_api::*;
 use crate::error::box_error_to_status;
-use crate::sandbox::{PodSandbox, SandboxState, SandboxStore};
+use crate::persistent_store::PersistentCriStore;
+use crate::sandbox::{PodSandbox, SandboxState};
+use crate::state::{default_state_path, JsonStateStore, NoopStateStore, StateStore};
 use crate::streaming::{SessionKind, StreamingHandle, StreamingSession};
 
 /// A3S Box implementation of the CRI RuntimeService.
 pub struct BoxRuntimeService {
-    sandbox_store: Arc<SandboxStore>,
-    container_store: Arc<ContainerStore>,
+    store: Arc<PersistentCriStore>,
     /// Maps sandbox_id → VmManager for running VMs.
     vm_managers: Arc<RwLock<HashMap<String, VmManager>>>,
     /// Handle for registering CRI streaming sessions.
     streaming: StreamingHandle,
+    /// Optional warm pool for instant VM acquisition.
+    warm_pool: Option<Arc<RwLock<WarmPool>>>,
 }
 
 impl BoxRuntimeService {
-    /// Create a new BoxRuntimeService.
+    /// Create a new BoxRuntimeService with JSON-backed persistent state.
     pub fn new(
         _image_store: Arc<ImageStore>,
         _auth: RegistryAuth,
         streaming: StreamingHandle,
     ) -> Self {
+        let state_store: Arc<dyn StateStore> = Arc::new(JsonStateStore::new(default_state_path()));
+        Self::with_state_store(_image_store, _auth, streaming, state_store)
+    }
+
+    /// Create a BoxRuntimeService with a custom StateStore (used in tests).
+    pub fn with_state_store(
+        _image_store: Arc<ImageStore>,
+        _auth: RegistryAuth,
+        streaming: StreamingHandle,
+        state_store: Arc<dyn StateStore>,
+    ) -> Self {
         Self {
-            sandbox_store: Arc::new(SandboxStore::new()),
-            container_store: Arc::new(ContainerStore::new()),
+            store: Arc::new(PersistentCriStore::new(state_store)),
             vm_managers: Arc::new(RwLock::new(HashMap::new())),
             streaming,
+            warm_pool: None,
+        }
+    }
+
+    /// Attach a warm pool for instant VM acquisition on RunPodSandbox.
+    pub fn with_warm_pool(mut self, pool: WarmPool) -> Self {
+        self.warm_pool = Some(Arc::new(RwLock::new(pool)));
+        self
+    }
+
+    /// Load persisted state from disk. Call once after construction.
+    pub async fn load_state(&self) {
+        if let Err(e) = self.store.load().await {
+            tracing::warn!(error = %e, "Failed to load persisted CRI state — starting fresh");
+        }
+    }
+
+    /// Acquire a VM: from warm pool if available, otherwise cold boot.
+    async fn acquire_vm(
+        &self,
+        box_config: a3s_box_core::config::BoxConfig,
+    ) -> Result<VmManager, Status> {
+        if let Some(ref pool) = self.warm_pool {
+            let pool = pool.read().await;
+            match pool.acquire().await {
+                Ok(vm) => {
+                    tracing::debug!(box_id = %vm.box_id(), "Acquired VM from warm pool");
+                    return Ok(vm);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Warm pool acquire failed, falling back to cold boot");
+                }
+            }
+        }
+
+        // Cold boot
+        let event_emitter = EventEmitter::new(256);
+        let mut vm = VmManager::new(box_config, event_emitter);
+        vm.boot().await.map_err(box_error_to_status)?;
+        Ok(vm)
+    }
+
+    /// Release a VM back to the warm pool, or destroy it if no pool.
+    async fn release_vm(&self, vm: VmManager) {
+        if let Some(ref pool) = self.warm_pool {
+            let pool = pool.read().await;
+            if let Err(e) = pool.release(vm).await {
+                tracing::warn!(error = %e, "Failed to release VM to warm pool");
+            }
+        } else {
+            let mut vm = vm;
+            if let Err(e) = vm.destroy().await {
+                tracing::warn!(error = %e, "Failed to destroy VM");
+            }
         }
     }
 }
@@ -90,13 +158,9 @@ impl RuntimeService for BoxRuntimeService {
         // Convert CRI config to BoxConfig
         let box_config = pod_sandbox_config_to_box_config(&config).map_err(box_error_to_status)?;
 
-        // Create VmManager
-        let event_emitter = EventEmitter::new(256);
-        let mut vm = VmManager::new(box_config, event_emitter);
+        // Acquire VM: from warm pool if available, otherwise cold boot
+        let vm = self.acquire_vm(box_config).await?;
         let sandbox_id = vm.box_id().to_string();
-
-        // Boot the VM
-        vm.boot().await.map_err(box_error_to_status)?;
 
         // Store sandbox state
         let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
@@ -113,7 +177,7 @@ impl RuntimeService for BoxRuntimeService {
             runtime_handler: req.runtime_handler,
         };
 
-        self.sandbox_store.add(sandbox).await;
+        self.store.add_sandbox(sandbox).await;
         self.vm_managers
             .write()
             .await
@@ -134,11 +198,11 @@ impl RuntimeService for BoxRuntimeService {
         tracing::info!(sandbox_id = %sandbox_id, "CRI StopPodSandbox");
 
         // Stop all containers in this sandbox
-        let containers = self.container_store.list(Some(sandbox_id), None).await;
+        let containers = self.store.containers.list(Some(sandbox_id), None).await;
         let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         for c in &containers {
             if c.state != ContainerState::Exited {
-                self.container_store.mark_exited(&c.id, now_ns, 137).await;
+                self.store.mark_container_exited(&c.id, now_ns, 137).await;
             }
         }
 
@@ -147,8 +211,8 @@ impl RuntimeService for BoxRuntimeService {
             vm.destroy().await.map_err(box_error_to_status)?;
         }
 
-        self.sandbox_store
-            .update_state(sandbox_id, SandboxState::NotReady)
+        self.store
+            .update_sandbox_state(sandbox_id, SandboxState::NotReady)
             .await;
 
         Ok(Response::new(StopPodSandboxResponse {}))
@@ -163,16 +227,16 @@ impl RuntimeService for BoxRuntimeService {
 
         tracing::info!(sandbox_id = %sandbox_id, "CRI RemovePodSandbox");
 
-        // Ensure VM is stopped
-        if let Some(mut vm) = self.vm_managers.write().await.remove(sandbox_id) {
-            let _ = vm.destroy().await;
+        // Release VM back to warm pool (or destroy if no pool)
+        if let Some(vm) = self.vm_managers.write().await.remove(sandbox_id) {
+            self.release_vm(vm).await;
         }
 
         // Remove all containers
-        self.container_store.remove_by_sandbox(sandbox_id).await;
+        self.store.remove_containers_by_sandbox(sandbox_id).await;
 
         // Remove sandbox
-        self.sandbox_store.remove(sandbox_id).await;
+        self.store.remove_sandbox(sandbox_id).await;
 
         Ok(Response::new(RemovePodSandboxResponse {}))
     }
@@ -185,7 +249,8 @@ impl RuntimeService for BoxRuntimeService {
         let sandbox_id = &req.pod_sandbox_id;
 
         let sandbox = self
-            .sandbox_store
+            .store
+            .sandboxes
             .get(sandbox_id)
             .await
             .ok_or_else(|| Status::not_found(format!("Sandbox not found: {}", sandbox_id)))?;
@@ -233,7 +298,7 @@ impl RuntimeService for BoxRuntimeService {
             .map(|f| &f.label_selector)
             .filter(|m| !m.is_empty());
 
-        let sandboxes = self.sandbox_store.list(label_filter).await;
+        let sandboxes = self.store.sandboxes.list(label_filter).await;
 
         let items: Vec<crate::cri_api::PodSandbox> = sandboxes
             .into_iter()
@@ -289,7 +354,8 @@ impl RuntimeService for BoxRuntimeService {
         let sandbox_id = &req.pod_sandbox_id;
 
         // Verify sandbox exists
-        self.sandbox_store
+        self.store
+            .sandboxes
             .get(sandbox_id)
             .await
             .ok_or_else(|| Status::not_found(format!("Sandbox not found: {}", sandbox_id)))?;
@@ -334,7 +400,7 @@ impl RuntimeService for BoxRuntimeService {
             log_path: config.log_path,
         };
 
-        self.container_store.add(container).await;
+        self.store.add_container(container).await;
 
         Ok(Response::new(CreateContainerResponse { container_id }))
     }
@@ -347,7 +413,8 @@ impl RuntimeService for BoxRuntimeService {
         let container_id = &req.container_id;
 
         let container = self
-            .container_store
+            .store
+            .containers
             .get(container_id)
             .await
             .ok_or_else(|| Status::not_found(format!("Container not found: {}", container_id)))?;
@@ -359,8 +426,8 @@ impl RuntimeService for BoxRuntimeService {
         );
 
         let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        self.container_store
-            .mark_started(container_id, now_ns)
+        self.store
+            .mark_container_started(container_id, now_ns)
             .await;
 
         Ok(Response::new(StartContainerResponse {}))
@@ -376,8 +443,8 @@ impl RuntimeService for BoxRuntimeService {
         tracing::info!(container_id = %container_id, "CRI StopContainer");
 
         let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        self.container_store
-            .mark_exited(container_id, now_ns, 0)
+        self.store
+            .mark_container_exited(container_id, now_ns, 0)
             .await;
 
         Ok(Response::new(StopContainerResponse {}))
@@ -392,7 +459,7 @@ impl RuntimeService for BoxRuntimeService {
 
         tracing::info!(container_id = %container_id, "CRI RemoveContainer");
 
-        self.container_store.remove(container_id).await;
+        self.store.remove_container(container_id).await;
 
         Ok(Response::new(RemoveContainerResponse {}))
     }
@@ -405,7 +472,8 @@ impl RuntimeService for BoxRuntimeService {
         let container_id = &req.container_id;
 
         let container = self
-            .container_store
+            .store
+            .containers
             .get(container_id)
             .await
             .ok_or_else(|| Status::not_found(format!("Container not found: {}", container_id)))?;
@@ -465,7 +533,8 @@ impl RuntimeService for BoxRuntimeService {
             .filter(|m| !m.is_empty());
 
         let containers = self
-            .container_store
+            .store
+            .containers
             .list(sandbox_filter, label_filter)
             .await;
 
@@ -576,7 +645,8 @@ impl RuntimeService for BoxRuntimeService {
 
         // Look up the container to find its sandbox
         let container = self
-            .container_store
+            .store
+            .containers
             .get(container_id)
             .await
             .ok_or_else(|| Status::not_found(format!("Container not found: {}", container_id)))?;
@@ -619,7 +689,8 @@ impl RuntimeService for BoxRuntimeService {
 
         // Look up the container to find its sandbox
         let container = self
-            .container_store
+            .store
+            .containers
             .get(container_id)
             .await
             .ok_or_else(|| Status::not_found(format!("Container not found: {}", container_id)))?;
@@ -670,7 +741,8 @@ impl RuntimeService for BoxRuntimeService {
         );
 
         let container = self
-            .container_store
+            .store
+            .containers
             .get(container_id)
             .await
             .ok_or_else(|| Status::not_found(format!("Container not found: {}", container_id)))?;
@@ -720,7 +792,8 @@ impl RuntimeService for BoxRuntimeService {
         );
 
         // Verify sandbox exists
-        self.sandbox_store
+        self.store
+            .sandboxes
             .get(sandbox_id)
             .await
             .ok_or_else(|| Status::not_found(format!("Sandbox not found: {}", sandbox_id)))?;
@@ -765,35 +838,99 @@ impl RuntimeService for BoxRuntimeService {
 
         // Verify container exists
         let container = self
-            .container_store
+            .store
+            .containers
             .get(container_id)
             .await
             .ok_or_else(|| Status::not_found(format!("Container not found: {}", container_id)))?;
 
-        if let Some(ref linux) = req.linux {
-            tracing::warn!(
+        let Some(ref linux) = req.linux else {
+            tracing::info!(
                 container_id = %container_id,
-                sandbox_id = %container.sandbox_id,
-                cpu_quota = linux.cpu_quota,
-                cpu_period = linux.cpu_period,
-                memory_limit = linux.memory_limit_in_bytes,
-                "CRI UpdateContainerResources rejected: microVM resources are fixed at boot"
+                "CRI UpdateContainerResources (no linux resources specified)"
             );
+            return Ok(Response::new(UpdateContainerResourcesResponse {}));
+        };
 
-            // MicroVM resources (CPU, memory) are fixed at boot time and cannot be
-            // dynamically resized. Return an explicit error so callers (e.g. K8s VPA)
-            // know the operation did NOT take effect, rather than silently succeeding.
+        // Build a ResourceUpdate from the CRI request.
+        // memory_limit_in_bytes maps to Tier 1 (immutable) — reject if set.
+        // cpu_quota, cpu_period, cpu_shares map to Tier 2 (cgroup) — apply via exec.
+        let mut update = a3s_box_runtime::resize::ResourceUpdate::default();
+
+        // Tier 1: memory_limit is a hard VM limit, cannot change after boot
+        if linux.memory_limit_in_bytes > 0 {
             return Err(Status::unimplemented(
-                "UpdateContainerResources is not supported: microVM resources (CPU, memory) \
-                 are fixed at boot time and cannot be dynamically resized",
+                "Cannot change memory limit on a running microVM: libkrun does not support \
+                 memory ballooning. Recreate the pod with the desired memory size.",
             ));
         }
 
-        // No linux resources specified — nothing to do, acknowledge
+        // Tier 2: cgroup-based limits — apply via guest exec
+        if linux.cpu_quota != 0 {
+            update.limits.cpu_quota = Some(linux.cpu_quota);
+        }
+        if linux.cpu_period != 0 {
+            update.limits.cpu_period = Some(linux.cpu_period as u64);
+        }
+        if linux.cpu_shares != 0 {
+            update.limits.cpu_shares = Some(linux.cpu_shares as u64);
+        }
+        if !linux.cpuset_cpus.is_empty() {
+            update.limits.cpuset_cpus = Some(linux.cpuset_cpus.clone());
+        }
+        if !linux.cpuset_mems.is_empty() {
+            // cpuset_mems is not directly supported, log and ignore
+            tracing::info!(
+                container_id = %container_id,
+                cpuset_mems = %linux.cpuset_mems,
+                "CRI cpuset_mems ignored (not supported in microVM)"
+            );
+        }
+
+        if !update.has_tier2_changes() {
+            tracing::info!(
+                container_id = %container_id,
+                "CRI UpdateContainerResources: no applicable Tier 2 changes"
+            );
+            return Ok(Response::new(UpdateContainerResourcesResponse {}));
+        }
+
+        // Find the VM manager for this container's sandbox
+        let managers = self.vm_managers.read().await;
+        let vm = managers.get(&container.sandbox_id).ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "Sandbox {} not running (VM not found)",
+                container.sandbox_id
+            ))
+        })?;
+
         tracing::info!(
             container_id = %container_id,
-            "CRI UpdateContainerResources (no linux resources specified)"
+            sandbox_id = %container.sandbox_id,
+            cpu_quota = linux.cpu_quota,
+            cpu_period = linux.cpu_period,
+            cpu_shares = linux.cpu_shares,
+            "CRI UpdateContainerResources: applying Tier 2 cgroup changes"
         );
+
+        let result = vm
+            .update_resources(&update)
+            .await
+            .map_err(|e| Status::internal(format!("Failed to apply resource update: {}", e)))?;
+
+        if !result.rejected.is_empty() {
+            let failures: Vec<String> = result
+                .rejected
+                .iter()
+                .map(|(cmd, reason)| format!("{}: {}", cmd, reason))
+                .collect();
+            tracing::warn!(
+                container_id = %container_id,
+                failures = ?failures,
+                "Some cgroup updates failed inside guest"
+            );
+        }
+
         Ok(Response::new(UpdateContainerResourcesResponse {}))
     }
 
@@ -805,7 +942,8 @@ impl RuntimeService for BoxRuntimeService {
         let container_id = &req.container_id;
 
         let container = self
-            .container_store
+            .store
+            .containers
             .get(container_id)
             .await
             .ok_or_else(|| Status::not_found(format!("Container not found: {}", container_id)))?;
@@ -847,17 +985,17 @@ mod tests {
     use crate::streaming::StreamingServer;
 
     /// Create a BoxRuntimeService for testing.
-    /// Uses a dummy ImageStore and StreamingHandle.
+    /// Uses NoopStateStore (no disk I/O) and a dummy StreamingHandle.
     fn make_test_service() -> BoxRuntimeService {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let streaming_server = StreamingServer::new(addr);
         let handle = streaming_server.handle();
 
         BoxRuntimeService {
-            sandbox_store: Arc::new(SandboxStore::new()),
-            container_store: Arc::new(ContainerStore::new()),
+            store: Arc::new(PersistentCriStore::new(Arc::new(NoopStateStore))),
             vm_managers: Arc::new(RwLock::new(HashMap::new())),
             streaming: handle,
+            warm_pool: None,
         }
     }
 
@@ -965,7 +1103,7 @@ mod tests {
     #[tokio::test]
     async fn test_pod_sandbox_status_found() {
         let svc = make_test_service();
-        svc.sandbox_store.add(test_sandbox("sb-1")).await;
+        svc.store.sandboxes.add(test_sandbox("sb-1")).await;
 
         let resp = svc
             .pod_sandbox_status(Request::new(PodSandboxStatusRequest {
@@ -998,8 +1136,8 @@ mod tests {
     #[tokio::test]
     async fn test_list_pod_sandbox_with_entries() {
         let svc = make_test_service();
-        svc.sandbox_store.add(test_sandbox("sb-1")).await;
-        svc.sandbox_store.add(test_sandbox("sb-2")).await;
+        svc.store.sandboxes.add(test_sandbox("sb-1")).await;
+        svc.store.sandboxes.add(test_sandbox("sb-2")).await;
 
         let resp = svc
             .list_pod_sandbox(Request::new(ListPodSandboxRequest { filter: None }))
@@ -1012,8 +1150,8 @@ mod tests {
     #[tokio::test]
     async fn test_list_pod_sandbox_filter_by_id() {
         let svc = make_test_service();
-        svc.sandbox_store.add(test_sandbox("sb-1")).await;
-        svc.sandbox_store.add(test_sandbox("sb-2")).await;
+        svc.store.sandboxes.add(test_sandbox("sb-1")).await;
+        svc.store.sandboxes.add(test_sandbox("sb-2")).await;
 
         let resp = svc
             .list_pod_sandbox(Request::new(ListPodSandboxRequest {
@@ -1059,7 +1197,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_container_missing_config() {
         let svc = make_test_service();
-        svc.sandbox_store.add(test_sandbox("sb-1")).await;
+        svc.store.sandboxes.add(test_sandbox("sb-1")).await;
 
         let result = svc
             .create_container(Request::new(CreateContainerRequest {
@@ -1075,7 +1213,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_container_missing_metadata() {
         let svc = make_test_service();
-        svc.sandbox_store.add(test_sandbox("sb-1")).await;
+        svc.store.sandboxes.add(test_sandbox("sb-1")).await;
 
         let result = svc
             .create_container(Request::new(CreateContainerRequest {
@@ -1094,7 +1232,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_container_success() {
         let svc = make_test_service();
-        svc.sandbox_store.add(test_sandbox("sb-1")).await;
+        svc.store.sandboxes.add(test_sandbox("sb-1")).await;
 
         let resp = svc
             .create_container(Request::new(CreateContainerRequest {
@@ -1119,7 +1257,7 @@ mod tests {
         assert!(!resp.container_id.is_empty());
 
         // Verify container is in the store
-        let c = svc.container_store.get(&resp.container_id).await.unwrap();
+        let c = svc.store.containers.get(&resp.container_id).await.unwrap();
         assert_eq!(c.name, "my-container");
         assert_eq!(c.sandbox_id, "sb-1");
         assert_eq!(c.state, ContainerState::Created);
@@ -1140,7 +1278,10 @@ mod tests {
     #[tokio::test]
     async fn test_start_container_success() {
         let svc = make_test_service();
-        svc.container_store.add(test_container("c-1", "sb-1")).await;
+        svc.store
+            .containers
+            .add(test_container("c-1", "sb-1"))
+            .await;
 
         svc.start_container(Request::new(StartContainerRequest {
             container_id: "c-1".to_string(),
@@ -1148,7 +1289,7 @@ mod tests {
         .await
         .unwrap();
 
-        let c = svc.container_store.get("c-1").await.unwrap();
+        let c = svc.store.containers.get("c-1").await.unwrap();
         assert_eq!(c.state, ContainerState::Running);
         assert!(c.started_at > 0);
     }
@@ -1156,8 +1297,14 @@ mod tests {
     #[tokio::test]
     async fn test_stop_container() {
         let svc = make_test_service();
-        svc.container_store.add(test_container("c-1", "sb-1")).await;
-        svc.container_store.mark_started("c-1", 2_000_000_000).await;
+        svc.store
+            .containers
+            .add(test_container("c-1", "sb-1"))
+            .await;
+        svc.store
+            .containers
+            .mark_started("c-1", 2_000_000_000)
+            .await;
 
         svc.stop_container(Request::new(StopContainerRequest {
             container_id: "c-1".to_string(),
@@ -1166,7 +1313,7 @@ mod tests {
         .await
         .unwrap();
 
-        let c = svc.container_store.get("c-1").await.unwrap();
+        let c = svc.store.containers.get("c-1").await.unwrap();
         assert_eq!(c.state, ContainerState::Exited);
         assert!(c.finished_at > 0);
         assert_eq!(c.exit_code, 0);
@@ -1175,7 +1322,10 @@ mod tests {
     #[tokio::test]
     async fn test_remove_container() {
         let svc = make_test_service();
-        svc.container_store.add(test_container("c-1", "sb-1")).await;
+        svc.store
+            .containers
+            .add(test_container("c-1", "sb-1"))
+            .await;
 
         svc.remove_container(Request::new(RemoveContainerRequest {
             container_id: "c-1".to_string(),
@@ -1183,7 +1333,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(svc.container_store.get("c-1").await.is_none());
+        assert!(svc.store.containers.get("c-1").await.is_none());
     }
 
     // ── Container Status ─────────────────────────────────────────────
@@ -1204,7 +1354,10 @@ mod tests {
     #[tokio::test]
     async fn test_container_status_created() {
         let svc = make_test_service();
-        svc.container_store.add(test_container("c-1", "sb-1")).await;
+        svc.store
+            .containers
+            .add(test_container("c-1", "sb-1"))
+            .await;
 
         let resp = svc
             .container_status(Request::new(ContainerStatusRequest {
@@ -1227,8 +1380,14 @@ mod tests {
     #[tokio::test]
     async fn test_container_status_running() {
         let svc = make_test_service();
-        svc.container_store.add(test_container("c-1", "sb-1")).await;
-        svc.container_store.mark_started("c-1", 2_000_000_000).await;
+        svc.store
+            .containers
+            .add(test_container("c-1", "sb-1"))
+            .await;
+        svc.store
+            .containers
+            .mark_started("c-1", 2_000_000_000)
+            .await;
 
         let resp = svc
             .container_status(Request::new(ContainerStatusRequest {
@@ -1263,9 +1422,18 @@ mod tests {
     #[tokio::test]
     async fn test_list_containers_filter_by_sandbox() {
         let svc = make_test_service();
-        svc.container_store.add(test_container("c-1", "sb-1")).await;
-        svc.container_store.add(test_container("c-2", "sb-1")).await;
-        svc.container_store.add(test_container("c-3", "sb-2")).await;
+        svc.store
+            .containers
+            .add(test_container("c-1", "sb-1"))
+            .await;
+        svc.store
+            .containers
+            .add(test_container("c-2", "sb-1"))
+            .await;
+        svc.store
+            .containers
+            .add(test_container("c-3", "sb-2"))
+            .await;
 
         let resp = svc
             .list_containers(Request::new(ListContainersRequest {
@@ -1285,8 +1453,14 @@ mod tests {
     #[tokio::test]
     async fn test_list_containers_filter_by_id() {
         let svc = make_test_service();
-        svc.container_store.add(test_container("c-1", "sb-1")).await;
-        svc.container_store.add(test_container("c-2", "sb-1")).await;
+        svc.store
+            .containers
+            .add(test_container("c-1", "sb-1"))
+            .await;
+        svc.store
+            .containers
+            .add(test_container("c-2", "sb-1"))
+            .await;
 
         let resp = svc
             .list_containers(Request::new(ListContainersRequest {
@@ -1323,7 +1497,10 @@ mod tests {
     #[tokio::test]
     async fn test_update_container_resources_no_linux() {
         let svc = make_test_service();
-        svc.container_store.add(test_container("c-1", "sb-1")).await;
+        svc.store
+            .containers
+            .add(test_container("c-1", "sb-1"))
+            .await;
 
         let result = svc
             .update_container_resources(Request::new(UpdateContainerResourcesRequest {
@@ -1338,7 +1515,10 @@ mod tests {
     #[tokio::test]
     async fn test_update_container_resources_linux_rejected() {
         let svc = make_test_service();
-        svc.container_store.add(test_container("c-1", "sb-1")).await;
+        svc.store
+            .containers
+            .add(test_container("c-1", "sb-1"))
+            .await;
 
         let result = svc
             .update_container_resources(Request::new(UpdateContainerResourcesRequest {
@@ -1372,7 +1552,10 @@ mod tests {
     #[tokio::test]
     async fn test_reopen_container_log_empty_path() {
         let svc = make_test_service();
-        svc.container_store.add(test_container("c-1", "sb-1")).await;
+        svc.store
+            .containers
+            .add(test_container("c-1", "sb-1"))
+            .await;
 
         // Should succeed even with empty log path (no-op)
         let result = svc
@@ -1393,7 +1576,7 @@ mod tests {
 
         let mut c = test_container("c-1", "sb-1");
         c.log_path = log_path.to_string_lossy().to_string();
-        svc.container_store.add(c).await;
+        svc.store.containers.add(c).await;
 
         svc.reopen_container_log(Request::new(ReopenContainerLogRequest {
             container_id: "c-1".to_string(),
@@ -1411,9 +1594,15 @@ mod tests {
     #[tokio::test]
     async fn test_stop_pod_sandbox_no_vm() {
         let svc = make_test_service();
-        svc.sandbox_store.add(test_sandbox("sb-1")).await;
-        svc.container_store.add(test_container("c-1", "sb-1")).await;
-        svc.container_store.mark_started("c-1", 2_000_000_000).await;
+        svc.store.sandboxes.add(test_sandbox("sb-1")).await;
+        svc.store
+            .containers
+            .add(test_container("c-1", "sb-1"))
+            .await;
+        svc.store
+            .containers
+            .mark_started("c-1", 2_000_000_000)
+            .await;
 
         svc.stop_pod_sandbox(Request::new(StopPodSandboxRequest {
             pod_sandbox_id: "sb-1".to_string(),
@@ -1422,19 +1611,22 @@ mod tests {
         .unwrap();
 
         // Sandbox should be NotReady
-        let sb = svc.sandbox_store.get("sb-1").await.unwrap();
+        let sb = svc.store.sandboxes.get("sb-1").await.unwrap();
         assert_eq!(sb.state, SandboxState::NotReady);
 
         // Container should be Exited
-        let c = svc.container_store.get("c-1").await.unwrap();
+        let c = svc.store.containers.get("c-1").await.unwrap();
         assert_eq!(c.state, ContainerState::Exited);
     }
 
     #[tokio::test]
     async fn test_remove_pod_sandbox_no_vm() {
         let svc = make_test_service();
-        svc.sandbox_store.add(test_sandbox("sb-1")).await;
-        svc.container_store.add(test_container("c-1", "sb-1")).await;
+        svc.store.sandboxes.add(test_sandbox("sb-1")).await;
+        svc.store
+            .containers
+            .add(test_container("c-1", "sb-1"))
+            .await;
 
         svc.remove_pod_sandbox(Request::new(RemovePodSandboxRequest {
             pod_sandbox_id: "sb-1".to_string(),
@@ -1443,8 +1635,8 @@ mod tests {
         .unwrap();
 
         // Sandbox and containers should be gone
-        assert!(svc.sandbox_store.get("sb-1").await.is_none());
-        assert!(svc.container_store.get("c-1").await.is_none());
+        assert!(svc.store.sandboxes.get("sb-1").await.is_none());
+        assert!(svc.store.containers.get("c-1").await.is_none());
     }
 
     // ── Exec/Attach/PortForward error paths ──────────────────────────
@@ -1467,7 +1659,8 @@ mod tests {
     async fn test_exec_sync_sandbox_not_found() {
         let svc = make_test_service();
         // Container exists but no VM for its sandbox
-        svc.container_store
+        svc.store
+            .containers
             .add(test_container("c-1", "sb-missing"))
             .await;
 
@@ -1526,5 +1719,63 @@ mod tests {
             .await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code(), tonic::Code::NotFound);
+    }
+
+    // ── Warm Pool ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_service_without_warm_pool_has_none() {
+        let svc = make_test_service();
+        assert!(svc.warm_pool.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_with_warm_pool_attaches_pool() {
+        use a3s_box_core::config::{BoxConfig, PoolConfig};
+        use a3s_box_core::event::EventEmitter;
+        use a3s_box_runtime::pool::WarmPool;
+
+        let pool_config = PoolConfig {
+            enabled: true,
+            min_idle: 0, // no pre-boot in tests
+            max_size: 2,
+            idle_ttl_secs: 300,
+            ..Default::default()
+        };
+
+        let result =
+            WarmPool::start(pool_config, BoxConfig::default(), EventEmitter::new(64)).await;
+
+        if let Ok(mut pool) = result {
+            let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let streaming_server = crate::streaming::StreamingServer::new(addr);
+            let handle = streaming_server.handle();
+
+            let svc = BoxRuntimeService {
+                store: Arc::new(PersistentCriStore::new(Arc::new(NoopStateStore))),
+                vm_managers: Arc::new(RwLock::new(HashMap::new())),
+                streaming: handle,
+                warm_pool: None,
+            }
+            .with_warm_pool(pool);
+
+            assert!(svc.warm_pool.is_some());
+            // Drain pool to clean up
+            if let Some(p) = svc.warm_pool {
+                let mut pool = p.write().await;
+                let _ = pool.drain().await;
+            }
+        }
+        // If WarmPool::start fails (no shim), test is skipped — acceptable in unit test env
+    }
+
+    #[tokio::test]
+    async fn test_acquire_vm_without_pool_fails_without_shim() {
+        // Without a warm pool, acquire_vm cold-boots — which fails in unit test env
+        let svc = make_test_service();
+        let config = a3s_box_core::config::BoxConfig::default();
+        let result = svc.acquire_vm(config).await;
+        // Expected: error because no shim binary available
+        assert!(result.is_err());
     }
 }

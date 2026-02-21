@@ -78,6 +78,7 @@ impl CriServer {
             self.auth.clone(),
             streaming_handle,
         );
+        runtime_service.load_state().await;
         let image_service = BoxImageService::new(self.image_store.clone(), self.auth.clone());
 
         let uds = UnixListener::bind(&self.socket_path)?;

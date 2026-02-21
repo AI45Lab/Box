@@ -31,6 +31,7 @@ mod logs;
 mod monitor;
 mod network;
 mod pause;
+mod pool;
 mod port;
 mod ps;
 mod pull;
@@ -178,6 +179,8 @@ pub enum Command {
     Info(info::InfoArgs),
     /// Background daemon that monitors and restarts dead boxes
     Monitor(monitor::MonitorArgs),
+    /// Manage the warm VM pool (pre-boot VMs for instant start)
+    Pool(pool::PoolArgs),
 }
 
 /// Return the path to the image store directory (~/.a3s/images).
@@ -292,5 +295,6 @@ pub async fn dispatch(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Version(args) => version::execute(args).await,
         Command::Info(args) => info::execute(args).await,
         Command::Monitor(args) => monitor::execute(args).await,
+        Command::Pool(args) => pool::execute(args).await,
     }
 }

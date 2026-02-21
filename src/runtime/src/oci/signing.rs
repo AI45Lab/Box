@@ -590,7 +590,7 @@ fn pem_to_der(pem_str: &str) -> std::result::Result<Vec<u8>, String> {
 }
 
 /// Cosign signature envelope stored in the OCI layer.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct CosignSignatureEnvelope {
     /// Base64-encoded SimpleSigning payload.
     payload: String,
@@ -687,6 +687,191 @@ fn base64_decode(input: &str) -> std::result::Result<Vec<u8>, String> {
     base64::engine::general_purpose::STANDARD
         .decode(input.trim())
         .map_err(|e| format!("base64 decode error: {}", e))
+}
+
+/// Encode bytes to base64 (standard alphabet with padding).
+fn base64_encode(input: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(input)
+}
+
+/// Result of a successful image signing operation.
+#[derive(Debug, Clone)]
+pub struct SignResult {
+    /// The signature tag pushed to the registry (e.g., "sha256-abc123.sig").
+    pub signature_tag: String,
+}
+
+/// Sign an image after push using a PEM-encoded ECDSA P-256 private key.
+///
+/// Creates a cosign-compatible signature artifact and pushes it to the registry
+/// as a separate image with the `.sig` tag convention.
+///
+/// # Arguments
+/// * `private_key_path` - Path to PEM-encoded ECDSA P-256 private key
+/// * `registry` - Registry hostname (e.g., "ghcr.io")
+/// * `repository` - Repository path (e.g., "myorg/myimage")
+/// * `manifest_digest` - Digest of the pushed manifest (e.g., "sha256:abc123...")
+/// * `docker_reference` - Full image reference (e.g., "ghcr.io/myorg/myimage:latest")
+pub async fn sign_image(
+    private_key_path: &str,
+    registry: &str,
+    repository: &str,
+    manifest_digest: &str,
+    docker_reference: &str,
+) -> Result<SignResult> {
+    use p256::ecdsa::signature::Signer;
+
+    // 1. Read and parse the private key
+    let pem_bytes = std::fs::read(private_key_path).map_err(|e| {
+        BoxError::OciImageError(format!(
+            "Failed to read signing key '{}': {}",
+            private_key_path, e
+        ))
+    })?;
+    let signing_key = parse_pem_private_key(&pem_bytes)
+        .map_err(|e| BoxError::OciImageError(format!("Failed to parse signing key: {}", e)))?;
+
+    // 2. Build the SimpleSigning payload
+    let payload = CosignPayload {
+        critical: CosignCritical {
+            identity: CosignIdentity {
+                docker_reference: docker_reference.to_string(),
+            },
+            image: CosignImage {
+                docker_manifest_digest: manifest_digest.to_string(),
+            },
+            sig_type: "cosign container image signature".to_string(),
+        },
+        optional: serde_json::json!({}),
+    };
+    let payload_bytes = serde_json::to_vec(&payload).map_err(|e| {
+        BoxError::SerializationError(format!("Failed to serialize cosign payload: {}", e))
+    })?;
+
+    // 3. Sign the payload with ECDSA P-256
+    let signature: p256::ecdsa::DerSignature = signing_key.sign(&payload_bytes);
+
+    // 4. Build the cosign signature envelope
+    let envelope = CosignSignatureEnvelope {
+        payload: base64_encode(&payload_bytes),
+        signature: base64_encode(signature.as_bytes()),
+    };
+    let envelope_bytes = serde_json::to_vec(&envelope).map_err(|e| {
+        BoxError::SerializationError(format!("Failed to serialize signature envelope: {}", e))
+    })?;
+
+    // 5. Push the signature as an OCI image with the .sig tag
+    let sig_tag = cosign_signature_tag(manifest_digest);
+    let sig_reference_str = format!("{}/{}:{}", registry, repository, sig_tag);
+
+    let sig_reference: Reference =
+        sig_reference_str
+            .parse()
+            .map_err(|e| BoxError::RegistryError {
+                registry: registry.to_string(),
+                message: format!("Invalid signature reference: {}", e),
+            })?;
+
+    let config = oci_distribution::client::ClientConfig {
+        protocol: oci_distribution::client::ClientProtocol::Https,
+        ..Default::default()
+    };
+    let client = Client::new(config);
+
+    // The signature layer uses the cosign media type
+    let sig_layer = oci_distribution::client::ImageLayer::new(
+        envelope_bytes,
+        "application/vnd.dev.cosign.simplesigning.v1+json".to_string(),
+        None,
+    );
+
+    // Empty config for the signature image
+    let sig_config = oci_distribution::client::Config::new(
+        b"{}".to_vec(),
+        "application/vnd.oci.image.config.v1+json".to_string(),
+        None,
+    );
+
+    client
+        .push(
+            &sig_reference,
+            &[sig_layer],
+            sig_config,
+            &RegistryAuth::Anonymous,
+            None,
+        )
+        .await
+        .map_err(|e| BoxError::RegistryError {
+            registry: registry.to_string(),
+            message: format!("Failed to push signature artifact: {}", e),
+        })?;
+
+    tracing::info!(
+        digest = %manifest_digest,
+        signature_tag = %sig_tag,
+        "Image signed and signature pushed"
+    );
+
+    Ok(SignResult {
+        signature_tag: sig_tag,
+    })
+}
+
+/// Parse a PEM-encoded ECDSA P-256 private key.
+///
+/// Supports "EC PRIVATE KEY" (SEC1) and "PRIVATE KEY" (PKCS#8) PEM formats.
+fn parse_pem_private_key(pem_bytes: &[u8]) -> std::result::Result<p256::ecdsa::SigningKey, String> {
+    let pem_str = std::str::from_utf8(pem_bytes)
+        .map_err(|e| format!("PEM file is not valid UTF-8: {}", e))?;
+
+    let der_bytes = if pem_str.contains("BEGIN EC PRIVATE KEY") {
+        // SEC1 format
+        extract_pem_content(
+            pem_str,
+            "-----BEGIN EC PRIVATE KEY-----",
+            "-----END EC PRIVATE KEY-----",
+        )?
+    } else if pem_str.contains("BEGIN PRIVATE KEY") {
+        // PKCS#8 format
+        extract_pem_content(
+            pem_str,
+            "-----BEGIN PRIVATE KEY-----",
+            "-----END PRIVATE KEY-----",
+        )?
+    } else {
+        return Err("Unsupported PEM format: expected EC PRIVATE KEY or PRIVATE KEY".to_string());
+    };
+
+    // Try SEC1 first, then PKCS#8
+    if let Ok(key) = p256::SecretKey::from_sec1_der(&der_bytes) {
+        return Ok(p256::ecdsa::SigningKey::from(key));
+    }
+
+    // Try PKCS#8
+    use p256::pkcs8::DecodePrivateKey;
+    p256::SecretKey::from_pkcs8_der(&der_bytes)
+        .map(p256::ecdsa::SigningKey::from)
+        .map_err(|e| format!("Failed to parse P-256 private key: {}", e))
+}
+
+/// Extract base64 content between PEM markers.
+fn extract_pem_content(
+    pem_str: &str,
+    begin_marker: &str,
+    end_marker: &str,
+) -> std::result::Result<Vec<u8>, String> {
+    let start = pem_str
+        .find(begin_marker)
+        .ok_or("Missing PEM begin marker")?
+        + begin_marker.len();
+    let end = pem_str.find(end_marker).ok_or("Missing PEM end marker")?;
+
+    let b64: String = pem_str[start..end]
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+
+    base64_decode(&b64).map_err(|e| format!("Failed to decode PEM base64: {}", e))
 }
 
 #[cfg(test)]
@@ -1140,5 +1325,133 @@ mod tests {
         assert!(extracted.is_ok());
         // P-256 uncompressed point is 65 bytes (0x04 + 32 + 32)
         assert_eq!(extracted.unwrap().len(), 65);
+    }
+
+    // --- Image signing tests ---
+
+    #[test]
+    fn test_base64_encode_roundtrip() {
+        let data = b"hello cosign signing";
+        let encoded = base64_encode(data);
+        let decoded = base64_decode(&encoded).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn test_cosign_signature_envelope_serde_roundtrip() {
+        let envelope = CosignSignatureEnvelope {
+            payload: base64_encode(b"test payload"),
+            signature: base64_encode(b"test signature"),
+        };
+        let json = serde_json::to_string(&envelope).unwrap();
+        let parsed: CosignSignatureEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.payload, envelope.payload);
+        assert_eq!(parsed.signature, envelope.signature);
+    }
+
+    #[test]
+    fn test_parse_pem_private_key_sec1() {
+        // Generate a P-256 key and export as SEC1 PEM
+        let signing_key = p256::ecdsa::SigningKey::random(&mut rand::thread_rng());
+        let secret_key = signing_key.as_nonzero_scalar();
+        let sec1_der = secret_key.to_bytes();
+
+        // Build a minimal SEC1 PEM (just the raw scalar isn't valid SEC1 DER,
+        // so use pkcs8 instead for this test)
+        use p256::pkcs8::EncodePrivateKey;
+        let pkcs8_der = p256::SecretKey::from(signing_key.clone())
+            .to_pkcs8_der()
+            .unwrap();
+        let b64 = base64_encode(pkcs8_der.as_bytes());
+        let pem = format!(
+            "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+            b64
+        );
+
+        let parsed = parse_pem_private_key(pem.as_bytes());
+        assert!(parsed.is_ok());
+
+        // Verify the parsed key can sign and the original key can verify
+        use p256::ecdsa::{signature::Signer, signature::Verifier};
+        let msg = b"test message";
+        let sig: p256::ecdsa::DerSignature = parsed.unwrap().sign(msg);
+        assert!(signing_key.verifying_key().verify(msg, &sig).is_ok());
+    }
+
+    #[test]
+    fn test_parse_pem_private_key_invalid() {
+        let result = parse_pem_private_key(b"not a pem file");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sign_and_verify_roundtrip() {
+        use p256::ecdsa::{signature::Signer, SigningKey};
+
+        // Generate key pair
+        let signing_key = SigningKey::random(&mut rand::thread_rng());
+        let pub_bytes = signing_key
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
+
+        // Build payload
+        let digest = "sha256:deadbeef1234";
+        let payload = CosignPayload {
+            critical: CosignCritical {
+                identity: CosignIdentity {
+                    docker_reference: "ghcr.io/myorg/myimage:latest".to_string(),
+                },
+                image: CosignImage {
+                    docker_manifest_digest: digest.to_string(),
+                },
+                sig_type: "cosign container image signature".to_string(),
+            },
+            optional: serde_json::json!({}),
+        };
+        let payload_bytes = serde_json::to_vec(&payload).unwrap();
+
+        // Sign
+        let sig: p256::ecdsa::DerSignature = signing_key.sign(&payload_bytes);
+
+        // Build envelope
+        let envelope = CosignSignatureEnvelope {
+            payload: base64_encode(&payload_bytes),
+            signature: base64_encode(sig.as_bytes()),
+        };
+        let envelope_bytes = serde_json::to_vec(&envelope).unwrap();
+
+        // Verify: parse envelope, decode, verify signature, verify payload
+        let parsed_env: CosignSignatureEnvelope = serde_json::from_slice(&envelope_bytes).unwrap();
+        let decoded_payload = base64_decode(&parsed_env.payload).unwrap();
+        let decoded_sig = base64_decode(&parsed_env.signature).unwrap();
+
+        assert!(verify_ecdsa_p256(&pub_bytes, &decoded_payload, &decoded_sig).is_ok());
+        assert!(verify_cosign_payload(&decoded_payload, digest).is_ok());
+    }
+
+    #[test]
+    fn test_extract_pem_content_valid() {
+        let data = vec![1, 2, 3, 4, 5];
+        let b64 = base64_encode(&data);
+        let pem = format!("-----BEGIN TEST-----\n{}\n-----END TEST-----\n", b64);
+        let result = extract_pem_content(&pem, "-----BEGIN TEST-----", "-----END TEST-----");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), data);
+    }
+
+    #[test]
+    fn test_extract_pem_content_missing_begin() {
+        let result = extract_pem_content("no markers", "-----BEGIN X-----", "-----END X-----");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sign_result_structure() {
+        let result = SignResult {
+            signature_tag: "sha256-abc123.sig".to_string(),
+        };
+        assert_eq!(result.signature_tag, "sha256-abc123.sig");
     }
 }

@@ -305,15 +305,15 @@ All SDKs provide: async API, streaming exec, file transfer, sandbox lifecycle ma
 
 | Crate | Binary | Purpose | Version | Tests |
 |-------|--------|---------|---------|------:|
-| `cli` | `a3s-box` | Docker-like CLI (52 commands) | 0.5.3 | 361 |
+| `cli` | `a3s-box` | Docker-like CLI (52 commands) | 0.5.3 | 369 |
 | `core` | — | Config, error types, events | 0.5.3 | 331 |
 | `runtime` | — | VM lifecycle, OCI, attestation | 0.5.3 | 711 |
 | `guest/init` | `a3s-box-guest-init` | Guest PID 1, exec/PTY/attestation servers | 0.5.3 | 25 |
 | `shim` | `a3s-box-shim` | libkrun bridge | 0.5.3 | 14 |
-| `cri` | `a3s-box-cri` | Kubernetes CRI runtime | 0.5.3 | 33 |
+| `cri` | `a3s-box-cri` | Kubernetes CRI runtime | 0.5.3 | 94 |
 | `sdk` | — | Embedded sandbox SDK | 0.5.3 | 24 |
 
-218 source files, ~1,499 unit tests, 7 integration tests.
+218 source files, ~1,577 unit tests, 7 integration tests.
 
 ### Vsock Port Allocation
 
@@ -396,7 +396,7 @@ All TEE code is implemented and unit-tested. Hardware validation on real AMD SEV
 | Crate | Tests | Coverage |
 |-------|------:|----------|
 | `a3s-box-cli` | 361 | State management, name resolution, output formatting, restart policies, compose, audit, snapshot, network isolation, max restart count |
-| `a3s-box-core` | 331 | Config validation, error types, event serialization, TEE types (SEV-SNP + TDX), security config (AppArmor/SELinux warnings), compose types, network policies (validation), scale API types, operator CRD types, IPv6 IPAM, volume quota |
+| `a3s-box-core` | 337 | Config validation, error types, event serialization, TEE types (SEV-SNP + TDX), security config (AppArmor/SELinux warnings), compose types, network policies (validation), scale API types, operator CRD types, IPv6 IPAM, volume quota, sidecar config |
 | `a3s-box-runtime` | 711 | OCI parsing, rootfs, health checking, attestation, RA-TLS, sealed storage, Prometheus metrics, tracing spans, image signing (honest verification), compose orchestrator, audit log, snapshot store, KBS client, re-attestation, rollback protection, syslog driver, gzip log compression, manifest digest, ONBUILD trigger parsing |
 | `a3s-box-cri` | 33 | CRI sandbox/container lifecycle, config mapping (SEV-SNP + TDX) |
 | `a3s-box-guest-init` | 25 | Exec server, attest server frame I/O, secret validation, namespace security (user + cgroup), seccomp arch validation |
@@ -462,9 +462,12 @@ cargo test -p a3s-box-cli --test tee_integration -- --ignored --nocapture --test
 - [x] Helm chart — DaemonSet, RuntimeClass, RBAC
 - [x] Embedded SDK — Rust, Python, TypeScript
 
-### 🚧 v0.6.x — Planned
+### ✅ v0.6.x — In Progress
 
-- [ ] Persistent CRI state store — survive CRI server restarts without orphaning VMs
+- [x] Persistent CRI state store — survive CRI server restarts without orphaning VMs (JSON file, atomic writes, crash-recovery on startup)
+- [x] Warm pool CLI/CRI integration — `a3s-box pool start/stop/status`, CRI acquires from pool on RunPodSandbox
+- [x] SafeClaw + Box sidecar integration — `--sidecar IMAGE` flag, `SidecarConfig` in BoxConfig, guest-init launches sidecar before main container
+- [ ] Intel TDX runtime support (hardware-gated, config variant already exists)
 - [ ] Intel TDX runtime support (hardware-gated, config variant already exists)
 - [ ] `--gpus` / `--device` passthrough via VFIO (libkrun upstream dependency)
 - [ ] `.tar.bz2` / `.tar.xz` auto-extraction in `ADD` (bzip2/xz deps)

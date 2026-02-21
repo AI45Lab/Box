@@ -1,4 +1,7 @@
 //! `a3s-box push` command — Push a local image to a registry.
+//!
+//! Optionally signs the image after push using a cosign-compatible
+//! ECDSA P-256 private key (`--sign-key`).
 
 use std::sync::Arc;
 
@@ -12,6 +15,10 @@ pub struct PushArgs {
     /// Suppress progress output
     #[arg(short, long)]
     pub quiet: bool,
+
+    /// Sign the image after push with a cosign-compatible ECDSA P-256 private key
+    #[arg(long)]
+    pub sign_key: Option<String>,
 }
 
 pub async fn execute(args: PushArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -44,5 +51,51 @@ pub async fn execute(args: PushArgs) -> Result<(), Box<dyn std::error::Error>> {
         println!("Pushed: {} ({})", args.image, result.manifest_url);
     }
 
+    // Sign the image if --sign-key is provided
+    if let Some(ref key_path) = args.sign_key {
+        if !args.quiet {
+            println!("Signing {}...", args.image);
+        }
+
+        let sign_result = a3s_box_runtime::oci::signing::sign_image(
+            key_path,
+            &reference.registry,
+            &reference.repository,
+            &result.manifest_digest,
+            &args.image,
+        )
+        .await?;
+
+        if !args.quiet {
+            println!("Signed: {} ({})", args.image, sign_result.signature_tag);
+        }
+    }
+
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_push_args_defaults() {
+        let args = PushArgs {
+            image: "ghcr.io/org/app:latest".to_string(),
+            quiet: false,
+            sign_key: None,
+        };
+        assert!(!args.quiet);
+        assert!(args.sign_key.is_none());
+    }
+
+    #[test]
+    fn test_push_args_with_sign_key() {
+        let args = PushArgs {
+            image: "ghcr.io/org/app:latest".to_string(),
+            quiet: false,
+            sign_key: Some("/path/to/cosign.key".to_string()),
+        };
+        assert_eq!(args.sign_key.as_deref(), Some("/path/to/cosign.key"));
+    }
 }

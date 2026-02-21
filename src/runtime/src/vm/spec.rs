@@ -240,6 +240,27 @@ impl VmManager {
                 .push(("A3S_TEE_SIMULATE".to_string(), "1".to_string()));
         }
 
+        // Inject sidecar configuration so guest-init can launch the sidecar process
+        if let Some(ref sidecar) = self.config.sidecar {
+            entrypoint
+                .env
+                .push(("BOX_SIDECAR_IMAGE".to_string(), sidecar.image.clone()));
+            entrypoint.env.push((
+                "BOX_SIDECAR_VSOCK_PORT".to_string(),
+                sidecar.vsock_port.to_string(),
+            ));
+            for (i, (key, value)) in sidecar.env.iter().enumerate() {
+                entrypoint.env.push((
+                    format!("BOX_SIDECAR_ENV_{}", i),
+                    format!("{}={}", key, value),
+                ));
+            }
+            entrypoint.env.push((
+                "BOX_SIDECAR_ENV_COUNT".to_string(),
+                sidecar.env.len().to_string(),
+            ));
+        }
+
         // Determine workdir
         let workdir = match &layout.oci_config {
             Some(oci_config) => oci_config

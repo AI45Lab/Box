@@ -52,6 +52,11 @@ test:
     #!/usr/bin/env bash
     set -e
 
+    # Ensure libkrun is findable on macOS (installed via homebrew)
+    if [ -d "/opt/homebrew/lib" ]; then
+        export LIBRARY_PATH="/opt/homebrew/lib:${LIBRARY_PATH:-}"
+    fi
+
     # Colors
     BOLD='\033[1m'
     GREEN='\033[0;32m'

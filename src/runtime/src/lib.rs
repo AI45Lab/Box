@@ -24,6 +24,7 @@ pub mod log;
 pub mod network;
 pub mod oci;
 pub mod prom;
+pub mod resize;
 pub mod rootfs;
 pub mod snapshot;
 pub mod tee;
@@ -60,7 +61,7 @@ pub use network::NetworkStore;
 pub use a3s_box_core::StoredImage;
 pub use oci::{CredentialStore, PushResult, RegistryPusher};
 pub use oci::{ImagePuller, ImageReference, ImageStore, RegistryAuth};
-pub use oci::{OciImage, SignaturePolicy};
+pub use oci::{OciImage, SignResult, SignaturePolicy};
 
 // Metrics
 pub use prom::RuntimeMetrics;
@@ -82,6 +83,9 @@ pub use vmm::{
     Entrypoint, FsMount, InstanceSpec, NetworkInstanceConfig, ShimHandler, TeeInstanceConfig,
     VmController, VmHandler, VmMetrics, VmmProvider,
 };
+
+// Resize
+pub use resize::{validate_update, ResizeResult, ResourceUpdate};
 
 // Volume
 pub use volume::VolumeStore;

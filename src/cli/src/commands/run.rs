@@ -3,7 +3,7 @@
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
-use a3s_box_core::config::{BoxConfig, ResourceConfig, TeeConfig};
+use a3s_box_core::config::{BoxConfig, ResourceConfig, SidecarConfig, TeeConfig};
 use a3s_box_core::event::EventEmitter;
 use a3s_box_core::vmm::{parse_signal_name, DEFAULT_SHUTDOWN_TIMEOUT_MS};
 use a3s_box_runtime::VmManager;
@@ -58,6 +58,16 @@ pub struct RunArgs {
     /// Enable TEE simulation mode (no AMD SEV-SNP hardware required)
     #[arg(long)]
     pub tee_simulate: bool,
+
+    /// Sidecar OCI image to run alongside the main container inside the VM.
+    /// Intended for security proxies such as SafeClaw.
+    /// Example: --sidecar ghcr.io/a3s-lab/safeclaw:latest
+    #[arg(long)]
+    pub sidecar: Option<String>,
+
+    /// Vsock port for the sidecar process (default: 4092)
+    #[arg(long, default_value = "4092")]
+    pub sidecar_vsock_port: u32,
 }
 
 /// Intermediate state produced by the setup phase, consumed by the run phase.
@@ -337,6 +347,11 @@ fn build_box_config(
         resource_limits,
         tee,
         read_only: args.common.read_only,
+        sidecar: args.sidecar.as_ref().map(|image| SidecarConfig {
+            image: image.clone(),
+            vsock_port: args.sidecar_vsock_port,
+            env: vec![],
+        }),
         ..Default::default()
     }
 }
@@ -662,6 +677,8 @@ mod tests {
             tee: false,
             tee_workload_id: None,
             tee_simulate: false,
+            sidecar: None,
+            sidecar_vsock_port: 4092,
         }
     }
 

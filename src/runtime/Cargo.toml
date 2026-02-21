@@ -20,7 +20,7 @@ operator = []
 build = []
 
 [dependencies]
-a3s-box-core = { version = "0.5", path = "../core" }
+a3s-box-core = { version = "0.6", path = "../core" }
 a3s-transport = { workspace = true }
 libkrun-sys = { version = "0.1", path = "../deps/libkrun-sys", package = "a3s-libkrun-sys" }
 
@@ -83,6 +83,8 @@ oci-spec = "0.6"
 oci-distribution = { workspace = true }
 tar = "0.4"
 flate2 = "1.0"
+bzip2 = "0.5"
+xz2 = "0.1"
 
 # Build support
 tempfile = { workspace = true }

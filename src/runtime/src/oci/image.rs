@@ -612,7 +612,11 @@ mod tests {
         // and surfaced in OciImageConfig.onbuild (oci-spec 0.6 doesn't model this field).
         let temp_dir = TempDir::new().unwrap();
         fs::create_dir_all(temp_dir.path().join("blobs/sha256")).unwrap();
-        fs::write(temp_dir.path().join("oci-layout"), r#"{"imageLayoutVersion":"1.0.0"}"#).unwrap();
+        fs::write(
+            temp_dir.path().join("oci-layout"),
+            r#"{"imageLayoutVersion":"1.0.0"}"#,
+        )
+        .unwrap();
 
         let config_content = r#"{
             "architecture": "amd64",
@@ -624,7 +628,11 @@ mod tests {
             "history": []
         }"#;
         let config_hash = "onbuildcfg001";
-        fs::write(temp_dir.path().join("blobs/sha256").join(config_hash), config_content).unwrap();
+        fs::write(
+            temp_dir.path().join("blobs/sha256").join(config_hash),
+            config_content,
+        )
+        .unwrap();
 
         let manifest_content = format!(
             r#"{{"schemaVersion":2,"config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:{}","size":{}}},"layers":[]}}"#,
@@ -632,7 +640,11 @@ mod tests {
             config_content.len()
         );
         let manifest_hash = "onbuildmfst001";
-        fs::write(temp_dir.path().join("blobs/sha256").join(manifest_hash), &manifest_content).unwrap();
+        fs::write(
+            temp_dir.path().join("blobs/sha256").join(manifest_hash),
+            &manifest_content,
+        )
+        .unwrap();
 
         let index_content = format!(
             r#"{{"schemaVersion":2,"manifests":[{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:{}","size":{}}}]}}"#,
@@ -642,7 +654,10 @@ mod tests {
         fs::write(temp_dir.path().join("index.json"), index_content).unwrap();
 
         let image = OciImage::from_path(temp_dir.path()).unwrap();
-        assert_eq!(image.config().onbuild, vec!["RUN echo hello", "COPY . /app"]);
+        assert_eq!(
+            image.config().onbuild,
+            vec!["RUN echo hello", "COPY . /app"]
+        );
     }
 
     // Helper function to create a test layer (minimal tar.gz)
