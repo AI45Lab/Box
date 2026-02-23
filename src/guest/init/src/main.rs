@@ -298,7 +298,7 @@ fn launch_sidecar(config: &SidecarConfig) -> Result<(), Box<dyn std::error::Erro
     let binary_name = config
         .image
         .split('/')
-        .last()
+        .next_back()
         .and_then(|s| s.split(':').next())
         .unwrap_or("sidecar");
 

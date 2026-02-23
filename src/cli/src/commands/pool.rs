@@ -97,9 +97,11 @@ async fn execute_start(args: PoolStartArgs) -> Result<(), Box<dyn std::error::Er
         ..Default::default()
     };
 
-    let mut box_config = BoxConfig::default();
-    box_config.image = args.image.clone();
-    box_config.pool = pool_config.clone();
+    let box_config = BoxConfig {
+        image: args.image.clone(),
+        pool: pool_config.clone(),
+        ..Default::default()
+    };
 
     let emitter = EventEmitter::new(256);
     let mut pool = WarmPool::start(pool_config, box_config, emitter).await?;
