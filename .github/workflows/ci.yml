@@ -139,3 +139,28 @@ jobs:
         run: cd sdk/python && cargo check
       - name: Check Node SDK
         run: cd sdk/node && cargo check
+
+  # ── Windows launcher build check ───────────────────────────────
+  build-windows:
+    name: Build Windows Launcher
+    needs: [fmt, clippy, test]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Init submodules
+        run: git -c http.extraheader= submodule update --init --recursive
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src
+          key: windows-launcher
+      - name: Build Windows launcher
+        working-directory: src
+        run: cargo build --release --bin a3s-box-win --target x86_64-pc-windows-msvc
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: a3s-box-win
+          path: src/target/x86_64-pc-windows-msvc/release/a3s-box-win.exe

@@ -168,9 +168,35 @@ jobs:
           path: ${{ env.ASSET }}
 
   # ── Create GitHub Release ──────────────────────────────────────
+
+  # ── Windows launcher build ─────────────────────────────────────
+  build-windows:
+    name: Build Windows Launcher
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Init submodules
+        run: git -c http.extraheader= submodule update --init --recursive
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src
+          key: release-windows
+      - name: Build Windows launcher
+        working-directory: src
+        run: cargo build --release --bin a3s-box-win --target x86_64-pc-windows-msvc
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-launcher
+          path: src/target/x86_64-pc-windows-msvc/release/a3s-box-win.exe
+
   release:
     name: GitHub Release
-    needs: build
+    needs: [build, build-windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -184,7 +210,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: artifacts/**/*.tar.gz
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/windows-launcher/a3s-box-win.exe
 
   # ── Publish to crates.io ───────────────────────────────────────
   publish-crates:
