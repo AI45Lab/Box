@@ -1,16 +1,18 @@
+[workspace]
+
 [package]
 name = "a3s-box-win"
-version.workspace = true
-edition.workspace = true
-authors.workspace = true
-license.workspace = true
+version = "0.7.0"
+edition = "2021"
+authors = ["A3S Lab Team"]
+license = "MIT"
 
 [[bin]]
 name = "a3s-box-win"
 path = "src/main.rs"
 
 [dependencies]
-dirs = { workspace = true }
+dirs = "5.0"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.52", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
+windows-sys = { version = "0.52", features = ["Win32_UI_Shell", "Win32_Foundation"] }
