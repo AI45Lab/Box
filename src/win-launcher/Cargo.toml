@@ -1,0 +1,16 @@
+[package]
+name = "a3s-box-win"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "a3s-box-win"
+path = "src/main.rs"
+
+[dependencies]
+dirs = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_UI_Shell", "Win32_Foundation"] }

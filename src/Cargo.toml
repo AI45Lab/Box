@@ -8,6 +8,7 @@ members = [
     "cri",
     "cli",
     "sdk",
+    "win-launcher",
 ]
 resolver = "2"
 
