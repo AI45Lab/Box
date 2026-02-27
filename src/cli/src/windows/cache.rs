@@ -83,7 +83,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = temp_cache_path(&dir);
         write_at(&path, "0.6.0").unwrap();
-        invalidate_at(&path);  // calls real production function
+        invalidate_at(&path); // calls real production function
         assert!(!is_valid_at(&path, "0.6.0"));
     }
 }

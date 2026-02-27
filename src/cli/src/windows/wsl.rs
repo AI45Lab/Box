@@ -15,9 +15,7 @@ pub enum WslStatus {
 
 /// Detect current WSL2 status by running `wsl --status`.
 pub fn detect() -> WslStatus {
-    let output = Command::new("wsl")
-        .args(["--status"])
-        .output();
+    let output = Command::new("wsl").args(["--status"]).output();
 
     match output {
         Err(_) => WslStatus::NotInstalled,

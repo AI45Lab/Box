@@ -492,7 +492,10 @@ impl VmManager {
 
         // Cleanup rootfs provider (unmount overlay if applicable)
         let box_dir = self.home_dir.join("boxes").join(&self.box_id);
-        if let Err(e) = self.rootfs_provider.cleanup(&box_dir, self.config.persistent) {
+        if let Err(e) = self
+            .rootfs_provider
+            .cleanup(&box_dir, self.config.persistent)
+        {
             tracing::warn!(
                 box_id = %self.box_id,
                 error = %e,
