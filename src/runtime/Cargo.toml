@@ -20,7 +20,7 @@ operator = []
 build = []
 
 [dependencies]
-a3s-box-core = { version = "0.6", path = "../core" }
+a3s-box-core = { version = "0.7", path = "../core" }
 a3s-transport = { workspace = true }
 libkrun-sys = { version = "0.1", path = "../deps/libkrun-sys", package = "a3s-libkrun-sys" }
 
