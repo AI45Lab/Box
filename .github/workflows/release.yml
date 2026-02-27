@@ -209,6 +209,7 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
+          name: "20行代码，开发Claude Code 核心能力"
           generate_release_notes: true
           files: |
             artifacts/**/*.tar.gz
