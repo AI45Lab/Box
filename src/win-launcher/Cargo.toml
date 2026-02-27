@@ -13,6 +13,3 @@ path = "src/main.rs"
 
 [dependencies]
 dirs = "5.0"
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.52", features = ["Win32_UI_Shell", "Win32_Foundation"] }

@@ -9,7 +9,19 @@ pub fn relaunch_as_admin() -> std::io::Result<()> {
     {
         use std::ffi::OsStr;
         use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+
+        // Declare ShellExecuteW directly to avoid windows-sys feature resolution issues.
+        #[link(name = "shell32")]
+        extern "system" {
+            fn ShellExecuteW(
+                hwnd: isize,
+                lpoperation: *const u16,
+                lpfile: *const u16,
+                lpparameters: *const u16,
+                lpdirectory: *const u16,
+                nshowcmd: i32,
+            ) -> isize;
+        }
 
         let verb: Vec<u16> = OsStr::new("runas\0").encode_wide().collect();
         let file: Vec<u16> = exe.as_os_str().encode_wide().chain(Some(0)).collect();
@@ -26,7 +38,7 @@ pub fn relaunch_as_admin() -> std::io::Result<()> {
             )
         };
 
-        if result as usize <= 32 {
+        if result <= 32 {
             return Err(std::io::Error::last_os_error());
         }
     }
