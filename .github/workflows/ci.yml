@@ -158,6 +158,8 @@ jobs:
           key: windows-launcher
       - name: Build Windows launcher
         working-directory: src
+        env:
+          A3S_DEPS_STUB: "1"
         run: cargo build --release --bin a3s-box-win --target x86_64-pc-windows-msvc
       - name: Upload artifact
         uses: actions/upload-artifact@v4
