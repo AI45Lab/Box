@@ -74,3 +74,10 @@ flate2 = "1.0"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[[bin]]
+name = "a3s-box-win"
+path = "src/windows/main.rs"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_UI_Shell", "Win32_Foundation"] }
