@@ -9,7 +9,7 @@ pub fn relaunch_as_admin() -> std::io::Result<()> {
     {
         use std::ffi::OsStr;
         use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::ShellExecuteW;
 
         let verb: Vec<u16> = OsStr::new("runas\0").encode_wide().collect();
         let file: Vec<u16> = exe.as_os_str().encode_wide().chain(Some(0)).collect();
