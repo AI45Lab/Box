@@ -192,8 +192,7 @@ jobs:
           # Build runtime with Windows WHPX backend
           cargo build --release -p a3s-box-runtime --target x86_64-pc-windows-msvc
           # Build Windows launcher
-          cd win-launcher
-          cargo build --release --bin a3s-box-win --target x86_64-pc-windows-msvc
+          cargo build --release -p a3s-box-win --target x86_64-pc-windows-msvc
 
       - name: Package Windows release
         shell: bash
