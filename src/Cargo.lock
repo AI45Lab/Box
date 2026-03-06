@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "a3s-box-cli"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "a3s-box-core",
  "a3s-box-runtime",
@@ -35,7 +35,7 @@ dependencies = [
 
 [[package]]
 name = "a3s-box-core"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "a3s-common",
  "async-trait",
@@ -51,7 +51,7 @@ dependencies = [
 
 [[package]]
 name = "a3s-box-cri"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "a3s-box-core",
  "a3s-box-runtime",
@@ -79,7 +79,7 @@ dependencies = [
 
 [[package]]
 name = "a3s-box-guest-init"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "a3s-box-core",
  "a3s-common",
@@ -101,7 +101,7 @@ dependencies = [
 
 [[package]]
 name = "a3s-box-runtime"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "a3s-box-core",
  "a3s-common",
@@ -147,7 +147,7 @@ dependencies = [
 
 [[package]]
 name = "a3s-box-sdk"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "a3s-box-core",
  "a3s-box-runtime",
@@ -165,7 +165,7 @@ dependencies = [
 
 [[package]]
 name = "a3s-box-shim"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "a3s-box-core",
  "a3s-box-runtime",
@@ -181,6 +181,8 @@ dependencies = [
 [[package]]
 name = "a3s-common"
 version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "40cd6201d7bcccd75f7719d5f3054c275dc31d0f406eab40d591d2c907f4fc60"
 dependencies = [
  "async-trait",
  "bytes",
@@ -196,11 +198,12 @@ dependencies = [
 
 [[package]]
 name = "a3s-libkrun-sys"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "libc",
  "num_cpus",
  "pkg-config",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

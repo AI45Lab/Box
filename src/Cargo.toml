@@ -117,7 +117,7 @@ base64 = "0.22"
 ring = "0.17"
 
 # Shared types (transport protocol, privacy, tools)
-a3s-transport = { path = "../../common", package = "a3s-common" }
+a3s-transport = { version = "0.1.1", package = "a3s-common" }
 
 # Metrics
 prometheus = "0.13"
