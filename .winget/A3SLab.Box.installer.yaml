@@ -15,7 +15,7 @@ NestedInstallerFiles:
 Installers:
 - Architecture: x64
   InstallerUrl: https://github.com/A3S-Lab/Box/releases/download/v0.8.0/a3s-box-v0.8.0-windows-x86_64.zip
-  InstallerSha256: PLACEHOLDER_SHA256
+  InstallerSha256: FA85AF0AC8A0BEBAA2A3BB51FE9FE3E966F366746484AFCA3FA72FE540015B3E
   Dependencies:
     WindowsFeatures:
     - HypervisorPlatform
