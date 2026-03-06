@@ -15,8 +15,11 @@
 use a3s_box_core::error::{BoxError, Result};
 use a3s_box_runtime::krun::KrunContext;
 use a3s_box_runtime::vmm::InstanceSpec;
+#[cfg(not(target_os = "windows"))]
 use a3s_box_runtime::ATTEST_VSOCK_PORT;
+#[cfg(not(target_os = "windows"))]
 use a3s_box_runtime::EXEC_VSOCK_PORT;
+#[cfg(not(target_os = "windows"))]
 use a3s_box_runtime::PTY_VSOCK_PORT;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
@@ -397,6 +400,8 @@ unsafe fn configure_and_start_vm(spec: &InstanceSpec) -> Result<()> {
     )?;
 
     // Configure exec communication channel (Unix socket bridged to vsock port 4089)
+    #[cfg(not(target_os = "windows"))]
+    {
     let exec_socket_str = spec
         .exec_socket_path
         .to_str()
@@ -453,6 +458,7 @@ unsafe fn configure_and_start_vm(spec: &InstanceSpec) -> Result<()> {
         );
         ctx.add_vsock_port(ATTEST_VSOCK_PORT, attest_socket_str, true)?;
     }
+    } // end #[cfg(not(target_os = "windows"))]
 
     // Note: A3S_TEE_SIMULATE is already included in spec.entrypoint.env
     // (added by vm.rs when simulate mode is on) and passed to the guest init
@@ -475,6 +481,7 @@ unsafe fn configure_and_start_vm(spec: &InstanceSpec) -> Result<()> {
     }
 
     // Configure networking: passt (virtio-net) or TSI (default)
+    #[cfg(not(target_os = "windows"))]
     if let Some(ref net_config) = spec.network {
         tracing::info!(
             ip = %net_config.ip_address,

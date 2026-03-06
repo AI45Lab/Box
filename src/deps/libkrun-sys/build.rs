@@ -610,14 +610,59 @@ fn build() {
     configure_linking(&libkrun_lib_dir, &libkrunfw_lib_dir);
 }
 
-/// Unsupported platform
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+/// Windows: locate pre-built krun.dll via LIBKRUN_DIR or a vendored prebuilt directory.
+///
+/// Build krun.dll from the libkrun source in this repo:
+///   cargo build --release -p libkrun --target x86_64-pc-windows-msvc
+///   set LIBKRUN_DIR=<path-to-libkrun>\target\x86_64-pc-windows-msvc\release
+///
+/// Or copy krun.dll + krun.lib (renamed from krun.dll.lib) into:
+///   deps/libkrun-sys/prebuilt/x86_64-pc-windows-msvc/
+#[cfg(target_os = "windows")]
 fn build() {
-    eprintln!("ERROR: libkrun is only supported on macOS and Linux");
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| "x86_64".to_string());
+    let triple = format!("{}-pc-windows-msvc", target_arch);
+
+    let lib_dir = if let Ok(dir) = env::var("LIBKRUN_DIR") {
+        PathBuf::from(dir)
+    } else {
+        let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+        manifest_dir.join("prebuilt").join(&triple)
+    };
+
+    let krun_lib = lib_dir.join("krun.lib");
+    if !krun_lib.exists() {
+        println!(
+            "cargo:warning=krun.lib not found at {}. \
+             Build libkrun (`cargo build --release -p libkrun --target {triple}`) \
+             and set LIBKRUN_DIR to the output directory, \
+             or copy krun.lib into deps/libkrun-sys/prebuilt/{triple}/. \
+             Set A3S_DEPS_STUB=1 to skip (CI lint mode).",
+            krun_lib.display(),
+            triple = triple,
+        );
+    }
+
+    println!("cargo:rustc-link-search=native={}", lib_dir.display());
+    println!("cargo:rustc-link-lib=dylib=krun");
+    // krun.dll itself imports WinHvPlatform; re-declare so the linker finds it.
+    println!("cargo:rustc-link-lib=WinHvPlatform");
+
+    println!("cargo:LIBKRUN_A3S_DEP={}", lib_dir.display());
+    println!("cargo:LIBKRUNFW_A3S_DEP={}", lib_dir.display());
+
+    println!("cargo:rerun-if-env-changed=LIBKRUN_DIR");
+    println!("cargo:rerun-if-changed=prebuilt/{}/krun.lib", triple);
+}
+
+/// Unsupported platform
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn build() {
+    eprintln!("ERROR: libkrun is only supported on macOS, Linux, and Windows");
     eprintln!();
     eprintln!("Supported platforms:");
     eprintln!("  - macOS ARM64 (Apple Silicon)");
-    eprintln!("  - Linux x86_64");
-    eprintln!("  - Linux aarch64");
+    eprintln!("  - Linux x86_64 / aarch64");
+    eprintln!("  - Windows x86_64 (WHPX)");
     std::process::exit(1);
 }

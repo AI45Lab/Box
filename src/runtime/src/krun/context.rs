@@ -11,11 +11,15 @@ use std::{ffi::CString, ptr};
 use super::check_status;
 use a3s_box_core::error::{BoxError, Result};
 use libkrun_sys::{
-    krun_add_net_unixstream, krun_add_virtiofs, krun_add_vsock_port2, krun_create_ctx,
-    krun_free_ctx, krun_init_log, krun_set_console_output, krun_set_env, krun_set_exec,
-    krun_set_port_map, krun_set_rlimits, krun_set_root, krun_set_vm_config, krun_set_workdir,
-    krun_setgid, krun_setuid, krun_split_irqchip, krun_start_enter,
+    krun_add_virtiofs, krun_create_ctx, krun_free_ctx, krun_init_log, krun_set_console_output,
+    krun_set_env, krun_set_exec, krun_set_port_map, krun_set_rlimits, krun_set_root,
+    krun_set_vm_config, krun_set_workdir, krun_setgid, krun_setuid, krun_split_irqchip,
+    krun_start_enter,
 };
+#[cfg(not(target_os = "windows"))]
+use libkrun_sys::{krun_add_net_unixstream, krun_add_vsock_port2};
+#[cfg(target_os = "windows")]
+use libkrun_sys::{krun_add_net_tcp, krun_add_vsock_port_windows, krun_set_kernel};
 
 /// Thin wrapper that owns a libkrun context.
 pub struct KrunContext {
@@ -252,6 +256,7 @@ impl KrunContext {
     /// * `socket_path` - Host Unix socket path for the bridge
     /// * `listen` - If true, libkrun creates the socket and listens (host connects).
     ///   If false, libkrun connects to an existing socket (host listens).
+    #[cfg(not(target_os = "windows"))]
     pub unsafe fn add_vsock_port(&self, port: u32, socket_path: &str, listen: bool) -> Result<()> {
         tracing::debug!(port, socket_path, listen, "Configuring vsock port");
         let socket_path_c = CString::new(socket_path).map_err(|e| BoxError::BoxBootError {
@@ -304,6 +309,7 @@ impl KrunContext {
     /// # Virtio-net features
     /// Uses the standard compat features: CSUM, GUEST_CSUM, GUEST_TSO4, GUEST_UFO,
     /// HOST_TSO4, HOST_UFO.
+    #[cfg(not(target_os = "windows"))]
     pub unsafe fn add_net_unixstream(&self, socket_path: &str, mac: &[u8; 6]) -> Result<()> {
         tracing::debug!(socket_path, mac = ?mac, "Adding virtio-net via passt");
 
@@ -334,7 +340,15 @@ impl KrunContext {
     /// Set the user ID for the VM process.
     ///
     /// The UID is applied right before the microVM starts.
+    #[cfg(not(target_os = "windows"))]
     pub unsafe fn set_uid(&self, uid: libc::uid_t) -> Result<()> {
+        tracing::debug!(uid, "Setting VM uid");
+        check_status("krun_setuid", krun_setuid(self.ctx_id, uid))
+    }
+
+    /// Set the user ID for the VM process (Windows).
+    #[cfg(target_os = "windows")]
+    pub unsafe fn set_uid(&self, uid: u32) -> Result<()> {
         tracing::debug!(uid, "Setting VM uid");
         check_status("krun_setuid", krun_setuid(self.ctx_id, uid))
     }
@@ -342,7 +356,15 @@ impl KrunContext {
     /// Set the group ID for the VM process.
     ///
     /// The GID is applied right before the microVM starts.
+    #[cfg(not(target_os = "windows"))]
     pub unsafe fn set_gid(&self, gid: libc::gid_t) -> Result<()> {
+        tracing::debug!(gid, "Setting VM gid");
+        check_status("krun_setgid", krun_setgid(self.ctx_id, gid))
+    }
+
+    /// Set the group ID for the VM process (Windows).
+    #[cfg(target_os = "windows")]
+    pub unsafe fn set_gid(&self, gid: u32) -> Result<()> {
         tracing::debug!(gid, "Setting VM gid");
         check_status("krun_setgid", krun_setgid(self.ctx_id, gid))
     }
@@ -399,6 +421,109 @@ impl KrunContext {
             )));
         }
         Ok(())
+    }
+
+    /// Set the kernel image for the microVM (required on Windows).
+    ///
+    /// On Windows, this **must** be called before `start_enter()`.
+    ///
+    /// # Arguments
+    /// * `kernel_path` - Path to the kernel image file
+    /// * `kernel_format` - One of the `KRUN_KERNEL_FORMAT_*` constants
+    /// * `initramfs` - Optional path to initramfs image
+    /// * `cmdline` - Optional kernel command line string
+    #[cfg(target_os = "windows")]
+    pub unsafe fn set_kernel(
+        &self,
+        kernel_path: &str,
+        kernel_format: u32,
+        initramfs: Option<&str>,
+        cmdline: Option<&str>,
+    ) -> Result<()> {
+        tracing::debug!(kernel_path, kernel_format, "Setting kernel");
+        let kernel_c = CString::new(kernel_path).map_err(|e| BoxError::BoxBootError {
+            message: format!("invalid kernel path: {}", e),
+            hint: None,
+        })?;
+        let initramfs_c = initramfs
+            .map(|s| {
+                CString::new(s).map_err(|e| BoxError::BoxBootError {
+                    message: format!("invalid initramfs path: {}", e),
+                    hint: None,
+                })
+            })
+            .transpose()?;
+        let cmdline_c = cmdline
+            .map(|s| {
+                CString::new(s).map_err(|e| BoxError::BoxBootError {
+                    message: format!("invalid cmdline: {}", e),
+                    hint: None,
+                })
+            })
+            .transpose()?;
+        check_status(
+            "krun_set_kernel",
+            krun_set_kernel(
+                self.ctx_id,
+                kernel_c.as_ptr(),
+                kernel_format,
+                initramfs_c
+                    .as_ref()
+                    .map_or(ptr::null(), |c| c.as_ptr()),
+                cmdline_c.as_ref().map_or(ptr::null(), |c| c.as_ptr()),
+            ),
+        )
+    }
+
+    /// Add a virtio-net device backed by a TCP connection (Windows only).
+    ///
+    /// # Arguments
+    /// * `iface_id` - Interface identifier string
+    /// * `mac` - MAC address as 6 bytes
+    /// * `tcp_addr` - Optional `"host:port"` string for the TCP backend; `None` for disconnected
+    #[cfg(target_os = "windows")]
+    pub unsafe fn add_net_tcp(
+        &self,
+        iface_id: &str,
+        mac: &[u8; 6],
+        tcp_addr: Option<&str>,
+    ) -> Result<()> {
+        tracing::debug!(iface_id, tcp_addr, "Adding virtio-net via TCP");
+        let iface_c = CString::new(iface_id)
+            .map_err(|e| BoxError::NetworkError(format!("invalid iface_id: {}", e)))?;
+        let tcp_c = tcp_addr
+            .map(|s| {
+                CString::new(s)
+                    .map_err(|e| BoxError::NetworkError(format!("invalid tcp_addr: {}", e)))
+            })
+            .transpose()?;
+        check_status(
+            "krun_add_net_tcp",
+            krun_add_net_tcp(
+                self.ctx_id,
+                iface_c.as_ptr(),
+                mac.as_ptr(),
+                tcp_c.as_ref().map_or(ptr::null(), |c| c.as_ptr()),
+            ),
+        )
+    }
+
+    /// Map a guest vsock port to a Windows Named Pipe (Windows only).
+    ///
+    /// # Arguments
+    /// * `port` - Guest vsock port number
+    /// * `pipe_name` - Named Pipe name (e.g., `"myservice"` → `\\.\pipe\myservice`)
+    #[cfg(target_os = "windows")]
+    pub unsafe fn add_vsock_port_windows(&self, port: u32, pipe_name: &str) -> Result<()> {
+        tracing::debug!(port, pipe_name, "Adding vsock port via Named Pipe");
+        let pipe_c = CString::new(pipe_name).map_err(|e| BoxError::BoxBootError {
+            message: format!("invalid pipe name: {}", e),
+            hint: None,
+        })?;
+        check_status(
+            "krun_add_vsock_port_windows",
+            krun_add_vsock_port_windows(self.ctx_id, port, pipe_c.as_ptr()),
+        )
     }
 
     /// Start the VM and enter it (process takeover).
