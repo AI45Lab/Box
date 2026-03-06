@@ -33,21 +33,20 @@ jobs:
           echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Download release asset
-        shell: bash
+        shell: pwsh
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          TAG="${{ steps.version.outputs.tag }}"
-          ASSET="a3s-box-${TAG}-windows-x86_64.zip"
-          URL="https://github.com/A3S-Lab/Box/releases/download/${TAG}/${ASSET}"
+          $VERSION = "${{ steps.version.outputs.version }}"
+          $TAG = "${{ steps.version.outputs.tag }}"
+          $ASSET = "a3s-box-$TAG-windows-x86_64.zip"
+          $URL = "https://github.com/A3S-Lab/Box/releases/download/$TAG/$ASSET"
 
-          echo "Downloading: $URL"
-          curl -L -o "$ASSET" "$URL"
+          Write-Host "Downloading: $URL"
+          Invoke-WebRequest -Uri $URL -OutFile $ASSET
 
           # Compute SHA256
-          SHA256=$(certutil -hashfile "$ASSET" SHA256 | findstr /v "hash" | findstr /v "CertUtil")
-          SHA256=$(echo $SHA256 | tr -d '[:space:]')
-          echo "SHA256: $SHA256"
-          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+          $SHA256 = (Get-FileHash -Path $ASSET -Algorithm SHA256).Hash
+          Write-Host "SHA256: $SHA256"
+          "sha256=$SHA256" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
         id: download
 
       - name: Update manifest files
