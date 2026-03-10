@@ -59,7 +59,8 @@ step3_configure_openclaw() {
     a3s-box run --name openclaw-onboard \
         -v ~/.openclaw:/home/node/.openclaw \
         -v ~/.openclaw/workspace:/home/node/.openclaw/workspace \
-        ghcr.io/openclaw/openclaw:latest -- onboard
+        ghcr.io/openclaw/openclaw:latest \
+        -- openclaw-cli onboard
 
     a3s-box rm openclaw-onboard 2>/dev/null || true
 
