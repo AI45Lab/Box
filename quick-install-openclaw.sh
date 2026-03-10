@@ -60,7 +60,7 @@ step3_configure_openclaw() {
         -v ~/.openclaw:/home/node/.openclaw \
         -v ~/.openclaw/workspace:/home/node/.openclaw/workspace \
         ghcr.io/openclaw/openclaw:latest \
-        -- openclaw-cli onboard
+        -- onboard
 
     a3s-box rm openclaw-onboard 2>/dev/null || true
 

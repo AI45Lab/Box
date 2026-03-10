@@ -35,7 +35,7 @@ mkdir -p ~/.openclaw/workspace && a3s-box pull ghcr.io/openclaw/openclaw:latest
 a3s-box run --name openclaw-onboard \
   -v ~/.openclaw:/home/node/.openclaw \
   -v ~/.openclaw/workspace:/home/node/.openclaw/workspace \
-  ghcr.io/openclaw/openclaw:latest -- openclaw-cli onboard && \
+  ghcr.io/openclaw/openclaw:latest -- onboard && \
 a3s-box rm openclaw-onboard
 
 # 启动服务
