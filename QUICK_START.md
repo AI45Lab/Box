@@ -28,17 +28,10 @@ brew tap a3s-lab/tap && brew install a3s-box
 mkdir -p ~/.openclaw/workspace && a3s-box pull ghcr.io/openclaw/openclaw:latest
 ```
 
-### 步骤 3: 配置并启动
+### 步骤 3: 启动 OpenClaw
 
 ```bash
-# 初始化配置
-a3s-box run --name openclaw-onboard \
-  -v ~/.openclaw:/home/node/.openclaw \
-  -v ~/.openclaw/workspace:/home/node/.openclaw/workspace \
-  ghcr.io/openclaw/openclaw:latest -- onboard && \
-a3s-box rm openclaw-onboard
-
-# 启动服务
+# 启动服务（首次启动会自动配置）
 a3s-box run -d --name openclaw-gateway \
   -p 18789:18789 \
   -v ~/.openclaw:/home/node/.openclaw \

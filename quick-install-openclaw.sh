@@ -52,19 +52,9 @@ step2_install_openclaw() {
 # 步骤 3: 配置并启动 OpenClaw
 # ============================================
 step3_configure_openclaw() {
-    echo -e "${BLUE}步骤 3: 配置并启动 OpenClaw${NC}"
+    echo -e "${BLUE}步骤 3: 启动 OpenClaw${NC}"
 
-    # 运行初始化配置
-    echo "正在运行初始化配置..."
-    a3s-box run --name openclaw-onboard \
-        -v ~/.openclaw:/home/node/.openclaw \
-        -v ~/.openclaw/workspace:/home/node/.openclaw/workspace \
-        ghcr.io/openclaw/openclaw:latest \
-        -- onboard
-
-    a3s-box rm openclaw-onboard 2>/dev/null || true
-
-    # 启动 OpenClaw Gateway
+    # 直接启动 OpenClaw Gateway（首次启动会自动进行配置）
     echo "正在启动 OpenClaw Gateway..."
     a3s-box run -d --name openclaw-gateway \
         -p 18789:18789 \
@@ -72,7 +62,7 @@ step3_configure_openclaw() {
         -v ~/.openclaw/workspace:/home/node/.openclaw/workspace \
         ghcr.io/openclaw/openclaw:latest
 
-    echo -e "${GREEN}✓ OpenClaw 配置完成并已启动${NC}"
+    echo -e "${GREEN}✓ OpenClaw 已启动${NC}"
     echo ""
 }
 
