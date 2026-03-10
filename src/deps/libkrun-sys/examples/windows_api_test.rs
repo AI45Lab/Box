@@ -46,7 +46,10 @@ fn main() {
         let mac: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
         let addr = CString::new("127.0.0.1:9000").unwrap();
         let ret = krun_add_net_tcp(ctx_id, iface.as_ptr(), mac.as_ptr(), addr.as_ptr());
-        println!("  ✓ Net device: {} (may fail if incompatible with root)\n", ret);
+        println!(
+            "  ✓ Net device: {} (may fail if incompatible with root)\n",
+            ret
+        );
 
         // Test 7: VSock
         println!("Test 7: VSock");
@@ -75,7 +78,10 @@ fn main() {
         let exec = CString::new("/bin/sh").unwrap();
         let arg = CString::new("sh").unwrap();
         let argv = [arg.as_ptr(), std::ptr::null()];
-        assert_eq!(krun_set_exec(ctx_id, exec.as_ptr(), argv.as_ptr(), std::ptr::null()), 0);
+        assert_eq!(
+            krun_set_exec(ctx_id, exec.as_ptr(), argv.as_ptr(), std::ptr::null()),
+            0
+        );
         println!("  ✓ Exec /bin/sh\n");
 
         // Test 11: UID/GID
@@ -87,7 +93,10 @@ fn main() {
         // Test 12: Shutdown event
         println!("Test 12: Shutdown event");
         let fd = krun_get_shutdown_eventfd(ctx_id);
-        println!("  ✓ Event handle: {} (may fail before krun_start_enter)\n", fd);
+        println!(
+            "  ✓ Event handle: {} (may fail before krun_start_enter)\n",
+            fd
+        );
 
         // Test 13: Port map
         println!("Test 13: Port map");

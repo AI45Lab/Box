@@ -3,19 +3,19 @@
 //! This test demonstrates running a real Linux VM with nginx using libkrun on Windows.
 
 use a3s_libkrun_sys::*;
+use std::env;
 use std::ffi::CString;
 use std::path::Path;
-use std::env;
 
 fn main() {
     println!("=== a3s-box nginx Container Test (Windows) ===\n");
 
     // Get kernel path
-    let kernel_path = env::var("TEST_VMLINUX_PATH")
-        .unwrap_or_else(|_| {
-            let temp = env::var("TEMP").unwrap_or_else(|_| "C:\\Users\\18770\\AppData\\Local\\Temp".to_string());
-            format!("{}\\libkrun-kernels\\vmlinux-5.10.225", temp)
-        });
+    let kernel_path = env::var("TEST_VMLINUX_PATH").unwrap_or_else(|_| {
+        let temp = env::var("TEMP")
+            .unwrap_or_else(|_| "C:\\Users\\18770\\AppData\\Local\\Temp".to_string());
+        format!("{}\\libkrun-kernels\\vmlinux-5.10.225", temp)
+    });
 
     if !Path::new(&kernel_path).exists() {
         eprintln!("Error: Kernel not found at: {}", kernel_path);
@@ -39,7 +39,10 @@ fn main() {
 
         println!("Note: This is a minimal rootfs. For nginx, you need:");
         println!("  1. Extract nginx:alpine Docker image");
-        println!("  2. Or use: docker export $(docker create nginx:alpine) | tar -xC {}", rootfs_path);
+        println!(
+            "  2. Or use: docker export $(docker create nginx:alpine) | tar -xC {}",
+            rootfs_path
+        );
         println!();
     }
 

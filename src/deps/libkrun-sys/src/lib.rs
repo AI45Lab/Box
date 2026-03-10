@@ -281,11 +281,7 @@ extern "C" {
     ) -> i32;
 
     /// Maps guest vsock `port` to a Windows Named Pipe (`\\.\pipe\<pipe_name>`).
-    pub fn krun_add_vsock_port_windows(
-        ctx_id: u32,
-        port: u32,
-        c_pipe_name: *const c_char,
-    ) -> i32;
+    pub fn krun_add_vsock_port_windows(ctx_id: u32, port: u32, c_pipe_name: *const c_char) -> i32;
 }
 
 // ============================================================================
@@ -317,4 +313,3 @@ pub unsafe fn krun_set_tee_config_file(ctx_id: u32, filepath: *const c_char) -> 
         None => -libc::ENOSYS,
     }
 }
-
