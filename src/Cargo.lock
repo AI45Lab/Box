@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "a3s-box-cli"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "a3s-box-core",
  "a3s-box-runtime",
@@ -35,7 +35,7 @@ dependencies = [
 
 [[package]]
 name = "a3s-box-core"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "a3s-common",
  "async-trait",
@@ -51,7 +51,7 @@ dependencies = [
 
 [[package]]
 name = "a3s-box-cri"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "a3s-box-core",
  "a3s-box-runtime",
@@ -79,7 +79,7 @@ dependencies = [
 
 [[package]]
 name = "a3s-box-guest-init"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "a3s-box-core",
  "a3s-common",
@@ -101,7 +101,7 @@ dependencies = [
 
 [[package]]
 name = "a3s-box-runtime"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "a3s-box-core",
  "a3s-common",
@@ -147,7 +147,7 @@ dependencies = [
 
 [[package]]
 name = "a3s-box-sdk"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "a3s-box-core",
  "a3s-box-runtime",
@@ -165,7 +165,7 @@ dependencies = [
 
 [[package]]
 name = "a3s-box-shim"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "a3s-box-core",
  "a3s-box-runtime",

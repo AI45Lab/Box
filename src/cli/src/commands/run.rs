@@ -205,9 +205,9 @@ async fn setup_and_boot(args: &RunArgs) -> Result<RunContext, Box<dyn std::error
             } else {
                 format!("{} B", actual_size)
             };
-            eprintln!("\r  [{current}/{total}] {short}: {size_str} ✓");
+            println!("  [{current}/{total}] {short}: {size_str} ✓");
         } else {
-            // Positive size means downloading
+            // Positive size means downloading - just show once
             let size_str = if size >= 1_048_576 {
                 format!("{:.1} MB", size as f64 / 1_048_576.0)
             } else if size >= 1024 {
@@ -215,9 +215,7 @@ async fn setup_and_boot(args: &RunArgs) -> Result<RunContext, Box<dyn std::error
             } else {
                 format!("{} B", size)
             };
-            eprint!("\r  [{current}/{total}] {short}: Downloading {size_str}...");
-            use std::io::Write;
-            let _ = std::io::stderr().flush();
+            println!("  [{current}/{total}] {short}: Pulling {size_str}...");
         }
     }));
 
