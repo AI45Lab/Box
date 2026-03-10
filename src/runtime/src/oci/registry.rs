@@ -315,6 +315,11 @@ impl RegistryPuller {
                     message: format!("Failed to pull layer {}: {}", layer.digest, e),
                 })?;
 
+            // Call progress callback again with negative size to signal completion
+            if let Some(ref f) = self.progress_fn {
+                f(idx + 1, total, &layer.digest, -(layer.size as i64));
+            }
+
             let layer_digest_hex = layer
                 .digest
                 .strip_prefix("sha256:")

@@ -191,18 +191,34 @@ async fn setup_and_boot(args: &RunArgs) -> Result<RunContext, Box<dyn std::error
 
     let image_name = args.common.image.clone();
     vm.set_pull_progress_fn(std::sync::Arc::new(move |current, total, digest, size| {
-        if current == 1 {
+        if current == 1 && size > 0 {
             println!("Pulling {}...", image_name);
         }
         let short = &digest[digest.len().saturating_sub(12)..];
-        let size_str = if size >= 1_048_576 {
-            format!("{:.1} MB", size as f64 / 1_048_576.0)
-        } else if size >= 1024 {
-            format!("{:.1} KB", size as f64 / 1024.0)
+        if size < 0 {
+            // Negative size signals completion
+            let actual_size = (-size) as i64;
+            let size_str = if actual_size >= 1_048_576 {
+                format!("{:.1} MB", actual_size as f64 / 1_048_576.0)
+            } else if actual_size >= 1024 {
+                format!("{:.1} KB", actual_size as f64 / 1024.0)
+            } else {
+                format!("{} B", actual_size)
+            };
+            eprintln!("\r  [{current}/{total}] {short}: {size_str} ✓");
         } else {
-            format!("{} B", size)
-        };
-        println!("  [{current}/{total}] {short}: {size_str}");
+            // Positive size means downloading
+            let size_str = if size >= 1_048_576 {
+                format!("{:.1} MB", size as f64 / 1_048_576.0)
+            } else if size >= 1024 {
+                format!("{:.1} KB", size as f64 / 1024.0)
+            } else {
+                format!("{} B", size)
+            };
+            eprint!("\r  [{current}/{total}] {short}: Downloading {size_str}...");
+            use std::io::Write;
+            let _ = std::io::stderr().flush();
+        }
     }));
 
     connect_network(args.common.network.as_deref(), &box_id, &name)?;
