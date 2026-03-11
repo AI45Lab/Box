@@ -103,6 +103,10 @@ pub struct InstanceSpec {
     #[serde(default)]
     pub attest_socket_path: PathBuf,
 
+    /// Path to the Unix socket for port forwarding communication
+    #[serde(default)]
+    pub portfwd_socket_path: PathBuf,
+
     /// Filesystem mounts (virtio-fs shares)
     pub fs_mounts: Vec<FsMount>,
 
@@ -147,6 +151,7 @@ impl Default for InstanceSpec {
             exec_socket_path: PathBuf::new(),
             pty_socket_path: PathBuf::new(),
             attest_socket_path: PathBuf::new(),
+            portfwd_socket_path: PathBuf::new(),
             fs_mounts: Vec::new(),
             entrypoint: Entrypoint {
                 executable: String::new(),

@@ -458,6 +458,16 @@ unsafe fn configure_and_start_vm(spec: &InstanceSpec) -> Result<()> {
             );
             ctx.add_vsock_port(ATTEST_VSOCK_PORT, attest_socket_str, true)?;
         }
+
+        // TSI port mapping for inbound connections (host -> guest)
+        // This allows external connections to reach services inside the guest
+        if !spec.port_map.is_empty() {
+            tracing::info!(
+                port_map = ?spec.port_map,
+                "Configuring TSI port mapping for inbound connections"
+            );
+            ctx.set_port_map(&spec.port_map)?;
+        }
     } // end #[cfg(not(target_os = "windows"))]
 
     // Note: A3S_TEE_SIMULATE is already included in spec.entrypoint.env
@@ -472,12 +482,6 @@ unsafe fn configure_and_start_vm(spec: &InstanceSpec) -> Result<()> {
         .any(|(k, _)| k == "A3S_TEE_SIMULATE")
     {
         tracing::info!("TEE simulation mode: A3S_TEE_SIMULATE=1 included in entrypoint env");
-    }
-
-    // Configure TSI port mappings if specified
-    if !spec.port_map.is_empty() {
-        tracing::info!(port_map = ?spec.port_map, "Configuring TSI port mappings");
-        ctx.set_port_map(&spec.port_map)?;
     }
 
     // Configure networking: passt (virtio-net) or TSI (default)
