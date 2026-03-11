@@ -281,7 +281,6 @@ impl VmManager {
             exec_socket_path: layout.exec_socket_path.clone(),
             pty_socket_path: layout.pty_socket_path.clone(),
             attest_socket_path: layout.attest_socket_path.clone(),
-            portfwd_socket_path: layout.portfwd_socket_path.clone(),
             fs_mounts,
             entrypoint,
             console_output: layout.console_output.clone(),

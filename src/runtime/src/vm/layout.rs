@@ -133,7 +133,6 @@ impl VmManager {
             exec_socket_path: socket_dir.join("exec.sock"),
             pty_socket_path: socket_dir.join("pty.sock"),
             attest_socket_path: socket_dir.join("attest.sock"),
-            portfwd_socket_path: socket_dir.join("portfwd.sock"),
             workspace_path,
             console_output: Some(logs_dir.join("console.log")),
             oci_config,
@@ -463,7 +462,6 @@ mod tests {
             prom: None,
             shim_exit_code: None,
             pull_progress_fn: None,
-            port_listeners: Vec::new(),
         }
     }
 

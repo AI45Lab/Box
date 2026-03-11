@@ -53,8 +53,6 @@ pub(crate) struct BoxLayout {
     pub(crate) pty_socket_path: PathBuf,
     /// Path to the attestation Unix socket
     pub(crate) attest_socket_path: PathBuf,
-    /// Path to the port forwarding Unix socket
-    pub(crate) portfwd_socket_path: PathBuf,
     /// Path to the workspace directory
     pub(crate) workspace_path: PathBuf,
     /// Path to console output file (optional)
@@ -119,9 +117,6 @@ pub struct VmManager {
 
     /// Optional progress callback for image pulls: `(current, total, digest, size_bytes)`.
     pub(crate) pull_progress_fn: Option<Arc<dyn Fn(usize, usize, &str, i64) + Send + Sync>>,
-
-    /// Host TCP listener handles for TSI inbound port forwarding.
-    pub(crate) port_listeners: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl VmManager {
@@ -150,7 +145,6 @@ impl VmManager {
             prom: None,
             shim_exit_code: None,
             pull_progress_fn: None,
-            port_listeners: Vec::new(),
         }
     }
 
@@ -178,7 +172,6 @@ impl VmManager {
             prom: None,
             shim_exit_code: None,
             pull_progress_fn: None,
-            port_listeners: Vec::new(),
         }
     }
 
@@ -210,7 +203,6 @@ impl VmManager {
             prom: None,
             shim_exit_code: None,
             pull_progress_fn: None,
-            port_listeners: Vec::new(),
         }
     }
 
@@ -522,11 +514,6 @@ impl VmManager {
         }
         self.passt_manager = None;
 
-        // Stop port forwarding listeners
-        for handle in self.port_listeners.drain(..) {
-            handle.abort();
-        }
-
         *state = BoxState::Stopped;
 
         // Cleanup rootfs provider (unmount overlay if applicable)
@@ -790,181 +777,6 @@ impl VmManager {
         }
 
         Ok(result)
-    }
-
-    /// Spawn TCP listeners for TSI inbound port forwarding.
-    ///
-    /// For each port mapping in spec.port_map, spawns a TCP listener on the host
-    /// that forwards connections through the portfwd.sock Unix socket to the guest.
-    async fn spawn_port_listeners(&mut self, spec: &crate::vmm::InstanceSpec) -> Result<()> {
-        use tokio::net::TcpListener;
-
-        tracing::info!(
-            port_map = ?spec.port_map,
-            "Spawning TCP listeners for TSI inbound port forwarding"
-        );
-
-        let portfwd_socket = spec.portfwd_socket_path.clone();
-
-        for port_spec in &spec.port_map {
-            // Parse port_spec: "host_port:guest_port"
-            let parts: Vec<&str> = port_spec.split(':').collect();
-            if parts.len() != 2 {
-                tracing::warn!(
-                    port_spec = port_spec,
-                    "Invalid port mapping format, skipping"
-                );
-                continue;
-            }
-
-            let host_port: u16 = match parts[0].parse() {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!(
-                        port_spec = port_spec,
-                        error = %e,
-                        "Invalid host port, skipping"
-                    );
-                    continue;
-                }
-            };
-
-            let guest_port: u16 = match parts[1].parse() {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!(
-                        port_spec = port_spec,
-                        error = %e,
-                        "Invalid guest port, skipping"
-                    );
-                    continue;
-                }
-            };
-
-            // Bind TCP listener on host
-            let listener = match TcpListener::bind(("0.0.0.0", host_port)).await {
-                Ok(l) => l,
-                Err(e) => {
-                    tracing::error!(
-                        host_port = host_port,
-                        error = %e,
-                        "Failed to bind TCP listener, port forwarding will not work"
-                    );
-                    return Err(BoxError::BoxBootError {
-                        message: format!("Failed to bind TCP listener on port {}: {}", host_port, e),
-                        hint: Some("Check if the port is already in use".to_string()),
-                    });
-                }
-            };
-
-            let portfwd_socket_clone = portfwd_socket.clone();
-
-            // Spawn listener task
-            let handle = tokio::spawn(async move {
-                tracing::info!(
-                    host_port = host_port,
-                    guest_port = guest_port,
-                    "TCP listener started for port forwarding"
-                );
-
-                loop {
-                    match listener.accept().await {
-                        Ok((tcp_stream, peer_addr)) => {
-                            tracing::debug!(
-                                peer = %peer_addr,
-                                host_port = host_port,
-                                guest_port = guest_port,
-                                "Accepted inbound connection"
-                            );
-
-                            let portfwd_socket = portfwd_socket_clone.clone();
-
-                            // Spawn connection handler
-                            tokio::spawn(async move {
-                                if let Err(e) = handle_port_forward_connection(
-                                    tcp_stream,
-                                    portfwd_socket,
-                                    guest_port,
-                                )
-                                .await
-                                {
-                                    tracing::warn!(
-                                        peer = %peer_addr,
-                                        guest_port = guest_port,
-                                        error = %e,
-                                        "Port forwarding connection failed"
-                                    );
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                host_port = host_port,
-                                error = %e,
-                                "Failed to accept connection"
-                            );
-                        }
-                    }
-                }
-            });
-
-            self.port_listeners.push(handle);
-        }
-
-        tracing::info!(
-            listener_count = self.port_listeners.len(),
-            "TSI inbound port forwarding listeners started"
-        );
-
-        Ok(())
-    }
-}
-
-/// Handle a single port forwarding connection.
-///
-/// Connects to the portfwd.sock Unix socket, sends the guest port,
-/// then performs bidirectional copy between TCP and Unix streams.
-async fn handle_port_forward_connection(
-    mut tcp_stream: tokio::net::TcpStream,
-    _portfwd_socket: PathBuf,  // Unused - kept for API compatibility
-    guest_port: u16,
-) -> Result<()> {
-    use tokio::io::AsyncWriteExt;
-
-    // Connect directly to guest vsock port 5000
-    let addr = tokio_vsock::VsockAddr::new(3, 5000);  // CID 3 = guest, port 5000
-    let vsock_stream = tokio_vsock::VsockStream::connect(addr)
-        .await
-        .map_err(|e| {
-            BoxError::ExecError(format!(
-                "Failed to connect to guest vsock port 5000: {}",
-                e
-            ))
-        })?;
-
-    let mut vsock_stream = vsock_stream;
-
-    // Send guest port (2 bytes BE)
-    vsock_stream
-        .write_u16(guest_port)
-        .await
-        .map_err(|e| BoxError::ExecError(format!("Failed to send guest port: {}", e)))?;
-
-    // Bidirectional copy
-    match tokio::io::copy_bidirectional(&mut tcp_stream, &mut vsock_stream).await {
-        Ok((to_vsock, to_tcp)) => {
-            tracing::debug!(
-                guest_port = guest_port,
-                to_vsock = to_vsock,
-                to_tcp = to_tcp,
-                "Port forwarding connection closed"
-            );
-            Ok(())
-        }
-        Err(e) => Err(BoxError::ExecError(format!(
-            "Port forwarding copy failed: {}",
-            e
-        ))),
     }
 }
 
