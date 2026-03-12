@@ -198,7 +198,7 @@ dependencies = [
 
 [[package]]
 name = "a3s-libkrun-sys"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "libc",
  "num_cpus",
