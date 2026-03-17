@@ -98,37 +98,38 @@ pub(super) fn handle_copy(
 
 /// Handle RUN: execute a command in the rootfs.
 ///
-/// On Linux, uses chroot. On macOS, skips with a warning.
+/// On Linux, uses chroot. On macOS, tries Docker/Podman, or skips with a warning.
 /// Returns Some(LayerInfo) if a layer was created, None if skipped.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn handle_run(
     command: &str,
-    _rootfs_dir: &Path,
-    _layers_dir: &Path,
-    _workdir: &str,
-    _env: &[(String, String)],
-    _shell: &[String],
-    _layer_index: usize,
+    rootfs_dir: &Path,
+    layers_dir: &Path,
+    workdir: &str,
+    env: &[(String, String)],
+    shell: &[String],
+    layer_index: usize,
     quiet: bool,
 ) -> Result<Option<LayerInfo>> {
-    if cfg!(target_os = "macos") {
-        if !quiet {
-            println!("  ⚠ RUN skipped on macOS (Linux rootfs cannot be executed on macOS host)");
-            println!("    Command: {}", command);
-        }
-        return Ok(None);
+    #[cfg(target_os = "macos")]
+    {
+        // On macOS, try to use Docker or Podman to execute RUN commands
+        return handle_run_via_container(
+            command,
+            rootfs_dir,
+            layers_dir,
+            workdir,
+            env,
+            shell,
+            layer_index,
+            quiet,
+        );
     }
 
     // Linux: execute via chroot
     #[cfg(target_os = "linux")]
     {
         use super::super::layer::DirSnapshot;
-
-        let rootfs_dir = _rootfs_dir;
-        let layers_dir = _layers_dir;
-        let env = _env;
-        let shell = _shell;
-        let layer_index = _layer_index;
 
         let before = DirSnapshot::capture(rootfs_dir)?;
 
@@ -192,8 +193,280 @@ pub(super) fn handle_run(
         Ok(Some(layer_info))
     }
 
-    #[cfg(not(target_os = "linux"))]
-    Ok(None)
+    // Other platforms: not supported
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (command, rootfs_dir, layers_dir, workdir, env, shell, layer_index, quiet);
+        Ok(None)
+    }
+}
+
+/// Execute RUN command via Docker or Podman on macOS.
+///
+/// This function:
+/// 1. Detects available container runtime (docker or podman)
+/// 2. Creates a temporary image from the current rootfs
+/// 3. Runs the command in a container based on that image
+/// 4. Captures filesystem changes and creates a layer
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn handle_run_via_container(
+    command: &str,
+    rootfs_dir: &Path,
+    layers_dir: &Path,
+    workdir: &str,
+    env: &[(String, String)],
+    shell: &[String],
+    layer_index: usize,
+    quiet: bool,
+) -> Result<Option<LayerInfo>> {
+    use super::super::layer::DirSnapshot;
+
+    // Detect available container runtime
+    let runtime = detect_container_runtime()?;
+
+    if !quiet {
+        println!("→ Using {} to execute RUN command", runtime);
+    }
+
+    // Capture filesystem state before execution
+    let before = DirSnapshot::capture(rootfs_dir)?;
+
+    // Verify rootfs exists and has content
+    if !rootfs_dir.exists() {
+        return Err(BoxError::BuildError(format!(
+            "Rootfs directory does not exist: {}",
+            rootfs_dir.display()
+        )));
+    }
+
+    // Check if rootfs has any content
+    let has_content = std::fs::read_dir(rootfs_dir)
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false);
+
+    if !has_content {
+        return Err(BoxError::BuildError(format!(
+            "Rootfs directory is empty: {}",
+            rootfs_dir.display()
+        )));
+    }
+
+    // Create a temporary image name
+    let temp_image = format!("a3s-box-build-temp-{}", uuid::Uuid::new_v4());
+
+    // Create a tar archive of the rootfs using system tar command
+    let temp_tar = std::env::temp_dir().join(format!("{}.tar", temp_image));
+
+    let tar_output = std::process::Command::new("tar")
+        .arg("-cf")
+        .arg(&temp_tar)
+        .arg("-C")
+        .arg(rootfs_dir)
+        .arg(".")
+        .output()
+        .map_err(|e| {
+            BoxError::BuildError(format!("Failed to execute tar command: {}", e))
+        })?;
+
+    if !tar_output.status.success() {
+        let stderr = String::from_utf8_lossy(&tar_output.stderr);
+        return Err(BoxError::BuildError(format!(
+            "Failed to create rootfs tar: {}",
+            stderr.trim()
+        )));
+    }
+
+    // Import the tar as a Docker image
+    let import_output = std::process::Command::new(&runtime)
+        .arg("import")
+        .arg(&temp_tar)
+        .arg(&temp_image)
+        .output()
+        .map_err(|e| {
+            BoxError::BuildError(format!("Failed to import image to {}: {}", runtime, e))
+        })?;
+
+    if !import_output.status.success() {
+        let stderr = String::from_utf8_lossy(&import_output.stderr);
+        std::fs::remove_file(&temp_tar).ok();
+        return Err(BoxError::BuildError(format!(
+            "Failed to import rootfs as image: {}",
+            stderr.trim()
+        )));
+    }
+
+    // Build the shell command
+    let shell_cmd = if !shell.is_empty() {
+        let mut cmd_parts = shell.to_vec();
+        cmd_parts.push(command.to_string());
+        cmd_parts
+    } else {
+        vec!["/bin/sh".to_string(), "-c".to_string(), command.to_string()]
+    };
+
+    // Run the command in a container
+    let container_name = format!("a3s-box-build-run-{}", uuid::Uuid::new_v4());
+    let mut cmd = std::process::Command::new(&runtime);
+    cmd.arg("run")
+        .arg("--name")
+        .arg(&container_name)
+        .arg("-w")
+        .arg(workdir);
+
+    // Add environment variables
+    for (key, value) in env {
+        cmd.arg("-e").arg(format!("{}={}", key, value));
+    }
+
+    // Add the image and command
+    cmd.arg(&temp_image);
+    for part in &shell_cmd {
+        cmd.arg(part);
+    }
+
+    if !quiet {
+        println!("→ Executing: {}", command);
+    }
+
+    let output = cmd.output().map_err(|e| {
+        BoxError::BuildError(format!("Failed to execute {} run: {}", runtime, e))
+    })?;
+
+    // Clean up: remove the container and image
+    let cleanup = || {
+        std::process::Command::new(&runtime)
+            .arg("rm")
+            .arg(&container_name)
+            .output()
+            .ok();
+        std::process::Command::new(&runtime)
+            .arg("rmi")
+            .arg(&temp_image)
+            .output()
+            .ok();
+        std::fs::remove_file(&temp_tar).ok();
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        cleanup();
+        return Err(BoxError::BuildError(format!(
+            "RUN command failed (exit {}): {}",
+            output.status.code().unwrap_or(-1),
+            stderr.trim()
+        )));
+    }
+
+    if !quiet {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if !stdout.is_empty() {
+            print!("{}", stdout);
+        }
+    }
+
+    // Export the container's filesystem
+    let export_output = std::process::Command::new(&runtime)
+        .arg("export")
+        .arg(&container_name)
+        .output()
+        .map_err(|e| {
+            cleanup();
+            BoxError::BuildError(format!("Failed to export container: {}", e))
+        })?;
+
+    if !export_output.status.success() {
+        let stderr = String::from_utf8_lossy(&export_output.stderr);
+        cleanup();
+        return Err(BoxError::BuildError(format!(
+            "Failed to export container: {}",
+            stderr.trim()
+        )));
+    }
+
+    // Write exported tar to a temporary file
+    let export_tar_path = std::env::temp_dir().join(format!("{}-export.tar", temp_image));
+    std::fs::write(&export_tar_path, &export_output.stdout).map_err(|e| {
+        cleanup();
+        BoxError::BuildError(format!("Failed to write export tar: {}", e))
+    })?;
+
+    // Extract using system tar command (handles hardlinks and special files better)
+    let extract_output = std::process::Command::new("tar")
+        .arg("-xf")
+        .arg(&export_tar_path)
+        .arg("-C")
+        .arg(rootfs_dir)
+        .output()
+        .map_err(|e| {
+            cleanup();
+            std::fs::remove_file(&export_tar_path).ok();
+            BoxError::BuildError(format!("Failed to extract exported tar: {}", e))
+        })?;
+
+    if !extract_output.status.success() {
+        let stderr = String::from_utf8_lossy(&extract_output.stderr);
+        cleanup();
+        std::fs::remove_file(&export_tar_path).ok();
+        return Err(BoxError::BuildError(format!(
+            "Failed to extract exported container: {}",
+            stderr.trim()
+        )));
+    }
+
+    std::fs::remove_file(&export_tar_path).ok();
+    cleanup();
+
+    // Capture filesystem changes
+    let after = DirSnapshot::capture(rootfs_dir)?;
+    let changed = before.diff(&after);
+
+    if changed.is_empty() {
+        if !quiet {
+            println!("→ No filesystem changes detected");
+        }
+        return Ok(None);
+    }
+
+    // Create layer from changes
+    let layer_path = layers_dir.join(format!("layer_{}.tar.gz", layer_index));
+    let layer_info = create_layer(rootfs_dir, &changed, &layer_path)?;
+
+    if !quiet {
+        println!("→ Created layer with {} changes", changed.len());
+    }
+
+    Ok(Some(layer_info))
+}
+
+/// Detect available container runtime (docker or podman).
+#[cfg(target_os = "macos")]
+fn detect_container_runtime() -> Result<String> {
+    // Try docker first
+    if std::process::Command::new("docker")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        return Ok("docker".to_string());
+    }
+
+    // Try podman
+    if std::process::Command::new("podman")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        return Ok("podman".to_string());
+    }
+
+    Err(BoxError::BuildError(
+        "No container runtime found. Please install Docker or Podman to build images on macOS.\n\
+         Install Docker: https://docs.docker.com/desktop/install/mac-install/\n\
+         Install Podman: brew install podman".to_string()
+    ))
 }
 
 /// Handle ADD: like COPY but supports URL download and tar auto-extraction.
