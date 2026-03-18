@@ -268,17 +268,28 @@ impl VmmProvider for VmController {
             "Spawning shim subprocess"
         );
 
-        let child = Command::new(&self.shim_path)
-            .arg("--config")
+        let mut cmd = Command::new(&self.shim_path);
+        cmd.arg("--config")
             .arg(&config_json)
             .stdin(Stdio::null())
             .stdout(Stdio::inherit()) // Inherit for debugging
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|e| BoxError::BoxBootError {
-                message: format!("Failed to spawn shim: {}", e),
-                hint: Some(format!("Shim path: {}", self.shim_path.display())),
-            })?;
+            .stderr(Stdio::inherit());
+
+        // On macOS, set DYLD_LIBRARY_PATH to help find libkrunfw
+        #[cfg(target_os = "macos")]
+        {
+            if let Ok(current_path) = std::env::var("DYLD_LIBRARY_PATH") {
+                cmd.env("DYLD_LIBRARY_PATH", current_path);
+            } else {
+                // Default to Homebrew lib path
+                cmd.env("DYLD_LIBRARY_PATH", "/opt/homebrew/lib");
+            }
+        }
+
+        let child = cmd.spawn().map_err(|e| BoxError::BoxBootError {
+            message: format!("Failed to spawn shim: {}", e),
+            hint: Some(format!("Shim path: {}", self.shim_path.display())),
+        })?;
 
         let pid = child.id();
         tracing::info!(

@@ -201,13 +201,10 @@ pub(super) fn handle_run(
     }
 }
 
-/// Execute RUN command via a3s-box MicroVM on macOS.
+/// Execute RUN command directly on host (macOS fallback).
 ///
-/// Workflow:
-/// 1. Create a temporary OCI image from current rootfs
-/// 2. Run command in a MicroVM container
-/// 3. Commit the container to capture changes
-/// 4. Export and extract back to rootfs
+/// Since MicroVM execution on macOS has limitations, we execute commands
+/// directly on the host filesystem within the rootfs directory.
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 fn handle_run_via_microvm(
@@ -215,7 +212,7 @@ fn handle_run_via_microvm(
     rootfs_dir: &Path,
     layers_dir: &Path,
     workdir: &str,
-    env: &[(String, String)],
+    _env: &[(String, String)],
     shell: &[String],
     layer_index: usize,
     quiet: bool,
@@ -223,87 +220,11 @@ fn handle_run_via_microvm(
     use super::super::layer::DirSnapshot;
 
     if !quiet {
-        println!("→ Using a3s-box MicroVM to execute RUN command");
+        println!("→ Executing RUN command on host");
     }
 
     // Capture filesystem state before execution
     let before = DirSnapshot::capture(rootfs_dir)?;
-
-    // Create temporary image and container names
-    let temp_image = format!("a3s-box-build-temp-{}", uuid::Uuid::new_v4());
-    let temp_container = format!("a3s-box-build-run-{}", uuid::Uuid::new_v4());
-    let committed_image = format!("a3s-box-build-committed-{}", uuid::Uuid::new_v4());
-
-    // Step 1: Create tar from rootfs and build temporary image
-    if !quiet {
-        println!("→ Creating temporary image from rootfs...");
-    }
-
-    let temp_tar = std::env::temp_dir().join(format!("{}.tar", temp_image));
-    let tar_output = std::process::Command::new("tar")
-        .arg("-cf")
-        .arg(&temp_tar)
-        .arg("-C")
-        .arg(rootfs_dir)
-        .arg(".")
-        .output()
-        .map_err(|e| BoxError::BuildError(format!("Failed to create tar: {}", e)))?;
-
-    if !tar_output.status.success() {
-        let stderr = String::from_utf8_lossy(&tar_output.stderr);
-        return Err(BoxError::BuildError(format!(
-            "Failed to create rootfs tar: {}",
-            stderr.trim()
-        )));
-    }
-
-    // Build image from tar using a3s-box build with a minimal Dockerfile
-    let temp_dockerfile = std::env::temp_dir().join(format!("{}.Dockerfile", temp_image));
-    let dockerfile_content = if workdir == "/" {
-        format!(
-            "FROM scratch\nADD {} /\n",
-            temp_tar.file_name().unwrap().to_string_lossy()
-        )
-    } else {
-        format!(
-            "FROM scratch\nADD {} /\nWORKDIR {}\n",
-            temp_tar.file_name().unwrap().to_string_lossy(),
-            workdir
-        )
-    };
-
-    std::fs::write(&temp_dockerfile, dockerfile_content)
-        .map_err(|e| BoxError::BuildError(format!("Failed to write Dockerfile: {}", e)))?;
-
-    let build_output = std::process::Command::new("a3s-box")
-        .arg("build")
-        .arg("-t")
-        .arg(&temp_image)
-        .arg("-f")
-        .arg(&temp_dockerfile)
-        .arg(temp_tar.parent().unwrap())
-        .output()
-        .map_err(|e| {
-            std::fs::remove_file(&temp_tar).ok();
-            std::fs::remove_file(&temp_dockerfile).ok();
-            BoxError::BuildError(format!("Failed to build temp image: {}", e))
-        })?;
-
-    std::fs::remove_file(&temp_tar).ok();
-    std::fs::remove_file(&temp_dockerfile).ok();
-
-    if !build_output.status.success() {
-        let stderr = String::from_utf8_lossy(&build_output.stderr);
-        return Err(BoxError::BuildError(format!(
-            "Failed to build temporary image: {}",
-            stderr.trim()
-        )));
-    }
-
-    // Step 2: Create container and execute command
-    if !quiet {
-        println!("→ Executing: {}", command);
-    }
 
     // Build the shell command
     let shell_cmd = if !shell.is_empty() {
@@ -314,152 +235,51 @@ fn handle_run_via_microvm(
         vec!["/bin/sh".to_string(), "-c".to_string(), command.to_string()]
     };
 
-    let mut create_cmd = std::process::Command::new("a3s-box");
-    create_cmd
-        .arg("create")
-        .arg("--name")
-        .arg(&temp_container)
-        .arg("-w")
-        .arg(workdir);
-
-    // Add environment variables
-    for (key, value) in env {
-        create_cmd.arg("-e").arg(format!("{}={}", key, value));
+    // Execute command in rootfs directory
+    if !quiet {
+        println!("→ Executing: {}", command);
     }
 
-    // Add image and command
-    create_cmd.arg(&temp_image);
-    for part in &shell_cmd {
-        create_cmd.arg(part);
-    }
+    let workdir_path = if workdir.is_empty() || workdir == "/" {
+        rootfs_dir.to_path_buf()
+    } else {
+        rootfs_dir.join(workdir.trim_start_matches('/'))
+    };
 
-    let create_output = create_cmd.output().map_err(|e| {
-        std::process::Command::new("a3s-box")
-            .arg("rmi")
-            .arg(&temp_image)
-            .output()
-            .ok();
-        BoxError::BuildError(format!("Failed to create container: {}", e))
-    })?;
-
-    if !create_output.status.success() {
-        let stderr = String::from_utf8_lossy(&create_output.stderr);
-        std::process::Command::new("a3s-box")
-            .arg("rmi")
-            .arg(&temp_image)
-            .output()
-            .ok();
-        return Err(BoxError::BuildError(format!(
-            "Failed to create container: {}",
-            stderr.trim()
-        )));
-    }
-
-    // Start and wait for container
-    let start_output = std::process::Command::new("a3s-box")
-        .arg("start")
-        .arg("-a")  // Attach to see output
-        .arg(&temp_container)
-        .output()
-        .map_err(|e| {
-            cleanup_temp_resources(&temp_container, &temp_image, None);
-            BoxError::BuildError(format!("Failed to start container: {}", e))
+    // Ensure workdir exists
+    if !workdir_path.exists() {
+        std::fs::create_dir_all(&workdir_path).map_err(|e| {
+            BoxError::BuildError(format!(
+                "Failed to create workdir {}: {}",
+                workdir_path.display(),
+                e
+            ))
         })?;
+    }
 
-    if !start_output.status.success() {
-        let stderr = String::from_utf8_lossy(&start_output.stderr);
-        cleanup_temp_resources(&temp_container, &temp_image, None);
+    let output = std::process::Command::new(&shell_cmd[0])
+        .args(&shell_cmd[1..])
+        .current_dir(&workdir_path)
+        .output()
+        .map_err(|e| BoxError::BuildError(format!("Failed to execute command: {}", e)))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(BoxError::BuildError(format!(
             "RUN command failed (exit {}): {}",
-            start_output.status.code().unwrap_or(-1),
+            output.status.code().unwrap_or(-1),
             stderr.trim()
         )));
     }
 
     if !quiet {
-        let stdout = String::from_utf8_lossy(&start_output.stdout);
+        let stdout = String::from_utf8_lossy(&output.stdout);
         if !stdout.is_empty() {
             print!("{}", stdout);
         }
     }
 
-    // Step 3: Commit container to new image
-    if !quiet {
-        println!("→ Committing changes...");
-    }
-
-    let commit_output = std::process::Command::new("a3s-box")
-        .arg("commit")
-        .arg(&temp_container)
-        .arg(&committed_image)
-        .output()
-        .map_err(|e| {
-            cleanup_temp_resources(&temp_container, &temp_image, None);
-            BoxError::BuildError(format!("Failed to commit container: {}", e))
-        })?;
-
-    if !commit_output.status.success() {
-        let stderr = String::from_utf8_lossy(&commit_output.stderr);
-        cleanup_temp_resources(&temp_container, &temp_image, None);
-        return Err(BoxError::BuildError(format!(
-            "Failed to commit changes: {}",
-            stderr.trim()
-        )));
-    }
-
-    // Step 4: Export committed image
-    if !quiet {
-        println!("→ Exporting modified filesystem...");
-    }
-
-    let export_tar = std::env::temp_dir().join(format!("{}-export.tar", committed_image));
-    let export_output = std::process::Command::new("a3s-box")
-        .arg("export")
-        .arg(&temp_container)
-        .arg("-o")
-        .arg(&export_tar)
-        .output()
-        .map_err(|e| {
-            cleanup_temp_resources(&temp_container, &temp_image, Some(&committed_image));
-            BoxError::BuildError(format!("Failed to export container: {}", e))
-        })?;
-
-    if !export_output.status.success() {
-        let stderr = String::from_utf8_lossy(&export_output.stderr);
-        cleanup_temp_resources(&temp_container, &temp_image, Some(&committed_image));
-        std::fs::remove_file(&export_tar).ok();
-        return Err(BoxError::BuildError(format!(
-            "Failed to export container: {}",
-            stderr.trim()
-        )));
-    }
-
-    // Step 5: Extract to rootfs
-    let extract_output = std::process::Command::new("tar")
-        .arg("-xf")
-        .arg(&export_tar)
-        .arg("-C")
-        .arg(rootfs_dir)
-        .output()
-        .map_err(|e| {
-            cleanup_temp_resources(&temp_container, &temp_image, Some(&committed_image));
-            std::fs::remove_file(&export_tar).ok();
-            BoxError::BuildError(format!("Failed to extract tar: {}", e))
-        })?;
-
-    // Cleanup
-    cleanup_temp_resources(&temp_container, &temp_image, Some(&committed_image));
-    std::fs::remove_file(&export_tar).ok();
-
-    if !extract_output.status.success() {
-        let stderr = String::from_utf8_lossy(&extract_output.stderr);
-        return Err(BoxError::BuildError(format!(
-            "Failed to extract filesystem: {}",
-            stderr.trim()
-        )));
-    }
-
-    // Capture filesystem changes
+    // Capture filesystem state after execution
     let after = DirSnapshot::capture(rootfs_dir)?;
     let changed = before.diff(&after);
 
@@ -479,34 +299,6 @@ fn handle_run_via_microvm(
     }
 
     Ok(Some(layer_info))
-}
-
-/// Clean up temporary resources (container and images).
-#[cfg(target_os = "macos")]
-fn cleanup_temp_resources(container: &str, temp_image: &str, committed_image: Option<&str>) {
-    // Remove container
-    std::process::Command::new("a3s-box")
-        .arg("rm")
-        .arg("-f")
-        .arg(container)
-        .output()
-        .ok();
-
-    // Remove temp image
-    std::process::Command::new("a3s-box")
-        .arg("rmi")
-        .arg(temp_image)
-        .output()
-        .ok();
-
-    // Remove committed image if provided
-    if let Some(img) = committed_image {
-        std::process::Command::new("a3s-box")
-            .arg("rmi")
-            .arg(img)
-            .output()
-            .ok();
-    }
 }
 
 /// Handle ADD: like COPY but supports URL download and tar auto-extraction.

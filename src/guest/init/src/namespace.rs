@@ -7,6 +7,7 @@
 use nix::sched::{unshare, CloneFlags};
 
 use nix::unistd::{fork, ForkResult};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 use thiserror::Error;
@@ -234,6 +235,32 @@ fn child_process(
     }
 
     // Execute the command
+    // DEBUG: Check if the command exists before executing
+    if let Ok(metadata) = std::fs::metadata(command) {
+        tracing::debug!(
+            "Command file exists: {} (size: {} bytes, executable: {})",
+            command,
+            metadata.len(),
+            metadata.permissions().mode() & 0o111 != 0
+        );
+    } else {
+        tracing::error!("Command file does not exist: {}", command);
+        // List root directory contents for debugging
+        if let Ok(entries) = std::fs::read_dir("/") {
+            tracing::error!("Root directory contents:");
+            for entry in entries.flatten() {
+                tracing::error!("  - {}", entry.path().display());
+            }
+        }
+        // List /bin directory if it exists
+        if let Ok(entries) = std::fs::read_dir("/bin") {
+            tracing::error!("/bin directory contents:");
+            for entry in entries.flatten().take(10) {
+                tracing::error!("  - {}", entry.path().display());
+            }
+        }
+    }
+
     let mut cmd = Command::new(command);
     cmd.args(args).current_dir(workdir);
 
