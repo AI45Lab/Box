@@ -2,7 +2,6 @@
 
 use a3s_box_core::error::{BoxError, Result};
 
-use crate::network::PasstManager;
 use crate::vmm::NetworkInstanceConfig;
 
 use super::VmManager;
@@ -60,23 +59,42 @@ impl VmManager {
             vec![std::net::Ipv4Addr::new(8, 8, 8, 8)]
         };
 
-        // Spawn passt daemon
+        // Spawn platform-specific network backend
         let box_dir = self.home_dir.join("boxes").join(&self.box_id);
-        let mut passt = PasstManager::new(&box_dir);
-        passt.spawn(ip, gateway, prefix_len, &dns_servers)?;
 
-        let socket_path = passt.socket_path().to_path_buf();
-        self.passt_manager = Some(passt);
+        #[cfg(target_os = "linux")]
+        let socket_path = {
+            let mut passt = crate::network::PasstManager::new(&box_dir);
+            passt.spawn(ip, gateway, prefix_len, &dns_servers)?;
+            let path = passt.socket_path().to_path_buf();
+            self.net_manager = Some(Box::new(passt));
+            tracing::info!(network = network_name, ip = %ip, gateway = %gateway, "Bridge networking configured via passt");
+            path
+        };
 
-        tracing::info!(
-            network = network_name,
-            ip = %ip,
-            gateway = %gateway,
-            "Bridge networking configured via passt"
-        );
+        #[cfg(target_os = "macos")]
+        let (socket_path, net_socket_fd, net_proxy_fd) = {
+            let mut netproxy = crate::network::NetProxyManager::new(&box_dir);
+            netproxy.spawn(ip, gateway, prefix_len, &dns_servers, &self.config.port_map)?;
+            let fd = netproxy.net_socket_fd();
+            let proxy_fd = netproxy.net_proxy_fd();
+            let path = netproxy.socket_path().to_path_buf();
+            self.net_manager = Some(Box::new(netproxy));
+            tracing::info!(network = network_name, ip = %ip, gateway = %gateway, "Bridge networking configured via built-in netproxy");
+            (path, fd, proxy_fd)
+        };
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        return Err(BoxError::NetworkError(
+            "Bridge networking (--network) is not supported on this platform".to_string(),
+        ));
 
         Ok(NetworkInstanceConfig {
-            passt_socket_path: socket_path,
+            net_socket_path: socket_path,
+            #[cfg(target_os = "macos")]
+            net_socket_fd,
+            #[cfg(target_os = "macos")]
+            net_proxy_fd,
             ip_address: ip,
             gateway,
             prefix_len,

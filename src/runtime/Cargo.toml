@@ -89,6 +89,18 @@ xz2 = "0.1"
 # Build support
 tempfile = { workspace = true }
 
+# macOS userspace network proxy (replaces gvproxy)
+[target.'cfg(target_os = "macos")'.dependencies]
+smoltcp = { version = "0.11", default-features = false, features = [
+    "medium-ethernet",
+    "proto-ipv4",
+    "socket-tcp",
+    "socket-udp",
+    "log",
+    "std",
+    "alloc",
+] }
+
 # Metrics
 prometheus = { workspace = true }
 

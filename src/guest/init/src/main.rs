@@ -441,7 +441,34 @@ fn mount_virtio_fs_shares() -> Result<(), Box<dyn std::error::Error>> {
                 std::fs::create_dir_all("/mnt/newroot/sys").ok();
                 std::fs::create_dir_all("/mnt/newroot/dev").ok();
 
-                // Move mounts
+                // Move mounts: MS_PRIVATE first to allow MS_MOVE on shared mounts (sysfs).
+                let mut proc_moved = false;
+                let mut sys_moved = false;
+                let mut dev_moved = false;
+
+                // Make mounts private so MS_MOVE works
+                let _ = mount(
+                    Some(""),
+                    "/proc",
+                    None::<&str>,
+                    MsFlags::MS_PRIVATE,
+                    None::<&str>,
+                );
+                let _ = mount(
+                    Some(""),
+                    "/sys",
+                    None::<&str>,
+                    MsFlags::MS_PRIVATE | MsFlags::MS_REC,
+                    None::<&str>,
+                );
+                let _ = mount(
+                    Some(""),
+                    "/dev",
+                    None::<&str>,
+                    MsFlags::MS_PRIVATE,
+                    None::<&str>,
+                );
+
                 if let Err(e) = mount(
                     Some("/proc"),
                     "/mnt/newroot/proc",
@@ -450,6 +477,8 @@ fn mount_virtio_fs_shares() -> Result<(), Box<dyn std::error::Error>> {
                     None::<&str>,
                 ) {
                     warn!("Failed to move /proc: {}", e);
+                } else {
+                    proc_moved = true;
                 }
 
                 if let Err(e) = mount(
@@ -460,6 +489,8 @@ fn mount_virtio_fs_shares() -> Result<(), Box<dyn std::error::Error>> {
                     None::<&str>,
                 ) {
                     warn!("Failed to move /sys: {}", e);
+                } else {
+                    sys_moved = true;
                 }
 
                 if let Err(e) = mount(
@@ -470,15 +501,55 @@ fn mount_virtio_fs_shares() -> Result<(), Box<dyn std::error::Error>> {
                     None::<&str>,
                 ) {
                     warn!("Failed to move /dev: {}", e);
+                } else {
+                    dev_moved = true;
                 }
 
                 // Change directory to new root
                 std::env::set_current_dir("/mnt/newroot")?;
 
-                // Pivot root
+                // Pivot root via chroot
                 use nix::unistd::{chdir, chroot};
                 chroot("/mnt/newroot")?;
                 chdir("/")?;
+
+                // Re-mount any filesystems that couldn't be moved (MS_MOVE failed).
+                // This ensures /proc, /sys, /dev are available in the new rootfs.
+                if !proc_moved {
+                    if let Err(e) = mount(
+                        Some("proc"),
+                        "/proc",
+                        Some("proc"),
+                        MsFlags::empty(),
+                        None::<&str>,
+                    ) {
+                        warn!("Failed to remount /proc after chroot: {}", e);
+                    }
+                }
+                if !sys_moved {
+                    if let Err(e) = mount(
+                        Some("sysfs"),
+                        "/sys",
+                        Some("sysfs"),
+                        MsFlags::empty(),
+                        None::<&str>,
+                    ) {
+                        warn!("Failed to remount /sys after chroot: {}", e);
+                    } else {
+                        info!("Remounted /sys after chroot (MS_MOVE failed)");
+                    }
+                }
+                if !dev_moved {
+                    if let Err(e) = mount(
+                        Some("devtmpfs"),
+                        "/dev",
+                        Some("devtmpfs"),
+                        MsFlags::empty(),
+                        None::<&str>,
+                    ) {
+                        warn!("Failed to remount /dev after chroot: {}", e);
+                    }
+                }
 
                 info!("Successfully pivoted to new root filesystem");
             }

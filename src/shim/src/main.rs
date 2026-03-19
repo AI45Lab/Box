@@ -14,6 +14,8 @@
 
 use a3s_box_core::error::{BoxError, Result};
 use a3s_box_runtime::krun::KrunContext;
+#[cfg(target_os = "macos")]
+use a3s_box_runtime::network::spawn_inherited_netproxy;
 use a3s_box_runtime::vmm::InstanceSpec;
 #[cfg(not(target_os = "windows"))]
 use a3s_box_runtime::ATTEST_VSOCK_PORT;
@@ -57,6 +59,17 @@ fn run() -> Result<()> {
             hint: None,
         })?;
 
+    #[cfg(target_os = "macos")]
+    tracing::info!(
+        box_id = %spec.box_id,
+        vcpus = spec.vcpus,
+        memory_mib = spec.memory_mib,
+        rootfs = %spec.rootfs_path.display(),
+        net_socket_fd = spec.network.as_ref().and_then(|net| net.net_socket_fd),
+        net_proxy_fd = spec.network.as_ref().and_then(|net| net.net_proxy_fd),
+        "Starting VM"
+    );
+    #[cfg(not(target_os = "macos"))]
     tracing::info!(
         box_id = %spec.box_id,
         vcpus = spec.vcpus,
@@ -484,30 +497,71 @@ unsafe fn configure_and_start_vm(spec: &InstanceSpec) -> Result<()> {
         tracing::info!("TEE simulation mode: A3S_TEE_SIMULATE=1 included in entrypoint env");
     }
 
-    // Configure networking: passt (virtio-net) or TSI (default)
+    // Configure networking: virtio-net (passt on Linux, gvproxy on macOS) or TSI (default)
     #[cfg(not(target_os = "windows"))]
     if let Some(ref net_config) = spec.network {
+        #[cfg(target_os = "macos")]
         tracing::info!(
             ip = %net_config.ip_address,
             gateway = %net_config.gateway,
             mac = ?net_config.mac_address,
-            socket = %net_config.passt_socket_path.display(),
-            "Configuring passt virtio-net networking"
+            socket = %net_config.net_socket_path.display(),
+            net_socket_fd = net_config.net_socket_fd,
+            net_proxy_fd = net_config.net_proxy_fd,
+            "Configuring virtio-net networking"
+        );
+        #[cfg(not(target_os = "macos"))]
+        tracing::info!(
+            ip = %net_config.ip_address,
+            gateway = %net_config.gateway,
+            mac = ?net_config.mac_address,
+            socket = %net_config.net_socket_path.display(),
+            "Configuring virtio-net networking"
         );
 
+        #[cfg(target_os = "linux")]
         let socket_str =
             net_config
-                .passt_socket_path
+                .net_socket_path
                 .to_str()
                 .ok_or_else(|| BoxError::BoxBootError {
                     message: format!(
-                        "Invalid passt socket path: {}",
-                        net_config.passt_socket_path.display()
+                        "Invalid network socket path: {}",
+                        net_config.net_socket_path.display()
                     ),
                     hint: None,
                 })?;
 
+        #[cfg(target_os = "linux")]
         ctx.add_net_unixstream(socket_str, &net_config.mac_address)?;
+        #[cfg(target_os = "macos")]
+        if let Some(fd) = net_config.net_socket_fd {
+            if let Some(proxy_fd) = net_config.net_proxy_fd {
+                spawn_inherited_netproxy(
+                    proxy_fd,
+                    net_config.ip_address,
+                    net_config.gateway,
+                    net_config.prefix_len,
+                    &net_config.dns_servers,
+                    &spec.port_map,
+                )?;
+            }
+            log_inherited_net_fd(fd);
+            ctx.add_net_unixgram_fd(fd, &net_config.mac_address)?;
+        } else {
+            let socket_str =
+                net_config
+                    .net_socket_path
+                    .to_str()
+                    .ok_or_else(|| BoxError::BoxBootError {
+                        message: format!(
+                            "Invalid network socket path: {}",
+                            net_config.net_socket_path.display()
+                        ),
+                        hint: None,
+                    })?;
+            ctx.add_net_unixgram(socket_str, &net_config.mac_address)?;
+        }
 
         // Network env vars (A3S_NET_IP, A3S_NET_GATEWAY, A3S_NET_DNS) are now
         // injected into spec.entrypoint.env by vm.rs, so they are passed via
@@ -597,6 +651,34 @@ unsafe fn configure_and_start_vm(spec: &InstanceSpec) -> Result<()> {
         tracing::info!(exit_status = status, "VM exited");
         std::process::exit(status);
     }
+}
+
+#[cfg(target_os = "macos")]
+fn log_inherited_net_fd(fd: i32) {
+    let fd_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    let file_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+
+    let mut sock_type: libc::c_int = 0;
+    let mut opt_len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    let sock_type_ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            &mut sock_type as *mut _ as *mut libc::c_void,
+            &mut opt_len,
+        )
+    };
+
+    tracing::info!(
+        fd,
+        fd_flags,
+        file_flags,
+        sock_type_ret,
+        sock_type,
+        last_os_error = %std::io::Error::last_os_error(),
+        "Validated inherited network socket fd"
+    );
 }
 
 /// Apply OCI USER directive to the krun context.

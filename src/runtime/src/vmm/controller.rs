@@ -262,6 +262,15 @@ impl VmmProvider for VmController {
         }
 
         // Spawn shim subprocess
+        #[cfg(target_os = "macos")]
+        tracing::info!(
+            shim = %self.shim_path.display(),
+            box_id = %spec.box_id,
+            net_socket_fd = spec.network.as_ref().and_then(|net| net.net_socket_fd),
+            net_proxy_fd = spec.network.as_ref().and_then(|net| net.net_proxy_fd),
+            "Spawning shim subprocess"
+        );
+        #[cfg(not(target_os = "macos"))]
         tracing::info!(
             shim = %self.shim_path.display(),
             box_id = %spec.box_id,

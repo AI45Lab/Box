@@ -10,6 +10,8 @@ use std::{ffi::CString, ptr};
 
 use super::check_status;
 use a3s_box_core::error::{BoxError, Result};
+#[cfg(target_os = "macos")]
+use libkrun_sys::krun_add_net_unixgram;
 #[cfg(target_os = "windows")]
 use libkrun_sys::{krun_add_net_tcp, krun_add_vsock_port_windows, krun_set_kernel};
 #[cfg(not(target_os = "windows"))]
@@ -334,6 +336,51 @@ impl KrunContext {
                 features,
                 0, // no flags
             ),
+        )
+    }
+
+    /// Add a virtio-net device connected to a gvproxy Unix datagram socket (macOS).
+    ///
+    /// Uses the vfkit protocol (NET_FLAG_VFKIT) for handshake with gvproxy.
+    ///
+    /// # Arguments
+    /// * `socket_path` - Path to the gvproxy Unix datagram socket
+    /// * `mac` - MAC address as 6 bytes
+    #[cfg(target_os = "macos")]
+    pub unsafe fn add_net_unixgram(&self, socket_path: &str, mac: &[u8; 6]) -> Result<()> {
+        tracing::debug!(socket_path, mac = ?mac, "Adding virtio-net via gvproxy (vfkit)");
+
+        let path_c = CString::new(socket_path)
+            .map_err(|e| BoxError::NetworkError(format!("invalid gvproxy socket path: {}", e)))?;
+
+        // The macOS netproxy path exchanges raw Ethernet frames in userspace and
+        // does not implement checksum/GSO offloads. Keep features disabled.
+        let features: u32 = 0;
+        const NET_FLAG_VFKIT: u32 = 1 << 0;
+
+        check_status(
+            "krun_add_net_unixgram",
+            krun_add_net_unixgram(
+                self.ctx_id,
+                path_c.as_ptr(),
+                -1, // use path, not fd
+                mac.as_ptr(),
+                features,
+                NET_FLAG_VFKIT,
+            ),
+        )
+    }
+
+    /// Add a virtio-net device connected to an inherited Unix datagram fd (macOS).
+    #[cfg(target_os = "macos")]
+    pub unsafe fn add_net_unixgram_fd(&self, fd: i32, mac: &[u8; 6]) -> Result<()> {
+        tracing::debug!(fd, mac = ?mac, "Adding virtio-net via inherited unixgram fd");
+
+        let features: u32 = 0;
+
+        check_status(
+            "krun_add_net_unixgram",
+            krun_add_net_unixgram(self.ctx_id, ptr::null(), fd, mac.as_ptr(), features, 0),
         )
     }
 

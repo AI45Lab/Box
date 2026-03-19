@@ -167,6 +167,16 @@ impl Drop for PasstManager {
     }
 }
 
+impl super::NetworkBackend for PasstManager {
+    fn socket_path(&self) -> &std::path::Path {
+        self.socket_path()
+    }
+
+    fn stop(&mut self) {
+        self.stop();
+    }
+}
+
 /// Convert a prefix length to a dotted-decimal netmask string.
 fn prefix_to_netmask(prefix: u8) -> Ipv4Addr {
     if prefix == 0 {

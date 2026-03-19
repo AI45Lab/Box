@@ -122,10 +122,41 @@ fn configure_interfaces(config: &GuestNetConfig) -> Result<(), Box<dyn std::erro
     info!("Bringing up loopback interface");
     set_interface_up("lo")?;
 
-    // Step 2: Check if eth0 exists (virtio-net from passt)
-    if !interface_exists("eth0") {
+    // Step 2: Wait for eth0 to appear (virtio-net driver may need a moment to probe).
+    // On macOS/krun the device activation is asynchronous, so we retry for up to 10s.
+    let eth0_ready = {
+        let mut found = false;
+        for attempt in 0..100 {
+            // Log what interfaces exist every 10 attempts (1s)
+            if attempt % 10 == 0 {
+                if let Ok(entries) = std::fs::read_dir("/sys/class/net") {
+                    let names: Vec<String> = entries
+                        .filter_map(|e| e.ok())
+                        .map(|e| e.file_name().to_string_lossy().to_string())
+                        .collect();
+                    info!(interfaces = ?names, attempt, "Waiting for eth0 — current interfaces");
+                }
+            }
+            if interface_exists("eth0") {
+                found = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        found
+    };
+    if !eth0_ready {
+        // Log final state of interfaces before failing
+        if let Ok(entries) = std::fs::read_dir("/sys/class/net") {
+            let names: Vec<String> = entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect();
+            tracing::error!(interfaces = ?names, "Final interface list when eth0 not found");
+        }
         return Err(Box::new(NetError::CommandFailed(
-            "eth0 not found — expected virtio-net interface from passt".to_string(),
+            "eth0 not found after 10s — expected virtio-net interface from network backend"
+                .to_string(),
         )));
     }
 
