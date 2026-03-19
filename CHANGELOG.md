@@ -4,6 +4,12 @@ All notable changes to A3S Box will be documented in this file.
 
 ## [Unreleased]
 
+## [0.8.11] — 2026-03-20
+
+### Fixed
+- macOS bridge networking restored for shim-hosted netproxy so `localhost` port publishing works reliably again
+- Linux release CI restored by adding the missing `prometheus` dependency back to the workspace
+
 ## [0.4.0] — 2026-02-18
 
 ### Added
