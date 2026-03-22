@@ -71,9 +71,9 @@ fn main() {
             configure_linking(&lib_dir, &lib_dir);
             return;
         }
-        if let Some((libkrun_dir, libkrunfw_dir)) = find_cached_a3s_libkrun() {
+        if let Some((libkrun_dir, libkrunfw_dir)) = find_cached_libkrun() {
             println!(
-                "cargo:warning=Using cached A3S libkrun from {} and libkrunfw from {}",
+                "cargo:warning=Using cached libkrun from {} and libkrunfw from {}",
                 libkrun_dir.display(),
                 libkrunfw_dir.display()
             );
@@ -88,32 +88,105 @@ fn main() {
     build();
 }
 
-fn find_cached_a3s_libkrun() -> Option<(PathBuf, PathBuf)> {
+fn find_cached_libkrun() -> Option<(PathBuf, PathBuf)> {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").ok()?);
-    let workspace_root = manifest_dir.join("../../../../..").canonicalize().ok()?;
+    let workspace_root = manifest_dir.join("../..").canonicalize().ok()?;
+    let target_roots = candidate_target_roots(&workspace_root);
 
-    let libkrun_candidates = [
-        workspace_root.join("crates/box/src/deps/libkrun-sys/vendor/libkrun/target/release"),
-        workspace_root.join("crates/box/src/deps/libkrun-sys/vendor/libkrun/target/release/deps"),
+    let mut libkrun_candidates = vec![
+        workspace_root.join("deps/libkrun-sys/vendor/libkrun/target/release"),
+        workspace_root.join("deps/libkrun-sys/vendor/libkrun/target/release/deps"),
+        workspace_root.join("target/release"),
+        workspace_root.join("target/release/deps"),
+        workspace_root.join("target/debug"),
+        workspace_root.join("target/debug/deps"),
     ];
-    let libkrunfw_candidates = [
-        workspace_root.join("apps/safeclaw/src-tauri/resources/box/lib"),
-        workspace_root.join("apps/safeclaw/src-tauri/target/debug/box/lib"),
-        workspace_root.join("apps/safeclaw/src-tauri/target/release/box/lib"),
-        workspace_root.join(
-            "apps/safeclaw/crates/safeclaw/target/debug/build/a3s-libkrun-sys-491946ab78c5e4f9/out/libkrunfw/lib",
-        ),
-    ];
+    for target_root in &target_roots {
+        libkrun_candidates.push(target_root.join("release"));
+        libkrun_candidates.push(target_root.join("release/deps"));
+        libkrun_candidates.push(target_root.join("debug"));
+        libkrun_candidates.push(target_root.join("debug/deps"));
+    }
 
     let libkrun_dir = libkrun_candidates
         .into_iter()
         .find(|dir| has_library(dir, "libkrun"))?;
-    let libkrunfw_dir = libkrunfw_candidates
+    let libkrunfw_dir = target_roots
         .into_iter()
-        .find(|dir| has_library(dir, "libkrunfw"))?;
+        .find_map(find_libkrunfw_under_target)?;
     #[cfg(target_os = "macos")]
     ensure_macos_lib_alias(&libkrun_dir, "libkrun.dylib", "libkrun.1.dylib");
     Some((libkrun_dir, libkrunfw_dir))
+}
+
+fn candidate_target_roots(workspace_root: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    if let Ok(out_dir) = env::var("OUT_DIR") {
+        let out_dir = PathBuf::from(out_dir);
+        if let Some(target_root) = target_root_from_out_dir(&out_dir) {
+            roots.push(target_root);
+        }
+    }
+
+    if let Some(target_dir) = env::var_os("CARGO_TARGET_DIR").map(PathBuf::from) {
+        roots.push(target_dir);
+    }
+
+    roots.push(workspace_root.join("target"));
+
+    let mut unique = Vec::new();
+    for root in roots {
+        if root.exists() && !unique.iter().any(|existing: &PathBuf| existing == &root) {
+            unique.push(root);
+        }
+    }
+    unique
+}
+
+fn target_root_from_out_dir(out_dir: &Path) -> Option<PathBuf> {
+    for ancestor in out_dir.ancestors() {
+        if ancestor.file_name().is_some_and(|name| name == "build") {
+            return ancestor.parent()?.parent().map(Path::to_path_buf);
+        }
+    }
+    None
+}
+
+fn find_libkrunfw_under_target(target_root: PathBuf) -> Option<PathBuf> {
+    let direct_candidates = [
+        target_root.join("release/build"),
+        target_root.join("debug/build"),
+        target_root.join("release"),
+        target_root.join("debug"),
+    ];
+
+    for candidate in direct_candidates {
+        if let Some(dir) = find_libkrunfw_dir(&candidate) {
+            return Some(dir);
+        }
+    }
+
+    None
+}
+
+fn find_libkrunfw_dir(root: &Path) -> Option<PathBuf> {
+    if has_library(root, "libkrunfw") {
+        return Some(root.to_path_buf());
+    }
+
+    for entry in fs::read_dir(root).ok()? {
+        let path = entry.ok()?.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let candidate = path.join("out").join("libkrunfw").join(LIB_DIR);
+        if has_library(&candidate, "libkrunfw") {
+            return Some(candidate);
+        }
+    }
+
+    None
 }
 
 #[cfg(target_os = "macos")]
@@ -260,7 +333,10 @@ fn configure_linking(libkrun_dir: &Path, libkrunfw_dir: &Path) {
     #[cfg(target_os = "macos")]
     {
         println!("cargo:rustc-link-arg=-Wl,-rpath,{}", libkrun_dir.display());
-        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", libkrunfw_dir.display());
+        println!(
+            "cargo:rustc-link-arg=-Wl,-rpath,{}",
+            libkrunfw_dir.display()
+        );
     }
 
     println!("cargo:LIBKRUN_A3S_DEP={}", libkrun_dir.display());
