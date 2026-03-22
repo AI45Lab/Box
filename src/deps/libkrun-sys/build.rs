@@ -71,12 +71,59 @@ fn main() {
             configure_linking(&lib_dir, &lib_dir);
             return;
         }
+        if let Some((libkrun_dir, libkrunfw_dir)) = find_cached_a3s_libkrun() {
+            println!(
+                "cargo:warning=Using cached A3S libkrun from {} and libkrunfw from {}",
+                libkrun_dir.display(),
+                libkrunfw_dir.display()
+            );
+            configure_linking(&libkrun_dir, &libkrunfw_dir);
+            return;
+        }
     } else {
         println!("cargo:warning=A3S_BUILD_LIBKRUN set: forcing build from source");
     }
 
     // Fall back to building from source (with prebuilt libkrunfw)
     build();
+}
+
+fn find_cached_a3s_libkrun() -> Option<(PathBuf, PathBuf)> {
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").ok()?);
+    let workspace_root = manifest_dir.join("../../../../..").canonicalize().ok()?;
+
+    let libkrun_candidates = [
+        workspace_root.join("crates/box/src/deps/libkrun-sys/vendor/libkrun/target/release"),
+        workspace_root.join("crates/box/src/deps/libkrun-sys/vendor/libkrun/target/release/deps"),
+    ];
+    let libkrunfw_candidates = [
+        workspace_root.join("apps/safeclaw/src-tauri/resources/box/lib"),
+        workspace_root.join("apps/safeclaw/src-tauri/target/debug/box/lib"),
+        workspace_root.join("apps/safeclaw/src-tauri/target/release/box/lib"),
+        workspace_root.join(
+            "apps/safeclaw/crates/safeclaw/target/debug/build/a3s-libkrun-sys-491946ab78c5e4f9/out/libkrunfw/lib",
+        ),
+    ];
+
+    let libkrun_dir = libkrun_candidates
+        .into_iter()
+        .find(|dir| has_library(dir, "libkrun"))?;
+    let libkrunfw_dir = libkrunfw_candidates
+        .into_iter()
+        .find(|dir| has_library(dir, "libkrunfw"))?;
+    #[cfg(target_os = "macos")]
+    ensure_macos_lib_alias(&libkrun_dir, "libkrun.dylib", "libkrun.1.dylib");
+    Some((libkrun_dir, libkrunfw_dir))
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_macos_lib_alias(dir: &Path, source: &str, alias: &str) {
+    let source_path = dir.join(source);
+    let alias_path = dir.join(alias);
+    if !source_path.exists() || alias_path.exists() {
+        return;
+    }
+    std::os::unix::fs::symlink(source, &alias_path).ok();
 }
 
 /// Try to find system-installed libkrun via pkg-config or common paths.
@@ -210,6 +257,11 @@ fn build_with_make(
 fn configure_linking(libkrun_dir: &Path, libkrunfw_dir: &Path) {
     println!("cargo:rustc-link-search=native={}", libkrun_dir.display());
     println!("cargo:rustc-link-lib=dylib=krun");
+    #[cfg(target_os = "macos")]
+    {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", libkrun_dir.display());
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", libkrunfw_dir.display());
+    }
 
     println!("cargo:LIBKRUN_A3S_DEP={}", libkrun_dir.display());
     println!("cargo:LIBKRUNFW_A3S_DEP={}", libkrunfw_dir.display());

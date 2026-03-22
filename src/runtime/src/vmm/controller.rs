@@ -287,11 +287,26 @@ impl VmmProvider for VmController {
         // On macOS, set DYLD_LIBRARY_PATH to help find libkrunfw
         #[cfg(target_os = "macos")]
         {
-            if let Ok(current_path) = std::env::var("DYLD_LIBRARY_PATH") {
-                cmd.env("DYLD_LIBRARY_PATH", current_path);
+            let mut dylib_paths = Vec::new();
+            let bundled_lib_dir = self
+                .shim_path
+                .parent()
+                .and_then(|dir| dir.parent())
+                .map(|dir| dir.join("lib"));
+            if let Some(path) = bundled_lib_dir.filter(|path| path.exists()) {
+                dylib_paths.push(path);
+            }
+            let home_lib_dir = a3s_box_core::dirs_home().join("lib");
+            if home_lib_dir.exists() {
+                dylib_paths.push(home_lib_dir);
+            }
+            if let Some(existing) = std::env::var_os("DYLD_LIBRARY_PATH") {
+                dylib_paths.extend(std::env::split_paths(&existing));
             } else {
-                // Default to Homebrew lib path
-                cmd.env("DYLD_LIBRARY_PATH", "/opt/homebrew/lib");
+                dylib_paths.push(std::path::PathBuf::from("/opt/homebrew/lib"));
+            }
+            if let Ok(joined) = std::env::join_paths(dylib_paths) {
+                cmd.env("DYLD_LIBRARY_PATH", joined);
             }
         }
 
