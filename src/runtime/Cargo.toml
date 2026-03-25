@@ -12,17 +12,18 @@ name = "a3s_box_runtime"
 path = "src/lib.rs"
 
 [features]
-default = ["pool", "scale", "compose", "operator", "build"]
-pool = []
+default = ["vm", "pool", "scale", "compose", "operator", "build"]
+vm = ["dep:libkrun-sys"]
+pool = ["vm"]
 scale = []
-compose = []
+compose = ["vm"]
 operator = []
 build = []
 
 [dependencies]
 a3s-box-core = { version = "0.8", path = "../core" }
 a3s-transport = { workspace = true }
-libkrun-sys = { version = "0.1.5", path = "../deps/libkrun-sys", package = "a3s-libkrun-sys" }
+libkrun-sys = { version = "0.1.5", path = "../deps/libkrun-sys", package = "a3s-libkrun-sys", optional = true }
 
 # Async runtime
 tokio = { workspace = true }
@@ -91,6 +92,18 @@ tempfile = { workspace = true }
 
 # Metrics
 prometheus = { workspace = true }
+
+# macOS userspace network proxy (replaces gvproxy)
+[target.'cfg(target_os = "macos")'.dependencies]
+smoltcp = { version = "0.11", default-features = false, features = [
+    "medium-ethernet",
+    "proto-ipv4",
+    "socket-tcp",
+    "socket-udp",
+    "log",
+    "std",
+    "alloc",
+] }
 
 [dev-dependencies]
 rand = { workspace = true }

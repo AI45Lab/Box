@@ -425,6 +425,12 @@ impl VmManager {
         }
 
         // Try PATH
+        let home_bin = a3s_box_core::dirs_home().join("bin").join(name);
+        if home_bin.exists() {
+            candidates.push(home_bin);
+        }
+
+        // Try PATH
         if let Ok(path_var) = std::env::var("PATH") {
             for dir in std::env::split_paths(&path_var) {
                 let path = dir.join(name);
@@ -479,7 +485,7 @@ mod tests {
             provider: None,
             handler: Arc::new(RwLock::new(None)),
             exec_client: None,
-            passt_manager: None,
+            net_manager: None,
             home_dir: home_dir.to_path_buf(),
             anonymous_volumes: Vec::new(),
             tee: None,

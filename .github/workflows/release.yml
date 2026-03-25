@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -565,4 +566,3 @@ jobs:
             });
 
             console.log(`Triggered winget publishing for version ${version}`);
-

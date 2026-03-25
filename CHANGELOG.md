@@ -4,6 +4,14 @@ All notable changes to A3S Box will be documented in this file.
 
 ## [Unreleased]
 
+## [0.8.12] — 2026-03-20
+
+### Fixed
+- macOS bridge networking restored for shim-hosted netproxy so `localhost` port publishing works reliably again
+- Linux release CI restored by adding the missing `prometheus` dependency back to the workspace
+- Windows release builds no longer fail on non-macOS network setup bindings
+- Release workflow can dispatch the winget publish workflow with `actions: write`
+
 ## [0.4.0] — 2026-02-18
 
 ### Added

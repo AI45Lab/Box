@@ -19,6 +19,7 @@ pub mod cache;
 pub mod fs;
 pub mod grpc;
 pub mod host_check;
+#[cfg(feature = "vm")]
 pub mod krun;
 pub mod log;
 pub mod network;
@@ -28,7 +29,9 @@ pub mod resize;
 pub mod rootfs;
 pub mod snapshot;
 pub mod tee;
+#[cfg(feature = "vm")]
 pub mod vm;
+#[cfg(feature = "vm")]
 pub mod vmm;
 pub mod volume;
 
@@ -80,7 +83,9 @@ pub use tee::{
 pub use tee::{AttestationReport, AttestationRequest, PlatformInfo};
 
 // VM
+#[cfg(feature = "vm")]
 pub use vm::{BoxState, VmManager};
+#[cfg(feature = "vm")]
 pub use vmm::{
     Entrypoint, FsMount, InstanceSpec, NetworkInstanceConfig, ShimHandler, TeeInstanceConfig,
     VmController, VmHandler, VmMetrics, VmmProvider,

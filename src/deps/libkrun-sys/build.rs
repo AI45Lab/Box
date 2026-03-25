@@ -71,12 +71,132 @@ fn main() {
             configure_linking(&lib_dir, &lib_dir);
             return;
         }
+        if let Some((libkrun_dir, libkrunfw_dir)) = find_cached_libkrun() {
+            println!(
+                "cargo:warning=Using cached libkrun from {} and libkrunfw from {}",
+                libkrun_dir.display(),
+                libkrunfw_dir.display()
+            );
+            configure_linking(&libkrun_dir, &libkrunfw_dir);
+            return;
+        }
     } else {
         println!("cargo:warning=A3S_BUILD_LIBKRUN set: forcing build from source");
     }
 
     // Fall back to building from source (with prebuilt libkrunfw)
     build();
+}
+
+fn find_cached_libkrun() -> Option<(PathBuf, PathBuf)> {
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").ok()?);
+    let workspace_root = manifest_dir.join("../..").canonicalize().ok()?;
+    let target_roots = candidate_target_roots(&workspace_root);
+
+    let mut libkrun_candidates = vec![
+        workspace_root.join("deps/libkrun-sys/vendor/libkrun/target/release"),
+        workspace_root.join("deps/libkrun-sys/vendor/libkrun/target/release/deps"),
+        workspace_root.join("target/release"),
+        workspace_root.join("target/release/deps"),
+        workspace_root.join("target/debug"),
+        workspace_root.join("target/debug/deps"),
+    ];
+    for target_root in &target_roots {
+        libkrun_candidates.push(target_root.join("release"));
+        libkrun_candidates.push(target_root.join("release/deps"));
+        libkrun_candidates.push(target_root.join("debug"));
+        libkrun_candidates.push(target_root.join("debug/deps"));
+    }
+
+    let libkrun_dir = libkrun_candidates
+        .into_iter()
+        .find(|dir| has_library(dir, "libkrun"))?;
+    let libkrunfw_dir = target_roots
+        .into_iter()
+        .find_map(find_libkrunfw_under_target)?;
+    #[cfg(target_os = "macos")]
+    ensure_macos_lib_alias(&libkrun_dir, "libkrun.dylib", "libkrun.1.dylib");
+    Some((libkrun_dir, libkrunfw_dir))
+}
+
+fn candidate_target_roots(workspace_root: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    if let Ok(out_dir) = env::var("OUT_DIR") {
+        let out_dir = PathBuf::from(out_dir);
+        if let Some(target_root) = target_root_from_out_dir(&out_dir) {
+            roots.push(target_root);
+        }
+    }
+
+    if let Some(target_dir) = env::var_os("CARGO_TARGET_DIR").map(PathBuf::from) {
+        roots.push(target_dir);
+    }
+
+    roots.push(workspace_root.join("target"));
+
+    let mut unique = Vec::new();
+    for root in roots {
+        if root.exists() && !unique.iter().any(|existing: &PathBuf| existing == &root) {
+            unique.push(root);
+        }
+    }
+    unique
+}
+
+fn target_root_from_out_dir(out_dir: &Path) -> Option<PathBuf> {
+    for ancestor in out_dir.ancestors() {
+        if ancestor.file_name().is_some_and(|name| name == "build") {
+            return ancestor.parent()?.parent().map(Path::to_path_buf);
+        }
+    }
+    None
+}
+
+fn find_libkrunfw_under_target(target_root: PathBuf) -> Option<PathBuf> {
+    let direct_candidates = [
+        target_root.join("release/build"),
+        target_root.join("debug/build"),
+        target_root.join("release"),
+        target_root.join("debug"),
+    ];
+
+    for candidate in direct_candidates {
+        if let Some(dir) = find_libkrunfw_dir(&candidate) {
+            return Some(dir);
+        }
+    }
+
+    None
+}
+
+fn find_libkrunfw_dir(root: &Path) -> Option<PathBuf> {
+    if has_library(root, "libkrunfw") {
+        return Some(root.to_path_buf());
+    }
+
+    for entry in fs::read_dir(root).ok()? {
+        let path = entry.ok()?.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let candidate = path.join("out").join("libkrunfw").join(LIB_DIR);
+        if has_library(&candidate, "libkrunfw") {
+            return Some(candidate);
+        }
+    }
+
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_macos_lib_alias(dir: &Path, source: &str, alias: &str) {
+    let source_path = dir.join(source);
+    let alias_path = dir.join(alias);
+    if !source_path.exists() || alias_path.exists() {
+        return;
+    }
+    std::os::unix::fs::symlink(source, &alias_path).ok();
 }
 
 /// Try to find system-installed libkrun via pkg-config or common paths.
@@ -210,6 +330,14 @@ fn build_with_make(
 fn configure_linking(libkrun_dir: &Path, libkrunfw_dir: &Path) {
     println!("cargo:rustc-link-search=native={}", libkrun_dir.display());
     println!("cargo:rustc-link-lib=dylib=krun");
+    #[cfg(target_os = "macos")]
+    {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", libkrun_dir.display());
+        println!(
+            "cargo:rustc-link-arg=-Wl,-rpath,{}",
+            libkrunfw_dir.display()
+        );
+    }
 
     println!("cargo:LIBKRUN_A3S_DEP={}", libkrun_dir.display());
     println!("cargo:LIBKRUNFW_A3S_DEP={}", libkrunfw_dir.display());
@@ -362,8 +490,24 @@ fn extract_major_soname(filename: &str) -> Option<String> {
 // ============================================================================
 
 #[cfg(target_os = "macos")]
+fn append_env_path(var: &str, path: &Path) {
+    let mut paths = env::var_os(var)
+        .map(|value| env::split_paths(&value).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if paths.iter().any(|existing| existing == path) {
+        return;
+    }
+    paths.push(path.to_path_buf());
+    if let Ok(joined) = env::join_paths(paths) {
+        env::set_var(var, joined);
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn setup_libclang_path() {
-    if env::var("LIBCLANG_PATH").is_ok() {
+    if let Some(existing) = env::var_os("LIBCLANG_PATH").map(PathBuf::from) {
+        append_env_path("DYLD_FALLBACK_LIBRARY_PATH", &existing);
+        append_env_path("DYLD_LIBRARY_PATH", &existing);
         return;
     }
     if Command::new("llvm-config")
@@ -380,9 +524,12 @@ fn setup_libclang_path() {
         if output.status.success() {
             let prefix = String::from_utf8_lossy(&output.stdout).trim().to_string();
             let lib_path = format!("{}/lib", prefix);
-            if Path::new(&lib_path).join("libclang.dylib").exists() {
+            let lib_path = PathBuf::from(lib_path);
+            if lib_path.join("libclang.dylib").exists() {
                 env::set_var("LIBCLANG_PATH", &lib_path);
-                println!("cargo:warning=Set LIBCLANG_PATH to {}", lib_path);
+                append_env_path("DYLD_FALLBACK_LIBRARY_PATH", &lib_path);
+                append_env_path("DYLD_LIBRARY_PATH", &lib_path);
+                println!("cargo:warning=Set LIBCLANG_PATH to {}", lib_path.display());
             }
         }
     }

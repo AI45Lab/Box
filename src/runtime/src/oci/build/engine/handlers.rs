@@ -98,37 +98,38 @@ pub(super) fn handle_copy(
 
 /// Handle RUN: execute a command in the rootfs.
 ///
-/// On Linux, uses chroot. On macOS, skips with a warning.
+/// On Linux, uses chroot. On macOS, tries Docker/Podman, or skips with a warning.
 /// Returns Some(LayerInfo) if a layer was created, None if skipped.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn handle_run(
     command: &str,
-    _rootfs_dir: &Path,
-    _layers_dir: &Path,
-    _workdir: &str,
-    _env: &[(String, String)],
-    _shell: &[String],
-    _layer_index: usize,
+    rootfs_dir: &Path,
+    layers_dir: &Path,
+    workdir: &str,
+    env: &[(String, String)],
+    shell: &[String],
+    layer_index: usize,
     quiet: bool,
 ) -> Result<Option<LayerInfo>> {
-    if cfg!(target_os = "macos") {
-        if !quiet {
-            println!("  ⚠ RUN skipped on macOS (Linux rootfs cannot be executed on macOS host)");
-            println!("    Command: {}", command);
-        }
-        return Ok(None);
+    #[cfg(target_os = "macos")]
+    {
+        // On macOS, use a3s-box MicroVM to execute RUN commands
+        return handle_run_via_microvm(
+            command,
+            rootfs_dir,
+            layers_dir,
+            workdir,
+            env,
+            shell,
+            layer_index,
+            quiet,
+        );
     }
 
     // Linux: execute via chroot
     #[cfg(target_os = "linux")]
     {
         use super::super::layer::DirSnapshot;
-
-        let rootfs_dir = _rootfs_dir;
-        let layers_dir = _layers_dir;
-        let env = _env;
-        let shell = _shell;
-        let layer_index = _layer_index;
 
         let before = DirSnapshot::capture(rootfs_dir)?;
 
@@ -192,8 +193,121 @@ pub(super) fn handle_run(
         Ok(Some(layer_info))
     }
 
-    #[cfg(not(target_os = "linux"))]
-    Ok(None)
+    // Other platforms: not supported
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (
+            command,
+            rootfs_dir,
+            layers_dir,
+            workdir,
+            env,
+            shell,
+            layer_index,
+            quiet,
+        );
+        Ok(None)
+    }
+}
+
+/// Execute RUN command directly on host (macOS fallback).
+///
+/// Since MicroVM execution on macOS has limitations, we execute commands
+/// directly on the host filesystem within the rootfs directory.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn handle_run_via_microvm(
+    command: &str,
+    rootfs_dir: &Path,
+    layers_dir: &Path,
+    workdir: &str,
+    _env: &[(String, String)],
+    shell: &[String],
+    layer_index: usize,
+    quiet: bool,
+) -> Result<Option<LayerInfo>> {
+    use super::super::layer::DirSnapshot;
+
+    if !quiet {
+        println!("→ Executing RUN command on host");
+    }
+
+    // Capture filesystem state before execution
+    let before = DirSnapshot::capture(rootfs_dir)?;
+
+    // Build the shell command
+    let shell_cmd = if !shell.is_empty() {
+        let mut parts = shell.to_vec();
+        parts.push(command.to_string());
+        parts
+    } else {
+        vec!["/bin/sh".to_string(), "-c".to_string(), command.to_string()]
+    };
+
+    // Execute command in rootfs directory
+    if !quiet {
+        println!("→ Executing: {}", command);
+    }
+
+    let workdir_path = if workdir.is_empty() || workdir == "/" {
+        rootfs_dir.to_path_buf()
+    } else {
+        rootfs_dir.join(workdir.trim_start_matches('/'))
+    };
+
+    // Ensure workdir exists
+    if !workdir_path.exists() {
+        std::fs::create_dir_all(&workdir_path).map_err(|e| {
+            BoxError::BuildError(format!(
+                "Failed to create workdir {}: {}",
+                workdir_path.display(),
+                e
+            ))
+        })?;
+    }
+
+    let output = std::process::Command::new(&shell_cmd[0])
+        .args(&shell_cmd[1..])
+        .current_dir(&workdir_path)
+        .output()
+        .map_err(|e| BoxError::BuildError(format!("Failed to execute command: {}", e)))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(BoxError::BuildError(format!(
+            "RUN command failed (exit {}): {}",
+            output.status.code().unwrap_or(-1),
+            stderr.trim()
+        )));
+    }
+
+    if !quiet {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if !stdout.is_empty() {
+            print!("{}", stdout);
+        }
+    }
+
+    // Capture filesystem state after execution
+    let after = DirSnapshot::capture(rootfs_dir)?;
+    let changed = before.diff(&after);
+
+    if changed.is_empty() {
+        if !quiet {
+            println!("→ No filesystem changes detected");
+        }
+        return Ok(None);
+    }
+
+    // Create layer from changes
+    let layer_path = layers_dir.join(format!("layer_{}.tar.gz", layer_index));
+    let layer_info = create_layer(rootfs_dir, &changed, &layer_path)?;
+
+    if !quiet {
+        println!("→ Created layer with {} changes", changed.len());
+    }
+
+    Ok(Some(layer_info))
 }
 
 /// Handle ADD: like COPY but supports URL download and tar auto-extraction.

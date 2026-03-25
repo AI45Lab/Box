@@ -40,7 +40,6 @@ pub fn spawn_health_checker(
 
 #[cfg(not(windows))]
 async fn run_health_loop(box_id: String, exec_socket_path: PathBuf, hc: HealthCheck) {
-    use std::path::Path;
     use std::time::Duration;
 
     // Honour start_period before the first probe

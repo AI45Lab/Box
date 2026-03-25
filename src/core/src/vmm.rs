@@ -10,6 +10,8 @@
 //! - [`VmHandler`] — lifecycle operations on a running VM
 
 use std::net::Ipv4Addr;
+#[cfg(target_os = "macos")]
+use std::os::fd::RawFd;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
@@ -51,11 +53,21 @@ pub struct TeeInstanceConfig {
     pub tee_type: String,
 }
 
-/// Network instance configuration for passt-based networking.
+/// Network instance configuration for the network backend (passt on Linux, gvproxy on macOS).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkInstanceConfig {
-    /// Path to the passt Unix socket.
-    pub passt_socket_path: PathBuf,
+    /// Path to the network backend Unix socket (passt on Linux, gvproxy on macOS).
+    pub net_socket_path: PathBuf,
+
+    /// Pre-opened Unix datagram socket fd inherited by the shim on macOS.
+    #[cfg(target_os = "macos")]
+    #[serde(default)]
+    pub net_socket_fd: Option<RawFd>,
+
+    /// Proxy-side Unix datagram socket fd inherited by the shim on macOS.
+    #[cfg(target_os = "macos")]
+    #[serde(default)]
+    pub net_proxy_fd: Option<RawFd>,
 
     /// Assigned IPv4 address for this VM.
     pub ip_address: Ipv4Addr,
@@ -127,8 +139,8 @@ pub struct InstanceSpec {
     #[serde(default)]
     pub user: Option<String>,
 
-    /// Network configuration for passt-based networking.
-    /// None = TSI mode (default), Some = passt virtio-net mode.
+    /// Network configuration for virtio-net networking.
+    /// None = TSI mode (default), Some = virtio-net mode (passt on Linux, gvproxy on macOS).
     #[serde(default)]
     pub network: Option<NetworkInstanceConfig>,
 
@@ -371,7 +383,11 @@ mod tests {
     fn test_instance_spec_with_network() {
         let spec = InstanceSpec {
             network: Some(NetworkInstanceConfig {
-                passt_socket_path: PathBuf::from("/tmp/passt.sock"),
+                net_socket_path: PathBuf::from("/tmp/net.sock"),
+                #[cfg(target_os = "macos")]
+                net_socket_fd: Some(42),
+                #[cfg(target_os = "macos")]
+                net_proxy_fd: Some(43),
                 ip_address: "10.0.0.2".parse().unwrap(),
                 gateway: "10.0.0.1".parse().unwrap(),
                 prefix_len: 24,
@@ -385,6 +401,10 @@ mod tests {
         let deserialized: InstanceSpec = serde_json::from_str(&json).unwrap();
 
         let net = deserialized.network.unwrap();
+        #[cfg(target_os = "macos")]
+        assert_eq!(net.net_socket_fd, Some(42));
+        #[cfg(target_os = "macos")]
+        assert_eq!(net.net_proxy_fd, Some(43));
         assert_eq!(net.ip_address, "10.0.0.2".parse::<Ipv4Addr>().unwrap());
         assert_eq!(net.gateway, "10.0.0.1".parse::<Ipv4Addr>().unwrap());
         assert_eq!(net.prefix_len, 24);

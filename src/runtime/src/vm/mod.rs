@@ -19,7 +19,6 @@ use libc;
 
 #[cfg(unix)]
 use crate::grpc::ExecClient;
-use crate::network::PasstManager;
 #[cfg(unix)]
 use crate::tee::TeeExtension;
 use crate::vmm::{VmController, VmHandler, VmmProvider, DEFAULT_SHUTDOWN_TIMEOUT_MS};
@@ -87,8 +86,9 @@ pub struct VmManager {
     #[cfg(unix)]
     pub(crate) exec_client: Option<ExecClient>,
 
-    /// Passt manager for bridge networking (None if TSI mode)
-    pub(crate) passt_manager: Option<PasstManager>,
+    /// Network backend manager for bridge networking (None if TSI mode).
+    /// Platform-specific: passt on Linux, gvproxy on macOS.
+    pub(crate) net_manager: Option<Box<dyn crate::network::NetworkBackend>>,
 
     /// A3S home directory (~/.a3s)
     pub(crate) home_dir: PathBuf,
@@ -134,7 +134,7 @@ impl VmManager {
             handler: Arc::new(RwLock::new(None)),
             #[cfg(unix)]
             exec_client: None,
-            passt_manager: None,
+            net_manager: None,
             home_dir,
             anonymous_volumes: Vec::new(),
             #[cfg(unix)]
@@ -161,7 +161,7 @@ impl VmManager {
             handler: Arc::new(RwLock::new(None)),
             #[cfg(unix)]
             exec_client: None,
-            passt_manager: None,
+            net_manager: None,
             home_dir,
             anonymous_volumes: Vec::new(),
             #[cfg(unix)]
@@ -192,7 +192,7 @@ impl VmManager {
             handler: Arc::new(RwLock::new(None)),
             #[cfg(unix)]
             exec_client: None,
-            passt_manager: None,
+            net_manager: None,
             home_dir,
             anonymous_volumes: Vec::new(),
             #[cfg(unix)]
@@ -508,11 +508,11 @@ impl VmManager {
             self.shim_exit_code = handler.exit_code();
         }
 
-        // Stop passt daemon if running
-        if let Some(ref mut passt) = self.passt_manager {
-            passt.stop();
+        // Stop network backend if running
+        if let Some(ref mut net) = self.net_manager {
+            net.stop();
         }
-        self.passt_manager = None;
+        self.net_manager = None;
 
         *state = BoxState::Stopped;
 

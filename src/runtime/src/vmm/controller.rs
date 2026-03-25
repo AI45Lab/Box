@@ -324,26 +324,60 @@ impl VmmProvider for VmController {
         }
 
         // Spawn shim subprocess
+        #[cfg(target_os = "macos")]
+        tracing::info!(
+            shim = %self.shim_path.display(),
+            box_id = %spec.box_id,
+            net_socket_fd = spec.network.as_ref().and_then(|net| net.net_socket_fd),
+            net_proxy_fd = spec.network.as_ref().and_then(|net| net.net_proxy_fd),
+            "Spawning shim subprocess"
+        );
+        #[cfg(not(target_os = "macos"))]
         tracing::info!(
             shim = %self.shim_path.display(),
             box_id = %spec.box_id,
             "Spawning shim subprocess"
         );
 
-        let mut command = Command::new(&self.shim_path);
-        command
-            .arg("--config")
+        let mut cmd = Command::new(&self.shim_path);
+        cmd.arg("--config")
             .arg(&config_json)
             .stdin(Stdio::null())
             .stdout(Stdio::inherit()) // Inherit for debugging
             .stderr(Stdio::inherit());
 
-        #[cfg(target_os = "windows")]
-        if let Some(path) = Self::windows_shim_path_env(&self.shim_path) {
-            command.env("PATH", path);
+        // On macOS, set DYLD_LIBRARY_PATH to help find libkrunfw
+        #[cfg(target_os = "macos")]
+        {
+            let mut dylib_paths = Vec::new();
+            let bundled_lib_dir = self
+                .shim_path
+                .parent()
+                .and_then(|dir| dir.parent())
+                .map(|dir| dir.join("lib"));
+            if let Some(path) = bundled_lib_dir.filter(|path| path.exists()) {
+                dylib_paths.push(path);
+            }
+            let home_lib_dir = a3s_box_core::dirs_home().join("lib");
+            if home_lib_dir.exists() {
+                dylib_paths.push(home_lib_dir);
+            }
+            if let Some(existing) = std::env::var_os("DYLD_LIBRARY_PATH") {
+                dylib_paths.extend(std::env::split_paths(&existing));
+            } else {
+                dylib_paths.push(std::path::PathBuf::from("/opt/homebrew/lib"));
+            }
+            if let Ok(joined) = std::env::join_paths(dylib_paths) {
+                cmd.env("DYLD_LIBRARY_PATH", joined);
+            }
         }
 
-        let child = command.spawn().map_err(|e| BoxError::BoxBootError {
+        #[cfg(target_os = "windows")]
+        if let Some(path) = Self::windows_shim_path_env(&self.shim_path) {
+            cmd.env("PATH", path);
+        }
+
+        let child = cmd.spawn().map_err(|e| BoxError::BoxBootError {
             message: format!("Failed to spawn shim: {}", e),
             hint: Some(format!("Shim path: {}", self.shim_path.display())),
         })?;
