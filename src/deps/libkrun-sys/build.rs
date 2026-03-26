@@ -39,6 +39,10 @@ const LIBKRUNFW_SHA256: &str = "e254bc3fb07b32e26a258d9958967b2f22eb6c3136cfedf3
 // since the `tee` feature in libkrun requires amd-sev or tdx to compile properly.
 const LIBKRUN_BUILD_FEATURES: &[(&str, &str)] = &[("NET", "1"), ("BLK", "1")];
 
+fn target_os() -> String {
+    env::var("CARGO_CFG_TARGET_OS").unwrap_or_default()
+}
+
 // Library directory name differs by platform
 #[cfg(target_os = "macos")]
 const LIB_DIR: &str = "lib";
@@ -58,6 +62,11 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=krun");
         println!("cargo:LIBKRUN_A3S_DEP=/nonexistent");
         println!("cargo:LIBKRUNFW_A3S_DEP=/nonexistent");
+        return;
+    }
+
+    if target_os() == "windows" {
+        build_windows();
         return;
     }
 
@@ -736,7 +745,6 @@ fn download_libkrunfw_so(install_dir: &Path) {
 
 /// Windows: Download and extract the prebuilt krun-windows-x64.zip.
 /// Returns the directory containing krun.lib, krun.dll, and libkrunfw.dll.
-#[cfg(target_os = "windows")]
 fn download_krun_windows_prebuilt(out_dir: &Path) -> PathBuf {
     let zip_path = out_dir.join("krun-windows-x64.zip");
     let extract_dir = out_dir.join("krun-windows-x64");
@@ -784,8 +792,7 @@ fn download_krun_windows_prebuilt(out_dir: &Path) -> PathBuf {
 ///   1. LIBKRUN_DIR env var (local build override)
 ///   2. deps/libkrun-sys/prebuilt/x86_64-pc-windows-msvc/ (vendored)
 ///   3. Auto-download krun-windows-x64.zip from GitHub Releases into OUT_DIR
-#[cfg(target_os = "windows")]
-fn build() {
+fn build_windows() {
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| "x86_64".to_string());
     let triple = format!("{}-pc-windows-msvc", target_arch);
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());

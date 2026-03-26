@@ -8,7 +8,9 @@ mod spec;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use a3s_box_core::config::{BoxConfig, TeeConfig};
+use a3s_box_core::config::BoxConfig;
+#[cfg(unix)]
+use a3s_box_core::config::TeeConfig;
 use a3s_box_core::error::{BoxError, Result};
 use a3s_box_core::event::{BoxEvent, EventEmitter};
 use serde::{Deserialize, Serialize};

@@ -84,6 +84,14 @@ impl VmManager {
             (path, fd, proxy_fd)
         };
 
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = box_dir;
+            return Err(BoxError::NetworkError(
+                "Bridge networking (--network) is not supported on this platform".to_string(),
+            ));
+        }
+
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             Ok(NetworkInstanceConfig {
@@ -98,13 +106,6 @@ impl VmManager {
                 mac_address,
                 dns_servers,
             })
-        }
-
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        {
-            Err(BoxError::NetworkError(
-                "Bridge networking (--network) is not supported on this platform".to_string(),
-            ))
         }
     }
 
