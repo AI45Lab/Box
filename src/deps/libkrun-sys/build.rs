@@ -165,7 +165,6 @@ fn target_root_from_out_dir(out_dir: &Path) -> Option<PathBuf> {
     None
 }
 
-#[cfg(target_os = "windows")]
 fn find_sibling_libkrun_windows(triple: &str) -> Option<PathBuf> {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").ok()?);
     let repo_root = manifest_dir.join("../../../../..").canonicalize().ok()?;

@@ -89,9 +89,12 @@ pub fn ensure_shim(home_dir: &Path) -> Result<Option<PathBuf>> {
         ))
     })?;
 
-    // On macOS, sign with Hypervisor.framework entitlement
+    // On macOS, fix library paths and sign with Hypervisor.framework entitlement
     #[cfg(target_os = "macos")]
-    sign_with_entitlement(&shim_path, home_dir)?;
+    {
+        fix_macos_library_paths(&shim_path, &bin_dir, home_dir)?;
+        sign_with_entitlement(&shim_path, home_dir)?;
+    }
 
     Ok(Some(shim_path))
 }
@@ -121,6 +124,109 @@ fn set_executable(path: &Path) -> Result<()> {
 
 #[cfg(not(unix))]
 fn set_executable(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// Fix library paths on macOS so the shim can find libkrun at runtime.
+///
+/// On macOS, when a binary has the Hypervisor entitlement, dyld ignores
+/// DYLD_LIBRARY_PATH. This function:
+/// 1. Looks for libkrun in the home lib directory first (~/.a3s/lib)
+/// 2. Falls back to common build artifact locations
+/// 3. Copies it to the same directory as the shim
+/// 4. Patches the shim's library dependency to use @executable_path
+#[cfg(target_os = "macos")]
+fn fix_macos_library_paths(shim_path: &Path, bin_dir: &Path, home_dir: &Path) -> Result<()> {
+    use std::process::Command;
+
+    // First check home lib directory (where we install libkrun during setup)
+    let home_lib = home_dir.join("lib");
+    let mut libkrun_paths = vec![home_lib.clone()];
+
+    // Add common build artifact locations
+    libkrun_paths.push(PathBuf::from(
+        "/Users/roylin/Desktop/code/a3s/crates/box/src/deps/libkrun-sys/vendor/libkrun/target/release",
+    ));
+    libkrun_paths.push(PathBuf::from(
+        "/Users/roylin/Desktop/code/a3s/target/release",
+    ));
+    libkrun_paths.push(PathBuf::from("/Users/roylin/Desktop/code/a3s/target/debug"));
+
+    let libkrun_dir = libkrun_paths
+        .iter()
+        .find(|p| p.join("libkrun.dylib").exists());
+
+    let libkrun_dir = match libkrun_dir {
+        Some(dir) => dir.clone(),
+        None => {
+            tracing::warn!(
+                "libkrun not found, VM boot may fail. \
+                 Install libkrun to ~/.a3s/lib or ensure build artifacts are preserved."
+            );
+            return Ok(()); // Non-fatal - VM boot may still work if libkrun is found elsewhere
+        }
+    };
+
+    let libkrun_src = libkrun_dir.join("libkrun.dylib");
+    let libkrun_alias_src = libkrun_dir.join("libkrun.1.dylib");
+    let libkrun_dst = bin_dir.join("libkrun.dylib");
+    let libkrun_alias_dst = bin_dir.join("libkrun.1.dylib");
+
+    // Copy libkrun.dylib if not already present or if source is newer
+    let should_copy = !libkrun_dst.exists()
+        || std::fs::metadata(&libkrun_src)
+            .ok()
+            .and_then(|s| s.modified().ok())
+            > std::fs::metadata(&libkrun_dst)
+                .ok()
+                .and_then(|s| s.modified().ok());
+
+    if should_copy {
+        tracing::info!(
+            src = %libkrun_src.display(),
+            dst = %libkrun_dst.display(),
+            "Copying libkrun to shim directory"
+        );
+        std::fs::copy(&libkrun_src, &libkrun_dst)
+            .map_err(|e| BoxError::ConfigError(format!("Failed to copy libkrun: {}", e)))?;
+
+        // Copy the versioned alias too
+        if libkrun_alias_src.exists() {
+            std::fs::copy(&libkrun_alias_src, &libkrun_alias_dst).ok();
+        }
+    }
+
+    // Patch the shim's library dependency to use @executable_path
+    // This changes "libkrun.1.dylib" to "@executable_path/libkrun.1.dylib"
+    let status = Command::new("install_name_tool")
+        .args([
+            "-change",
+            "libkrun.1.dylib",
+            "@executable_path/libkrun.1.dylib",
+            shim_path.to_str().unwrap(),
+        ])
+        .status()
+        .map_err(|e| BoxError::ExecError(format!("Failed to run install_name_tool: {}", e)))?;
+
+    if !status.success() {
+        tracing::warn!("Failed to patch shim library path (install_name_tool failed)");
+    }
+
+    // Also fix the install name in libkrun.dylib to use @executable_path
+    let libkrun_install_name_status = Command::new("install_name_tool")
+        .args([
+            "-id",
+            "@executable_path/libkrun.dylib",
+            libkrun_dst.to_str().unwrap(),
+        ])
+        .status();
+
+    if let Ok(s) = libkrun_install_name_status {
+        if s.success() {
+            tracing::debug!("Patched libkrun install name to @executable_path/libkrun.dylib");
+        }
+    }
+
     Ok(())
 }
 

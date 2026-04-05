@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use a3s_box_core::config::{BoxConfig, ResourceConfig};
+use a3s_box_core::network::NetworkMode;
 use a3s_box_core::error::{BoxError, Result};
 use a3s_box_core::event::EventEmitter;
 use a3s_box_runtime::vmm::VmController;
@@ -197,6 +198,11 @@ impl BoxSdk {
             volumes,
             port_map,
             cmd: options.workdir.as_ref().map(|_| vec![]).unwrap_or_default(),
+            network: if options.network {
+                NetworkMode::Tsi
+            } else {
+                NetworkMode::None
+            },
             ..BoxConfig::default()
         })
     }

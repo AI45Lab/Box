@@ -463,6 +463,40 @@ unsafe fn configure_and_start_vm(spec: &InstanceSpec) -> Result<()> {
         &spec.entrypoint.env,
     )?;
 
+    // TSI port mapping for inbound connections (host -> guest)
+    // This allows external connections to reach services inside the guest.
+    // Must be called before add_vsock_port to avoid EINVAL from libkrun.
+    // Skip port mappings with host_port=0 (auto-assign) - those are handled by
+    // netproxy on macOS and would fail with EINVAL in libkrun's TSI.
+    #[cfg(not(target_os = "windows"))]
+    {
+        let valid_port_map: Vec<String> = spec
+            .port_map
+            .iter()
+            .filter(|p| {
+                if let Some((host, _)) = p.split_once(':') {
+                    host.parse::<u16>().map_or(true, |h| h != 0)
+                } else {
+                    true
+                }
+            })
+            .cloned()
+            .collect();
+
+        if !valid_port_map.is_empty() {
+            tracing::info!(
+                port_map = ?valid_port_map,
+                "Configuring TSI port mapping for inbound connections"
+            );
+            ctx.set_port_map(&valid_port_map)?;
+        } else if !spec.port_map.is_empty() {
+            tracing::debug!(
+                port_map = ?spec.port_map,
+                "Skipping TSI port mapping (all host ports are 0, handled by netproxy)"
+            );
+        }
+    }
+
     // Configure exec communication channel
     #[cfg(not(target_os = "windows"))]
     {
@@ -521,16 +555,6 @@ unsafe fn configure_and_start_vm(spec: &InstanceSpec) -> Result<()> {
                 "Configuring vsock bridge for attestation"
             );
             ctx.add_vsock_port(ATTEST_VSOCK_PORT, attest_socket_str, true)?;
-        }
-
-        // TSI port mapping for inbound connections (host -> guest)
-        // This allows external connections to reach services inside the guest
-        if !spec.port_map.is_empty() {
-            tracing::info!(
-                port_map = ?spec.port_map,
-                "Configuring TSI port mapping for inbound connections"
-            );
-            ctx.set_port_map(&spec.port_map)?;
         }
     }
 

@@ -340,6 +340,7 @@ impl VmManager {
     ///
     /// The binary must be a Linux ELF executable since it runs inside the VM.
     pub(crate) fn find_guest_init() -> Result<PathBuf> {
+        #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
         let mut candidates = Self::find_binary_candidates("a3s-box-guest-init");
 
         #[cfg(target_os = "windows")]
