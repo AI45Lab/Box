@@ -3,9 +3,9 @@
 use std::path::PathBuf;
 
 use a3s_box_core::config::{BoxConfig, ResourceConfig};
-use a3s_box_core::network::NetworkMode;
 use a3s_box_core::error::{BoxError, Result};
 use a3s_box_core::event::EventEmitter;
+use a3s_box_core::network::NetworkMode;
 use a3s_box_runtime::vmm::VmController;
 use a3s_box_runtime::VmManager;
 

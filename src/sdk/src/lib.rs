@@ -37,5 +37,9 @@ pub use sdk::BoxSdk;
 // Re-export streaming types from runtime for convenience
 pub use a3s_box_runtime::StreamingExec;
 
+// Re-export exec types for direct socket connection
+pub use a3s_box_core::exec::ExecRequest;
+pub use a3s_box_runtime::ExecClient;
+
 /// SDK version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
