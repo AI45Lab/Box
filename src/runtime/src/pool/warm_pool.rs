@@ -305,6 +305,62 @@ impl WarmPool {
         Ok(())
     }
 
+    /// Remove and destroy specific idle VMs by their box IDs.
+    ///
+    /// Used when `fill_to_min` partially fails and needs to rollback
+    /// successfully added VMs.
+    async fn remove_idle_vms(&self, box_ids: &[String]) {
+        // First pass: collect indices of VMs to remove
+        let indices_to_remove: Vec<usize> = {
+            let idle = self.idle.lock().await;
+            idle.iter()
+                .enumerate()
+                .filter(|(_, wm)| box_ids.iter().any(|id| id == wm.vm.box_id()))
+                .map(|(i, _)| i)
+                .collect()
+        };
+
+        if indices_to_remove.is_empty() {
+            return;
+        }
+
+        // Second pass: remove and collect VMs to destroy
+        // We do this in reverse order to avoid index shifting issues
+        let mut to_destroy: Vec<WarmVm> = Vec::new();
+        {
+            let mut idle = self.idle.lock().await;
+            for idx in indices_to_remove.into_iter().rev() {
+                if idx < idle.len() {
+                    let warm_vm = idle.remove(idx);
+                    to_destroy.push(warm_vm);
+                }
+            }
+        }
+
+        // Update stats before destroying (approximate, since VMs still exist in to_destroy)
+        {
+            let idle_count = self.idle.lock().await.len();
+            if let Ok(mut stats) = self.stats.try_lock() {
+                stats.idle_count = idle_count;
+            }
+        }
+
+        // Destroy collected VMs (outside of pool lock)
+        for warm_vm in to_destroy {
+            let box_id = warm_vm.vm.box_id().to_string();
+            let mut vm = warm_vm.vm;
+            if let Err(e) = vm.destroy().await {
+                tracing::warn!(
+                    box_id = %box_id,
+                    error = %e,
+                    "Failed to destroy VM during fill_to_min rollback"
+                );
+            } else {
+                tracing::debug!(box_id = %box_id, "Destroyed VM during fill_to_min rollback");
+            }
+        }
+    }
+
     /// Boot a new VM using the pool's template config.
     async fn boot_new_vm(&self) -> Result<VmManager> {
         let mut vm = VmManager::new(self.box_config.clone(), self.event_emitter.clone());
@@ -337,6 +393,9 @@ impl WarmPool {
             "Replenishing warm pool"
         );
 
+        // Track VMs added in this fill attempt so we can clean up on failure.
+        let mut added_ids: Vec<String> = Vec::new();
+
         for _ in 0..needed {
             match self.boot_new_vm().await {
                 Ok(vm) => {
@@ -348,11 +407,20 @@ impl WarmPool {
                     });
                     let mut stats = self.stats.lock().await;
                     stats.idle_count = idle.len();
+                    added_ids.push(box_id.clone());
 
                     tracing::debug!(box_id = %box_id, "Added VM to warm pool");
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "Failed to boot VM for warm pool");
+                    // Clean up any VMs that were successfully added before this failure.
+                    if !added_ids.is_empty() {
+                        tracing::info!(
+                            count = added_ids.len(),
+                            "Cleaning up VMs added before fill_to_min failed"
+                        );
+                        self.remove_idle_vms(&added_ids).await;
+                    }
                     break;
                 }
             }

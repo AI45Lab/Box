@@ -177,6 +177,22 @@ impl VmManager {
         }
     }
 
+    /// Remove the box directory on the host.
+    ///
+    /// Called when boot fails after `prepare_layout` succeeded to avoid leaving
+    /// orphaned directories on disk.
+    fn cleanup_box_dir(&self) {
+        let box_dir = self.home_dir.join("boxes").join(&self.box_id);
+        if let Err(e) = std::fs::remove_dir_all(&box_dir) {
+            tracing::warn!(
+                box_id = %self.box_id,
+                path = %box_dir.display(),
+                error = %e,
+                "Failed to cleanup box directory after boot failure"
+            );
+        }
+    }
+
     /// Create a new VM manager with a custom VMM provider.
     pub fn with_provider(
         config: BoxConfig,
@@ -365,13 +381,20 @@ impl VmManager {
         // 1.5. Override /etc/resolv.conf with configured DNS
         let resolv_content = a3s_box_core::dns::generate_resolv_conf(&self.config.dns);
         let resolv_path = layout.rootfs_path.join("etc/resolv.conf");
-        tokio::fs::write(&resolv_path, &resolv_content)
-            .await
-            .map_err(BoxError::IoError)?;
+        if let Err(e) = tokio::fs::write(&resolv_path, &resolv_content).await {
+            self.cleanup_box_dir();
+            return Err(BoxError::IoError(e));
+        }
         tracing::debug!(parent: &boot_span, dns = %resolv_content.trim(), "Configured guest DNS");
 
         // 2. Build InstanceSpec
-        let mut spec = self.build_instance_spec(&layout)?;
+        let mut spec = match self.build_instance_spec(&layout) {
+            Ok(s) => s,
+            Err(e) => {
+                self.cleanup_box_dir();
+                return Err(e);
+            }
+        };
 
         // 2.5. Configure bridge networking if requested
         let bridge_network = match &self.config.network {
@@ -379,10 +402,22 @@ impl VmManager {
             _ => None,
         };
         if let Some(network_name) = bridge_network {
-            let net_config = self.setup_bridge_network(&network_name)?;
+            let net_config = match self.setup_bridge_network(&network_name) {
+                Ok(n) => n,
+                Err(e) => {
+                    self.cleanup_box_dir();
+                    return Err(e);
+                }
+            };
 
             // Write /etc/hosts for DNS service discovery
-            self.write_hosts_file(&layout, &network_name)?;
+            match self.write_hosts_file(&layout, &network_name) {
+                Ok(()) => (),
+                Err(e) => {
+                    self.cleanup_box_dir();
+                    return Err(e);
+                }
+            };
 
             // Inject network env vars into entrypoint so they are passed via
             // krun_set_exec's envp (not krun_set_env which overwrites all vars).
@@ -409,8 +444,20 @@ impl VmManager {
 
         // 3. Initialize VMM provider (use injected provider or default to VmController)
         if self.provider.is_none() {
-            let shim_path = VmController::find_shim()?;
-            let controller = VmController::new(shim_path)?;
+            let shim_path = match VmController::find_shim() {
+                Ok(p) => p,
+                Err(e) => {
+                    self.cleanup_box_dir();
+                    return Err(e);
+                }
+            };
+            let controller = match VmController::new(shim_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    self.cleanup_box_dir();
+                    return Err(e);
+                }
+            };
             self.provider = Some(Box::new(controller));
         }
 
@@ -424,9 +471,16 @@ impl VmManager {
                     hint: Some("Ensure VmManager has a provider set before boot".to_string()),
                 })?;
             let vm_start_span = tracing::info_span!(parent: &boot_span, "vm_start");
-            async { provider.start(&spec).await }
+            match async { provider.start(&spec).await }
                 .instrument(vm_start_span)
-                .await?
+                .await
+            {
+                Ok(h) => h,
+                Err(e) => {
+                    self.cleanup_box_dir();
+                    return Err(e);
+                }
+            }
         };
 
         // Store handler
@@ -435,7 +489,7 @@ impl VmManager {
         // 5. Wait for guest ready
         {
             let wait_span = tracing::info_span!(parent: &boot_span, "wait_for_ready");
-            async {
+            if let Err(e) = async {
                 self.wait_for_vm_running().await?;
 
                 // 5b. Wait for exec server to become ready (Heartbeat health check)
@@ -444,7 +498,12 @@ impl VmManager {
                 Ok::<(), BoxError>(())
             }
             .instrument(wait_span)
-            .await?;
+            .await
+            {
+                // Cleanup box_dir but leave handler for caller to destroy via destroy()
+                self.cleanup_box_dir();
+                return Err(e);
+            }
         }
 
         // 5b2. Store socket paths for CRI streaming access
@@ -504,9 +563,16 @@ impl VmManager {
 
         tracing::info!(box_id = %self.box_id, signal, timeout_ms, "Destroying VM");
 
+        // Mark as stopped first — ensures state is correct even if handler.stop() fails.
+        *state = BoxState::Stopped;
+
         // Stop the VM handler and capture its exit code before it's dropped.
         if let Some(mut handler) = self.handler.write().await.take() {
-            handler.stop(signal, timeout_ms)?;
+            if let Err(e) = handler.stop(signal, timeout_ms) {
+                tracing::error!(box_id = %self.box_id, error = %e, "Failed to stop VM handler");
+                self.shim_exit_code = handler.exit_code();
+                return Err(e.into());
+            }
             self.shim_exit_code = handler.exit_code();
         }
 
@@ -515,8 +581,6 @@ impl VmManager {
             net.stop();
         }
         self.net_manager = None;
-
-        *state = BoxState::Stopped;
 
         // Cleanup rootfs provider (unmount overlay if applicable)
         let box_dir = self.home_dir.join("boxes").join(&self.box_id);
