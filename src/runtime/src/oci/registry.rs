@@ -16,6 +16,9 @@ use super::credentials::CredentialStore;
 use super::reference::ImageReference;
 use super::signing::{verify_image_signature, SignaturePolicy, VerifyResult};
 
+/// Callback type for layer pull progress: `(current, total, digest, size_bytes)`.
+type PullProgressFn = Arc<dyn Fn(usize, usize, &str, i64) + Send + Sync>;
+
 /// Authentication credentials for a container registry.
 #[derive(Debug, Clone)]
 pub struct RegistryAuth {
@@ -84,7 +87,7 @@ pub(crate) struct RegistryPuller {
     /// Signature verification policy (default: Skip).
     signature_policy: SignaturePolicy,
     /// Optional layer progress callback: (current, total, digest, size_bytes).
-    progress_fn: Option<Arc<dyn Fn(usize, usize, &str, i64) + Send + Sync>>,
+    progress_fn: Option<PullProgressFn>,
 }
 
 impl Default for RegistryPuller {
@@ -123,10 +126,7 @@ impl RegistryPuller {
     }
 
     /// Set a progress callback invoked for each layer: `(current, total, digest, size_bytes)`.
-    pub fn with_progress_fn(
-        mut self,
-        f: Arc<dyn Fn(usize, usize, &str, i64) + Send + Sync>,
-    ) -> Self {
+    pub fn with_progress_fn(mut self, f: PullProgressFn) -> Self {
         self.progress_fn = Some(f);
         self
     }
@@ -317,7 +317,7 @@ impl RegistryPuller {
 
             // Call progress callback again with negative size to signal completion
             if let Some(ref f) = self.progress_fn {
-                f(idx + 1, total, &layer.digest, -(layer.size as i64));
+                f(idx + 1, total, &layer.digest, -(layer.size));
             }
 
             let layer_digest_hex = layer

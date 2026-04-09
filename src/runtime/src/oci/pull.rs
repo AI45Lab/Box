@@ -13,6 +13,9 @@ use super::reference::ImageReference;
 use super::registry::{RegistryAuth, RegistryPuller};
 use super::store::ImageStore;
 
+/// Callback type for layer pull progress: `(current, total, digest, size_bytes)`.
+type PullProgressFn = Arc<dyn Fn(usize, usize, &str, i64) + Send + Sync>;
+
 /// High-level image puller with caching.
 pub struct ImagePuller {
     store: Arc<ImageStore>,
@@ -43,10 +46,7 @@ impl ImagePuller {
     }
 
     /// Set a layer progress callback: `(current, total, digest, size_bytes)`.
-    pub fn with_progress_fn(
-        mut self,
-        f: Arc<dyn Fn(usize, usize, &str, i64) + Send + Sync>,
-    ) -> Self {
+    pub fn with_progress_fn(mut self, f: PullProgressFn) -> Self {
         self.puller = self.puller.with_progress_fn(f);
         self
     }

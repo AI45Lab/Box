@@ -105,7 +105,7 @@ pub(super) fn handle_run(
     command: &str,
     rootfs_dir: &Path,
     layers_dir: &Path,
-    workdir: &str,
+    _workdir: &str,
     env: &[(String, String)],
     shell: &[String],
     layer_index: usize,

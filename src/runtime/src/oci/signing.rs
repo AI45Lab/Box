@@ -1354,7 +1354,7 @@ mod tests {
         // Generate a P-256 key and export as SEC1 PEM
         let signing_key = p256::ecdsa::SigningKey::random(&mut rand::thread_rng());
         let secret_key = signing_key.as_nonzero_scalar();
-        let sec1_der = secret_key.to_bytes();
+        let _sec1_der = secret_key.to_bytes();
 
         // Build a minimal SEC1 PEM (just the raw scalar isn't valid SEC1 DER,
         // so use pkcs8 instead for this test)

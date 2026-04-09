@@ -70,7 +70,7 @@ fn connect_control() -> io::Result<std::fs::File> {
     let addr = VsockAddr::new(HOST_CID, PORT_FWD_VSOCK_PORT);
     connect(fd.as_raw_fd(), &addr).map_err(io::Error::other)?;
 
-    let owned: OwnedFd = fd.into();
+    let owned: OwnedFd = fd;
     Ok(std::fs::File::from(owned))
 }
 

@@ -8,6 +8,9 @@ mod spec;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// Callback type for image pull progress: `(current, total, digest, size_bytes)`.
+type PullProgressFn = Arc<dyn Fn(usize, usize, &str, i64) + Send + Sync>;
+
 use a3s_box_core::config::BoxConfig;
 #[cfg(unix)]
 use a3s_box_core::config::TeeConfig;
@@ -118,7 +121,7 @@ pub struct VmManager {
     pub(crate) shim_exit_code: Option<i32>,
 
     /// Optional progress callback for image pulls: `(current, total, digest, size_bytes)`.
-    pub(crate) pull_progress_fn: Option<Arc<dyn Fn(usize, usize, &str, i64) + Send + Sync>>,
+    pub(crate) pull_progress_fn: Option<PullProgressFn>,
 }
 
 impl VmManager {
@@ -273,7 +276,7 @@ impl VmManager {
 
     /// Set a progress callback for image pulls: `(current, total, digest, size_bytes)`.
     /// Called once per layer when `run` pulls an image that is not yet cached.
-    pub fn set_pull_progress_fn(&mut self, f: Arc<dyn Fn(usize, usize, &str, i64) + Send + Sync>) {
+    pub fn set_pull_progress_fn(&mut self, f: PullProgressFn) {
         self.pull_progress_fn = Some(f);
     }
 
@@ -571,7 +574,7 @@ impl VmManager {
             if let Err(e) = handler.stop(signal, timeout_ms) {
                 tracing::error!(box_id = %self.box_id, error = %e, "Failed to stop VM handler");
                 self.shim_exit_code = handler.exit_code();
-                return Err(e.into());
+                return Err(e);
             }
             self.shim_exit_code = handler.exit_code();
         }
