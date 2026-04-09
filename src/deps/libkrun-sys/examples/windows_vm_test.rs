@@ -2,8 +2,11 @@
 //!
 //! This demonstrates the basic workflow without requiring the full a3s-box CLI.
 
+#[cfg(windows)]
 use a3s_libkrun_sys::*;
+#[cfg(windows)]
 use std::ffi::CString;
+#[cfg(windows)]
 use std::path::Path;
 
 #[cfg(windows)]
@@ -143,3 +146,6 @@ fn main() {
 
     println!("\n=== Test completed successfully ===");
 }
+
+#[cfg(not(windows))]
+fn main() {}

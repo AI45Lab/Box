@@ -5,6 +5,7 @@
 //! Run with:
 //!   cargo run --target x86_64-pc-windows-msvc --example windows_smoke
 
+#[cfg(windows)]
 use a3s_libkrun_sys::*;
 
 #[cfg(windows)]
@@ -52,3 +53,6 @@ fn main() {
 
     println!("=== All tests passed! ===");
 }
+
+#[cfg(not(windows))]
+fn main() {}

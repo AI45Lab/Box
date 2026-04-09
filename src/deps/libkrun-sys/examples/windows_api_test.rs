@@ -2,7 +2,9 @@
 //!
 //! Tests all Windows-specific functions without requiring a kernel.
 
+#[cfg(windows)]
 use a3s_libkrun_sys::*;
+#[cfg(windows)]
 use std::ffi::CString;
 
 #[cfg(windows)]
@@ -125,3 +127,6 @@ fn main() {
 
     println!("=== All 16 tests passed! ===");
 }
+
+#[cfg(not(windows))]
+fn main() {}
