@@ -22,9 +22,9 @@ use crate::cri_api::*;
 use crate::error::box_error_to_status;
 use crate::persistent_store::PersistentCriStore;
 use crate::sandbox::{PodSandbox, SandboxState};
-use crate::state::{default_state_path, JsonStateStore, StateStore};
 #[cfg(test)]
 use crate::state::NoopStateStore;
+use crate::state::{default_state_path, JsonStateStore, StateStore};
 use crate::streaming::{SessionKind, StreamingHandle, StreamingSession};
 
 /// A3S Box implementation of the CRI RuntimeService.

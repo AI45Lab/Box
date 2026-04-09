@@ -7,6 +7,7 @@
 use nix::sched::{unshare, CloneFlags};
 
 use nix::unistd::{fork, ForkResult};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 use thiserror::Error;
