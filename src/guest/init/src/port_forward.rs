@@ -57,10 +57,15 @@ fn connect_control() -> io::Result<std::fs::File> {
     let fd = socket(
         AddressFamily::Vsock,
         SockType::Stream,
-        SockFlag::SOCK_CLOEXEC,
+        SockFlag::empty(),
         None,
     )
     .map_err(io::Error::other)?;
+
+    // Set CLOEXEC manually since SOCK_CLOEXEC isn't available in nix 0.29 on macOS
+    unsafe {
+        libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+    }
 
     let addr = VsockAddr::new(HOST_CID, PORT_FWD_VSOCK_PORT);
     connect(fd.as_raw_fd(), &addr).map_err(io::Error::other)?;

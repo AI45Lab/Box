@@ -101,9 +101,14 @@ fn run_ratls_server() -> Result<(), Box<dyn std::error::Error>> {
     let sock_fd = socket(
         AddressFamily::Vsock,
         SockType::Stream,
-        SockFlag::SOCK_CLOEXEC,
+        SockFlag::empty(),
         None,
     )?;
+
+    // Set CLOEXEC manually since SOCK_CLOEXEC isn't available in nix 0.29 on macOS
+    unsafe {
+        libc::fcntl(sock_fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+    }
 
     let addr = VsockAddr::new(libc::VMADDR_CID_ANY, ATTEST_VSOCK_PORT);
     bind(sock_fd.as_raw_fd(), &addr)?;
