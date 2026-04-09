@@ -475,7 +475,7 @@ unsafe fn configure_and_start_vm(spec: &InstanceSpec) -> Result<()> {
             .iter()
             .filter(|p| {
                 if let Some((host, _)) = p.split_once(':') {
-                    host.parse::<u16>().map_or(true, |h| h != 0)
+                    host.parse::<u16>() != Ok(0)
                 } else {
                     true
                 }

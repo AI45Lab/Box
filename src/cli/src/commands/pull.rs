@@ -63,7 +63,7 @@ pub async fn execute(args: PullArgs) -> Result<(), Box<dyn std::error::Error>> {
             let short = &digest[digest.len().saturating_sub(12)..];
             if size < 0 {
                 // Negative size signals completion
-                let actual_size = (-size) as i64;
+                let actual_size = -size;
                 let size_str = if actual_size >= 1_048_576 {
                     format!("{:.1} MB", actual_size as f64 / 1_048_576.0)
                 } else if actual_size >= 1024 {
