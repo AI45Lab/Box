@@ -6,6 +6,7 @@ use a3s_libkrun_sys::*;
 use std::ffi::CString;
 use std::path::Path;
 
+#[cfg(windows)]
 fn main() {
     println!("=== a3s-box Windows Integration Test ===\n");
 

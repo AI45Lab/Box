@@ -5,6 +5,7 @@
 use a3s_libkrun_sys::*;
 use std::ffi::CString;
 
+#[cfg(windows)]
 fn main() {
     println!("=== a3s-libkrun-sys Windows API Test ===\n");
 

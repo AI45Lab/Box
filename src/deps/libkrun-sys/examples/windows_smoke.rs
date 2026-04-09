@@ -7,6 +7,7 @@
 
 use a3s_libkrun_sys::*;
 
+#[cfg(windows)]
 fn main() {
     println!("=== a3s-libkrun-sys Windows Smoke Test ===\n");
 
