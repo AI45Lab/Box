@@ -12,7 +12,6 @@
   <a href="#features">Features</a> •
   <a href="#quick-start">Quick Start</a> •
   <a href="#cli-reference">CLI Reference</a> •
-  <a href="#sdk">SDK</a> •
   <a href="#architecture">Architecture</a> •
   <a href="#tee-confidential-computing">TEE</a> •
   <a href="#testing">Testing</a>
@@ -252,49 +251,6 @@ Boxes can be referenced by name, full ID, or unique ID prefix (Docker-compatible
 | `monitor` | Background restart daemon |
 | `version/info` | System information |
 
-## SDK
-
-### Embedded Rust SDK
-
-Create, exec, and stop MicroVM sandboxes directly from Rust code — no CLI or daemon required.
-
-```rust
-use a3s_box_sdk::{BoxSdk, SandboxOptions};
-
-let sdk = BoxSdk::new()?;
-let sandbox = sdk.create(SandboxOptions {
-    image: "python:3.12-slim".into(),
-    cpus: 2,
-    memory_mb: 1024,
-    ..Default::default()
-}).await?;
-
-let result = sandbox.exec("python", &["-c", "print('hello')"]).await?;
-println!("{}", result.stdout);
-
-sandbox.stop().await?;
-```
-
-Capabilities:
-- Streaming exec via `sandbox.exec_stream()` with async event iterator
-- File transfer via `sandbox.upload()` / `sandbox.download()`
-- Port forwarding via `SandboxOptions::port_forwards`
-- Persistent workspaces that survive sandbox restarts
-- Per-exec metrics (duration, stdout/stderr byte counts)
-- Interactive PTY via `sandbox.pty()`
-- Pause/resume via `sandbox.pause()` / `sandbox.resume()`
-- Optional embedded shim (`--features embed-shim`): compiles and bundles `a3s-box-shim` into the binary, auto-extracts to `~/.a3s/bin/` on first use
-
-### Multi-Language SDKs
-
-| SDK | Package | Version | Tests |
-|-----|---------|---------|------:|
-| Python | `pip install a3s-box` | 0.5.3 | 25 |
-| TypeScript | `npm install @a3s-lab/box` | 0.5.3 | 21 |
-| Rust | `a3s-box-sdk` crate | 0.5.3 | 24 |
-
-All SDKs provide: async API, streaming exec, file transfer, sandbox lifecycle management.
-
 ## Architecture
 
 ```
@@ -342,7 +298,6 @@ All SDKs provide: async API, streaming exec, file transfer, sandbox lifecycle ma
 | `guest/init` | `a3s-box-guest-init` | Guest PID 1, exec/PTY/attestation servers | 0.5.3 | 25 |
 | `shim` | `a3s-box-shim` | libkrun bridge | 0.5.3 | 14 |
 | `cri` | `a3s-box-cri` | Kubernetes CRI runtime | 0.5.3 | 94 |
-| `sdk` | — | Embedded sandbox SDK | 0.5.3 | 24 |
 
 218 source files, ~1,577 unit tests, 7 integration tests.
 

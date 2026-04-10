@@ -11,12 +11,10 @@ cz:
 # Build
 # ============================================================================
 
-# Build all (Rust + SDKs)
+# Build all
 build:
     cd src && cargo build --workspace
     just sign-shim debug
-    just sdk-ts build
-    just sdk-python build
 
 # Build release
 release:
@@ -154,7 +152,6 @@ test:
     run_tests "a3s-box-runtime"    "runtime"
     run_tests "a3s-box-cli"        "cli"
     run_tests "a3s-box-cri"        "cri"
-    run_tests "a3s-box-sdk"        "sdk"
     run_tests "a3s-box-guest-init" "guest-init"
     run_tests "a3s-box-shim"       "shim"
 
@@ -174,11 +171,11 @@ test:
 
 # Run tests without progress (raw cargo output)
 test-raw:
-    cd src && cargo test -p a3s-box-core -p a3s-box-runtime -p a3s-box-cli -p a3s-box-cri -p a3s-box-sdk -p a3s-box-guest-init -p a3s-box-shim --lib
+    cd src && cargo test -p a3s-box-core -p a3s-box-runtime -p a3s-box-cli -p a3s-box-cri -p a3s-box-guest-init -p a3s-box-shim --lib
 
 # Run tests with verbose output
 test-v:
-    cd src && cargo test -p a3s-box-core -p a3s-box-runtime -p a3s-box-cli -p a3s-box-cri -p a3s-box-sdk -p a3s-box-guest-init -p a3s-box-shim --lib -- --nocapture
+    cd src && cargo test -p a3s-box-core -p a3s-box-runtime -p a3s-box-cli -p a3s-box-cri -p a3s-box-guest-init -p a3s-box-shim --lib -- --nocapture
 
 # ============================================================================
 # Test Subsets
@@ -480,7 +477,6 @@ test-cov:
     run_cov_realtime "a3s-box-runtime" "runtime"
     run_cov_realtime "a3s-box-cli" "cli"
     run_cov_realtime "a3s-box-cri" "cri"
-    run_cov_realtime "a3s-box-sdk" "sdk"
     run_cov_realtime "a3s-box-guest-init" "guest-init"
     run_cov_realtime "a3s-box-shim" "shim"
 
@@ -609,12 +605,6 @@ core *ARGS:
 
 runtime *ARGS:
     just -f src/runtime/justfile {{ARGS}}
-
-sdk-python *ARGS:
-    just -f src/sdk/python/justfile {{ARGS}}
-
-sdk-ts *ARGS:
-    just -f src/sdk/typescript/justfile {{ARGS}}
 
 # ============================================================================
 # Utilities

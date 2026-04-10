@@ -148,24 +148,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "a3s-box-sdk"
-version = "2.0.0"
-dependencies = [
- "a3s-box-core",
- "a3s-box-runtime",
- "a3s-common",
- "base64 0.22.1",
- "dirs",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "a3s-box-shim"
 version = "2.0.0"
 dependencies = [

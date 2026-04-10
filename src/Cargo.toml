@@ -7,7 +7,6 @@ members = [
     "deps/libkrun-sys",
     "cri",
     "cli",
-    "sdk",
 ]
 resolver = "2"
 
@@ -74,14 +73,6 @@ rustls-pki-types = "1"
 
 # HTTP client (for skill downloads)
 reqwest = { version = "0.11", features = ["json", "stream"] }
-
-# Python bindings
-pyo3 = { version = "0.20", features = ["abi3-py38"] }
-
-# TypeScript bindings
-napi = { version = "2.14", features = ["async", "tokio_rt"] }
-napi-derive = "2.14"
-napi-build = "2.1"
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
