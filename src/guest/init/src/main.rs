@@ -616,22 +616,63 @@ fn mount_user_volumes() -> Result<(), Box<dyn std::error::Error>> {
                 let guest_path = parts[1];
                 let read_only = parts.get(2).map(|&m| m == "ro").unwrap_or(false);
 
-                info!(
-                    tag = tag,
-                    guest_path = guest_path,
-                    read_only = read_only,
-                    "Mounting user volume"
-                );
+                // Check if guest_path is a file (has an extension) or a directory
+                // virtio-fs can only mount directories, so if guest_path is a file,
+                // we need to mount at the parent directory instead
+                let mount_path: &str;
+                let file_name: Option<&str>;
 
-                // Ensure mount point exists
-                std::fs::create_dir_all(guest_path)?;
+                if guest_path.rsplit('/').next().map(|s| s.contains('.')).unwrap_or(false) {
+                    // guest_path looks like a file (has extension)
+                    // Extract parent directory and file name
+                    if let Some(last_slash) = guest_path.rfind('/') {
+                        mount_path = &guest_path[..last_slash];
+                        file_name = Some(&guest_path[last_slash + 1..]);
+                    } else {
+                        // No slash, just a filename - mount at current directory
+                        mount_path = ".";
+                        file_name = Some(guest_path);
+                    }
+                    info!(
+                        tag = tag,
+                        guest_path = guest_path,
+                        mount_path = mount_path,
+                        file_name = file_name.unwrap_or(""),
+                        read_only = read_only,
+                        "Mounting user volume (file mount detected, will mount parent directory)"
+                    );
+                } else {
+                    // guest_path is a directory
+                    mount_path = guest_path;
+                    file_name = None;
+                    info!(
+                        tag = tag,
+                        guest_path = guest_path,
+                        read_only = read_only,
+                        "Mounting user volume"
+                    );
+                }
+
+                // Ensure mount point exists (parent directory for file mounts)
+                std::fs::create_dir_all(mount_path)?;
 
                 let flags = if read_only {
                     MsFlags::MS_RDONLY
                 } else {
                     MsFlags::empty()
                 };
-                mount(Some(tag), guest_path, Some("virtiofs"), flags, None::<&str>)?;
+                mount(Some(tag), mount_path, Some("virtiofs"), flags, None::<&str>)?;
+
+                // For file mounts, verify the file exists in the mounted directory
+                if let Some(name) = file_name {
+                    let mounted_file = format!("{}/{}", mount_path, name);
+                    if !std::path::Path::new(&mounted_file).exists() {
+                        warn!(
+                            "Expected file {} after mount but it does not exist",
+                            mounted_file
+                        );
+                    }
+                }
 
                 index += 1;
             }
