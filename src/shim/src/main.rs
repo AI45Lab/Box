@@ -450,12 +450,10 @@ unsafe fn configure_and_start_vm(spec: &InstanceSpec) -> Result<()> {
             mount_path = host_path.clone();
         }
 
-        let path_str = mount_path
-            .to_str()
-            .ok_or_else(|| BoxError::BoxBootError {
-                message: format!("Invalid path: {}", mount_path.display()),
-                hint: None,
-            })?;
+        let path_str = mount_path.to_str().ok_or_else(|| BoxError::BoxBootError {
+            message: format!("Invalid path: {}", mount_path.display()),
+            hint: None,
+        })?;
 
         tracing::info!(
             "  {} → {} ({})",

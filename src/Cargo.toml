@@ -7,6 +7,7 @@ members = [
     "deps/libkrun-sys",
     "cri",
     "cli",
+    "sdk",
 ]
 resolver = "2"
 

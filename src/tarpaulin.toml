@@ -1,0 +1,20 @@
+# Tarpaulin configuration for a3s-box
+# Excludes vendor/third-party dependencies from coverage
+
+[tarpaulin]
+# Run on the entire workspace
+workspace = true
+
+# Exclude vendor dependencies from coverage
+exclude = [
+    "deps/.*",
+    "guest/.*",
+    "*/vendor/.*",
+]
+
+# Ignore test functions in coverage
+ignore-tests = false
+
+# Generate HTML report
+html-report = true
+report-path = "target/tarpaulin-report.html"

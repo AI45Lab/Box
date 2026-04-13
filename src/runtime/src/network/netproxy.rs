@@ -661,6 +661,67 @@ mod tests {
     }
 
     #[test]
+    fn test_smoltcp_now_returns_reasonable_value() {
+        let now = smoltcp_now();
+        // Should return microseconds since epoch
+        assert!(now.micros() > 0);
+    }
+
+    #[test]
+    fn test_to_smoltcp_ipv4_conversion() {
+        let ip = Ipv4Addr::new(10, 88, 0, 1);
+        let smol_ip = to_smoltcp_ipv4(ip);
+        assert_eq!(smol_ip.as_bytes(), &[10, 88, 0, 1]);
+    }
+
+    #[test]
+    fn test_to_smoltcp_ipv4_loopback() {
+        let ip = Ipv4Addr::new(127, 0, 0, 1);
+        let smol_ip = to_smoltcp_ipv4(ip);
+        assert_eq!(smol_ip.as_bytes(), &[127, 0, 0, 1]);
+    }
+
+    #[test]
+    fn test_parse_port_forwards_empty_rules() {
+        let guest = Ipv4Addr::new(10, 89, 0, 2);
+        let fwds = parse_port_forwards(&[], guest).unwrap();
+        assert!(fwds.is_empty());
+    }
+
+    #[test]
+    fn test_parse_port_forwards_udp_suffix() {
+        let guest = Ipv4Addr::new(10, 89, 0, 2);
+        let rules = vec!["19990:80/udp".to_string()];
+        let fwds = parse_port_forwards(&rules, guest).unwrap();
+        assert_eq!(fwds.len(), 1);
+        assert_eq!(fwds[0].guest_port, 80);
+    }
+
+    #[test]
+    fn test_parse_port_forwards_multiple_rules() {
+        let guest = Ipv4Addr::new(10, 89, 0, 2);
+        let rules = vec![
+            "19991:80".to_string(),
+            "19992:443".to_string(),
+            "19993:8080".to_string(),
+        ];
+        let fwds = parse_port_forwards(&rules, guest).unwrap();
+        assert_eq!(fwds.len(), 3);
+        assert_eq!(fwds[0].guest_port, 80);
+        assert_eq!(fwds[1].guest_port, 443);
+        assert_eq!(fwds[2].guest_port, 8080);
+    }
+
+    #[test]
+    fn test_parse_port_forwards_empty_string() {
+        let guest = Ipv4Addr::new(10, 89, 0, 2);
+        // Empty entry should fail parsing
+        let rules = vec!["".to_string()];
+        let result = parse_port_forwards(&rules, guest);
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_netproxy_manager_new() {
         let dir = tempfile::tempdir().unwrap();
         let mgr = NetProxyManager::new(dir.path());

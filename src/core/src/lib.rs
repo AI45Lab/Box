@@ -22,6 +22,7 @@ pub mod tee;
 pub mod traits;
 pub mod vmm;
 pub mod volume;
+pub mod workload;
 
 // Re-export commonly used types
 pub use audit::{AuditAction, AuditConfig, AuditEvent, AuditOutcome};
@@ -54,6 +55,9 @@ pub use vmm::{
     VmMetrics, VmmProvider, DEFAULT_SHUTDOWN_TIMEOUT_MS,
 };
 pub use volume::VolumeConfig;
+pub use workload::{
+    BoxRuntimeSpec, BoxWorkloadEnvelope, ExecutionLaunchMode, RuntimeClass, WorkloadKind,
+};
 
 /// A3S Box version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

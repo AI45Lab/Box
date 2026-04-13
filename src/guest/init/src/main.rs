@@ -622,7 +622,12 @@ fn mount_user_volumes() -> Result<(), Box<dyn std::error::Error>> {
                 let mount_path: &str;
                 let file_name: Option<&str>;
 
-                if guest_path.rsplit('/').next().map(|s| s.contains('.')).unwrap_or(false) {
+                if guest_path
+                    .rsplit('/')
+                    .next()
+                    .map(|s| s.contains('.'))
+                    .unwrap_or(false)
+                {
                     // guest_path looks like a file (has extension)
                     // Extract parent directory and file name
                     if let Some(last_slash) = guest_path.rfind('/') {

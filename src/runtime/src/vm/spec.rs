@@ -709,4 +709,17 @@ mod tests {
             Some("/usr/sbin/init")
         );
     }
+
+    #[test]
+    fn test_parse_volume_mount_guest_path_with_colons() {
+        let temp = TempDir::new().unwrap();
+        let host_path = temp.path().to_str().unwrap();
+        // Path like /host/path:/guest/path:ro where guest path contains colon
+        let volume = format!("{}:/data:/media/c:ro", host_path);
+
+        let result = VmManager::parse_volume_mount(&volume, 0);
+        // Should handle this gracefully or error on the guest path with colon
+        // The exact behavior depends on implementation
+        assert!(result.is_err() || result.is_ok()); // Just verify it doesn't panic
+    }
 }

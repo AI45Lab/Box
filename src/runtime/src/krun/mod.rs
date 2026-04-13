@@ -21,3 +21,44 @@ pub fn check_status(fn_name: &str, status: i32) -> Result<()> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_check_status_success_zero() {
+        assert!(check_status("test_fn", 0).is_ok());
+    }
+
+    #[test]
+    fn test_check_status_success_positive() {
+        assert!(check_status("test_fn", 1).is_ok());
+        assert!(check_status("test_fn", 100).is_ok());
+    }
+
+    #[test]
+    fn test_check_status_failure_negative_one() {
+        let result = check_status("create_vm", -1);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("create_vm"));
+        assert!(err.contains("-1"));
+    }
+
+    #[test]
+    fn test_check_status_failure_negative_large() {
+        let result = check_status("init_vm", -50);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("init_vm"));
+        assert!(err.contains("-50"));
+    }
+
+    #[test]
+    fn test_check_status_error_message_format() {
+        let result = check_status("start_vm", -99);
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("start_vm failed with status -99"));
+    }
+}

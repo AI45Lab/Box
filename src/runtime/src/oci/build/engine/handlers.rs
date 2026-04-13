@@ -587,3 +587,222 @@ fn download_url(url: &str) -> std::result::Result<Vec<u8>, String> {
         })
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::dockerfile::Instruction;
+    use super::instruction_to_string;
+
+    #[test]
+    fn test_instruction_to_string_run() {
+        let instr = Instruction::Run {
+            command: "echo hello".to_string(),
+        };
+        assert_eq!(instruction_to_string(&instr), "RUN echo hello");
+    }
+
+    #[test]
+    fn test_instruction_to_string_copy() {
+        let instr = Instruction::Copy {
+            src: vec!["file1.txt".to_string(), "file2.txt".to_string()],
+            dst: "/app/".to_string(),
+            from: None,
+        };
+        assert_eq!(instruction_to_string(&instr), "COPY file1.txt file2.txt /app/");
+    }
+
+    #[test]
+    fn test_instruction_to_string_copy_from_stage() {
+        let instr = Instruction::Copy {
+            src: vec!["app".to_string()],
+            dst: "/usr/local/bin/".to_string(),
+            from: Some("builder".to_string()),
+        };
+        assert_eq!(
+            instruction_to_string(&instr),
+            "COPY --from=builder app /usr/local/bin/"
+        );
+    }
+
+    #[test]
+    fn test_instruction_to_string_add() {
+        let instr = Instruction::Add {
+            src: vec!["app.tar.gz".to_string()],
+            dst: "/app/".to_string(),
+            chown: Some("1000:1000".to_string()),
+        };
+        assert_eq!(
+            instruction_to_string(&instr),
+            "ADD --chown=1000:1000 app.tar.gz /app/"
+        );
+    }
+
+    #[test]
+    fn test_instruction_to_string_add_no_chown() {
+        let instr = Instruction::Add {
+            src: vec!["file.tar.gz".to_string()],
+            dst: "/tmp/".to_string(),
+            chown: None,
+        };
+        assert_eq!(instruction_to_string(&instr), "ADD file.tar.gz /tmp/");
+    }
+
+    #[test]
+    fn test_instruction_to_string_env() {
+        let instr = Instruction::Env {
+            key: "PATH".to_string(),
+            value: "/usr/local/bin:/usr/bin".to_string(),
+        };
+        assert_eq!(instruction_to_string(&instr), "ENV PATH=/usr/local/bin:/usr/bin");
+    }
+
+    #[test]
+    fn test_instruction_to_string_workdir() {
+        let instr = Instruction::Workdir {
+            path: "/app".to_string(),
+        };
+        assert_eq!(instruction_to_string(&instr), "WORKDIR /app");
+    }
+
+    #[test]
+    fn test_instruction_to_string_entrypoint() {
+        let instr = Instruction::Entrypoint {
+            exec: vec!["/bin/agent".to_string(), "--listen".to_string()],
+        };
+        assert_eq!(
+            instruction_to_string(&instr),
+            "ENTRYPOINT [\"/bin/agent\", \"--listen\"]"
+        );
+    }
+
+    #[test]
+    fn test_instruction_to_string_cmd() {
+        let instr = Instruction::Cmd {
+            exec: vec!["python".to_string(), "app.py".to_string()],
+        };
+        assert_eq!(instruction_to_string(&instr), "CMD [\"python\", \"app.py\"]");
+    }
+
+    #[test]
+    fn test_instruction_to_string_expose() {
+        let instr = Instruction::Expose {
+            port: "8080/tcp".to_string(),
+        };
+        assert_eq!(instruction_to_string(&instr), "EXPOSE 8080/tcp");
+    }
+
+    #[test]
+    fn test_instruction_to_string_label() {
+        let instr = Instruction::Label {
+            key: "version".to_string(),
+            value: "1.0.0".to_string(),
+        };
+        assert_eq!(instruction_to_string(&instr), "LABEL version=1.0.0");
+    }
+
+    #[test]
+    fn test_instruction_to_string_user() {
+        let instr = Instruction::User {
+            user: "nobody".to_string(),
+        };
+        assert_eq!(instruction_to_string(&instr), "USER nobody");
+    }
+
+    #[test]
+    fn test_instruction_to_string_arg_no_default() {
+        let instr = Instruction::Arg {
+            name: "VERSION".to_string(),
+            default: None,
+        };
+        assert_eq!(instruction_to_string(&instr), "ARG VERSION");
+    }
+
+    #[test]
+    fn test_instruction_to_string_arg_with_default() {
+        let instr = Instruction::Arg {
+            name: "VERSION".to_string(),
+            default: Some("1.0.0".to_string()),
+        };
+        assert_eq!(instruction_to_string(&instr), "ARG VERSION=1.0.0");
+    }
+
+    #[test]
+    fn test_instruction_to_string_shell() {
+        let instr = Instruction::Shell {
+            exec: vec!["/bin/bash".to_string(), "-c".to_string()],
+        };
+        assert_eq!(instruction_to_string(&instr), "SHELL [\"/bin/bash\", \"-c\"]");
+    }
+
+    #[test]
+    fn test_instruction_to_string_stopsignal() {
+        let instr = Instruction::StopSignal {
+            signal: "SIGTERM".to_string(),
+        };
+        assert_eq!(instruction_to_string(&instr), "STOPSIGNAL SIGTERM");
+    }
+
+    #[test]
+    fn test_instruction_to_string_healthcheck_none() {
+        let instr = Instruction::HealthCheck {
+            cmd: None,
+            interval: None,
+            timeout: None,
+            retries: None,
+            start_period: None,
+        };
+        assert_eq!(instruction_to_string(&instr), "HEALTHCHECK NONE");
+    }
+
+    #[test]
+    fn test_instruction_to_string_healthcheck_with_cmd() {
+        let instr = Instruction::HealthCheck {
+            cmd: Some(vec!["curl".to_string(), "-f".to_string(), "http://localhost/".to_string()]),
+            interval: Some(10),
+            timeout: Some(5),
+            retries: Some(3),
+            start_period: Some(30),
+        };
+        assert_eq!(
+            instruction_to_string(&instr),
+            "HEALTHCHECK CMD curl -f http://localhost/"
+        );
+    }
+
+    #[test]
+    fn test_instruction_to_string_volume() {
+        let instr = Instruction::Volume {
+            paths: vec!["/data".to_string(), "/var/log".to_string()],
+        };
+        assert_eq!(instruction_to_string(&instr), "VOLUME /data /var/log");
+    }
+
+    #[test]
+    fn test_instruction_to_string_from() {
+        let instr = Instruction::From {
+            image: "alpine:3.19".to_string(),
+            alias: None,
+        };
+        assert_eq!(instruction_to_string(&instr), "FROM alpine:3.19");
+    }
+
+    #[test]
+    fn test_instruction_to_string_from_with_alias() {
+        let instr = Instruction::From {
+            image: "golang:1.21".to_string(),
+            alias: Some("builder".to_string()),
+        };
+        assert_eq!(instruction_to_string(&instr), "FROM golang:1.21 AS builder");
+    }
+
+    #[test]
+    fn test_instruction_to_string_onbuild() {
+        let inner = Instruction::Run {
+            command: "echo triggered".to_string(),
+        };
+        let instr = Instruction::OnBuild {
+            instruction: Box::new(inner),
+        };
+        assert_eq!(instruction_to_string(&instr), "ONBUILD RUN echo triggered");
+    }
+}

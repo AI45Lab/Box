@@ -198,4 +198,73 @@ mod tests {
         assert!(tcb.snp.is_none());
         assert!(tcb.microcode.is_none());
     }
+
+    #[test]
+    fn test_min_tcb_policy_serde_roundtrip() {
+        let tcb = MinTcbPolicy {
+            boot_loader: Some(3),
+            tee: Some(0),
+            snp: Some(8),
+            microcode: Some(115),
+        };
+        let json = serde_json::to_string(&tcb).unwrap();
+        let parsed: MinTcbPolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.boot_loader, Some(3));
+        assert_eq!(parsed.tee, Some(0));
+        assert_eq!(parsed.snp, Some(8));
+        assert_eq!(parsed.microcode, Some(115));
+    }
+
+    #[test]
+    fn test_policy_violation_debug() {
+        let v = PolicyViolation {
+            check: "tcb".to_string(),
+            reason: "SNP version too low".to_string(),
+        };
+        let debug_str = format!("{:?}", v);
+        assert!(debug_str.contains("check: \"tcb\""));
+        assert!(debug_str.contains("reason: \"SNP version too low\""));
+    }
+
+    #[test]
+    fn test_policy_result_debug() {
+        let result = PolicyResult::pass();
+        let debug_str = format!("{:?}", result);
+        assert!(debug_str.contains("passed: true"));
+    }
+
+    #[test]
+    fn test_policy_result_from_violations_empty() {
+        let result = PolicyResult::from_violations(vec![]);
+        assert!(result.passed);
+        assert!(result.violations.is_empty());
+    }
+
+    #[test]
+    fn test_attestation_policy_clone() {
+        let policy = AttestationPolicy {
+            expected_measurement: Some("abc123".to_string()),
+            min_tcb: Some(MinTcbPolicy {
+                snp: Some(8),
+                ..Default::default()
+            }),
+            require_no_debug: true,
+            require_no_smt: true,
+            allowed_policy_mask: Some(0xFFFF),
+            max_report_age_secs: Some(3600),
+        };
+        let cloned = policy.clone();
+        assert_eq!(cloned.expected_measurement, policy.expected_measurement);
+        assert_eq!(cloned.require_no_debug, policy.require_no_debug);
+        assert_eq!(cloned.require_no_smt, policy.require_no_smt);
+        assert_eq!(cloned.allowed_policy_mask, policy.allowed_policy_mask);
+        assert_eq!(cloned.max_report_age_secs, policy.max_report_age_secs);
+    }
+
+    #[test]
+    fn test_attestation_policy_debug() {
+        let policy = AttestationPolicy::default();
+        let debug_str = format!("{:?}", policy);
+        assert!(debug_str.contains("AttestationPolicy"));
+    }
 }
