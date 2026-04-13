@@ -115,10 +115,7 @@ mod tests {
 
     #[test]
     fn test_split_into_stages_single_stage() {
-        let instructions = vec![
-            make_from("alpine:3.19", None),
-            make_run("echo hello"),
-        ];
+        let instructions = vec![make_from("alpine:3.19", None), make_run("echo hello")];
         let stages = split_into_stages(&instructions);
         assert_eq!(stages.len(), 1);
         assert_eq!(stages[0].alias, None);
@@ -178,11 +175,7 @@ mod tests {
             name: "VERSION".to_string(),
             default: Some("1.0.0".to_string()),
         };
-        let instructions = vec![
-            arg,
-            make_from("alpine:3.19", None),
-            make_run("echo hello"),
-        ];
+        let instructions = vec![arg, make_from("alpine:3.19", None), make_run("echo hello")];
         let stages = split_into_stages(&instructions);
         assert_eq!(stages.len(), 1);
         assert_eq!(stages[0].instructions.len(), 3);
@@ -231,9 +224,7 @@ mod tests {
 
     #[test]
     fn test_resolve_stage_rootfs_out_of_bounds() {
-        let stages = vec![
-            (Some("builder".to_string()), PathBuf::from("/tmp/stage0")),
-        ];
+        let stages = vec![(Some("builder".to_string()), PathBuf::from("/tmp/stage0"))];
         let result = resolve_stage_rootfs("5", &stages);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("stage not found"));
@@ -241,9 +232,7 @@ mod tests {
 
     #[test]
     fn test_resolve_stage_rootfs_invalid_reference() {
-        let stages = vec![
-            (Some("builder".to_string()), PathBuf::from("/tmp/stage0")),
-        ];
+        let stages = vec![(Some("builder".to_string()), PathBuf::from("/tmp/stage0"))];
         let result = resolve_stage_rootfs("nonexistent", &stages);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("stage not found"));

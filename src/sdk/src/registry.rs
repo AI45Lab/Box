@@ -443,14 +443,20 @@ mod tests {
     #[test]
     fn test_capability_match_mode_eq() {
         assert_eq!(CapabilityMatchMode::None, CapabilityMatchMode::None);
-        assert_eq!(CapabilityMatchMode::AllRequired, CapabilityMatchMode::AllRequired);
+        assert_eq!(
+            CapabilityMatchMode::AllRequired,
+            CapabilityMatchMode::AllRequired
+        );
         assert_ne!(CapabilityMatchMode::None, CapabilityMatchMode::AllRequired);
     }
 
     #[test]
     fn test_capability_match_mode_debug() {
         assert_eq!(format!("{:?}", CapabilityMatchMode::None), "None");
-        assert_eq!(format!("{:?}", CapabilityMatchMode::AllRequired), "AllRequired");
+        assert_eq!(
+            format!("{:?}", CapabilityMatchMode::AllRequired),
+            "AllRequired"
+        );
     }
 
     // ── ExecutionPolicy tests ─────────────────────────────────────────────────
@@ -458,7 +464,10 @@ mod tests {
     #[test]
     fn test_execution_policy_default() {
         let policy = ExecutionPolicy::default();
-        assert_eq!(policy.capability_match_mode, CapabilityMatchMode::AllRequired);
+        assert_eq!(
+            policy.capability_match_mode,
+            CapabilityMatchMode::AllRequired
+        );
         assert_eq!(policy.max_risk, None);
         assert!(!policy.allow_risk_escalation);
         assert!(policy.allowed_scopes.is_empty());
@@ -551,10 +560,7 @@ mod tests {
     #[test]
     fn test_execution_registry_register_adapter() {
         let mut registry = ExecutionRegistry::new();
-        let mock = Arc::new(MockAdapter::new(
-            vec![],
-            Ok(serde_json::json!({})),
-        ));
+        let mock = Arc::new(MockAdapter::new(vec![], Ok(serde_json::json!({}))));
         registry.register_adapter("test", mock);
         assert!(registry.get_adapter("test").is_some());
     }
@@ -730,7 +736,9 @@ mod tests {
             input: serde_json::json!({}),
             labels: Default::default(),
         };
-        let result = registry.execute_via_adapter(&envelope, Duration::from_secs(5)).await;
+        let result = registry
+            .execute_via_adapter(&envelope, Duration::from_secs(5))
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("unknown runtime"));
     }
@@ -751,9 +759,13 @@ mod tests {
             labels: Default::default(),
         };
         // Should fail because "agent" is not registered
-        let result = registry.execute_via_adapter(&envelope, Duration::from_secs(5)).await;
+        let result = registry
+            .execute_via_adapter(&envelope, Duration::from_secs(5))
+            .await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("no adapter registered for executor: agent"));
+        assert!(result
+            .unwrap_err()
+            .contains("no adapter registered for executor: agent"));
     }
 
     // ── execute_box_workload tests ───────────────────────────────────────────
@@ -773,7 +785,9 @@ mod tests {
             input: serde_json::json!({}),
             labels: Default::default(),
         };
-        let result = registry.execute_box_workload(&envelope, Duration::from_secs(5)).await;
+        let result = registry
+            .execute_box_workload(&envelope, Duration::from_secs(5))
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("invalid workload envelope"));
     }
@@ -797,7 +811,9 @@ mod tests {
             input: serde_json::json!({}),
             labels: Default::default(),
         };
-        let result = registry.execute_box_workload(&envelope, Duration::from_secs(5)).await;
+        let result = registry
+            .execute_box_workload(&envelope, Duration::from_secs(5))
+            .await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), serde_json::json!({"vm": "result"}));
     }
@@ -817,7 +833,9 @@ mod tests {
             input: serde_json::json!({}),
             labels: Default::default(),
         };
-        let result = registry.execute_box_workload(&envelope, Duration::from_secs(5)).await;
+        let result = registry
+            .execute_box_workload(&envelope, Duration::from_secs(5))
+            .await;
         // Should fail with unknown runtime since no VM executor
         assert!(result.is_err());
     }
@@ -827,11 +845,7 @@ mod tests {
     #[test]
     fn test_validate_capabilities_unknown_executor() {
         let registry = ExecutionRegistry::new();
-        let result = registry.validate_capabilities(
-            "unknown",
-            &[],
-            &ExecutionPolicy::default(),
-        );
+        let result = registry.validate_capabilities("unknown", &[], &ExecutionPolicy::default());
         assert!(result.is_err());
         let err = result.err().unwrap();
         assert!(err.contains("no adapter registered"));
@@ -839,10 +853,7 @@ mod tests {
 
     #[test]
     fn test_validate_capabilities_missing_capability() {
-        let mock = Arc::new(MockAdapter::new(
-            vec![],
-            Ok(serde_json::json!({})),
-        ));
+        let mock = Arc::new(MockAdapter::new(vec![], Ok(serde_json::json!({}))));
         let mut registry = ExecutionRegistry::new();
         registry.register_adapter("test", mock);
 
@@ -956,7 +967,7 @@ mod tests {
         ));
         let registry = ExecutionRegistry::new().with_vm_executor(mock_executor);
         let snapshot = registry.box_runtime_pool_snapshot().await;
-        
+
         assert_eq!(snapshot.idle_vms, 5);
         assert_eq!(snapshot.active_vms, 3);
         assert_eq!(snapshot.total_vms, 10);
@@ -978,7 +989,7 @@ mod tests {
         ));
         let registry = ExecutionRegistry::new().with_vm_executor(mock_executor);
         let snapshot = registry.box_runtime_pool_snapshot().await;
-        
+
         assert!(snapshot.has_capacity_pressure);
     }
 
@@ -995,7 +1006,7 @@ mod tests {
         ));
         let registry = ExecutionRegistry::new().with_vm_executor(mock_executor);
         let snapshot = registry.box_runtime_pool_snapshot().await;
-        
+
         assert_eq!(snapshot.occupancy_ratio, 0.8);
         assert_eq!(snapshot.active_ratio, 0.8);
     }

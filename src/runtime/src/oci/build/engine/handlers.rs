@@ -608,7 +608,10 @@ mod tests {
             dst: "/app/".to_string(),
             from: None,
         };
-        assert_eq!(instruction_to_string(&instr), "COPY file1.txt file2.txt /app/");
+        assert_eq!(
+            instruction_to_string(&instr),
+            "COPY file1.txt file2.txt /app/"
+        );
     }
 
     #[test]
@@ -653,7 +656,10 @@ mod tests {
             key: "PATH".to_string(),
             value: "/usr/local/bin:/usr/bin".to_string(),
         };
-        assert_eq!(instruction_to_string(&instr), "ENV PATH=/usr/local/bin:/usr/bin");
+        assert_eq!(
+            instruction_to_string(&instr),
+            "ENV PATH=/usr/local/bin:/usr/bin"
+        );
     }
 
     #[test]
@@ -680,7 +686,10 @@ mod tests {
         let instr = Instruction::Cmd {
             exec: vec!["python".to_string(), "app.py".to_string()],
         };
-        assert_eq!(instruction_to_string(&instr), "CMD [\"python\", \"app.py\"]");
+        assert_eq!(
+            instruction_to_string(&instr),
+            "CMD [\"python\", \"app.py\"]"
+        );
     }
 
     #[test]
@@ -731,7 +740,10 @@ mod tests {
         let instr = Instruction::Shell {
             exec: vec!["/bin/bash".to_string(), "-c".to_string()],
         };
-        assert_eq!(instruction_to_string(&instr), "SHELL [\"/bin/bash\", \"-c\"]");
+        assert_eq!(
+            instruction_to_string(&instr),
+            "SHELL [\"/bin/bash\", \"-c\"]"
+        );
     }
 
     #[test]
@@ -757,7 +769,11 @@ mod tests {
     #[test]
     fn test_instruction_to_string_healthcheck_with_cmd() {
         let instr = Instruction::HealthCheck {
-            cmd: Some(vec!["curl".to_string(), "-f".to_string(), "http://localhost/".to_string()]),
+            cmd: Some(vec![
+                "curl".to_string(),
+                "-f".to_string(),
+                "http://localhost/".to_string(),
+            ]),
             interval: Some(10),
             timeout: Some(5),
             retries: Some(3),

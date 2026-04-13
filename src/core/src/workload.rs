@@ -126,27 +126,42 @@ mod tests {
 
     #[test]
     fn test_execution_launch_mode_default() {
-        assert_eq!(ExecutionLaunchMode::default(), ExecutionLaunchMode::HostAdapterCompat);
+        assert_eq!(
+            ExecutionLaunchMode::default(),
+            ExecutionLaunchMode::HostAdapterCompat
+        );
     }
 
     #[test]
     fn test_execution_launch_mode_variants() {
-        assert_ne!(ExecutionLaunchMode::MicroVM, ExecutionLaunchMode::HostAdapterCompat);
-        assert_ne!(ExecutionLaunchMode::HostAdapterCompat, ExecutionLaunchMode::Hybrid);
+        assert_ne!(
+            ExecutionLaunchMode::MicroVM,
+            ExecutionLaunchMode::HostAdapterCompat
+        );
+        assert_ne!(
+            ExecutionLaunchMode::HostAdapterCompat,
+            ExecutionLaunchMode::Hybrid
+        );
         assert_ne!(ExecutionLaunchMode::MicroVM, ExecutionLaunchMode::Hybrid);
     }
 
     #[test]
     fn test_execution_launch_mode_eq() {
         assert_eq!(ExecutionLaunchMode::MicroVM, ExecutionLaunchMode::MicroVM);
-        assert_eq!(ExecutionLaunchMode::HostAdapterCompat, ExecutionLaunchMode::HostAdapterCompat);
+        assert_eq!(
+            ExecutionLaunchMode::HostAdapterCompat,
+            ExecutionLaunchMode::HostAdapterCompat
+        );
         assert_eq!(ExecutionLaunchMode::Hybrid, ExecutionLaunchMode::Hybrid);
     }
 
     #[test]
     fn test_execution_launch_mode_debug() {
         assert_eq!(format!("{:?}", ExecutionLaunchMode::MicroVM), "MicroVM");
-        assert_eq!(format!("{:?}", ExecutionLaunchMode::HostAdapterCompat), "HostAdapterCompat");
+        assert_eq!(
+            format!("{:?}", ExecutionLaunchMode::HostAdapterCompat),
+            "HostAdapterCompat"
+        );
         assert_eq!(format!("{:?}", ExecutionLaunchMode::Hybrid), "Hybrid");
     }
 
@@ -177,8 +192,14 @@ mod tests {
 
     #[test]
     fn test_workload_kind_serde_snake_case() {
-        assert_eq!(serde_json::to_string(&WorkloadKind::AgentInvocation).unwrap(), "\"agent_invocation\"");
-        assert_eq!(serde_json::to_string(&WorkloadKind::ExecutionTask).unwrap(), "\"execution_task\"");
+        assert_eq!(
+            serde_json::to_string(&WorkloadKind::AgentInvocation).unwrap(),
+            "\"agent_invocation\""
+        );
+        assert_eq!(
+            serde_json::to_string(&WorkloadKind::ExecutionTask).unwrap(),
+            "\"execution_task\""
+        );
     }
 
     #[test]
@@ -214,7 +235,9 @@ mod tests {
         assert_eq!(spec.entrypoint, "a3s-code");
         assert!(spec.args.contains(&"run".to_string()));
         assert!(spec.args.contains(&"--package".to_string()));
-        assert!(spec.args.contains(&"registry://my-agent@v1.0.0".to_string()));
+        assert!(spec
+            .args
+            .contains(&"registry://my-agent@v1.0.0".to_string()));
         assert!(spec.env.is_empty());
     }
 
@@ -384,13 +407,15 @@ mod tests {
 
     #[test]
     fn test_box_runtime_spec_env_defaults_to_empty() {
-        let spec: BoxRuntimeSpec = serde_json::from_str(r#"{"runtime":"test","entrypoint":"entry"}"#).unwrap();
+        let spec: BoxRuntimeSpec =
+            serde_json::from_str(r#"{"runtime":"test","entrypoint":"entry"}"#).unwrap();
         assert!(spec.env.is_empty());
     }
 
     #[test]
     fn test_box_runtime_spec_args_defaults_to_empty() {
-        let spec: BoxRuntimeSpec = serde_json::from_str(r#"{"runtime":"test","entrypoint":"entry"}"#).unwrap();
+        let spec: BoxRuntimeSpec =
+            serde_json::from_str(r#"{"runtime":"test","entrypoint":"entry"}"#).unwrap();
         assert!(spec.args.is_empty());
     }
 

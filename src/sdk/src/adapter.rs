@@ -564,7 +564,10 @@ mod tests {
 <body><p>Content here</p></body>
 </html>"#;
         let result = extract_html_content(html);
-        assert_eq!(result.description, Some("Page description text".to_string()));
+        assert_eq!(
+            result.description,
+            Some("Page description text".to_string())
+        );
     }
 
     #[test]
@@ -577,7 +580,10 @@ mod tests {
 <body><p>Content</p></body>
 </html>"#;
         let result = extract_html_content(html);
-        assert_eq!(result.description, Some("OpenGraph description".to_string()));
+        assert_eq!(
+            result.description,
+            Some("OpenGraph description".to_string())
+        );
     }
 
     #[test]
@@ -641,7 +647,10 @@ mod tests {
     fn test_extract_html_content_links_limit() {
         let mut html = String::from("<html><body>");
         for i in 0..=150 {
-            html.push_str(&format!(r#"<a href="https://example{}.com">Link {}</a>"#, i, i));
+            html.push_str(&format!(
+                r#"<a href="https://example{}.com">Link {}</a>"#,
+                i, i
+            ));
         }
         html.push_str("</body></html>");
         let result = extract_html_content(&html);
@@ -740,7 +749,8 @@ mod tests {
 
     #[test]
     fn test_select_meta_content_found() {
-        let html = r#"<html><head><meta name="description" content="Test Description"></head></html>"#;
+        let html =
+            r#"<html><head><meta name="description" content="Test Description"></head></html>"#;
         let document = scraper::Html::parse_document(html);
         let result = select_meta_content(&document, "description");
         assert_eq!(result, Some("Test Description".to_string()));
@@ -819,7 +829,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_http_unsupported_handler() {
-        let result = execute_http("unsupported", &serde_json::json!({}), Duration::from_secs(5)).await;
+        let result = execute_http(
+            "unsupported",
+            &serde_json::json!({}),
+            Duration::from_secs(5),
+        )
+        .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("unsupported http handler"));
     }
@@ -828,14 +843,18 @@ mod tests {
     async fn test_execute_http_get_missing_url() {
         let result = execute_http("get", &serde_json::json!({}), Duration::from_secs(5)).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("http get requires string field `url`"));
+        assert!(result
+            .unwrap_err()
+            .contains("http get requires string field `url`"));
     }
 
     #[tokio::test]
     async fn test_execute_http_post_missing_url() {
         let result = execute_http("post", &serde_json::json!({}), Duration::from_secs(5)).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("http post requires string field `url`"));
+        assert!(result
+            .unwrap_err()
+            .contains("http post requires string field `url`"));
     }
 
     #[tokio::test]
@@ -882,7 +901,11 @@ mod tests {
     async fn test_http_execution_adapter_execute_unsupported() {
         let adapter = HttpExecutionAdapter;
         let result = adapter
-            .execute("unsupported", &serde_json::json!({}), Duration::from_secs(5))
+            .execute(
+                "unsupported",
+                &serde_json::json!({}),
+                Duration::from_secs(5),
+            )
             .await;
         assert!(result.is_err());
     }
