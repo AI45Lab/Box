@@ -656,10 +656,6 @@ fn parse_port_forwards(
 mod tests {
     use super::*;
 
-    fn port_is_bindable(port: u16) -> bool {
-        TcpListener::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port)).is_ok()
-    }
-
     #[test]
     fn test_smoltcp_now_returns_reasonable_value() {
         let now = smoltcp_now();

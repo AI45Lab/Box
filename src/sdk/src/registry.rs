@@ -355,7 +355,7 @@ fn capability_matches(granted: &ExecutionCapability, required: &ExecutionCapabil
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapter::{CapabilityAccess, ExecutionCapabilityGrant, HttpExecutionAdapter};
+    use crate::adapter::{CapabilityAccess, ExecutionCapabilityGrant};
     use crate::vm::VmResult;
     use crate::BoxRuntimeSpec;
     use crate::ExecutionAdapter;
