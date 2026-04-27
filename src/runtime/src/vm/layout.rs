@@ -485,10 +485,12 @@ mod tests {
             event_emitter: emitter,
             provider: None,
             handler: Arc::new(RwLock::new(None)),
+            #[cfg(unix)]
             exec_client: None,
             net_manager: None,
             home_dir: home_dir.to_path_buf(),
             anonymous_volumes: Vec::new(),
+            #[cfg(unix)]
             tee: None,
             rootfs_provider: crate::rootfs::default_provider(),
             exec_socket_path: None,
@@ -622,6 +624,7 @@ mod tests {
         assert!(cache.entry_count().unwrap() <= 2);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_exec_command_rejects_created_state() {
         let tmp = TempDir::new().unwrap();
@@ -633,6 +636,7 @@ mod tests {
         assert!(err.to_string().contains("not yet booted"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_exec_command_rejects_stopped_state() {
         let tmp = TempDir::new().unwrap();
@@ -645,6 +649,7 @@ mod tests {
         assert!(err.to_string().contains("stopped"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_exec_command_no_client() {
         let tmp = TempDir::new().unwrap();

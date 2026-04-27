@@ -780,8 +780,9 @@ fn remount_rootfs_readonly() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Wait for all child processes and reap zombies.
 ///
-/// Only exits when `container_pid` exits. Other child processes (e.g., from
-/// exec server) are reaped silently.
+/// Only exits when `container_pid` exits AND `shutdown_requested` is set (SIGTERM).
+/// Otherwise loops forever so background services (exec/PTY/attestation) stay alive
+/// after the container exits — the VM stays alive until explicitly stopped by the host.
 fn wait_for_children(container_pid: nix::unistd::Pid) -> Result<(), Box<dyn std::error::Error>> {
     use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
     use nix::unistd::Pid;
@@ -802,8 +803,22 @@ fn wait_for_children(container_pid: nix::unistd::Pid) -> Result<(), Box<dyn std:
         match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::Exited(pid, status)) => {
                 if pid == container_pid {
-                    info!("Container process {} exited with status {}", pid, status);
-                    process::exit(status);
+                    // Container exited — keep the VM alive so vsock services remain available.
+                    // The host stops the VM via SIGTERM, at which point graceful_shutdown runs.
+                    info!(
+                        "Container process {} exited with status {}. \
+                         VM staying alive for vsock services (stop with Ctrl-C)",
+                        pid, status
+                    );
+                    // Loop forever — VM stays alive until SIGTERM from host
+                    loop {
+                        if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+                            info!("SIGTERM received during container-exited idle, shutting down");
+                            graceful_shutdown(CHILD_SHUTDOWN_TIMEOUT_MS);
+                            return Ok(());
+                        }
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                    }
                 } else {
                     info!(
                         "Child process {} exited with status {} (reaped)",
@@ -814,7 +829,14 @@ fn wait_for_children(container_pid: nix::unistd::Pid) -> Result<(), Box<dyn std:
             Ok(WaitStatus::Signaled(pid, signal, _)) => {
                 if pid == container_pid {
                     error!("Container process {} killed by signal {:?}", pid, signal);
-                    process::exit(128 + signal as i32);
+                    loop {
+                        if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+                            info!("SIGTERM received, shutting down");
+                            graceful_shutdown(CHILD_SHUTDOWN_TIMEOUT_MS);
+                            return Ok(());
+                        }
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                    }
                 } else if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
                     info!(
                         "Child process {} terminated by signal {:?} during shutdown",
