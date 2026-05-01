@@ -7,6 +7,7 @@
 //! Restore creates a new box from the saved configuration, leveraging
 //! rootfs caching for sub-500ms cold start.
 
+use std::cmp::Reverse;
 use std::path::{Path, PathBuf};
 
 use a3s_box_core::error::{BoxError, Result};
@@ -149,7 +150,7 @@ impl SnapshotStore {
         }
 
         // Sort newest first
-        snapshots.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        snapshots.sort_by_key(|snapshot| Reverse(snapshot.created_at));
         Ok(snapshots)
     }
 
