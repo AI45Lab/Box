@@ -5,6 +5,12 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Vsock port for the exec server.
+pub const EXEC_VSOCK_PORT: u32 = a3s_transport::ports::EXEC_SERVER;
+
+/// Vsock port for the Windows host-port forward control channel.
+pub const PORT_FWD_VSOCK_PORT: u32 = 4093;
+
 /// Default exec timeout: 5 seconds.
 pub const DEFAULT_EXEC_TIMEOUT_NS: u64 = 5_000_000_000;
 

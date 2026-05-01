@@ -241,6 +241,10 @@ async fn execute_up(
             .map_err(|e| format!("Failed to start service '{}': {}", svc_name, e))?;
 
         let pid = vm.pid().await;
+        let exec_socket_path = vm
+            .exec_socket_path()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| box_dir.join("sockets").join("exec.sock"));
 
         // Build labels with compose metadata
         let mut labels = HashMap::new();
@@ -290,7 +294,7 @@ async fn execute_up(
                 .unwrap_or_default(),
             entrypoint: svc.and_then(|s| s.entrypoint.as_ref()).map(|e| e.to_vec()),
             box_dir: box_dir.clone(),
-            exec_socket_path: box_dir.join("sockets").join("exec.sock"),
+            exec_socket_path: exec_socket_path.clone(),
             console_log: box_dir.join("logs").join("console.log"),
             created_at: chrono::Utc::now(),
             started_at: Some(chrono::Utc::now()),
@@ -344,7 +348,7 @@ async fn execute_up(
         if let Some(ref hc) = health_check {
             crate::health::spawn_health_checker(
                 box_id.clone(),
-                box_dir.join("sockets").join("exec.sock"),
+                exec_socket_path.clone(),
                 hc.clone(),
             );
         }
@@ -410,6 +414,7 @@ struct ServiceBox {
     pid: Option<u32>,
     status: String,
     box_dir: PathBuf,
+    exec_socket_path: PathBuf,
     network_name: Option<String>,
     volume_names: Vec<String>,
 }
@@ -431,6 +436,7 @@ async fn execute_down(
             pid: r.pid,
             status: r.status.clone(),
             box_dir: r.box_dir.clone(),
+            exec_socket_path: r.exec_socket_path.clone(),
             network_name: r.network_name.clone(),
             volume_names: r.volume_names.clone(),
         })
@@ -467,6 +473,7 @@ async fn execute_down(
 
         // Remove box directory and state record
         let _ = std::fs::remove_dir_all(&svc.box_dir);
+        crate::cleanup::cleanup_external_socket_dir(&svc.box_dir, &svc.exec_socket_path);
         state.remove(&svc.box_id)?;
 
         println!(" ✓");

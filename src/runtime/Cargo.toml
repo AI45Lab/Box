@@ -13,7 +13,7 @@ path = "src/lib.rs"
 
 [features]
 default = ["vm", "pool", "scale", "compose", "operator", "build"]
-vm = ["dep:libkrun-sys"]
+vm = []
 pool = ["vm"]
 scale = []
 compose = ["vm"]
@@ -23,7 +23,6 @@ build = []
 [dependencies]
 a3s-box-core = { version = "2.0.0", path = "../core" }
 a3s-transport = { workspace = true }
-libkrun-sys = { version = "0.1.5", path = "../deps/libkrun-sys", package = "a3s-libkrun-sys", optional = true }
 
 # Async runtime
 tokio = { workspace = true }
@@ -43,22 +42,11 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 
-# TEE attestation verification
+# Image signature verification
 p256 = { workspace = true }
-p384 = { workspace = true }
-ecdsa = { workspace = true }
 x509-cert = { workspace = true }
 der = { workspace = true }
 spki = { workspace = true }
-
-# RA-TLS (Remote Attestation TLS)
-rcgen = { workspace = true }
-rustls = { workspace = true }
-tokio-rustls = { workspace = true }
-rustls-pki-types = { workspace = true }
-
-# Sealed storage
-ring = { workspace = true }
 base64 = { workspace = true }
 
 # HTTP client
@@ -84,8 +72,6 @@ oci-spec = "0.6"
 oci-distribution = { workspace = true }
 tar = "0.4"
 flate2 = "1.0"
-bzip2 = "0.5"
-xz2 = "0.1"
 
 # Build support
 tempfile = { workspace = true }
@@ -95,15 +81,26 @@ prometheus = { workspace = true }
 
 # macOS userspace network proxy (replaces gvproxy)
 [target.'cfg(target_os = "macos")'.dependencies]
-smoltcp = { version = "0.11", default-features = false, features = [
-    "medium-ethernet",
-    "proto-ipv4",
-    "socket-tcp",
-    "socket-udp",
-    "log",
-    "std",
-    "alloc",
-] }
+a3s-box-netproxy = { path = "../netproxy" }
+
+[target.'cfg(unix)'.dependencies]
+# TEE attestation verification
+p384 = { workspace = true }
+ecdsa = { workspace = true }
+
+# RA-TLS (Remote Attestation TLS)
+rcgen = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+
+# Sealed storage
+ring = { workspace = true }
+
+# Extra Dockerfile ADD archive formats. These crates build C libraries, so they
+# stay off Windows where .tar/.tar.gz remain supported without a C toolchain.
+bzip2 = "0.5"
+xz2 = "0.1"
 
 [dev-dependencies]
 rand = { workspace = true }

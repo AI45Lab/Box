@@ -5,8 +5,12 @@ pub mod cleanup;
 pub mod commands;
 pub mod health;
 pub mod output;
+pub mod platform;
 pub mod process;
 pub mod resolve;
+pub mod socket_paths;
 pub mod state;
+#[cfg(not(windows))]
+pub mod terminal;
 pub mod test_helpers;
 pub mod windows;

@@ -12,19 +12,19 @@
 // Allow large error types - this is a binary, not a library
 #![allow(clippy::result_large_err)]
 
+mod krun;
+
 use a3s_box_core::error::{BoxError, Result};
-use a3s_box_runtime::krun::KrunContext;
-#[cfg(target_os = "macos")]
-use a3s_box_runtime::network::spawn_inherited_netproxy;
-use a3s_box_runtime::vmm::InstanceSpec;
-#[cfg(not(target_os = "windows"))]
-use a3s_box_runtime::ATTEST_VSOCK_PORT;
-use a3s_box_runtime::EXEC_VSOCK_PORT;
+use a3s_box_core::vmm::InstanceSpec;
+use a3s_box_core::EXEC_VSOCK_PORT;
 #[cfg(target_os = "windows")]
-use a3s_box_runtime::PORT_FWD_VSOCK_PORT;
+use a3s_box_core::PORT_FWD_VSOCK_PORT;
 #[cfg(not(target_os = "windows"))]
-use a3s_box_runtime::PTY_VSOCK_PORT;
+use a3s_box_core::{ATTEST_VSOCK_PORT, PTY_VSOCK_PORT};
+#[cfg(target_os = "macos")]
+use a3s_box_netproxy::spawn_inherited_netproxy;
 use clap::Parser;
+use krun::KrunContext;
 #[cfg(target_os = "windows")]
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;

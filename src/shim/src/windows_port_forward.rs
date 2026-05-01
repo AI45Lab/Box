@@ -10,7 +10,7 @@ use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -399,7 +399,7 @@ fn wait_for_control(
     timeout: Duration,
 ) -> io::Result<Arc<ControlConnection>> {
     let deadline = Instant::now() + timeout;
-    let mut guard = shared_control.control.lock().unwrap();
+    let mut guard = lock_or_recover(&shared_control.control, "shared port-forward control");
 
     loop {
         if let Some(control) = guard.as_ref() {
@@ -415,9 +415,18 @@ fn wait_for_control(
         }
 
         let wait = deadline.saturating_duration_since(now);
-        let (new_guard, result) = shared_control.cvar.wait_timeout(guard, wait).unwrap();
+        let (new_guard, timed_out) = match shared_control.cvar.wait_timeout(guard, wait) {
+            Ok((new_guard, result)) => (new_guard, result.timed_out()),
+            Err(poisoned) => {
+                tracing::warn!(
+                    "Recovered poisoned shared port-forward control mutex while waiting"
+                );
+                let (new_guard, result) = poisoned.into_inner();
+                (new_guard, result.timed_out())
+            }
+        };
         guard = new_guard;
-        if result.timed_out() {
+        if timed_out {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "guest port-forward control channel is not connected",
@@ -453,7 +462,7 @@ fn pipe_server_loop(
 
         let control = Arc::new(ControlConnection::new(server));
         {
-            let mut guard = shared_control.control.lock().unwrap();
+            let mut guard = lock_or_recover(&shared_control.control, "shared port-forward control");
             *guard = Some(control.clone());
             shared_control.cvar.notify_all();
         }
@@ -464,13 +473,26 @@ fn pipe_server_loop(
         }
         control.close_all_streams();
 
-        let mut guard = shared_control.control.lock().unwrap();
+        let mut guard = lock_or_recover(&shared_control.control, "shared port-forward control");
         if guard
             .as_ref()
             .map(|existing| Arc::ptr_eq(existing, &control))
             .unwrap_or(false)
         {
             *guard = None;
+        }
+    }
+}
+
+fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, name: &str) -> MutexGuard<'a, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::warn!(
+                mutex = name,
+                "Recovered poisoned Windows port-forward mutex"
+            );
+            poisoned.into_inner()
         }
     }
 }
@@ -493,24 +515,26 @@ impl ControlConnection {
     }
 
     fn register_stream(&self, stream_id: u32, stream: TcpStream) {
-        self.streams.lock().unwrap().insert(stream_id, stream);
+        lock_or_recover(&self.streams, "port-forward streams").insert(stream_id, stream);
     }
 
     fn unregister_stream(&self, stream_id: u32) {
-        if let Some(stream) = self.streams.lock().unwrap().remove(&stream_id) {
+        if let Some(stream) =
+            lock_or_recover(&self.streams, "port-forward streams").remove(&stream_id)
+        {
             let _ = stream.shutdown(Shutdown::Both);
         }
-        self.pending_open.lock().unwrap().remove(&stream_id);
+        lock_or_recover(&self.pending_open, "port-forward pending open").remove(&stream_id);
     }
 
     fn register_open_waiter(&self, stream_id: u32) -> mpsc::Receiver<bool> {
         let (tx, rx) = mpsc::channel();
-        self.pending_open.lock().unwrap().insert(stream_id, tx);
+        lock_or_recover(&self.pending_open, "port-forward pending open").insert(stream_id, tx);
         rx
     }
 
     fn send_frame(&self, kind: u8, stream_id: u32, payload: &[u8]) -> io::Result<()> {
-        let _guard = self.write_lock.lock().unwrap();
+        let _guard = lock_or_recover(&self.write_lock, "port-forward write lock");
         self.pipe.write_frame(kind, stream_id, payload)
     }
 
@@ -533,14 +557,17 @@ impl ControlConnection {
             match frame.kind {
                 FRAME_OPEN_ACK => {
                     let ok = frame.payload.first().copied().unwrap_or(1) == 0;
-                    if let Some(tx) = self.pending_open.lock().unwrap().remove(&frame.stream_id) {
+                    if let Some(tx) =
+                        lock_or_recover(&self.pending_open, "port-forward pending open")
+                            .remove(&frame.stream_id)
+                    {
                         let _ = tx.send(ok);
                     }
                 }
                 FRAME_DATA => {
                     let mut remove = false;
                     {
-                        let mut streams = self.streams.lock().unwrap();
+                        let mut streams = lock_or_recover(&self.streams, "port-forward streams");
                         if let Some(stream) = streams.get_mut(&frame.stream_id) {
                             if stream.write_all(&frame.payload).is_err() {
                                 remove = true;
@@ -563,11 +590,11 @@ impl ControlConnection {
     }
 
     fn close_all_streams(&self) {
-        let mut streams = self.streams.lock().unwrap();
+        let mut streams = lock_or_recover(&self.streams, "port-forward streams");
         for (_, stream) in streams.drain() {
             let _ = stream.shutdown(Shutdown::Both);
         }
-        let mut pending = self.pending_open.lock().unwrap();
+        let mut pending = lock_or_recover(&self.pending_open, "port-forward pending open");
         for (_, tx) in pending.drain() {
             let _ = tx.send(false);
         }

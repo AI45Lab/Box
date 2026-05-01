@@ -10,6 +10,7 @@ use nix::unistd::{fork, ForkResult};
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
 use std::process::Command;
 use thiserror::Error;
 
@@ -235,31 +236,24 @@ fn child_process(
         }
     }
 
-    // Execute the command
-    // DEBUG: Check if the command exists before executing
-    if let Ok(metadata) = std::fs::metadata(command) {
+    // Execute the command. `Command::exec` uses PATH for bare command names, so
+    // the preflight check needs to mirror that instead of statting "sleep".
+    if let Some(command_path) = resolve_command_path(command, env) {
+        let metadata = std::fs::metadata(&command_path).ok();
         tracing::debug!(
-            "Command file exists: {} (size: {} bytes, executable: {})",
-            command,
-            metadata.len(),
-            metadata.permissions().mode() & 0o111 != 0
+            path = %command_path.display(),
+            size = metadata.as_ref().map(|m| m.len()).unwrap_or(0),
+            executable = metadata
+                .as_ref()
+                .map(|m| m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false),
+            "Command file resolved"
         );
     } else {
-        tracing::error!("Command file does not exist: {}", command);
-        // List root directory contents for debugging
-        if let Ok(entries) = std::fs::read_dir("/") {
-            tracing::error!("Root directory contents:");
-            for entry in entries.flatten() {
-                tracing::error!("  - {}", entry.path().display());
-            }
-        }
-        // List /bin directory if it exists
-        if let Ok(entries) = std::fs::read_dir("/bin") {
-            tracing::error!("/bin directory contents:");
-            for entry in entries.flatten().take(10) {
-                tracing::error!("  - {}", entry.path().display());
-            }
-        }
+        tracing::warn!(
+            command,
+            "Command could not be resolved before exec; exec will report the final error"
+        );
     }
 
     let mut cmd = Command::new(command);
@@ -280,6 +274,25 @@ fn child_process(
 
     // If exec returns, it failed
     Err(NamespaceError::ExecFailed(err))
+}
+
+fn resolve_command_path(command: &str, env: &[(&str, &str)]) -> Option<PathBuf> {
+    if command.contains('/') {
+        let path = PathBuf::from(command);
+        return path.exists().then_some(path);
+    }
+
+    let path_env = env
+        .iter()
+        .rev()
+        .find_map(|(key, value)| (*key == "PATH").then_some((*value).to_string()))
+        .or_else(|| std::env::var("PATH").ok())?;
+
+    path_env
+        .split(':')
+        .filter(|dir| !dir.is_empty())
+        .map(|dir| PathBuf::from(dir).join(command))
+        .find(|path| path.exists())
 }
 
 /// Apply security restrictions (seccomp, no-new-privileges, capabilities)
@@ -683,6 +696,10 @@ fn child_process(
         cmd.env(key, value);
     }
 
+    if let Some(command_path) = resolve_command_path(command, env) {
+        tracing::debug!(path = %command_path.display(), "Command file resolved");
+    }
+
     let err = cmd.exec();
     Err(NamespaceError::ExecFailed(err))
 }
@@ -725,6 +742,24 @@ mod tests {
         assert!(!config.net);
         assert!(!config.user);
         assert!(!config.cgroup);
+    }
+
+    #[test]
+    fn test_resolve_command_path_absolute() {
+        let path = resolve_command_path("/bin/sh", &[]);
+        assert_eq!(path, Some(PathBuf::from("/bin/sh")));
+    }
+
+    #[test]
+    fn test_resolve_command_path_from_env_path() {
+        let path = resolve_command_path("sh", &[("PATH", "/bin:/usr/bin")]);
+        assert_eq!(path, Some(PathBuf::from("/bin/sh")));
+    }
+
+    #[test]
+    fn test_resolve_command_path_missing() {
+        let path = resolve_command_path("definitely-not-an-a3s-command", &[("PATH", "/bin")]);
+        assert!(path.is_none());
     }
 
     #[test]

@@ -222,8 +222,17 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
             .map_err(|e| BoxError::CacheError(format!("Failed to read directory entry: {}", e)))?;
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
+        let file_type = entry.file_type().map_err(|e| {
+            BoxError::CacheError(format!(
+                "Failed to read file type for {}: {}",
+                src_path.display(),
+                e
+            ))
+        })?;
 
-        if src_path.is_dir() {
+        if file_type.is_symlink() {
+            copy_symlink(&src_path, &dst_path)?;
+        } else if file_type.is_dir() {
             copy_dir_recursive(&src_path, &dst_path)?;
         } else {
             std::fs::copy(&src_path, &dst_path).map_err(|e| {
@@ -235,6 +244,53 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
                 ))
             })?;
         }
+    }
+
+    Ok(())
+}
+
+fn copy_symlink(src: &Path, dst: &Path) -> Result<()> {
+    let target = std::fs::read_link(src).map_err(|e| {
+        BoxError::CacheError(format!("Failed to read symlink {}: {}", src.display(), e))
+    })?;
+
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&target, dst).map_err(|e| {
+            BoxError::CacheError(format!(
+                "Failed to create symlink {} → {}: {}",
+                dst.display(),
+                target.display(),
+                e
+            ))
+        })?;
+    }
+
+    #[cfg(windows)]
+    {
+        let is_dir = src.metadata().map(|m| m.is_dir()).unwrap_or(false);
+        let result = if is_dir {
+            std::os::windows::fs::symlink_dir(&target, dst)
+        } else {
+            std::os::windows::fs::symlink_file(&target, dst)
+        };
+        result.map_err(|e| {
+            BoxError::CacheError(format!(
+                "Failed to create symlink {} → {}: {}",
+                dst.display(),
+                target.display(),
+                e
+            ))
+        })?;
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = target;
+        return Err(BoxError::CacheError(format!(
+            "Symlink copy is not supported on this platform: {}",
+            src.display()
+        )));
     }
 
     Ok(())

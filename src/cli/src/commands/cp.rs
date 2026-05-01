@@ -15,10 +15,13 @@ use a3s_box_core::exec::{ExecRequest, DEFAULT_EXEC_TIMEOUT_NS};
 #[cfg(not(windows))]
 use a3s_box_runtime::ExecClient;
 
+#[cfg(not(windows))]
 use crate::resolve;
+#[cfg(not(windows))]
 use crate::state::StateFile;
 
 /// Timeout for directory transfers (60 seconds).
+#[cfg(not(windows))]
 const DIR_TRANSFER_TIMEOUT_NS: u64 = 60_000_000_000;
 
 #[derive(Args)]
@@ -31,11 +34,13 @@ pub struct CpArgs {
 }
 
 /// Parsed copy endpoint — either a host path or a box:path pair.
+#[cfg(not(windows))]
 enum Endpoint {
     Host(String),
     Box { name: String, path: String },
 }
 
+#[cfg(not(windows))]
 fn parse_endpoint(s: &str) -> Endpoint {
     // Docker convention: "container:/path" means container path
     // A bare path (no colon, or colon after drive letter on Windows) means host
@@ -55,7 +60,10 @@ pub async fn execute(args: CpArgs) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(windows)]
     {
         let _ = args;
-        return Err("'cp' requires Unix domain sockets and is not supported on Windows".into());
+        return Err(crate::platform::unsupported_command(
+            "cp",
+            "guest exec channel support",
+        ));
     }
 
     #[cfg(not(windows))]
@@ -337,6 +345,7 @@ async fn copy_dir_to_box(
 }
 
 /// Create a tar archive from a host directory using the `tar` command.
+#[cfg(not(windows))]
 fn create_tar_from_dir(dir_path: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let output = std::process::Command::new("tar")
         .args(["-cf", "-", "-C", dir_path, "."])
@@ -352,6 +361,7 @@ fn create_tar_from_dir(dir_path: &str) -> Result<Vec<u8>, Box<dyn std::error::Er
 }
 
 /// Extract a tar archive to a host directory using the `tar` command.
+#[cfg(not(windows))]
 fn extract_tar_to_dir(tar_data: &[u8], dir_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write;
     use std::process::Stdio;
@@ -415,11 +425,12 @@ async fn connect_exec(box_name: &str) -> Result<ExecClient, Box<dyn std::error::
 }
 
 /// Minimal shell escaping for a file path.
+#[cfg(not(windows))]
 fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(windows)))]
 mod tests {
     use super::*;
 

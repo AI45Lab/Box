@@ -9,7 +9,9 @@
 
 use clap::Args;
 
+#[cfg(not(windows))]
 use crate::resolve;
+#[cfg(not(windows))]
 use crate::state::StateFile;
 
 #[derive(Args)]
@@ -48,7 +50,10 @@ pub struct ExecArgs {
 
 #[cfg(windows)]
 pub async fn execute(_args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
-    Err("'exec' requires Unix domain sockets and is not supported on Windows".into())
+    Err(crate::platform::unsupported_command(
+        "exec",
+        "guest exec channel support",
+    ))
 }
 
 #[cfg(not(windows))]
@@ -141,12 +146,11 @@ async fn execute_pty(
     args: ExecArgs,
     record: &crate::state::BoxRecord,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::terminal;
     use a3s_box_core::pty::PtyRequest;
     use a3s_box_runtime::PtyClient;
-    use crossterm::terminal;
 
-    // Resolve PTY socket path
-    let pty_socket_path = record.box_dir.join("sockets").join("pty.sock");
+    let pty_socket_path = crate::socket_paths::pty(record);
     if !pty_socket_path.exists() {
         return Err(format!(
             "PTY socket not found for box {} at {} (guest may not support interactive mode)",
@@ -173,16 +177,13 @@ async fn execute_pty(
     };
     client.send_request(&request).await?;
 
-    // Put terminal into raw mode
-    terminal::enable_raw_mode()?;
-
     // Split the PTY client stream for concurrent read/write
     let (read_half, write_half) = client.into_split();
 
-    let exit_code = run_pty_session(read_half, write_half).await;
-
-    // Restore terminal
-    terminal::disable_raw_mode()?;
+    let exit_code = {
+        let _raw_mode = terminal::raw_mode()?;
+        run_pty_session(read_half, write_half).await
+    };
 
     if exit_code != 0 {
         std::process::exit(exit_code);
@@ -291,7 +292,7 @@ pub(crate) async fn run_pty_session(
                         None => std::future::pending().await,
                     }
                 } => {
-                    if let Ok((cols, rows)) = crossterm::terminal::size() {
+                    if let Ok((cols, rows)) = crate::terminal::size() {
                         let resize = a3s_box_core::pty::PtyResize { cols, rows };
                         if let Ok(payload) = serde_json::to_vec(&resize) {
                             let ft = a3s_transport::FrameType::try_from(a3s_box_core::pty::FRAME_PTY_RESIZE)

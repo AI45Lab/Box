@@ -61,7 +61,11 @@ impl Platform {
             "aarch64" => "arm64",
             other => other,
         };
-        Self::new("linux", arch)
+        let os = match std::env::consts::OS {
+            "macos" => "darwin",
+            other => other,
+        };
+        Self::new(os, arch)
     }
 
     /// Parse a platform string like "linux/amd64" or "linux/arm/v7".
@@ -109,6 +113,121 @@ impl fmt::Display for Platform {
         }
         Ok(())
     }
+}
+
+/// Runtime capabilities exposed by the current host OS.
+///
+/// This is intentionally separate from [`Platform`], which represents an OCI
+/// image platform. Capabilities describe what the host can execute directly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlatformCapabilities {
+    /// Host OS as reported by Rust.
+    pub os: String,
+    /// Host architecture in OCI naming.
+    pub architecture: String,
+    /// VM backend used on this host.
+    pub vm_backend: VmBackend,
+    /// Host/guest control channel available on this host.
+    pub host_guest_channel: HostGuestChannel,
+    /// Whether Unix domain sockets are available.
+    pub unix_sockets: bool,
+    /// Whether Windows named pipes are available.
+    pub named_pipes: bool,
+    /// Whether the native network proxy is available.
+    pub netproxy: bool,
+    /// Whether published ports can be bridged on this host.
+    pub published_ports: bool,
+    /// Whether TEE attestation is available in the native runtime.
+    pub tee_attestation: bool,
+    /// Whether sealed storage is available in the native runtime.
+    pub sealed_storage: bool,
+    /// Whether this host can run interactive PTY sessions through the native control channel.
+    pub interactive_pty: bool,
+}
+
+/// VM backend selected for the current host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VmBackend {
+    /// Native libkrun-backed VM execution.
+    Krun,
+    /// Windows launcher that delegates execution into WSL2.
+    WslLauncher,
+    /// No supported VM backend for this host.
+    Unsupported,
+}
+
+/// Host/guest control transport available on the current host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HostGuestChannel {
+    /// Unix domain sockets.
+    UnixSocket,
+    /// Windows named pipes.
+    NamedPipe,
+    /// No supported channel.
+    Unsupported,
+}
+
+impl PlatformCapabilities {
+    /// Detect capabilities for the current host.
+    pub fn current() -> Self {
+        let host = Platform::host();
+
+        Self {
+            os: std::env::consts::OS.to_string(),
+            architecture: host.architecture,
+            vm_backend: current_vm_backend(),
+            host_guest_channel: current_host_guest_channel(),
+            unix_sockets: cfg!(unix),
+            named_pipes: cfg!(windows),
+            netproxy: cfg!(target_os = "macos"),
+            published_ports: cfg!(unix) || cfg!(windows),
+            tee_attestation: cfg!(unix),
+            sealed_storage: cfg!(unix),
+            interactive_pty: cfg!(unix),
+        }
+    }
+
+    /// Whether the host can run the VM runtime directly.
+    pub fn supports_native_vm(&self) -> bool {
+        self.vm_backend == VmBackend::Krun
+    }
+
+    /// Whether the host has a supported control channel.
+    pub fn supports_host_guest_channel(&self) -> bool {
+        self.host_guest_channel != HostGuestChannel::Unsupported
+    }
+}
+
+#[cfg(unix)]
+fn current_vm_backend() -> VmBackend {
+    VmBackend::Krun
+}
+
+#[cfg(windows)]
+fn current_vm_backend() -> VmBackend {
+    VmBackend::Krun
+}
+
+#[cfg(not(any(unix, windows)))]
+fn current_vm_backend() -> VmBackend {
+    VmBackend::Unsupported
+}
+
+#[cfg(unix)]
+fn current_host_guest_channel() -> HostGuestChannel {
+    HostGuestChannel::UnixSocket
+}
+
+#[cfg(windows)]
+fn current_host_guest_channel() -> HostGuestChannel {
+    HostGuestChannel::NamedPipe
+}
+
+#[cfg(not(any(unix, windows)))]
+fn current_host_guest_channel() -> HostGuestChannel {
+    HostGuestChannel::Unsupported
 }
 
 /// Normalize architecture names to OCI conventions.
@@ -195,7 +314,11 @@ mod tests {
     #[test]
     fn test_platform_host() {
         let host = Platform::host();
-        assert_eq!(host.os, "linux");
+        let expected_os = match std::env::consts::OS {
+            "macos" => "darwin",
+            other => other,
+        };
+        assert_eq!(host.os, expected_os);
         assert!(host.architecture == "amd64" || host.architecture == "arm64");
     }
 
@@ -242,5 +365,34 @@ mod tests {
     fn test_platform_equality() {
         assert_eq!(Platform::linux_amd64(), Platform::new("linux", "amd64"));
         assert_ne!(Platform::linux_amd64(), Platform::linux_arm64());
+    }
+
+    #[test]
+    fn test_platform_capabilities_match_host() {
+        let capabilities = PlatformCapabilities::current();
+        assert_eq!(capabilities.os, std::env::consts::OS);
+        assert!(capabilities.supports_host_guest_channel());
+
+        #[cfg(unix)]
+        {
+            assert_eq!(capabilities.vm_backend, VmBackend::Krun);
+            assert_eq!(
+                capabilities.host_guest_channel,
+                HostGuestChannel::UnixSocket
+            );
+            assert!(capabilities.unix_sockets);
+            assert!(!capabilities.named_pipes);
+            assert!(capabilities.supports_native_vm());
+        }
+
+        #[cfg(windows)]
+        {
+            assert_eq!(capabilities.vm_backend, VmBackend::Krun);
+            assert_eq!(capabilities.host_guest_channel, HostGuestChannel::NamedPipe);
+            assert!(!capabilities.unix_sockets);
+            assert!(capabilities.named_pipes);
+            assert!(capabilities.supports_native_vm());
+            assert!(!capabilities.interactive_pty);
+        }
     }
 }

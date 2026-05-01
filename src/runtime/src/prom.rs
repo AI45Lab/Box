@@ -14,7 +14,8 @@
 //! ```
 
 use prometheus::{
-    GaugeVec, Histogram, HistogramOpts, IntCounter, IntGauge, IntGaugeVec, Opts, Registry,
+    Error as PrometheusError, GaugeVec, Histogram, HistogramOpts, IntCounter, IntGauge,
+    IntGaugeVec, Opts, Registry,
 };
 
 /// Pre-registered Prometheus metrics for the Box runtime.
@@ -73,12 +74,23 @@ pub struct RuntimeMetrics {
 impl RuntimeMetrics {
     /// Create and register all metrics with a new registry.
     pub fn new() -> Self {
+        Self::try_new().expect("static RuntimeMetrics descriptors should be valid")
+    }
+
+    /// Try to create and register all metrics with a new registry.
+    pub fn try_new() -> Result<Self, PrometheusError> {
         let registry = Registry::new();
-        Self::with_registry(registry)
+        Self::try_with_registry(registry)
     }
 
     /// Create and register all metrics with an existing registry.
     pub fn with_registry(registry: Registry) -> Self {
+        Self::try_with_registry(registry)
+            .expect("static RuntimeMetrics descriptors should not conflict")
+    }
+
+    /// Try to create and register all metrics with an existing registry.
+    pub fn try_with_registry(registry: Registry) -> Result<Self, PrometheusError> {
         // VM lifecycle
         let vm_boot_duration = Histogram::with_opts(
             HistogramOpts::new(
@@ -86,38 +98,31 @@ impl RuntimeMetrics {
                 "VM boot duration in seconds",
             )
             .buckets(vec![0.05, 0.1, 0.15, 0.2, 0.3, 0.5, 1.0, 2.0, 5.0, 10.0]),
-        )
-        .expect("valid histogram");
+        )?;
 
         let vm_count = IntGaugeVec::new(
             Opts::new("a3s_box_vm_count", "Number of VMs by state"),
             &["state"],
-        )
-        .expect("valid gauge vec");
+        )?;
 
-        let vm_created_total = IntCounter::new("a3s_box_vm_created_total", "Total VMs created")
-            .expect("valid counter");
+        let vm_created_total = IntCounter::new("a3s_box_vm_created_total", "Total VMs created")?;
 
         let vm_destroyed_total =
-            IntCounter::new("a3s_box_vm_destroyed_total", "Total VMs destroyed")
-                .expect("valid counter");
+            IntCounter::new("a3s_box_vm_destroyed_total", "Total VMs destroyed")?;
 
         // VM resources
         let vm_cpu_percent = GaugeVec::new(
             Opts::new("a3s_box_vm_cpu_percent", "VM CPU usage percentage"),
             &["box_id"],
-        )
-        .expect("valid gauge vec");
+        )?;
 
         let vm_memory_bytes = GaugeVec::new(
             Opts::new("a3s_box_vm_memory_bytes", "VM memory usage in bytes"),
             &["box_id"],
-        )
-        .expect("valid gauge vec");
+        )?;
 
         // Exec operations
-        let exec_total = IntCounter::new("a3s_box_exec_total", "Total exec commands executed")
-            .expect("valid counter");
+        let exec_total = IntCounter::new("a3s_box_exec_total", "Total exec commands executed")?;
 
         let exec_duration = Histogram::with_opts(
             HistogramOpts::new(
@@ -125,16 +130,13 @@ impl RuntimeMetrics {
                 "Exec command duration in seconds",
             )
             .buckets(vec![0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0]),
-        )
-        .expect("valid histogram");
+        )?;
 
         let exec_errors_total =
-            IntCounter::new("a3s_box_exec_errors_total", "Total failed exec commands")
-                .expect("valid counter");
+            IntCounter::new("a3s_box_exec_errors_total", "Total failed exec commands")?;
 
         // Image operations
-        let image_pull_total = IntCounter::new("a3s_box_image_pull_total", "Total image pulls")
-            .expect("valid counter");
+        let image_pull_total = IntCounter::new("a3s_box_image_pull_total", "Total image pulls")?;
 
         let image_pull_duration = Histogram::with_opts(
             HistogramOpts::new(
@@ -142,100 +144,56 @@ impl RuntimeMetrics {
                 "Image pull duration in seconds",
             )
             .buckets(vec![0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0]),
-        )
-        .expect("valid histogram");
+        )?;
 
-        let image_build_total = IntCounter::new("a3s_box_image_build_total", "Total image builds")
-            .expect("valid counter");
+        let image_build_total = IntCounter::new("a3s_box_image_build_total", "Total image builds")?;
 
         let rootfs_cache_hits =
-            IntCounter::new("a3s_box_rootfs_cache_hits_total", "Rootfs cache hits")
-                .expect("valid counter");
+            IntCounter::new("a3s_box_rootfs_cache_hits_total", "Rootfs cache hits")?;
 
         let rootfs_cache_misses =
-            IntCounter::new("a3s_box_rootfs_cache_misses_total", "Rootfs cache misses")
-                .expect("valid counter");
+            IntCounter::new("a3s_box_rootfs_cache_misses_total", "Rootfs cache misses")?;
 
         // Warm pool
         let warm_pool_size = IntGauge::new(
             "a3s_box_warm_pool_size",
             "Current warm pool size (idle VMs)",
-        )
-        .expect("valid gauge");
+        )?;
 
         let warm_pool_capacity =
-            IntGauge::new("a3s_box_warm_pool_capacity", "Warm pool max capacity")
-                .expect("valid gauge");
+            IntGauge::new("a3s_box_warm_pool_capacity", "Warm pool max capacity")?;
 
         let warm_pool_hits = IntCounter::new(
             "a3s_box_warm_pool_hits_total",
             "VMs allocated from warm pool",
-        )
-        .expect("valid counter");
+        )?;
 
         let warm_pool_misses = IntCounter::new(
             "a3s_box_warm_pool_misses_total",
             "VMs created fresh (warm pool miss)",
-        )
-        .expect("valid counter");
+        )?;
 
         // Register all metrics
-        registry
-            .register(Box::new(vm_boot_duration.clone()))
-            .expect("register");
-        registry
-            .register(Box::new(vm_count.clone()))
-            .expect("register");
-        registry
-            .register(Box::new(vm_created_total.clone()))
-            .expect("register");
-        registry
-            .register(Box::new(vm_destroyed_total.clone()))
-            .expect("register");
-        registry
-            .register(Box::new(vm_cpu_percent.clone()))
-            .expect("register");
-        registry
-            .register(Box::new(vm_memory_bytes.clone()))
-            .expect("register");
-        registry
-            .register(Box::new(exec_total.clone()))
-            .expect("register");
-        registry
-            .register(Box::new(exec_duration.clone()))
-            .expect("register");
-        registry
-            .register(Box::new(exec_errors_total.clone()))
-            .expect("register");
-        registry
-            .register(Box::new(image_pull_total.clone()))
-            .expect("register");
-        registry
-            .register(Box::new(image_pull_duration.clone()))
-            .expect("register");
-        registry
-            .register(Box::new(image_build_total.clone()))
-            .expect("register");
-        registry
-            .register(Box::new(rootfs_cache_hits.clone()))
-            .expect("register");
-        registry
-            .register(Box::new(rootfs_cache_misses.clone()))
-            .expect("register");
-        registry
-            .register(Box::new(warm_pool_size.clone()))
-            .expect("register");
-        registry
-            .register(Box::new(warm_pool_capacity.clone()))
-            .expect("register");
-        registry
-            .register(Box::new(warm_pool_hits.clone()))
-            .expect("register");
-        registry
-            .register(Box::new(warm_pool_misses.clone()))
-            .expect("register");
+        registry.register(Box::new(vm_boot_duration.clone()))?;
+        registry.register(Box::new(vm_count.clone()))?;
+        registry.register(Box::new(vm_created_total.clone()))?;
+        registry.register(Box::new(vm_destroyed_total.clone()))?;
+        registry.register(Box::new(vm_cpu_percent.clone()))?;
+        registry.register(Box::new(vm_memory_bytes.clone()))?;
+        registry.register(Box::new(exec_total.clone()))?;
+        registry.register(Box::new(exec_duration.clone()))?;
+        registry.register(Box::new(exec_errors_total.clone()))?;
+        registry.register(Box::new(image_pull_total.clone()))?;
+        registry.register(Box::new(image_pull_duration.clone()))?;
+        registry.register(Box::new(image_build_total.clone()))?;
+        registry.register(Box::new(rootfs_cache_hits.clone()))?;
+        registry.register(Box::new(rootfs_cache_misses.clone()))?;
+        registry.register(Box::new(warm_pool_size.clone()))?;
+        registry.register(Box::new(warm_pool_capacity.clone()))?;
+        registry.register(Box::new(warm_pool_hits.clone()))?;
+        registry.register(Box::new(warm_pool_misses.clone()))?;
 
-        Self {
+        Ok(Self {
             registry,
             vm_boot_duration,
             vm_count,
@@ -255,7 +213,7 @@ impl RuntimeMetrics {
             warm_pool_capacity,
             warm_pool_hits,
             warm_pool_misses,
-        }
+        })
     }
 
     /// Encode all metrics in Prometheus text exposition format.
@@ -436,5 +394,13 @@ mod tests {
     fn test_metrics_default() {
         let m = RuntimeMetrics::default();
         assert_eq!(m.vm_created_total.get(), 0);
+    }
+
+    #[test]
+    fn test_try_with_registry_reports_duplicate_registration() {
+        let registry = Registry::new();
+        let _first = RuntimeMetrics::try_with_registry(registry.clone()).unwrap();
+        let second = RuntimeMetrics::try_with_registry(registry);
+        assert!(second.is_err());
     }
 }

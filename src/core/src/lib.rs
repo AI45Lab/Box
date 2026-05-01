@@ -33,9 +33,10 @@ pub use event::{BoxEvent, EventEmitter};
 pub use exec::{ExecChunk, ExecEvent, ExecExit, ExecMetrics, StreamType};
 pub use exec::{ExecOutput, ExecRequest};
 pub use exec::{FileOp, FileRequest, FileResponse};
+pub use exec::{EXEC_VSOCK_PORT, PORT_FWD_VSOCK_PORT};
 pub use network::{IsolationMode, NetworkConfig, NetworkEndpoint, NetworkMode, NetworkPolicy};
 pub use operator::{BoxAutoscaler, BoxAutoscalerSpec, BoxAutoscalerStatus, MetricType};
-pub use platform::Platform;
+pub use platform::{HostGuestChannel, Platform, PlatformCapabilities, VmBackend};
 pub use pty::PTY_VSOCK_PORT;
 pub use scale::{
     InstanceDeregistration, InstanceEvent, InstanceHealth, InstanceInfo, InstanceRegistration,

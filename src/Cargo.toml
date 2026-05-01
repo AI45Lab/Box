@@ -2,12 +2,14 @@
 members = [
     "core",
     "runtime",
+    "netproxy",
     "shim",
     "guest/init",
     "deps/libkrun-sys",
     "cri",
     "cli",
     "sdk",
+    "win-launcher",
 ]
 resolver = "2"
 
@@ -97,7 +99,7 @@ tempfile = "3.10"
 oci-distribution = "0.11"
 
 # Table formatting
-comfy-table = "7"
+comfy-table = { version = "7", default-features = false }
 
 # Random
 rand = "0.8"

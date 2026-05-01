@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::Instrument;
 
+#[cfg(unix)]
 use libc;
 
 #[cfg(unix)]
@@ -194,6 +195,18 @@ impl VmManager {
                 "Failed to cleanup box directory after boot failure"
             );
         }
+
+        let socket_dir = self.socket_dir();
+        if socket_dir != box_dir.join("sockets") {
+            if let Err(e) = std::fs::remove_dir_all(&socket_dir) {
+                tracing::debug!(
+                    box_id = %self.box_id,
+                    path = %socket_dir.display(),
+                    error = %e,
+                    "Failed to cleanup socket directory after boot failure"
+                );
+            }
+        }
     }
 
     /// Create a new VM manager with a custom VMM provider.
@@ -305,6 +318,25 @@ impl VmManager {
     /// yet stopped or the exit code could not be determined.
     pub fn exit_code(&self) -> Option<i32> {
         self.shim_exit_code
+    }
+
+    /// Poll the owned VM process for natural exit without sending a signal.
+    ///
+    /// This is used by foreground CLI flows where the container command may
+    /// finish on its own and the CLI should clean up instead of waiting for
+    /// a Ctrl-C.
+    pub async fn try_wait_exit(&mut self) -> Result<Option<i32>> {
+        let mut handler = self.handler.write().await;
+        let Some(handler) = handler.as_mut() else {
+            return Ok(self.shim_exit_code);
+        };
+
+        if let Some(code) = handler.try_wait_exit()? {
+            self.shim_exit_code = Some(code);
+            return Ok(Some(code));
+        }
+
+        Ok(None)
     }
 
     /// Execute a command in the guest VM.
@@ -543,7 +575,7 @@ impl VmManager {
 
     /// Destroy the VM with the default shutdown timeout and SIGTERM.
     pub async fn destroy(&mut self) -> Result<()> {
-        self.destroy_with_options(libc::SIGTERM, DEFAULT_SHUTDOWN_TIMEOUT_MS)
+        self.destroy_with_options(default_stop_signal(), DEFAULT_SHUTDOWN_TIMEOUT_MS)
             .await
     }
 
@@ -595,6 +627,16 @@ impl VmManager {
                 box_id = %self.box_id,
                 error = %e,
                 "Failed to cleanup rootfs provider"
+            );
+        }
+
+        let socket_dir = self.socket_dir();
+        if let Err(e) = std::fs::remove_dir_all(&socket_dir) {
+            tracing::debug!(
+                box_id = %self.box_id,
+                path = %socket_dir.display(),
+                error = %e,
+                "Failed to cleanup VM socket directory"
             );
         }
 
@@ -857,4 +899,14 @@ pub(crate) fn fnv1a_hash(input: &str) -> u64 {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     hash
+}
+
+#[cfg(unix)]
+fn default_stop_signal() -> i32 {
+    libc::SIGTERM
+}
+
+#[cfg(windows)]
+fn default_stop_signal() -> i32 {
+    15
 }

@@ -16,6 +16,15 @@ use super::credentials::CredentialStore;
 use super::reference::ImageReference;
 use super::signing::{verify_image_signature, SignaturePolicy, VerifyResult};
 
+const REGISTRY_PROTOCOL_ENV: &str = "A3S_REGISTRY_PROTOCOL";
+
+fn registry_protocol_from_env() -> ClientProtocol {
+    match std::env::var(REGISTRY_PROTOCOL_ENV) {
+        Ok(value) if value.eq_ignore_ascii_case("http") => ClientProtocol::Http,
+        _ => ClientProtocol::Https,
+    }
+}
+
 /// Callback type for layer pull progress: `(current, total, digest, size_bytes)`.
 type PullProgressFn = Arc<dyn Fn(usize, usize, &str, i64) + Send + Sync>;
 
@@ -105,7 +114,7 @@ impl RegistryPuller {
     /// Create a new registry puller with the given authentication.
     pub fn with_auth(auth: RegistryAuth) -> Self {
         let config = ClientConfig {
-            protocol: ClientProtocol::Https,
+            protocol: registry_protocol_from_env(),
             platform_resolver: Some(Box::new(linux_platform_resolver)),
             ..Default::default()
         };
@@ -383,7 +392,7 @@ impl RegistryPusher {
     /// Create a new registry pusher with the given authentication.
     pub fn with_auth(auth: RegistryAuth) -> Self {
         let config = ClientConfig {
-            protocol: ClientProtocol::Https,
+            protocol: registry_protocol_from_env(),
             ..Default::default()
         };
         let client = Client::new(config);
@@ -522,6 +531,12 @@ fn linux_platform_resolver(manifests: &[ImageIndexEntry]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
 
     #[test]
     fn test_registry_auth_anonymous() {
@@ -549,6 +564,35 @@ mod tests {
         let auth = RegistryAuth::basic("user", "pass");
         let oci_auth = auth.to_oci_auth();
         assert!(matches!(oci_auth, OciRegistryAuth::Basic(_, _)));
+    }
+
+    #[test]
+    fn test_registry_protocol_defaults_to_https() {
+        let _guard = env_lock();
+        std::env::remove_var(REGISTRY_PROTOCOL_ENV);
+        assert!(matches!(
+            registry_protocol_from_env(),
+            ClientProtocol::Https
+        ));
+    }
+
+    #[test]
+    fn test_registry_protocol_can_use_http_for_local_testing() {
+        let _guard = env_lock();
+        std::env::set_var(REGISTRY_PROTOCOL_ENV, "http");
+        assert!(matches!(registry_protocol_from_env(), ClientProtocol::Http));
+        std::env::remove_var(REGISTRY_PROTOCOL_ENV);
+    }
+
+    #[test]
+    fn test_registry_protocol_rejects_unknown_values_to_https() {
+        let _guard = env_lock();
+        std::env::set_var(REGISTRY_PROTOCOL_ENV, "ftp");
+        assert!(matches!(
+            registry_protocol_from_env(),
+            ClientProtocol::Https
+        ));
+        std::env::remove_var(REGISTRY_PROTOCOL_ENV);
     }
 
     #[test]

@@ -778,19 +778,19 @@ fn remount_rootfs_readonly() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Wait for all child processes and reap zombies.
+/// Wait for the main container process.
 ///
-/// Only exits when `container_pid` exits AND `shutdown_requested` is set (SIGTERM).
-/// Otherwise loops forever so background services (exec/PTY/attestation) stay alive
-/// after the container exits — the VM stays alive until explicitly stopped by the host.
+/// Exec and PTY requests run in other guest-init threads and wait for their
+/// own child processes. The main supervision loop must not call waitpid(-1),
+/// otherwise it can reap those children before the request handler observes
+/// their exit status.
 fn wait_for_children(container_pid: nix::unistd::Pid) -> Result<(), Box<dyn std::error::Error>> {
     use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-    use nix::unistd::Pid;
 
     /// Maximum time to wait for children after forwarding SIGTERM (5 seconds).
     const CHILD_SHUTDOWN_TIMEOUT_MS: u64 = 5000;
 
-    info!("Waiting for child processes");
+    info!("Waiting for container process {}", container_pid);
 
     loop {
         // Check if shutdown was requested via SIGTERM
@@ -800,65 +800,23 @@ fn wait_for_children(container_pid: nix::unistd::Pid) -> Result<(), Box<dyn std:
             return Ok(());
         }
 
-        match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
+        match waitpid(container_pid, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::Exited(pid, status)) => {
-                if pid == container_pid {
-                    // Container exited — keep the VM alive so vsock services remain available.
-                    // The host stops the VM via SIGTERM, at which point graceful_shutdown runs.
-                    info!(
-                        "Container process {} exited with status {}. \
-                         VM staying alive for vsock services (stop with Ctrl-C)",
-                        pid, status
-                    );
-                    // Loop forever — VM stays alive until SIGTERM from host
-                    loop {
-                        if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
-                            info!("SIGTERM received during container-exited idle, shutting down");
-                            graceful_shutdown(CHILD_SHUTDOWN_TIMEOUT_MS);
-                            return Ok(());
-                        }
-                        std::thread::sleep(std::time::Duration::from_secs(1));
-                    }
-                } else {
-                    info!(
-                        "Child process {} exited with status {} (reaped)",
-                        pid, status
-                    );
-                }
+                info!("Container process {} exited with status {}", pid, status);
+                process::exit(status);
             }
             Ok(WaitStatus::Signaled(pid, signal, _)) => {
-                if pid == container_pid {
-                    error!("Container process {} killed by signal {:?}", pid, signal);
-                    loop {
-                        if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
-                            info!("SIGTERM received, shutting down");
-                            graceful_shutdown(CHILD_SHUTDOWN_TIMEOUT_MS);
-                            return Ok(());
-                        }
-                        std::thread::sleep(std::time::Duration::from_secs(1));
-                    }
-                } else if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
-                    info!(
-                        "Child process {} terminated by signal {:?} during shutdown",
-                        pid, signal
-                    );
-                } else {
-                    info!(
-                        "Child process {} killed by signal {:?} (reaped)",
-                        pid, signal
-                    );
-                }
+                error!("Container process {} killed by signal {:?}", pid, signal);
+                process::exit(128 + signal as i32);
             }
             Ok(WaitStatus::StillAlive) => {
-                // No children to reap, sleep briefly
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
             Ok(_) => {
                 // Other status, continue waiting
             }
             Err(nix::errno::Errno::ECHILD) => {
-                // No more children
-                info!("No more child processes");
+                info!("Container process {} is no longer a child", container_pid);
                 break;
             }
             Err(e) => {

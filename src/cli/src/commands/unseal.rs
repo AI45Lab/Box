@@ -6,7 +6,9 @@
 
 use clap::Args;
 
+#[cfg(not(windows))]
 use crate::resolve;
+#[cfg(not(windows))]
 use crate::state::StateFile;
 
 #[cfg(not(windows))]
@@ -50,7 +52,10 @@ struct UnsealOutput {
 
 #[cfg(windows)]
 pub async fn execute(_args: UnsealArgs) -> Result<(), Box<dyn std::error::Error>> {
-    Err("'unseal' requires Unix domain sockets and is not supported on Windows".into())
+    Err(crate::platform::unsupported_command(
+        "unseal",
+        "TEE sealed-storage channel support",
+    ))
 }
 
 #[cfg(not(windows))]
@@ -62,8 +67,7 @@ pub async fn execute(args: UnsealArgs) -> Result<(), Box<dyn std::error::Error>>
         return Err(format!("Box {} is not running", record.name).into());
     }
 
-    // Derive the attestation socket path from box_dir.
-    let attest_socket_path = record.box_dir.join("sockets").join("attest.sock");
+    let attest_socket_path = crate::socket_paths::attest(record);
     let socket_path = &attest_socket_path;
     if !socket_path.exists() {
         return Err(format!(
@@ -113,6 +117,7 @@ pub async fn execute(args: UnsealArgs) -> Result<(), Box<dyn std::error::Error>>
 }
 
 /// Normalize CLI-friendly policy names to internal format.
+#[cfg(any(not(windows), test))]
 fn normalize_policy(policy: &str) -> Result<String, String> {
     match policy.to_lowercase().replace('-', "").as_str() {
         "measurementandchip" => Ok("MeasurementAndChip".to_string()),

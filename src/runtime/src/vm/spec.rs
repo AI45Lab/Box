@@ -101,7 +101,14 @@ impl VmManager {
                     );
                     (exec, args, oci_config.env.clone())
                 }
-                None => ("/bin/sh".to_string(), vec!["-c".to_string(), "echo No command specified; exec /bin/sh".to_string()], vec![]),
+                None => (
+                    "/bin/sh".to_string(),
+                    vec![
+                        "-c".to_string(),
+                        "echo No command specified; exec /bin/sh".to_string(),
+                    ],
+                    vec![],
+                ),
             };
 
             // Pass exec + args as individual env vars (avoids spaces being truncated
@@ -216,7 +223,10 @@ impl VmManager {
                 }
                 None => Entrypoint {
                     executable: "/bin/sh".to_string(),
-                    args: vec!["-c".to_string(), "echo No command specified; exec /bin/sh".to_string()],
+                    args: vec![
+                        "-c".to_string(),
+                        "echo No command specified; exec /bin/sh".to_string(),
+                    ],
                     env: vec![],
                 },
             }
@@ -343,7 +353,13 @@ impl VmManager {
             (exec, args)
         } else {
             // Neither set: fall back to /bin/sh (universal across all Linux distros)
-            ("/bin/sh".to_string(), vec!["-c".to_string(), "echo No command specified; exec /bin/sh".to_string()])
+            (
+                "/bin/sh".to_string(),
+                vec![
+                    "-c".to_string(),
+                    "echo No command specified; exec /bin/sh".to_string(),
+                ],
+            )
         }
     }
 
@@ -408,7 +424,9 @@ impl VmManager {
                 || s.starts_with('\\')
                 || s.starts_with("./")
                 || s.starts_with("../")
-                || (s.len() == 2 && s.chars().next().map_or(false, |c| c.is_alphabetic()) && s.ends_with(':'))
+                || (s.len() == 2
+                    && s.chars().next().map_or(false, |c| c.is_alphabetic())
+                    && s.ends_with(':'))
         };
         if parts.len() >= 2 && !has_mode && !last.map_or(false, looks_like_path) {
             return Err(BoxError::ConfigError(format!(
@@ -430,10 +448,7 @@ impl VmManager {
         };
 
         // Validate guest path is not empty or a mode keyword
-        if guest_path_str.is_empty()
-            || guest_path_str == "ro"
-            || guest_path_str == "rw"
-        {
+        if guest_path_str.is_empty() || guest_path_str == "ro" || guest_path_str == "rw" {
             return Err(BoxError::ConfigError(format!(
                 "Invalid volume format (expected host:guest[:ro|rw]): {}",
                 volume
@@ -457,7 +472,11 @@ impl VmManager {
         // - If parts[0] is a single-letter (Windows drive letter), reconstruct the
         //   Windows path by joining parts[0..guest_idx] with colons.
         // - Otherwise (Unix), join parts[0..guest_idx] with colons.
-        let guest_idx = if has_mode { parts.len() - 2 } else { parts.len() - 1 };
+        let guest_idx = if has_mode {
+            parts.len() - 2
+        } else {
+            parts.len() - 1
+        };
         let host_path_str = if parts[0].len() == 1 {
             // Windows drive letter — parts[0] is "C", parts[1..] is the rest of the path
             let host_parts = &parts[..guest_idx];

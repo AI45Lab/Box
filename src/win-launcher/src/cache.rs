@@ -27,6 +27,7 @@ fn write_at(path: &PathBuf, version: &str) -> std::io::Result<()> {
 }
 
 /// Delete the cache file at `path`.
+#[cfg(test)]
 fn invalidate_at(path: &PathBuf) {
     let _ = fs::remove_file(path);
 }
@@ -39,11 +40,6 @@ pub fn is_valid(version: &str) -> bool {
 /// Write the version string to the cache file.
 pub fn write(version: &str) -> std::io::Result<()> {
     write_at(&cache_path(), version)
-}
-
-/// Delete the cache file (used on error recovery).
-pub fn invalidate() {
-    invalidate_at(&cache_path());
 }
 
 #[cfg(test)]

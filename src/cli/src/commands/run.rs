@@ -76,6 +76,9 @@ struct RunContext {
     box_id: String,
     box_dir: PathBuf,
     name: String,
+    exec_socket_path: PathBuf,
+    #[cfg_attr(windows, allow(dead_code))]
+    pty_socket_path: PathBuf,
     volume_names: Vec<String>,
     health_checker: Option<tokio::task::JoinHandle<()>>,
     stop_signal: i32,
@@ -224,6 +227,14 @@ async fn setup_and_boot(args: &RunArgs) -> Result<RunContext, Box<dyn std::error
 
     let pid = vm.pid().await;
     let box_dir = a3s_box_core::dirs_home().join("boxes").join(&box_id);
+    let exec_socket_path = vm
+        .exec_socket_path()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| box_dir.join("sockets").join("exec.sock"));
+    let pty_socket_path = vm
+        .pty_socket_path()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| box_dir.join("sockets").join("pty.sock"));
 
     let health_status = if health_check.is_some() {
         "starting"
@@ -244,7 +255,7 @@ async fn setup_and_boot(args: &RunArgs) -> Result<RunContext, Box<dyn std::error
         cmd: args.cmd.clone(),
         entrypoint: entrypoint_override.clone(),
         box_dir: box_dir.clone(),
-        exec_socket_path: box_dir.join("sockets").join("exec.sock"),
+        exec_socket_path: exec_socket_path.clone(),
         console_log: box_dir.join("logs").join("console.log"),
         created_at: chrono::Utc::now(),
         started_at: Some(chrono::Utc::now()),
@@ -297,11 +308,7 @@ async fn setup_and_boot(args: &RunArgs) -> Result<RunContext, Box<dyn std::error
     );
 
     let health_checker = health_check.as_ref().map(|hc| {
-        crate::health::spawn_health_checker(
-            box_id.clone(),
-            box_dir.join("sockets").join("exec.sock"),
-            hc.clone(),
-        )
+        crate::health::spawn_health_checker(box_id.clone(), exec_socket_path.clone(), hc.clone())
     });
 
     super::volume::attach_volumes(&volume_names, &box_id)?;
@@ -323,6 +330,8 @@ async fn setup_and_boot(args: &RunArgs) -> Result<RunContext, Box<dyn std::error
         box_id,
         box_dir,
         name,
+        exec_socket_path,
+        pty_socket_path,
         volume_names,
         health_checker,
         stop_signal,
@@ -417,11 +426,11 @@ fn connect_network(
 
 #[cfg(not(windows))]
 async fn run_tty(mut ctx: RunContext, args: &RunArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::terminal;
     use a3s_box_core::pty::PtyRequest;
     use a3s_box_runtime::PtyClient;
-    use crossterm::terminal;
 
-    let pty_socket_path = ctx.box_dir.join("sockets").join("pty.sock");
+    let pty_socket_path = ctx.pty_socket_path.clone();
 
     // Wait for PTY socket to appear
     for _ in 0..50 {
@@ -465,10 +474,11 @@ async fn run_tty(mut ctx: RunContext, args: &RunArgs) -> Result<(), Box<dyn std:
         })
         .await?;
 
-    terminal::enable_raw_mode()?;
     let (read_half, write_half) = client.into_split();
-    let exit_code = super::exec::run_pty_session(read_half, write_half).await;
-    terminal::disable_raw_mode()?;
+    let exit_code = {
+        let _raw_mode = terminal::raw_mode()?;
+        super::exec::run_pty_session(read_half, write_half).await
+    };
 
     // Cleanup
     cleanup_box(&mut ctx, args.common.network.as_deref(), args.rm).await?;
@@ -481,7 +491,10 @@ async fn run_tty(mut ctx: RunContext, args: &RunArgs) -> Result<(), Box<dyn std:
 
 #[cfg(windows)]
 async fn run_tty(_ctx: RunContext, _args: &RunArgs) -> Result<(), Box<dyn std::error::Error>> {
-    Err("Interactive PTY mode (-it) is not supported on Windows".into())
+    Err(crate::platform::unsupported_command(
+        "run -it",
+        "interactive PTY support",
+    ))
 }
 
 // ============================================================================
@@ -504,19 +517,21 @@ async fn run_foreground(
     });
 
     let name = ctx.name.clone();
-    let user_interrupted = tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            println!("\nStopping box {}...", name);
-            true
-        }
-        _ = async {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let user_interrupted = loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                println!("\nStopping box {}...", name);
+                break true;
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                if ctx.vm.try_wait_exit().await?.is_some() {
+                    break false;
+                }
                 if !ctx.vm.health_check().await.unwrap_or(false) {
-                    break;
+                    break false;
                 }
             }
-        } => false,
+        }
     };
 
     log_handle.abort();
@@ -533,6 +548,7 @@ async fn run_foreground(
     // Detach volumes and disconnect network
     super::volume::detach_volumes(&ctx.volume_names, &ctx.box_id);
     disconnect_network(&ctx.box_id, args.common.network.as_deref())?;
+    crate::cleanup::cleanup_external_socket_dir(&ctx.box_dir, &ctx.exec_socket_path);
 
     // Update state
     let mut state = StateFile::load_default()?;
@@ -620,6 +636,7 @@ fn disconnect_network(
 }
 
 /// Shared cleanup: abort health checker, destroy VM, detach volumes, disconnect network, update state.
+#[cfg(not(windows))]
 async fn cleanup_box(
     ctx: &mut RunContext,
     net_name: Option<&str>,
@@ -633,6 +650,7 @@ async fn cleanup_box(
         .await?;
     super::volume::detach_volumes(&ctx.volume_names, &ctx.box_id);
     disconnect_network(&ctx.box_id, net_name)?;
+    crate::cleanup::cleanup_external_socket_dir(&ctx.box_dir, &ctx.exec_socket_path);
 
     let mut state = StateFile::load_default()?;
     if let Some(rec) = state.find_by_id_mut(&ctx.box_id) {

@@ -244,6 +244,15 @@ pub trait VmHandler: Send + Sync {
     fn exit_code(&self) -> Option<i32> {
         None
     }
+
+    /// Poll the VM process for natural exit without sending any signal.
+    ///
+    /// Implementations that own a child process handle can use this to reap
+    /// short-lived foreground workloads. Backends that cannot poll should
+    /// return `Ok(None)`.
+    fn try_wait_exit(&mut self) -> Result<Option<i32>> {
+        Ok(None)
+    }
 }
 
 // ── VMM provider ─────────────────────────────────────────────────────────────

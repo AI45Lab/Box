@@ -1,3 +1,5 @@
+#![cfg(target_os = "macos")]
+
 //! Pure-Rust userspace network proxy for libkrun on macOS.
 //!
 //! Uses a Unix datagram `socketpair()` to connect libkrun's virtio-net backend
@@ -534,16 +536,6 @@ impl NetProxyManager {
     }
 }
 
-impl super::NetworkBackend for NetProxyManager {
-    fn socket_path(&self) -> &Path {
-        &self.socket_path
-    }
-
-    fn stop(&mut self) {
-        self.stop();
-    }
-}
-
 impl Drop for NetProxyManager {
     fn drop(&mut self) {
         self.stop();
@@ -656,6 +648,14 @@ fn parse_port_forwards(
 mod tests {
     use super::*;
 
+    fn port_is_bindable(port: u16) -> bool {
+        TcpListener::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port)).is_ok()
+    }
+
+    fn ports_are_bindable(ports: &[u16]) -> bool {
+        ports.iter().copied().all(port_is_bindable)
+    }
+
     #[test]
     fn test_smoltcp_now_returns_reasonable_value() {
         let now = smoltcp_now();
@@ -687,6 +687,10 @@ mod tests {
     #[test]
     fn test_parse_port_forwards_udp_suffix() {
         let guest = Ipv4Addr::new(10, 89, 0, 2);
+        if !port_is_bindable(19990) {
+            eprintln!("skipping test: host port 19990 is not bindable");
+            return;
+        }
         let rules = vec!["19990:80/udp".to_string()];
         let fwds = parse_port_forwards(&rules, guest).unwrap();
         assert_eq!(fwds.len(), 1);
@@ -696,6 +700,10 @@ mod tests {
     #[test]
     fn test_parse_port_forwards_multiple_rules() {
         let guest = Ipv4Addr::new(10, 89, 0, 2);
+        if !ports_are_bindable(&[19991, 19992, 19993]) {
+            eprintln!("skipping test: one or more host ports are not bindable");
+            return;
+        }
         let rules = vec![
             "19991:80".to_string(),
             "19992:443".to_string(),
@@ -759,6 +767,10 @@ mod tests {
     #[test]
     fn test_parse_port_forwards_valid() {
         let guest = Ipv4Addr::new(10, 89, 0, 2);
+        if !ports_are_bindable(&[19988, 19443]) {
+            eprintln!("skipping test: one or more host ports are not bindable");
+            return;
+        }
         // Use a random high port to avoid conflicts
         let rules = vec!["19988:80".to_string(), "19443:443".to_string()];
         let fwds = parse_port_forwards(&rules, guest).unwrap();
@@ -770,6 +782,10 @@ mod tests {
     #[test]
     fn test_parse_port_forwards_with_protocol_suffix() {
         let guest = Ipv4Addr::new(10, 89, 0, 2);
+        if !port_is_bindable(19989) {
+            eprintln!("skipping test: host port 19989 is not bindable");
+            return;
+        }
         let rules = vec!["19989:80/tcp".to_string()];
         let fwds = parse_port_forwards(&rules, guest).unwrap();
         assert_eq!(fwds[0].guest_port, 80);

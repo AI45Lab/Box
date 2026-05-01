@@ -6,11 +6,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use a3s_box_core::PORT_FWD_VSOCK_PORT;
 use nix::sys::socket::{connect, socket, AddressFamily, SockFlag, SockType, VsockAddr};
 use tracing::{debug, info, warn};
 
 const HOST_CID: u32 = 2;
-const PORT_FWD_VSOCK_PORT: u32 = 4093;
 const ENV_ENABLED: &str = "BOX_WINDOWS_PORT_FWD";
 
 const FRAME_OPEN: u8 = 1;

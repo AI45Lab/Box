@@ -59,6 +59,7 @@ fn rm_one(
     let box_id = record.id.clone();
     let name = record.name.clone();
     let box_dir = record.box_dir.clone();
+    let exec_socket_path = record.exec_socket_path.clone();
     let network_name = record.network_name.clone();
     let volume_names = record.volume_names.clone();
     let anonymous_volumes = record.anonymous_volumes.clone();
@@ -81,6 +82,7 @@ fn rm_one(
     if box_dir.exists() {
         let _ = std::fs::remove_dir_all(&box_dir);
     }
+    cleanup::cleanup_external_socket_dir(&box_dir, &exec_socket_path);
 
     // Remove from state
     state.remove(&box_id)?;

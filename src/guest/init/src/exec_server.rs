@@ -8,13 +8,10 @@ use std::io::Read;
 use std::io::Write;
 use std::time::Duration;
 
-use a3s_box_core::exec::{ExecOutput, DEFAULT_EXEC_TIMEOUT_NS, MAX_OUTPUT_BYTES};
+use a3s_box_core::exec::{ExecOutput, DEFAULT_EXEC_TIMEOUT_NS, EXEC_VSOCK_PORT, MAX_OUTPUT_BYTES};
 #[cfg(any(target_os = "linux", test))]
 use a3s_transport::frame::FrameType;
 use tracing::{info, warn};
-
-/// Vsock port for the exec server.
-pub const EXEC_VSOCK_PORT: u32 = a3s_transport::ports::EXEC_SERVER;
 
 /// Run the exec server, listening on vsock port 4089.
 ///

@@ -1,9 +1,7 @@
-[workspace]
-
 [package]
 name = "a3s-box-win"
 version = "0.8.0"
-edition = "2021"
+edition.workspace = true
 authors = ["A3S Lab Team"]
 license = "MIT"
 
@@ -12,4 +10,7 @@ name = "a3s-box-win"
 path = "src/main.rs"
 
 [dependencies]
-dirs = "5.0"
+dirs = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

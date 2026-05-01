@@ -48,6 +48,8 @@ async fn restart_one(
     let name = record.name.clone();
     let was_running = record.status == "running";
     let pid = record.pid;
+    let box_dir = record.box_dir.clone();
+    let exec_socket_path = record.exec_socket_path.clone();
 
     // Phase 1: Stop the box if it's running
     if was_running {
@@ -65,6 +67,7 @@ async fn restart_one(
         let record = resolve::resolve_mut(state, &box_id)?;
         record.status = "stopped".to_string();
         record.pid = None;
+        crate::cleanup::cleanup_external_socket_dir(&box_dir, &exec_socket_path);
         state.save()?;
     } else {
         // Verify the box is in a startable state
@@ -84,6 +87,9 @@ async fn restart_one(
     let record = resolve::resolve_mut(state, &box_id)?;
     record.status = "running".to_string();
     record.pid = result.pid;
+    if let Some(exec_socket_path) = result.exec_socket_path {
+        record.exec_socket_path = exec_socket_path;
+    }
     record.started_at = Some(chrono::Utc::now());
     state.save()?;
 

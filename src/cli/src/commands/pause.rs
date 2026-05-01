@@ -50,7 +50,10 @@ fn pause_one(state: &mut StateFile, query: &str) -> Result<(), Box<dyn std::erro
         #[cfg(windows)]
         {
             let _ = pid;
-            return Err("pause is not supported on Windows".into());
+            return Err(crate::platform::unsupported_command(
+                "pause",
+                "host process suspension support",
+            ));
         }
     }
 
