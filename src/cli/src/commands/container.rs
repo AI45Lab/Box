@@ -24,6 +24,8 @@ pub enum ContainerCommand {
     /// Remove one or more boxes
     #[command(alias = "remove")]
     Rm(super::rm::RmArgs),
+    /// Remove all stopped boxes
+    Prune(super::container_prune::ContainerPruneArgs),
     /// Force-kill one or more running boxes
     Kill(super::kill::KillArgs),
     /// Pause one or more running boxes
@@ -64,6 +66,7 @@ pub async fn execute(args: ContainerArgs) -> Result<(), Box<dyn std::error::Erro
         ContainerCommand::Stop(a) => super::stop::execute(a).await,
         ContainerCommand::Restart(a) => super::restart::execute(a).await,
         ContainerCommand::Rm(a) => super::rm::execute(a).await,
+        ContainerCommand::Prune(a) => super::container_prune::execute(a).await,
         ContainerCommand::Kill(a) => super::kill::execute(a).await,
         ContainerCommand::Pause(a) => super::pause::execute(a).await,
         ContainerCommand::Unpause(a) => super::unpause::execute(a).await,

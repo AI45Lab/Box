@@ -8,6 +8,7 @@ mod commit;
 pub(crate) mod common;
 mod compose;
 mod container;
+mod container_prune;
 mod container_update;
 mod cp;
 mod create;
@@ -433,6 +434,20 @@ mod tests {
         };
 
         assert_eq!(args.r#box, "web");
+    }
+
+    #[test]
+    fn test_parse_container_prune_namespace() {
+        let cli = Cli::try_parse_from(["a3s-box", "container", "prune", "-f"]).unwrap();
+
+        let Command::Container(args) = cli.command else {
+            panic!("expected container command");
+        };
+        let container::ContainerCommand::Prune(args) = args.command else {
+            panic!("expected container prune command");
+        };
+
+        assert!(args.force);
     }
 
     #[test]

@@ -34,7 +34,7 @@ pub async fn execute(args: RmArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn rm_one(
+pub(crate) fn rm_one(
     state: &mut StateFile,
     query: &str,
     force: bool,
