@@ -459,6 +459,34 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_logs_tail_all() {
+        let cli = Cli::try_parse_from(["a3s-box", "logs", "--tail", "all", "web"]).unwrap();
+
+        let Command::Logs(args) = cli.command else {
+            panic!("expected logs command");
+        };
+
+        assert_eq!(args.r#box, "web");
+        assert_eq!(args.tail.as_deref(), Some("all"));
+    }
+
+    #[test]
+    fn test_parse_container_logs_tail_all() {
+        let cli =
+            Cli::try_parse_from(["a3s-box", "container", "logs", "--tail", "all", "web"]).unwrap();
+
+        let Command::Container(args) = cli.command else {
+            panic!("expected container command");
+        };
+        let container::ContainerCommand::Logs(args) = args.command else {
+            panic!("expected container logs command");
+        };
+
+        assert_eq!(args.r#box, "web");
+        assert_eq!(args.tail.as_deref(), Some("all"));
+    }
+
+    #[test]
     fn test_parse_container_list_alias() {
         let cli = Cli::try_parse_from(["a3s-box", "container", "list"]).unwrap();
 

@@ -19,9 +19,9 @@ pub struct LogsArgs {
     #[arg(short, long)]
     pub follow: bool,
 
-    /// Number of lines to show from the end
+    /// Number of lines to show from the end, or "all"
     #[arg(long)]
-    pub tail: Option<usize>,
+    pub tail: Option<String>,
 
     /// Show logs since timestamp (e.g., "2024-01-01T00:00:00Z", "1h", "30m")
     #[arg(long)]
@@ -65,10 +65,11 @@ pub async fn execute(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let since = args.since.as_deref().map(parse_time_filter).transpose()?;
     let until = args.until.as_deref().map(parse_time_filter).transpose()?;
+    let tail = args.tail.as_deref().map(parse_tail).transpose()?;
 
     let has_time_filter = since.is_some() || until.is_some();
 
-    if let Some(tail_n) = args.tail {
+    if let Some(TailMode::Lines(tail_n)) = tail {
         let file = std::fs::File::open(log_path)?;
         let reader = BufReader::new(file);
         let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
@@ -89,7 +90,7 @@ pub async fn execute(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> {
                 print_line(line, args.timestamps);
             }
         }
-    } else if !args.follow {
+    } else if tail == Some(TailMode::All) || !args.follow {
         let file = std::fs::File::open(log_path)?;
         let reader = BufReader::new(file);
         for line in reader.lines() {
@@ -115,9 +116,7 @@ pub async fn execute(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> {
         let file = std::fs::File::open(log_path)?;
         let mut reader = BufReader::new(file);
 
-        if args.tail.is_none() {
-            reader.seek(SeekFrom::End(0))?;
-        }
+        reader.seek(SeekFrom::End(0))?;
 
         loop {
             let mut line = String::new();
@@ -156,6 +155,23 @@ pub async fn execute(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TailMode {
+    All,
+    Lines(usize),
+}
+
+fn parse_tail(value: &str) -> Result<TailMode, String> {
+    if value == "all" {
+        return Ok(TailMode::All);
+    }
+
+    let lines = value.parse::<usize>().map_err(|_| {
+        format!("Invalid --tail value {value:?}: expected non-negative integer or 'all'")
+    })?;
+    Ok(TailMode::Lines(lines))
 }
 
 /// Print a structured JSON log line, extracting the message and optional timestamp.
@@ -311,6 +327,27 @@ fn extract_line_timestamp(line: &str) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_tail_all() {
+        assert_eq!(parse_tail("all").unwrap(), TailMode::All);
+    }
+
+    #[test]
+    fn test_parse_tail_lines() {
+        assert_eq!(parse_tail("25").unwrap(), TailMode::Lines(25));
+    }
+
+    #[test]
+    fn test_parse_tail_zero() {
+        assert_eq!(parse_tail("0").unwrap(), TailMode::Lines(0));
+    }
+
+    #[test]
+    fn test_parse_tail_invalid() {
+        assert!(parse_tail("latest").is_err());
+        assert!(parse_tail("-1").is_err());
+    }
 
     #[test]
     fn test_parse_duration_seconds() {
