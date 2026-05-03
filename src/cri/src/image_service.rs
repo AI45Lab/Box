@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use a3s_box_core::StoredImage;
+use base64::Engine;
 use tonic::{Request, Response, Status};
 
 use a3s_box_runtime::oci::{ImagePuller, ImageReference, ImageStore, OciImage, RegistryAuth};
@@ -18,17 +19,14 @@ use crate::persistent_store::PersistentCriStore;
 /// A3S Box implementation of the CRI ImageService.
 pub struct BoxImageService {
     image_store: Arc<ImageStore>,
-    image_puller: Arc<ImagePuller>,
     cri_store: Option<Arc<PersistentCriStore>>,
 }
 
 impl BoxImageService {
     /// Create a new BoxImageService.
-    pub fn new(image_store: Arc<ImageStore>, auth: RegistryAuth) -> Self {
-        let image_puller = Arc::new(ImagePuller::new(image_store.clone(), auth));
+    pub fn new(image_store: Arc<ImageStore>, _auth: RegistryAuth) -> Self {
         Self {
             image_store,
-            image_puller,
             cri_store: None,
         }
     }
@@ -196,15 +194,30 @@ impl ImageService for BoxImageService {
 
         tracing::info!(image = %image_spec.image, "CRI PullImage");
 
-        let _oci_image = self
-            .image_puller
-            .pull(&image_spec.image)
+        let config = a3s_box_core::A3sConfig::load_default().map_err(box_error_to_status)?;
+        let default_registry = config.registry.default_image_registry();
+        let reference =
+            ImageReference::parse_with_default_registry(&image_spec.image, &default_registry)
+                .map_err(box_error_to_status)?;
+        let auth = registry_auth_for_pull(req.auth.as_ref(), &reference.registry)?;
+        let mut puller = ImagePuller::new(self.image_store.clone(), auth)
+            .with_default_registry(&default_registry);
+
+        if let Some(platform) = image_platform_annotation(&image_spec.annotations) {
+            puller = puller
+                .with_platform(platform)
+                .map_err(box_error_to_status)?;
+        }
+
+        let full_reference = reference.full_reference();
+        let _oci_image = puller
+            .pull(&full_reference)
             .await
             .map_err(box_error_to_status)?;
 
         // Return the image reference as the image_ref
         Ok(Response::new(PullImageResponse {
-            image_ref: image_spec.image,
+            image_ref: full_reference,
         }))
     }
 
@@ -257,6 +270,57 @@ impl ImageService for BoxImageService {
             image_filesystems: vec![usage],
         }))
     }
+}
+
+fn registry_auth_for_pull(
+    auth: Option<&AuthConfig>,
+    registry: &str,
+) -> Result<RegistryAuth, Status> {
+    let Some(auth) = auth else {
+        return Ok(RegistryAuth::from_credential_store(registry));
+    };
+
+    if !auth.username.is_empty() || !auth.password.is_empty() {
+        if auth.username.is_empty() || auth.password.is_empty() {
+            return Err(Status::invalid_argument(
+                "CRI PullImage auth requires both username and password",
+            ));
+        }
+        return Ok(RegistryAuth::basic(&auth.username, &auth.password));
+    }
+
+    if !auth.auth.is_empty() {
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(auth.auth.trim())
+            .map_err(|e| Status::invalid_argument(format!("invalid CRI auth field: {e}")))?;
+        let decoded = String::from_utf8(decoded)
+            .map_err(|e| Status::invalid_argument(format!("invalid CRI auth UTF-8: {e}")))?;
+        let Some((username, password)) = decoded.split_once(':') else {
+            return Err(Status::invalid_argument(
+                "invalid CRI auth field: expected base64(username:password)",
+            ));
+        };
+        if username.is_empty() || password.is_empty() {
+            return Err(Status::invalid_argument(
+                "invalid CRI auth field: username and password are required",
+            ));
+        }
+        return Ok(RegistryAuth::basic(username, password));
+    }
+
+    Ok(RegistryAuth::from_credential_store(registry))
+}
+
+fn image_platform_annotation(annotations: &HashMap<String, String>) -> Option<&str> {
+    [
+        "io.kubernetes.cri.image-platform",
+        "io.kubernetes.cri.platform",
+        "io.cri-containerd.image-platform",
+        "a3s.io/platform",
+    ]
+    .iter()
+    .find_map(|key| annotations.get(*key).map(String::as_str))
+    .filter(|value| !value.trim().is_empty())
 }
 
 fn stored_image_matches(query: &str, stored: &StoredImage) -> bool {
@@ -889,6 +953,62 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
         assert!(svc.image_store.get("nginx:latest").await.is_some());
+    }
+
+    #[test]
+    fn test_registry_auth_for_pull_accepts_username_password() {
+        let auth = AuthConfig {
+            username: "alice".to_string(),
+            password: "secret".to_string(),
+            auth: String::new(),
+            server_address: "registry.example.com".to_string(),
+            identity_token: String::new(),
+            registry_token: String::new(),
+        };
+
+        assert!(registry_auth_for_pull(Some(&auth), "registry.example.com").is_ok());
+    }
+
+    #[test]
+    fn test_registry_auth_for_pull_accepts_encoded_auth() {
+        let auth = AuthConfig {
+            username: String::new(),
+            password: String::new(),
+            auth: "YWxpY2U6c2VjcmV0".to_string(),
+            server_address: "registry.example.com".to_string(),
+            identity_token: String::new(),
+            registry_token: String::new(),
+        };
+
+        assert!(registry_auth_for_pull(Some(&auth), "registry.example.com").is_ok());
+    }
+
+    #[test]
+    fn test_registry_auth_for_pull_rejects_partial_basic_auth() {
+        let auth = AuthConfig {
+            username: "alice".to_string(),
+            password: String::new(),
+            auth: String::new(),
+            server_address: "registry.example.com".to_string(),
+            identity_token: String::new(),
+            registry_token: String::new(),
+        };
+
+        let err = registry_auth_for_pull(Some(&auth), "registry.example.com").unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn test_image_platform_annotation_prefers_cri_key() {
+        let annotations = HashMap::from([
+            ("a3s.io/platform".to_string(), "linux/amd64".to_string()),
+            (
+                "io.kubernetes.cri.image-platform".to_string(),
+                "linux/arm64".to_string(),
+            ),
+        ]);
+
+        assert_eq!(image_platform_annotation(&annotations), Some("linux/arm64"));
     }
 
     // ── ImageFsInfo ──────────────────────────────────────────────────

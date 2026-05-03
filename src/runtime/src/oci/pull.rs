@@ -58,6 +58,13 @@ impl ImagePuller {
         self
     }
 
+    /// Select the target platform for multi-architecture image pulls.
+    pub fn with_platform(mut self, platform: &str) -> Result<Self> {
+        let platform = a3s_box_core::Platform::parse(platform).map_err(BoxError::ConfigError)?;
+        self.puller = self.puller.with_platform(platform);
+        Ok(self)
+    }
+
     /// Set a layer progress callback: `(current, total, digest, size_bytes)`.
     pub fn with_progress_fn(mut self, f: PullProgressFn) -> Self {
         self.puller = self.puller.with_progress_fn(f);
@@ -304,5 +311,23 @@ mod tests {
         let parsed = puller.parse_reference("nginx").unwrap();
         assert_eq!(parsed.registry, "docker.io");
         assert_eq!(parsed.repository, "library/nginx");
+    }
+
+    #[test]
+    fn test_with_platform_accepts_docker_platform_string() {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(ImageStore::new(tmp.path(), 10 * 1024 * 1024).unwrap());
+        let puller = ImagePuller::new(store, RegistryAuth::anonymous());
+
+        assert!(puller.with_platform("linux/arm64").is_ok());
+    }
+
+    #[test]
+    fn test_with_platform_rejects_invalid_platform_string() {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(ImageStore::new(tmp.path(), 10 * 1024 * 1024).unwrap());
+        let puller = ImagePuller::new(store, RegistryAuth::anonymous());
+
+        assert!(puller.with_platform("linux").is_err());
     }
 }

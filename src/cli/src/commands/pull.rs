@@ -44,6 +44,9 @@ pub async fn execute(args: PullArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut puller =
         a3s_box_runtime::ImagePuller::new(store, auth).with_default_registry(&default_registry);
+    if let Some(platform) = args.platform.as_deref() {
+        puller = puller.with_platform(platform)?;
+    }
 
     // Configure signature verification policy
     let policy = if let Some(ref key_path) = args.verify_key {

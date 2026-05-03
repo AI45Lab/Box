@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use a3s_box_core::error::{BoxError, Result};
+use a3s_box_core::Platform as A3sPlatform;
 use oci_distribution::client::{ClientConfig, ClientProtocol, Config, ImageLayer, PushResponse};
 use oci_distribution::manifest::{ImageIndexEntry, OciImageManifest};
 use oci_distribution::secrets::RegistryAuth as OciRegistryAuth;
@@ -369,12 +370,7 @@ impl RegistryPuller {
 
     /// Create a new registry puller with the given authentication.
     pub fn with_auth(auth: RegistryAuth) -> Self {
-        let config = ClientConfig {
-            protocol: registry_protocol_from_env(),
-            platform_resolver: Some(Box::new(linux_platform_resolver)),
-            ..Default::default()
-        };
-        let client = Client::new(config);
+        let client = registry_client(default_linux_platform());
 
         Self {
             client,
@@ -382,6 +378,12 @@ impl RegistryPuller {
             signature_policy: SignaturePolicy::default(),
             progress_fn: None,
         }
+    }
+
+    /// Select the target platform when resolving multi-architecture image indexes.
+    pub fn with_platform(mut self, platform: A3sPlatform) -> Self {
+        self.client = registry_client(platform);
+        self
     }
 
     /// Set the signature verification policy.
@@ -762,24 +764,43 @@ impl RegistryPusher {
     }
 }
 
-/// Platform resolver that always selects linux images matching the host architecture.
+fn registry_client(platform: A3sPlatform) -> Client {
+    let config = ClientConfig {
+        protocol: registry_protocol_from_env(),
+        platform_resolver: Some(Box::new(move |manifests| {
+            select_platform_digest(manifests, &platform)
+        })),
+        ..Default::default()
+    };
+    Client::new(config)
+}
+
+/// Platform resolver that selects linux images matching the host architecture.
 ///
 /// Container images run inside a Linux microVM regardless of the host OS,
 /// so we always look for `os: "linux"` with the host's CPU architecture.
-fn linux_platform_resolver(manifests: &[ImageIndexEntry]) -> Option<String> {
+fn default_linux_platform() -> A3sPlatform {
     let arch = match std::env::consts::ARCH {
         "x86_64" => "amd64",
         "aarch64" => "arm64",
         other => other,
     };
 
+    A3sPlatform::new("linux", arch)
+}
+
+fn select_platform_digest(manifests: &[ImageIndexEntry], platform: &A3sPlatform) -> Option<String> {
     manifests
         .iter()
         .find(|entry| {
-            entry
-                .platform
-                .as_ref()
-                .is_some_and(|p| p.os == "linux" && p.architecture == arch)
+            entry.platform.as_ref().is_some_and(|p| {
+                p.os == platform.os
+                    && p.architecture == platform.architecture
+                    && match platform.variant.as_ref() {
+                        Some(variant) => p.variant.as_ref() == Some(variant),
+                        None => true,
+                    }
+            })
         })
         .map(|entry| entry.digest.clone())
 }
@@ -787,6 +808,7 @@ fn linux_platform_resolver(manifests: &[ImageIndexEntry]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oci_distribution::manifest::Platform as OciPlatform;
     use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
 
@@ -900,6 +922,51 @@ mod tests {
             ClientProtocol::Https
         ));
         std::env::remove_var(REGISTRY_PROTOCOL_ENV);
+    }
+
+    fn index_entry(
+        digest: &str,
+        os: &str,
+        architecture: &str,
+        variant: Option<&str>,
+    ) -> ImageIndexEntry {
+        ImageIndexEntry {
+            media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+            digest: digest.to_string(),
+            size: 1,
+            platform: Some(OciPlatform {
+                architecture: architecture.to_string(),
+                os: os.to_string(),
+                os_version: None,
+                os_features: None,
+                variant: variant.map(ToOwned::to_owned),
+                features: None,
+            }),
+            annotations: None,
+        }
+    }
+
+    #[test]
+    fn test_select_platform_digest_matches_requested_architecture() {
+        let entries = vec![
+            index_entry("sha256:amd64", "linux", "amd64", None),
+            index_entry("sha256:arm64", "linux", "arm64", None),
+        ];
+
+        let digest = select_platform_digest(&entries, &A3sPlatform::linux_arm64());
+        assert_eq!(digest.as_deref(), Some("sha256:arm64"));
+    }
+
+    #[test]
+    fn test_select_platform_digest_matches_variant() {
+        let entries = vec![
+            index_entry("sha256:armv6", "linux", "arm", Some("v6")),
+            index_entry("sha256:armv7", "linux", "arm", Some("v7")),
+        ];
+
+        let digest =
+            select_platform_digest(&entries, &A3sPlatform::with_variant("linux", "arm", "v7"));
+        assert_eq!(digest.as_deref(), Some("sha256:armv7"));
     }
 
     #[test]
