@@ -250,6 +250,28 @@ impl VmHandler for ShimHandler {
     fn exit_code(&self) -> Option<i32> {
         self.exit_code
     }
+
+    fn try_wait_exit(&mut self) -> Result<Option<i32>> {
+        if self.exit_code.is_some() {
+            return Ok(self.exit_code);
+        }
+
+        let Some(process) = self.process.as_mut() else {
+            return Ok(None);
+        };
+
+        match process.try_wait() {
+            Ok(Some(status)) => {
+                self.exit_code = status.code();
+                Ok(self.exit_code)
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(a3s_box_core::error::BoxError::ExecError(format!(
+                "Failed to poll VM process {}: {}",
+                self.pid, e
+            ))),
+        }
+    }
 }
 
 #[cfg(test)]

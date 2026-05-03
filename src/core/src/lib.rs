@@ -22,6 +22,7 @@ pub mod tee;
 pub mod traits;
 pub mod vmm;
 pub mod volume;
+pub mod workload;
 
 // Re-export commonly used types
 pub use audit::{AuditAction, AuditConfig, AuditEvent, AuditOutcome};
@@ -32,9 +33,10 @@ pub use event::{BoxEvent, EventEmitter};
 pub use exec::{ExecChunk, ExecEvent, ExecExit, ExecMetrics, StreamType};
 pub use exec::{ExecOutput, ExecRequest};
 pub use exec::{FileOp, FileRequest, FileResponse};
+pub use exec::{EXEC_VSOCK_PORT, PORT_FWD_VSOCK_PORT};
 pub use network::{IsolationMode, NetworkConfig, NetworkEndpoint, NetworkMode, NetworkPolicy};
 pub use operator::{BoxAutoscaler, BoxAutoscalerSpec, BoxAutoscalerStatus, MetricType};
-pub use platform::Platform;
+pub use platform::{HostGuestChannel, Platform, PlatformCapabilities, VmBackend};
 pub use pty::PTY_VSOCK_PORT;
 pub use scale::{
     InstanceDeregistration, InstanceEvent, InstanceHealth, InstanceInfo, InstanceRegistration,
@@ -54,6 +56,9 @@ pub use vmm::{
     VmMetrics, VmmProvider, DEFAULT_SHUTDOWN_TIMEOUT_MS,
 };
 pub use volume::VolumeConfig;
+pub use workload::{
+    BoxRuntimeSpec, BoxWorkloadEnvelope, ExecutionLaunchMode, RuntimeClass, WorkloadKind,
+};
 
 /// A3S Box version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

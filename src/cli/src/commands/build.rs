@@ -1,6 +1,6 @@
-//! `a3s-box build` command — Build an image from a Dockerfile.
+//! `a3s-box build` command — Build an image from a Dockerfile or Containerfile.
 //!
-//! Parses a Dockerfile, pulls the base image, executes instructions,
+//! Parses a Dockerfile/Containerfile, pulls the base image, executes instructions,
 //! and produces an OCI image stored in the local image store.
 
 use std::collections::HashMap;
@@ -11,7 +11,7 @@ use clap::Args;
 
 #[derive(Args)]
 pub struct BuildArgs {
-    /// Build context directory (contains Dockerfile and source files)
+    /// Build context directory (contains Dockerfile/Containerfile and source files)
     #[arg(default_value = ".")]
     pub path: String,
 
@@ -19,7 +19,7 @@ pub struct BuildArgs {
     #[arg(short = 't', long = "tag")]
     pub tag: Option<String>,
 
-    /// Path to Dockerfile (default: <PATH>/Dockerfile)
+    /// Path to Dockerfile/Containerfile (default: <PATH>/Dockerfile, then <PATH>/Containerfile)
     #[arg(short = 'f', long = "file")]
     pub file: Option<String>,
 
@@ -49,22 +49,7 @@ pub async fn execute(args: BuildArgs) -> Result<(), Box<dyn std::error::Error>> 
         .into());
     }
 
-    // Resolve Dockerfile path
-    let dockerfile_path = match &args.file {
-        Some(f) => {
-            let p = PathBuf::from(f);
-            if p.is_absolute() {
-                p
-            } else {
-                context_dir.join(p)
-            }
-        }
-        None => context_dir.join("Dockerfile"),
-    };
-
-    if !dockerfile_path.exists() {
-        return Err(format!("Dockerfile not found at {}", dockerfile_path.display()).into());
-    }
+    let dockerfile_path = resolve_build_file(&context_dir, args.file.as_deref())?;
 
     // Parse build args
     let build_args = parse_build_args(&args.build_arg)?;
@@ -110,6 +95,39 @@ fn parse_build_args(args: &[String]) -> Result<HashMap<String, String>, String> 
     Ok(map)
 }
 
+fn resolve_build_file(
+    context_dir: &std::path::Path,
+    file: Option<&str>,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if let Some(file) = file {
+        let path = PathBuf::from(file);
+        let build_file = if path.is_absolute() {
+            path
+        } else {
+            context_dir.join(path)
+        };
+
+        if build_file.exists() {
+            return Ok(build_file);
+        }
+
+        return Err(format!("Build file not found at {}", build_file.display()).into());
+    }
+
+    for candidate in ["Dockerfile", "Containerfile"] {
+        let path = context_dir.join(candidate);
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+
+    Err(format!(
+        "Build file not found: expected Dockerfile or Containerfile in {}",
+        context_dir.display()
+    )
+    .into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,5 +160,42 @@ mod tests {
             result.get("URL"),
             Some(&"http://example.com?a=1".to_string())
         );
+    }
+
+    #[test]
+    fn test_resolve_build_file_prefers_dockerfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Dockerfile"), "FROM scratch\n").unwrap();
+        std::fs::write(tmp.path().join("Containerfile"), "FROM scratch\n").unwrap();
+
+        let path = resolve_build_file(tmp.path(), None).unwrap();
+        assert_eq!(path.file_name().unwrap(), "Dockerfile");
+    }
+
+    #[test]
+    fn test_resolve_build_file_falls_back_to_containerfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Containerfile"), "FROM scratch\n").unwrap();
+
+        let path = resolve_build_file(tmp.path(), None).unwrap();
+        assert_eq!(path.file_name().unwrap(), "Containerfile");
+    }
+
+    #[test]
+    fn test_resolve_build_file_explicit_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Customfile"), "FROM scratch\n").unwrap();
+
+        let path = resolve_build_file(tmp.path(), Some("Customfile")).unwrap();
+        assert_eq!(path.file_name().unwrap(), "Customfile");
+    }
+
+    #[test]
+    fn test_resolve_build_file_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = resolve_build_file(tmp.path(), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Dockerfile or Containerfile"));
     }
 }

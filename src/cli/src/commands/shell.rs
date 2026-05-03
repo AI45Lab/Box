@@ -5,7 +5,9 @@
 
 use clap::Args;
 
+#[cfg(not(windows))]
 use crate::resolve;
+#[cfg(not(windows))]
 use crate::state::StateFile;
 
 #[derive(Args)]
@@ -28,14 +30,17 @@ pub struct ShellArgs {
 
 #[cfg(windows)]
 pub async fn execute(_args: ShellArgs) -> Result<(), Box<dyn std::error::Error>> {
-    Err("'shell' requires Unix domain sockets and is not supported on Windows".into())
+    Err(crate::platform::unsupported_command(
+        "shell",
+        "interactive PTY support",
+    ))
 }
 
 #[cfg(not(windows))]
 pub async fn execute(args: ShellArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::terminal;
     use a3s_box_core::pty::PtyRequest;
     use a3s_box_runtime::PtyClient;
-    use crossterm::terminal;
 
     let state = StateFile::load_default()?;
     let record = resolve::resolve(&state, &args.r#box)?;
@@ -44,7 +49,7 @@ pub async fn execute(args: ShellArgs) -> Result<(), Box<dyn std::error::Error>> 
         return Err(format!("Box {} is not running", record.name).into());
     }
 
-    let pty_socket_path = record.box_dir.join("sockets").join("pty.sock");
+    let pty_socket_path = crate::socket_paths::pty(record);
     if !pty_socket_path.exists() {
         return Err(format!(
             "PTY socket not found for box {} at {} (guest may not support interactive mode)",
@@ -67,10 +72,11 @@ pub async fn execute(args: ShellArgs) -> Result<(), Box<dyn std::error::Error>> 
         })
         .await?;
 
-    terminal::enable_raw_mode()?;
     let (read_half, write_half) = client.into_split();
-    let exit_code = super::exec::run_pty_session(read_half, write_half).await;
-    terminal::disable_raw_mode()?;
+    let exit_code = {
+        let _raw_mode = terminal::raw_mode()?;
+        super::exec::run_pty_session(read_half, write_half).await
+    };
 
     if exit_code != 0 {
         std::process::exit(exit_code);

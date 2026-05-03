@@ -9,10 +9,13 @@ use a3s_box_core::exec::{ExecRequest, DEFAULT_EXEC_TIMEOUT_NS};
 #[cfg(not(windows))]
 use a3s_box_runtime::ExecClient;
 
+#[cfg(not(windows))]
 use crate::resolve;
+#[cfg(not(windows))]
 use crate::state::StateFile;
 
 /// Default ps arguments when none are specified.
+#[cfg(not(windows))]
 const DEFAULT_PS_ARGS: &[&str] = &["aux"];
 
 #[derive(Args)]
@@ -27,7 +30,10 @@ pub struct TopArgs {
 
 #[cfg(windows)]
 pub async fn execute(_args: TopArgs) -> Result<(), Box<dyn std::error::Error>> {
-    Err("'top' requires Unix domain sockets and is not supported on Windows".into())
+    Err(crate::platform::unsupported_command(
+        "top",
+        "guest exec channel support",
+    ))
 }
 
 #[cfg(not(windows))]
@@ -95,7 +101,7 @@ pub async fn execute(args: TopArgs) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Build the ps command from user-provided arguments or defaults.
-#[cfg(test)]
+#[cfg(all(test, not(windows)))]
 fn build_ps_command(ps_args: &[String]) -> Vec<String> {
     let mut cmd = vec!["ps".to_string()];
     if ps_args.is_empty() {
@@ -106,7 +112,7 @@ fn build_ps_command(ps_args: &[String]) -> Vec<String> {
     cmd
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(windows)))]
 mod tests {
     use super::*;
 

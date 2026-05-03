@@ -1,0 +1,44 @@
+[package]
+name = "a3s-box-sdk"
+version = "0.7.0"
+edition = "2021"
+authors = ["A3S Lab"]
+license = "MIT"
+repository = "https://github.com/A3S-Lab/a3s"
+description = "A3S Box SDK - MicroVM workload execution for Lambda"
+
+[dependencies]
+# Box runtime for VM management
+a3s-box-runtime = { path = "../runtime", features = ["vm", "pool"] }
+
+# Core types
+a3s-box-core = { path = "../core" }
+
+# Async runtime
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# UUID
+uuid = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# TEE/Attestation
+sha2 = { workspace = true }
+
+# HTTP client
+reqwest = { workspace = true }
+
+# HTML parsing for web extract
+scraper = "0.24"

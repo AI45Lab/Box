@@ -59,6 +59,15 @@ impl ImagePuller {
         let full_ref = parsed.full_reference();
 
         // Check cache first
+        if let Some(stored) = self.store.get(reference).await {
+            tracing::info!(
+                reference = %reference,
+                digest = %stored.digest,
+                "Using cached image by requested reference"
+            );
+            return OciImage::from_path(&stored.path);
+        }
+
         if let Some(stored) = self.store.get(&full_ref).await {
             tracing::info!(
                 reference = %full_ref,

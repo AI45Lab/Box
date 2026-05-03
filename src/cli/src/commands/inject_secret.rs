@@ -6,7 +6,9 @@
 
 use clap::Args;
 
+#[cfg(not(windows))]
 use crate::resolve;
+#[cfg(not(windows))]
 use crate::state::StateFile;
 
 #[cfg(not(windows))]
@@ -45,7 +47,10 @@ struct InjectOutput {
 
 #[cfg(windows)]
 pub async fn execute(_args: InjectSecretArgs) -> Result<(), Box<dyn std::error::Error>> {
-    Err("'inject-secret' requires Unix domain sockets and is not supported on Windows".into())
+    Err(crate::platform::unsupported_command(
+        "inject-secret",
+        "RA-TLS secret injection channel support",
+    ))
 }
 
 #[cfg(not(windows))]
@@ -57,8 +62,7 @@ pub async fn execute(args: InjectSecretArgs) -> Result<(), Box<dyn std::error::E
         return Err(format!("Box {} is not running", record.name).into());
     }
 
-    // Derive the attestation socket path from box_dir.
-    let attest_socket_path = record.box_dir.join("sockets").join("attest.sock");
+    let attest_socket_path = crate::socket_paths::attest(record);
     let socket_path = &attest_socket_path;
     if !socket_path.exists() {
         return Err(format!(

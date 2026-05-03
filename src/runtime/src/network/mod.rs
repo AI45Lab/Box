@@ -5,13 +5,13 @@
 //! - Linux: `PasstManager` (passt Unix stream socket)
 //! - macOS: `NetProxyManager` (pure-Rust vfkit server, no external binary)
 
-#[cfg(target_os = "macos")]
-mod netproxy;
+#[cfg(any(target_os = "linux", test))]
 mod passt;
 mod store;
 
 #[cfg(target_os = "macos")]
-pub use netproxy::{spawn_inherited_netproxy, NetProxyManager};
+pub use a3s_box_netproxy::NetProxyManager;
+#[cfg(any(target_os = "linux", test))]
 pub use passt::PasstManager;
 pub use store::NetworkStore;
 
@@ -21,4 +21,15 @@ pub trait NetworkBackend: Send + Sync {
     fn socket_path(&self) -> &std::path::Path;
     /// Stop the backend and clean up the socket.
     fn stop(&mut self);
+}
+
+#[cfg(target_os = "macos")]
+impl NetworkBackend for NetProxyManager {
+    fn socket_path(&self) -> &std::path::Path {
+        self.socket_path()
+    }
+
+    fn stop(&mut self) {
+        self.stop();
+    }
 }

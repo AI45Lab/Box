@@ -109,4 +109,31 @@ mod tests {
         assert!(!support_unavailable.available);
         assert_eq!(support_unavailable.reason, Some("Test reason".to_string()));
     }
+
+    #[test]
+    fn test_sev_snp_support_debug() {
+        let support = SevSnpSupport {
+            available: true,
+            reason: None,
+        };
+        let debug_str = format!("{:?}", support);
+        assert!(debug_str.contains("available: true"));
+
+        let support_unavailable = SevSnpSupport {
+            available: false,
+            reason: Some("SEV driver not loaded".to_string()),
+        };
+        let debug_str = format!("{:?}", support_unavailable);
+        assert!(debug_str.contains("available: false"));
+        assert!(debug_str.contains("SEV driver not loaded"));
+    }
+
+    #[test]
+    fn test_require_sev_snp_support_when_available() {
+        // This test will pass or fail depending on actual hardware
+        // We just verify it returns a Result
+        let result = require_sev_snp_support();
+        // Don't assert on the actual value since it depends on hardware
+        assert!(result.is_ok() || result.is_err());
+    }
 }

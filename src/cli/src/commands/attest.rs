@@ -7,7 +7,9 @@
 use clap::Args;
 use std::path::PathBuf;
 
+#[cfg(not(windows))]
 use crate::resolve;
+#[cfg(not(windows))]
 use crate::state::StateFile;
 
 #[cfg(not(windows))]
@@ -74,7 +76,10 @@ struct AttestOutput {
 
 #[cfg(windows)]
 pub async fn execute(_args: AttestArgs) -> Result<(), Box<dyn std::error::Error>> {
-    Err("'attest' requires Unix domain sockets and is not supported on Windows".into())
+    Err(crate::platform::unsupported_command(
+        "attest",
+        "TEE attestation channel support",
+    ))
 }
 
 #[cfg(not(windows))]
@@ -98,8 +103,7 @@ pub async fn execute(args: AttestArgs) -> Result<(), Box<dyn std::error::Error>>
         user_data: None,
     };
 
-    // Derive the attestation socket path from box_dir.
-    let attest_socket_path = record.box_dir.join("sockets").join("attest.sock");
+    let attest_socket_path = crate::socket_paths::attest(record);
     let socket_path = &attest_socket_path;
     if !socket_path.exists() {
         return Err(format!(
@@ -223,6 +227,7 @@ pub async fn execute(args: AttestArgs) -> Result<(), Box<dyn std::error::Error>>
 }
 
 /// Generate a random 64-byte nonce.
+#[cfg(any(not(windows), test))]
 fn generate_random_nonce() -> Vec<u8> {
     use rand::Rng;
     let mut rng = rand::thread_rng();
@@ -232,6 +237,7 @@ fn generate_random_nonce() -> Vec<u8> {
 }
 
 /// Decode a hex string to bytes.
+#[cfg(any(not(windows), test))]
 fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let hex = hex.trim().trim_start_matches("0x");
     if !hex.len().is_multiple_of(2) {
@@ -247,6 +253,7 @@ fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
 }
 
 /// Encode bytes as a hex string.
+#[cfg(any(not(windows), test))]
 fn bytes_to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }

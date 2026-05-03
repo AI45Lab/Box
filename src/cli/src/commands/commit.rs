@@ -131,6 +131,7 @@ fn build_oci_image(
         let file = std::fs::File::create(&layer_path)?;
         let encoder = GzEncoder::new(file, Compression::default());
         let mut builder = tar::Builder::new(encoder);
+        builder.follow_symlinks(false);
         builder
             .append_dir_all(".", rootfs_dir)
             .map_err(|e| format!("Failed to archive rootfs: {e}"))?;
@@ -227,6 +228,7 @@ fn compute_diff_id(rootfs_dir: &Path) -> Result<String, Box<dyn std::error::Erro
     let mut hasher = Sha256::new();
     let buf = Vec::new();
     let mut builder = tar::Builder::new(buf);
+    builder.follow_symlinks(false);
     builder.append_dir_all(".", rootfs_dir)?;
     builder.finish()?;
     let data = builder.into_inner()?;

@@ -204,7 +204,7 @@ jobs:
           mkdir -p "$DIR/lib"
 
           # Copy launcher
-          cp src/win-launcher/target/x86_64-pc-windows-msvc/release/a3s-box-win.exe "$DIR/"
+          cp src/target/x86_64-pc-windows-msvc/release/a3s-box-win.exe "$DIR/"
 
           # Copy krun.dll from prebuilt
           if [ -f "src/deps/libkrun-sys/prebuilt/x86_64-pc-windows-msvc/krun.dll" ]; then
@@ -303,7 +303,7 @@ jobs:
       - name: Download release tarballs and compute SHA256
         run: |
           TAG="${{ steps.version.outputs.tag }}"
-          BASE="https://github.com/A3S-Lab/Box/releases/download/${TAG}"
+          BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
 
           for target in linux-x86_64 linux-arm64 macos-arm64; do
             FILE="a3s-box-${TAG}-${target}.tar.gz"
@@ -324,27 +324,28 @@ jobs:
         run: |
           TAG="${{ steps.version.outputs.tag }}"
           VERSION="${{ steps.version.outputs.version }}"
+          REPO="${GITHUB_REPOSITORY}"
           cat > homebrew-tap/Formula/a3s-box.rb <<FORMULA
           class A3sBox < Formula
             desc "MicroVM sandbox runtime with TEE support"
-            homepage "https://github.com/A3S-Lab/Box"
+            homepage "https://github.com/${REPO}"
             version "${VERSION}"
             license "MIT"
 
             on_macos do
               on_arm do
-                url "https://github.com/A3S-Lab/Box/releases/download/${TAG}/a3s-box-${TAG}-macos-arm64.tar.gz"
+                url "https://github.com/${REPO}/releases/download/${TAG}/a3s-box-${TAG}-macos-arm64.tar.gz"
                 sha256 "${SHA_macos_arm64}"
               end
             end
 
             on_linux do
               on_arm do
-                url "https://github.com/A3S-Lab/Box/releases/download/${TAG}/a3s-box-${TAG}-linux-arm64.tar.gz"
+                url "https://github.com/${REPO}/releases/download/${TAG}/a3s-box-${TAG}-linux-arm64.tar.gz"
                 sha256 "${SHA_linux_arm64}"
               end
               on_intel do
-                url "https://github.com/A3S-Lab/Box/releases/download/${TAG}/a3s-box-${TAG}-linux-x86_64.tar.gz"
+                url "https://github.com/${REPO}/releases/download/${TAG}/a3s-box-${TAG}-linux-x86_64.tar.gz"
                 sha256 "${SHA_linux_x86_64}"
               end
             end

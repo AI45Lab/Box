@@ -21,10 +21,8 @@ pub(super) fn is_tar_archive(name: &str) -> bool {
 
 /// Extract a tar archive to a destination directory.
 pub(super) fn extract_tar_to_dst(archive_path: &Path, dst: &Path) -> Result<()> {
-    use bzip2::read::BzDecoder;
     use flate2::read::GzDecoder;
     use std::io::BufReader;
-    use xz2::read::XzDecoder;
 
     std::fs::create_dir_all(dst).map_err(|e| {
         BoxError::BuildError(format!(
@@ -55,25 +53,47 @@ pub(super) fn extract_tar_to_dst(archive_path: &Path, dst: &Path) -> Result<()> 
             ))
         })?;
     } else if name.ends_with(".tar.bz2") || name.ends_with(".tbz2") {
-        let decoder = BzDecoder::new(BufReader::new(file));
-        let mut archive = tar::Archive::new(decoder);
-        archive.unpack(dst).map_err(|e| {
-            BoxError::BuildError(format!(
-                "Failed to extract tar.bz2 {}: {}",
-                archive_path.display(),
-                e
-            ))
-        })?;
+        #[cfg(not(unix))]
+        return Err(BoxError::BuildError(format!(
+            "Unsupported archive format on Windows: {}",
+            archive_path.display()
+        )));
+
+        #[cfg(unix)]
+        {
+            use bzip2::read::BzDecoder;
+
+            let decoder = BzDecoder::new(BufReader::new(file));
+            let mut archive = tar::Archive::new(decoder);
+            archive.unpack(dst).map_err(|e| {
+                BoxError::BuildError(format!(
+                    "Failed to extract tar.bz2 {}: {}",
+                    archive_path.display(),
+                    e
+                ))
+            })?;
+        }
     } else if name.ends_with(".tar.xz") || name.ends_with(".txz") {
-        let decoder = XzDecoder::new(BufReader::new(file));
-        let mut archive = tar::Archive::new(decoder);
-        archive.unpack(dst).map_err(|e| {
-            BoxError::BuildError(format!(
-                "Failed to extract tar.xz {}: {}",
-                archive_path.display(),
-                e
-            ))
-        })?;
+        #[cfg(not(unix))]
+        return Err(BoxError::BuildError(format!(
+            "Unsupported archive format on Windows: {}",
+            archive_path.display()
+        )));
+
+        #[cfg(unix)]
+        {
+            use xz2::read::XzDecoder;
+
+            let decoder = XzDecoder::new(BufReader::new(file));
+            let mut archive = tar::Archive::new(decoder);
+            archive.unpack(dst).map_err(|e| {
+                BoxError::BuildError(format!(
+                    "Failed to extract tar.xz {}: {}",
+                    archive_path.display(),
+                    e
+                ))
+            })?;
+        }
     } else if name.ends_with(".tar") {
         let mut archive = tar::Archive::new(BufReader::new(file));
         archive.unpack(dst).map_err(|e| {
@@ -295,6 +315,7 @@ mod tests {
         assert!(dst.join("test.txt").exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_extract_tar_bz2() {
         use bzip2::write::BzEncoder;
@@ -330,6 +351,7 @@ mod tests {
         assert!(dst.join("test.txt").exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_extract_tar_xz() {
         use std::io::Write;

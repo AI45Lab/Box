@@ -35,9 +35,10 @@ pub async fn execute(args: AttachArgs) -> Result<(), Box<dyn std::error::Error>>
         #[cfg(not(windows))]
         return execute_pty_attach(record).await;
         #[cfg(windows)]
-        return Err(
-            "'attach -it' requires Unix domain sockets and is not supported on Windows".into(),
-        );
+        return Err(crate::platform::unsupported_command(
+            "attach -it",
+            "interactive PTY support",
+        ));
     }
 
     // Original behavior: tail console log
@@ -70,11 +71,11 @@ pub async fn execute(args: AttachArgs) -> Result<(), Box<dyn std::error::Error>>
 async fn execute_pty_attach(
     record: &crate::state::BoxRecord,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::terminal;
     use a3s_box_core::pty::PtyRequest;
     use a3s_box_runtime::PtyClient;
-    use crossterm::terminal;
 
-    let pty_socket_path = record.box_dir.join("sockets").join("pty.sock");
+    let pty_socket_path = crate::socket_paths::pty(record);
     if !pty_socket_path.exists() {
         return Err(format!(
             "PTY socket not found for box {} (guest may not support interactive mode)",
@@ -98,12 +99,11 @@ async fn execute_pty_attach(
     };
     client.send_request(&request).await?;
 
-    terminal::enable_raw_mode()?;
-
     let (read_half, write_half) = client.into_split();
-    let exit_code = super::exec::run_pty_session(read_half, write_half).await;
-
-    terminal::disable_raw_mode()?;
+    let exit_code = {
+        let _raw_mode = terminal::raw_mode()?;
+        super::exec::run_pty_session(read_half, write_half).await
+    };
 
     if exit_code != 0 {
         std::process::exit(exit_code);

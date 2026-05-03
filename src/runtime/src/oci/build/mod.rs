@@ -1,7 +1,7 @@
 //! OCI image build support.
 //!
-//! Provides Dockerfile parsing, layer creation, and a build engine
-//! that produces OCI images from Dockerfiles.
+//! Provides Dockerfile/Containerfile parsing, layer creation, and a build engine
+//! that produces OCI images from Dockerfile-compatible build files.
 //!
 //! # Usage
 //!

@@ -9,7 +9,7 @@
 //! - `scale` — Multi-node scale manager and instance registry (enabled by default)
 //! - `compose` — Multi-container compose orchestration (enabled by default)
 //! - `operator` — Kubernetes CRD autoscaler controller (enabled by default)
-//! - `build` — Dockerfile build engine (enabled by default)
+//! - `build` — Dockerfile/Containerfile build engine (enabled by default)
 
 #![allow(clippy::result_large_err)]
 
@@ -19,8 +19,6 @@ pub mod cache;
 pub mod fs;
 pub mod grpc;
 pub mod host_check;
-#[cfg(feature = "vm")]
-pub mod krun;
 pub mod log;
 pub mod network;
 pub mod oci;
@@ -28,6 +26,7 @@ pub mod prom;
 pub mod resize;
 pub mod rootfs;
 pub mod snapshot;
+#[cfg(unix)]
 pub mod tee;
 #[cfg(feature = "vm")]
 pub mod vm;
@@ -75,11 +74,14 @@ pub use prom::RuntimeMetrics;
 pub use snapshot::SnapshotStore;
 
 // TEE
+#[cfg(unix)]
 pub use tee::{seal, unseal};
+#[cfg(unix)]
 pub use tee::{
     verify_attestation, verify_attestation_with_time, AmdKdsClient, AttestationPolicy,
     MinTcbPolicy, PolicyResult, VerificationResult,
 };
+#[cfg(unix)]
 pub use tee::{AttestationReport, AttestationRequest, PlatformInfo};
 
 // VM
@@ -119,17 +121,7 @@ pub use scale::ScaleManager;
 /// A3S Box Runtime version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Default vsock port for exec server in the guest.
-pub const EXEC_VSOCK_PORT: u32 = 4089;
-
-/// Default vsock port for PTY server in the guest.
-pub const PTY_VSOCK_PORT: u32 = 4090;
-
-/// Default vsock port for TEE attestation server in the guest.
-pub const ATTEST_VSOCK_PORT: u32 = 4091;
-
-/// Default vsock port for port forwarding server in the guest.
-pub const PORT_FWD_VSOCK_PORT: u32 = 4093;
+pub use a3s_box_core::{ATTEST_VSOCK_PORT, EXEC_VSOCK_PORT, PORT_FWD_VSOCK_PORT, PTY_VSOCK_PORT};
 
 /// Default maximum image cache size: 10 GB.
 pub const DEFAULT_IMAGE_CACHE_SIZE: u64 = 10 * 1024 * 1024 * 1024;

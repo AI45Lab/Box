@@ -38,7 +38,7 @@ jobs:
           $VERSION = "${{ steps.version.outputs.version }}"
           $TAG = "${{ steps.version.outputs.tag }}"
           $ASSET = "a3s-box-$TAG-windows-x86_64.zip"
-          $URL = "https://github.com/A3S-Lab/Box/releases/download/$TAG/$ASSET"
+          $URL = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$TAG/$ASSET"
 
           Write-Host "Downloading: $URL"
           Invoke-WebRequest -Uri $URL -OutFile $ASSET
@@ -55,6 +55,7 @@ jobs:
           VERSION="${{ steps.version.outputs.version }}"
           TAG="${{ steps.version.outputs.tag }}"
           SHA256="${{ steps.download.outputs.sha256 }}"
+          REPO="${GITHUB_REPOSITORY}"
 
           # Update version in all manifest files
           sed -i "s/PackageVersion: .*/PackageVersion: $VERSION/" .winget/A3SLab.Box.yaml
@@ -62,7 +63,7 @@ jobs:
           sed -i "s/PackageVersion: .*/PackageVersion: $VERSION/" .winget/A3SLab.Box.locale.en-US.yaml
 
           # Update installer URL and SHA256
-          sed -i "s|InstallerUrl: .*|InstallerUrl: https://github.com/A3S-Lab/Box/releases/download/${TAG}/a3s-box-${TAG}-windows-x86_64.zip|" .winget/A3SLab.Box.installer.yaml
+          sed -i "s|InstallerUrl: .*|InstallerUrl: https://github.com/${REPO}/releases/download/${TAG}/a3s-box-${TAG}-windows-x86_64.zip|" .winget/A3SLab.Box.installer.yaml
           sed -i "s/InstallerSha256: .*/InstallerSha256: $SHA256/" .winget/A3SLab.Box.installer.yaml
 
           # Update nested installer path
@@ -101,4 +102,4 @@ jobs:
           echo "4. Create PR to microsoft/winget-pkgs"
           echo ""
           echo "Or use wingetcreate:"
-          echo "wingetcreate update A3SLab.Box -v $VERSION -u https://github.com/A3S-Lab/Box/releases/download/v$VERSION/a3s-box-v$VERSION-windows-x86_64.zip -t ${{ secrets.GITHUB_TOKEN }}"
+          echo "wingetcreate update A3SLab.Box -v $VERSION -u https://github.com/${GITHUB_REPOSITORY}/releases/download/v$VERSION/a3s-box-v$VERSION-windows-x86_64.zip -t ${{ secrets.GITHUB_TOKEN }}"

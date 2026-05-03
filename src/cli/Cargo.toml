@@ -17,7 +17,6 @@ path = "src/lib.rs"
 a3s-box-core = { path = "../core" }
 a3s-box-runtime = { path = "../runtime" }
 a3s-transport = { workspace = true }
-libkrun-sys = { version = "0.1.5", path = "../deps/libkrun-sys", package = "a3s-libkrun-sys" }
 
 # Async runtime
 tokio = { workspace = true }
@@ -55,9 +54,6 @@ rand = { workspace = true }
 
 # Base64 (for cp command)
 base64 = { workspace = true }
-
-# Terminal (for interactive PTY)
-crossterm = "0.28"
 
 # Archive support (for save/load commands)
 tar = "0.4"

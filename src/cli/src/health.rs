@@ -12,7 +12,9 @@
 
 use std::path::PathBuf;
 
-use crate::state::{HealthCheck, StateFile};
+use crate::state::HealthCheck;
+#[cfg(not(windows))]
+use crate::state::StateFile;
 
 /// Spawn a background health checker task for a running box.
 ///

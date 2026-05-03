@@ -50,7 +50,10 @@ fn unpause_one(state: &mut StateFile, query: &str) -> Result<(), Box<dyn std::er
         #[cfg(windows)]
         {
             let _ = pid;
-            return Err("unpause is not supported on Windows".into());
+            return Err(crate::platform::unsupported_command(
+                "unpause",
+                "host process resume support",
+            ));
         }
     }
 

@@ -616,22 +616,68 @@ fn mount_user_volumes() -> Result<(), Box<dyn std::error::Error>> {
                 let guest_path = parts[1];
                 let read_only = parts.get(2).map(|&m| m == "ro").unwrap_or(false);
 
-                info!(
-                    tag = tag,
-                    guest_path = guest_path,
-                    read_only = read_only,
-                    "Mounting user volume"
-                );
+                // Check if guest_path is a file (has an extension) or a directory
+                // virtio-fs can only mount directories, so if guest_path is a file,
+                // we need to mount at the parent directory instead
+                let mount_path: &str;
+                let file_name: Option<&str>;
 
-                // Ensure mount point exists
-                std::fs::create_dir_all(guest_path)?;
+                if guest_path
+                    .rsplit('/')
+                    .next()
+                    .map(|s| s.contains('.'))
+                    .unwrap_or(false)
+                {
+                    // guest_path looks like a file (has extension)
+                    // Extract parent directory and file name
+                    if let Some(last_slash) = guest_path.rfind('/') {
+                        mount_path = &guest_path[..last_slash];
+                        file_name = Some(&guest_path[last_slash + 1..]);
+                    } else {
+                        // No slash, just a filename - mount at current directory
+                        mount_path = ".";
+                        file_name = Some(guest_path);
+                    }
+                    info!(
+                        tag = tag,
+                        guest_path = guest_path,
+                        mount_path = mount_path,
+                        file_name = file_name.unwrap_or(""),
+                        read_only = read_only,
+                        "Mounting user volume (file mount detected, will mount parent directory)"
+                    );
+                } else {
+                    // guest_path is a directory
+                    mount_path = guest_path;
+                    file_name = None;
+                    info!(
+                        tag = tag,
+                        guest_path = guest_path,
+                        read_only = read_only,
+                        "Mounting user volume"
+                    );
+                }
+
+                // Ensure mount point exists (parent directory for file mounts)
+                std::fs::create_dir_all(mount_path)?;
 
                 let flags = if read_only {
                     MsFlags::MS_RDONLY
                 } else {
                     MsFlags::empty()
                 };
-                mount(Some(tag), guest_path, Some("virtiofs"), flags, None::<&str>)?;
+                mount(Some(tag), mount_path, Some("virtiofs"), flags, None::<&str>)?;
+
+                // For file mounts, verify the file exists in the mounted directory
+                if let Some(name) = file_name {
+                    let mounted_file = format!("{}/{}", mount_path, name);
+                    if !std::path::Path::new(&mounted_file).exists() {
+                        warn!(
+                            "Expected file {} after mount but it does not exist",
+                            mounted_file
+                        );
+                    }
+                }
 
                 index += 1;
             }
@@ -732,18 +778,19 @@ fn remount_rootfs_readonly() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Wait for all child processes and reap zombies.
+/// Wait for the main container process.
 ///
-/// Only exits when `container_pid` exits. Other child processes (e.g., from
-/// exec server) are reaped silently.
+/// Exec and PTY requests run in other guest-init threads and wait for their
+/// own child processes. The main supervision loop must not call waitpid(-1),
+/// otherwise it can reap those children before the request handler observes
+/// their exit status.
 fn wait_for_children(container_pid: nix::unistd::Pid) -> Result<(), Box<dyn std::error::Error>> {
     use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-    use nix::unistd::Pid;
 
     /// Maximum time to wait for children after forwarding SIGTERM (5 seconds).
     const CHILD_SHUTDOWN_TIMEOUT_MS: u64 = 5000;
 
-    info!("Waiting for child processes");
+    info!("Waiting for container process {}", container_pid);
 
     loop {
         // Check if shutdown was requested via SIGTERM
@@ -753,44 +800,23 @@ fn wait_for_children(container_pid: nix::unistd::Pid) -> Result<(), Box<dyn std:
             return Ok(());
         }
 
-        match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
+        match waitpid(container_pid, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::Exited(pid, status)) => {
-                if pid == container_pid {
-                    info!("Container process {} exited with status {}", pid, status);
-                    process::exit(status);
-                } else {
-                    info!(
-                        "Child process {} exited with status {} (reaped)",
-                        pid, status
-                    );
-                }
+                info!("Container process {} exited with status {}", pid, status);
+                process::exit(status);
             }
             Ok(WaitStatus::Signaled(pid, signal, _)) => {
-                if pid == container_pid {
-                    error!("Container process {} killed by signal {:?}", pid, signal);
-                    process::exit(128 + signal as i32);
-                } else if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
-                    info!(
-                        "Child process {} terminated by signal {:?} during shutdown",
-                        pid, signal
-                    );
-                } else {
-                    info!(
-                        "Child process {} killed by signal {:?} (reaped)",
-                        pid, signal
-                    );
-                }
+                error!("Container process {} killed by signal {:?}", pid, signal);
+                process::exit(128 + signal as i32);
             }
             Ok(WaitStatus::StillAlive) => {
-                // No children to reap, sleep briefly
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
             Ok(_) => {
                 // Other status, continue waiting
             }
             Err(nix::errno::Errno::ECHILD) => {
-                // No more children
-                info!("No more child processes");
+                info!("Container process {} is no longer a child", container_pid);
                 break;
             }
             Err(e) => {

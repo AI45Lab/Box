@@ -138,7 +138,7 @@ pub enum Command {
     Compose(compose::ComposeArgs),
     /// Manage VM snapshots (create, restore, list, remove)
     Snapshot(snapshot::SnapshotArgs),
-    /// Build an image from a Dockerfile
+    /// Build an image from a Dockerfile or Containerfile
     Build(build::BuildArgs),
     /// List cached images
     Images(images::ImagesArgs),

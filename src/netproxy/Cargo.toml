@@ -1,0 +1,29 @@
+[package]
+name = "a3s-box-netproxy"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "macOS userspace network proxy for A3S Box libkrun VMs"
+
+[lib]
+name = "a3s_box_netproxy"
+path = "src/lib.rs"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+a3s-box-core = { path = "../core" }
+libc = { workspace = true }
+tracing = { workspace = true }
+smoltcp = { version = "0.11", default-features = false, features = [
+    "medium-ethernet",
+    "proto-ipv4",
+    "socket-tcp",
+    "socket-udp",
+    "log",
+    "std",
+    "alloc",
+] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

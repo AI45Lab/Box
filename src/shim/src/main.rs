@@ -12,19 +12,19 @@
 // Allow large error types - this is a binary, not a library
 #![allow(clippy::result_large_err)]
 
+mod krun;
+
 use a3s_box_core::error::{BoxError, Result};
-use a3s_box_runtime::krun::KrunContext;
-#[cfg(target_os = "macos")]
-use a3s_box_runtime::network::spawn_inherited_netproxy;
-use a3s_box_runtime::vmm::InstanceSpec;
-#[cfg(not(target_os = "windows"))]
-use a3s_box_runtime::ATTEST_VSOCK_PORT;
-use a3s_box_runtime::EXEC_VSOCK_PORT;
+use a3s_box_core::vmm::InstanceSpec;
+use a3s_box_core::EXEC_VSOCK_PORT;
 #[cfg(target_os = "windows")]
-use a3s_box_runtime::PORT_FWD_VSOCK_PORT;
+use a3s_box_core::PORT_FWD_VSOCK_PORT;
 #[cfg(not(target_os = "windows"))]
-use a3s_box_runtime::PTY_VSOCK_PORT;
+use a3s_box_core::{ATTEST_VSOCK_PORT, PTY_VSOCK_PORT};
+#[cfg(target_os = "macos")]
+use a3s_box_netproxy::spawn_inherited_netproxy;
 use clap::Parser;
+use krun::KrunContext;
 #[cfg(target_os = "windows")]
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
@@ -417,20 +417,47 @@ unsafe fn configure_and_start_vm(spec: &InstanceSpec) -> Result<()> {
     ctx.set_rlimits(&rlimits)?;
 
     // Add filesystem mounts via virtiofs
+    // For file mounts, we need to create a temporary directory and copy the file into it
+    // because virtio-fs only supports directory mounts.
     tracing::info!("Adding filesystem mounts via virtiofs:");
     for mount in &spec.fs_mounts {
-        let path_str = mount
-            .host_path
-            .to_str()
-            .ok_or_else(|| BoxError::BoxBootError {
-                message: format!("Invalid path: {}", mount.host_path.display()),
+        let host_path = &mount.host_path;
+
+        let mount_path: std::path::PathBuf = if host_path.is_file() {
+            // Create a temporary directory to hold the file
+            let temp_dir = std::env::temp_dir().join(format!("a3s-fs-mount-{}", spec.box_id));
+            let file_name = host_path.file_name().unwrap();
+            let temp_file_path = temp_dir.join(file_name);
+
+            std::fs::create_dir_all(&temp_dir).map_err(|e| BoxError::BoxBootError {
+                message: format!("Failed to create temp directory for file mount: {}", e),
                 hint: None,
             })?;
+            std::fs::copy(host_path, &temp_file_path).map_err(|e| BoxError::BoxBootError {
+                message: format!("Failed to copy file for mount: {}", e),
+                hint: None,
+            })?;
+
+            tracing::debug!(
+                tag = %mount.tag,
+                original = %host_path.display(),
+                temp = %temp_dir.display(),
+                "File mount converted to directory mount"
+            );
+            temp_dir
+        } else {
+            host_path.clone()
+        };
+
+        let path_str = mount_path.to_str().ok_or_else(|| BoxError::BoxBootError {
+            message: format!("Invalid path: {}", mount_path.display()),
+            hint: None,
+        })?;
 
         tracing::info!(
             "  {} → {} ({})",
             mount.tag,
-            mount.host_path.display(),
+            host_path.display(),
             if mount.read_only { "ro" } else { "rw" }
         );
         ctx.add_virtiofs(&mount.tag, path_str)?;

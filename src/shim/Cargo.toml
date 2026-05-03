@@ -12,7 +12,6 @@ path = "src/main.rs"
 
 [dependencies]
 a3s-box-core = { path = "../core" }
-a3s-box-runtime = { path = "../runtime" }
 libkrun-sys = { version = "0.1.5", path = "../deps/libkrun-sys", package = "a3s-libkrun-sys" }
 
 # CLI
@@ -26,7 +25,10 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
-# System
+[target.'cfg(target_os = "macos")'.dependencies]
+a3s-box-netproxy = { path = "../netproxy" }
+
+[target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]

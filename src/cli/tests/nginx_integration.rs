@@ -251,28 +251,20 @@ fn test_alpine_full_lifecycle() {
     std::thread::sleep(Duration::from_secs(2));
 
     // uname -a: verify we're in a Linux VM
-    let (stdout, _, success) = run_cmd_capture(&["exec", box_name, "--", "uname", "-a"]);
-    if success {
-        assert!(stdout.contains("Linux"), "Expected Linux kernel");
-        println!("    ✓ uname: {}", stdout.trim());
-    } else {
-        println!("    ⚠ exec not available, skipping");
-    }
+    let stdout = run_ok_capture(&["exec", box_name, "--", "uname", "-a"]);
+    assert!(stdout.contains("Linux"), "Expected Linux kernel");
+    println!("    ✓ uname: {}", stdout.trim());
 
     // cat /etc/os-release: verify Alpine
-    let (stdout, _, success) = run_cmd_capture(&["exec", box_name, "--", "cat", "/etc/os-release"]);
-    if success {
-        assert!(stdout.contains("Alpine"), "Expected Alpine Linux");
-        println!("    ✓ OS: Alpine Linux");
-    }
+    let stdout = run_ok_capture(&["exec", box_name, "--", "cat", "/etc/os-release"]);
+    assert!(stdout.contains("Alpine"), "Expected Alpine Linux");
+    println!("    ✓ OS: Alpine Linux");
 
     // ls /: verify filesystem structure
-    let (stdout, _, success) = run_cmd_capture(&["exec", box_name, "--", "ls", "/"]);
-    if success {
-        assert!(stdout.contains("bin"), "Expected /bin in rootfs");
-        assert!(stdout.contains("etc"), "Expected /etc in rootfs");
-        println!("    ✓ Filesystem looks correct");
-    }
+    let stdout = run_ok_capture(&["exec", box_name, "--", "ls", "/"]);
+    assert!(stdout.contains("bin"), "Expected /bin in rootfs");
+    assert!(stdout.contains("etc"), "Expected /etc in rootfs");
+    println!("    ✓ Filesystem looks correct");
 
     // ---- Step 6: Check logs ----
     println!("==> Step 6: Checking logs...");

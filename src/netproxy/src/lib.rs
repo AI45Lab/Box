@@ -1,3 +1,5 @@
+#![cfg(target_os = "macos")]
+
 //! Pure-Rust userspace network proxy for libkrun on macOS.
 //!
 //! Uses a Unix datagram `socketpair()` to connect libkrun's virtio-net backend
@@ -13,14 +15,13 @@
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
-use std::os::fd::{FromRawFd, RawFd};
+use std::os::fd::{FromRawFd, IntoRawFd, RawFd};
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use std::thread::JoinHandle;
 use std::time::Duration;
 
 use a3s_box_core::error::{BoxError, Result};
@@ -473,8 +474,6 @@ pub struct NetProxyManager {
     socket_path: PathBuf,
     net_socket_fd: Option<RawFd>,
     net_proxy_fd: Option<RawFd>,
-    shutdown: Option<Arc<AtomicBool>>,
-    worker: Option<JoinHandle<()>>,
 }
 
 impl NetProxyManager {
@@ -485,8 +484,6 @@ impl NetProxyManager {
             socket_path: box_dir.join("sockets").join("net.sock"),
             net_socket_fd: None,
             net_proxy_fd: None,
-            shutdown: None,
-            worker: None,
         }
     }
 
@@ -502,56 +499,25 @@ impl NetProxyManager {
         self.net_proxy_fd
     }
 
-    /// Spawn the proxy thread.
+    /// Create socketpair for NetProxy.
     ///
-    /// `port_map` entries have the Docker format `"host_port:guest_port"`
-    /// (e.g. `"8088:80"`). Guest IP is taken from `ip`.
+    /// Unlike the name suggests, this does NOT spawn a thread. Thread spawning
+    /// happens in `spawn_inherited_netproxy()` called from the shim.
     pub fn spawn(
         &mut self,
-        ip: Ipv4Addr,
-        gateway: Ipv4Addr,
-        prefix_len: u8,
-        dns_servers: &[Ipv4Addr],
-        port_map: &[String],
+        _ip: Ipv4Addr,
+        _gateway: Ipv4Addr,
+        _prefix_len: u8,
+        _dns_servers: &[Ipv4Addr],
+        _port_map: &[String],
     ) -> Result<()> {
         let (proxy_socket, krun_fd) = socketpair_unixgram()?;
-        let port_forwards = parse_port_forwards(port_map, ip)
-            .map_err(|e| BoxError::NetworkError(format!("invalid port_map: {}", e)))?;
-        proxy_socket.set_nonblocking(true).map_err(|e| {
-            BoxError::NetworkError(format!("failed to configure netproxy socket: {}", e))
-        })?;
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let dns_servers = dns_servers.to_vec();
-        let worker_shutdown = shutdown.clone();
-        let worker = std::thread::Builder::new()
-            .name("a3s-netproxy".to_string())
-            .spawn(move || {
-                tracing::info!(gateway = %gateway, guest_ip = %ip, "NetProxy thread started");
-                let mut engine = ProxyEngine::new(
-                    proxy_socket,
-                    gateway,
-                    prefix_len,
-                    dns_servers,
-                    port_forwards,
-                    worker_shutdown,
-                );
-                engine.run();
-                tracing::info!("NetProxy thread exiting");
-            })
-            .map_err(|e| {
-                BoxError::NetworkError(format!("failed to spawn netproxy thread: {}", e))
-            })?;
         self.net_socket_fd = Some(krun_fd);
-        self.net_proxy_fd = None;
-        self.shutdown = Some(shutdown);
-        self.worker = Some(worker);
+        self.net_proxy_fd = Some(proxy_socket.into_raw_fd());
         Ok(())
     }
 
     pub fn stop(&mut self) {
-        if let Some(shutdown) = self.shutdown.take() {
-            shutdown.store(true, Ordering::Relaxed);
-        }
         if let Some(fd) = self.net_socket_fd.take() {
             unsafe {
                 libc::close(fd);
@@ -562,24 +528,11 @@ impl NetProxyManager {
                 libc::close(fd);
             }
         }
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
         std::fs::remove_file(&self.socket_path).ok();
     }
 
     pub fn is_running(&mut self) -> bool {
         self.net_socket_fd.is_some() || self.net_proxy_fd.is_some()
-    }
-}
-
-impl super::NetworkBackend for NetProxyManager {
-    fn socket_path(&self) -> &Path {
-        &self.socket_path
-    }
-
-    fn stop(&mut self) {
-        self.stop();
     }
 }
 
@@ -699,6 +652,79 @@ mod tests {
         TcpListener::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port)).is_ok()
     }
 
+    fn ports_are_bindable(ports: &[u16]) -> bool {
+        ports.iter().copied().all(port_is_bindable)
+    }
+
+    #[test]
+    fn test_smoltcp_now_returns_reasonable_value() {
+        let now = smoltcp_now();
+        // Should return microseconds since epoch
+        assert!(now.micros() > 0);
+    }
+
+    #[test]
+    fn test_to_smoltcp_ipv4_conversion() {
+        let ip = Ipv4Addr::new(10, 88, 0, 1);
+        let smol_ip = to_smoltcp_ipv4(ip);
+        assert_eq!(smol_ip.as_bytes(), &[10, 88, 0, 1]);
+    }
+
+    #[test]
+    fn test_to_smoltcp_ipv4_loopback() {
+        let ip = Ipv4Addr::new(127, 0, 0, 1);
+        let smol_ip = to_smoltcp_ipv4(ip);
+        assert_eq!(smol_ip.as_bytes(), &[127, 0, 0, 1]);
+    }
+
+    #[test]
+    fn test_parse_port_forwards_empty_rules() {
+        let guest = Ipv4Addr::new(10, 89, 0, 2);
+        let fwds = parse_port_forwards(&[], guest).unwrap();
+        assert!(fwds.is_empty());
+    }
+
+    #[test]
+    fn test_parse_port_forwards_udp_suffix() {
+        let guest = Ipv4Addr::new(10, 89, 0, 2);
+        if !port_is_bindable(19990) {
+            eprintln!("skipping test: host port 19990 is not bindable");
+            return;
+        }
+        let rules = vec!["19990:80/udp".to_string()];
+        let fwds = parse_port_forwards(&rules, guest).unwrap();
+        assert_eq!(fwds.len(), 1);
+        assert_eq!(fwds[0].guest_port, 80);
+    }
+
+    #[test]
+    fn test_parse_port_forwards_multiple_rules() {
+        let guest = Ipv4Addr::new(10, 89, 0, 2);
+        if !ports_are_bindable(&[19991, 19992, 19993]) {
+            eprintln!("skipping test: one or more host ports are not bindable");
+            return;
+        }
+        let rules = vec![
+            "19991:80".to_string(),
+            "19992:443".to_string(),
+            "19993:8080".to_string(),
+        ];
+        let fwds = parse_port_forwards(&rules, guest).unwrap();
+        assert_eq!(fwds.len(), 3);
+        assert_eq!(fwds[0].guest_port, 80);
+        assert_eq!(fwds[1].guest_port, 443);
+        assert_eq!(fwds[2].guest_port, 8080);
+    }
+
+    #[test]
+    fn test_parse_port_forwards_empty_string() {
+        let guest = Ipv4Addr::new(10, 89, 0, 2);
+        // Empty entry should fail parsing
+        let rules = vec!["".to_string()];
+        let result = parse_port_forwards(&rules, guest);
+        assert!(result.is_err());
+    }
+
     #[test]
     fn test_netproxy_manager_new() {
         let dir = tempfile::tempdir().unwrap();
@@ -741,6 +767,10 @@ mod tests {
     #[test]
     fn test_parse_port_forwards_valid() {
         let guest = Ipv4Addr::new(10, 89, 0, 2);
+        if !ports_are_bindable(&[19988, 19443]) {
+            eprintln!("skipping test: one or more host ports are not bindable");
+            return;
+        }
         // Use a random high port to avoid conflicts
         let rules = vec!["19988:80".to_string(), "19443:443".to_string()];
         let fwds = parse_port_forwards(&rules, guest).unwrap();
@@ -752,6 +782,10 @@ mod tests {
     #[test]
     fn test_parse_port_forwards_with_protocol_suffix() {
         let guest = Ipv4Addr::new(10, 89, 0, 2);
+        if !port_is_bindable(19989) {
+            eprintln!("skipping test: host port 19989 is not bindable");
+            return;
+        }
         let rules = vec!["19989:80/tcp".to_string()];
         let fwds = parse_port_forwards(&rules, guest).unwrap();
         assert_eq!(fwds[0].guest_port, 80);
@@ -765,27 +799,7 @@ mod tests {
         assert!(parse_port_forwards(&["80:xyz".to_string()], guest).is_err());
     }
 
-    #[test]
-    fn test_netproxy_manager_spawn_binds_and_releases_host_ports() {
-        let dir = tempfile::tempdir().unwrap();
-        let probe = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let host_port = probe.local_addr().unwrap().port();
-        drop(probe);
-
-        let mut mgr = NetProxyManager::new(dir.path());
-        mgr.spawn(
-            Ipv4Addr::new(10, 89, 0, 2),
-            Ipv4Addr::new(10, 89, 0, 1),
-            24,
-            &[Ipv4Addr::new(8, 8, 8, 8)],
-            &[format!("{host_port}:80")],
-        )
-        .unwrap();
-
-        assert!(!port_is_bindable(host_port));
-
-        mgr.stop();
-
-        assert!(port_is_bindable(host_port));
-    }
+    // Note: test_netproxy_manager_spawn_binds_and_releases_host_ports was removed
+    // because spawn() no longer spawns a thread or binds ports. Port binding
+    // now happens in spawn_inherited_netproxy() called from the shim.
 }

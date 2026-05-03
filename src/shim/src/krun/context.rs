@@ -12,15 +12,18 @@ use super::check_status;
 use a3s_box_core::error::{BoxError, Result};
 #[cfg(target_os = "macos")]
 use libkrun_sys::krun_add_net_unixgram;
+#[cfg(not(target_os = "windows"))]
+use libkrun_sys::krun_add_vsock_port2;
+#[cfg(not(target_os = "windows"))]
+use libkrun_sys::krun_set_port_map;
 #[cfg(target_os = "windows")]
 use libkrun_sys::{krun_add_net_tcp, krun_add_vsock_port_windows, krun_set_kernel};
-#[cfg(not(target_os = "windows"))]
-use libkrun_sys::{krun_add_net_unixstream, krun_add_vsock_port2};
+#[cfg(target_os = "linux")]
+use libkrun_sys::{krun_add_net_unixstream, krun_split_irqchip};
 use libkrun_sys::{
     krun_add_virtiofs, krun_create_ctx, krun_free_ctx, krun_init_log, krun_set_console_output,
-    krun_set_env, krun_set_exec, krun_set_port_map, krun_set_rlimits, krun_set_root,
-    krun_set_vm_config, krun_set_workdir, krun_setgid, krun_setuid, krun_split_irqchip,
-    krun_start_enter,
+    krun_set_env, krun_set_exec, krun_set_rlimits, krun_set_root, krun_set_vm_config,
+    krun_set_workdir, krun_setgid, krun_setuid, krun_start_enter,
 };
 
 /// Thin wrapper that owns a libkrun context.
@@ -162,6 +165,10 @@ impl KrunContext {
     }
 
     /// Set environment variables for the VM.
+    ///
+    /// Kept as a wrapper for libkrun completeness, but normal boot flow passes
+    /// environment through `set_exec` so guest-init metadata is not overwritten.
+    #[allow(dead_code)]
     pub unsafe fn set_env(&self, env: &[(String, String)]) -> Result<()> {
         if env.is_empty() {
             let empty: [*const std::ffi::c_char; 1] = [ptr::null()];
@@ -279,6 +286,7 @@ impl KrunContext {
     ///
     /// # Arguments
     /// * `port_map` - Slice of "host_port:guest_port" strings (e.g., ["8080:80", "3000:3000"])
+    #[cfg(not(target_os = "windows"))]
     pub unsafe fn set_port_map(&self, port_map: &[String]) -> Result<()> {
         tracing::debug!(port_map = ?port_map, "Setting TSI port mappings");
         let entries: Vec<CString> = port_map
@@ -311,7 +319,7 @@ impl KrunContext {
     /// # Virtio-net features
     /// Uses the standard compat features: CSUM, GUEST_CSUM, GUEST_TSO4, GUEST_UFO,
     /// HOST_TSO4, HOST_UFO.
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
     pub unsafe fn add_net_unixstream(&self, socket_path: &str, mac: &[u8; 6]) -> Result<()> {
         tracing::debug!(socket_path, mac = ?mac, "Adding virtio-net via passt");
 
@@ -432,6 +440,7 @@ impl KrunContext {
     /// Enable split IRQ chip mode (required for TEE VMs).
     ///
     /// This must be called before starting a TEE-enabled VM.
+    #[cfg(target_os = "linux")]
     pub unsafe fn enable_split_irqchip(&self) -> Result<()> {
         tracing::debug!("Enabling split IRQ chip for TEE");
         let ret = krun_split_irqchip(self.ctx_id, true);
@@ -480,6 +489,7 @@ impl KrunContext {
     /// * `initramfs` - Optional path to initramfs image
     /// * `cmdline` - Optional kernel command line string
     #[cfg(target_os = "windows")]
+    #[allow(dead_code)]
     pub unsafe fn set_kernel(
         &self,
         kernel_path: &str,
@@ -527,6 +537,7 @@ impl KrunContext {
     /// * `mac` - MAC address as 6 bytes
     /// * `tcp_addr` - Optional `"host:port"` string for the TCP backend; `None` for disconnected
     #[cfg(target_os = "windows")]
+    #[allow(dead_code)]
     pub unsafe fn add_net_tcp(
         &self,
         iface_id: &str,

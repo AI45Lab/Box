@@ -366,12 +366,45 @@ fn copy_dir_recursive_io(src: &std::path::Path, dst: &std::path::Path) -> std::i
         let entry = entry?;
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
-        if src_path.is_dir() {
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            copy_symlink_io(&src_path, &dst_path)?;
+        } else if file_type.is_dir() {
             copy_dir_recursive_io(&src_path, &dst_path)?;
         } else {
             std::fs::copy(&src_path, &dst_path)?;
         }
     }
+    Ok(())
+}
+
+fn copy_symlink_io(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    let target = std::fs::read_link(src)?;
+
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&target, dst)?;
+    }
+
+    #[cfg(windows)]
+    {
+        let is_dir = src.metadata().map(|m| m.is_dir()).unwrap_or(false);
+        if is_dir {
+            std::os::windows::fs::symlink_dir(&target, dst)?;
+        } else {
+            std::os::windows::fs::symlink_file(&target, dst)?;
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = target;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "symlink copy is not supported on this platform",
+        ));
+    }
+
     Ok(())
 }
 

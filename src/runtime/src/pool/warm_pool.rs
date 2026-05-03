@@ -270,6 +270,14 @@ impl WarmPool {
         self.idle.lock().await.len()
     }
 
+    /// Signal the pool to shutdown. This signals the background task to stop
+    /// replenishing and sets the shutdown flag. VMs will continue to exist
+    /// until the pool is drained or dropped.
+    pub fn signal_shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
+        tracing::info!("Warm pool shutdown signaled");
+    }
+
     /// Gracefully drain all VMs and stop the pool.
     pub async fn drain(&mut self) -> Result<()> {
         // Signal shutdown to background task

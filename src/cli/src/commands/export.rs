@@ -28,6 +28,7 @@ pub async fn execute(args: ExportArgs) -> Result<(), Box<dyn std::error::Error>>
         .map_err(|e| format!("Failed to create {}: {e}", args.output))?;
 
     let mut builder = tar::Builder::new(file);
+    builder.follow_symlinks(false);
     builder
         .append_dir_all(".", &rootfs_dir)
         .map_err(|e| format!("Failed to archive filesystem: {e}"))?;

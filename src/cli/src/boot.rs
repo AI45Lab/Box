@@ -6,6 +6,7 @@
 use a3s_box_core::config::{BoxConfig, ResourceConfig};
 use a3s_box_core::event::EventEmitter;
 use a3s_box_runtime::{prom::RuntimeMetrics, VmManager};
+use std::path::PathBuf;
 
 use crate::state::BoxRecord;
 
@@ -13,6 +14,10 @@ use crate::state::BoxRecord;
 pub struct BootResult {
     /// PID of the shim process.
     pub pid: Option<u32>,
+    /// Host-side exec socket path selected by the runtime.
+    pub exec_socket_path: Option<PathBuf>,
+    /// Host-side PTY socket path selected by the runtime.
+    pub pty_socket_path: Option<PathBuf>,
 }
 
 /// Reconstruct a `BoxConfig` from a persisted `BoxRecord` and boot the VM.
@@ -27,7 +32,7 @@ pub async fn boot_from_record(
     let mut vm = VmManager::with_box_id(config, emitter, record.id.clone());
 
     // Activate Prometheus metrics collection
-    vm.set_metrics(RuntimeMetrics::new());
+    vm.set_metrics(RuntimeMetrics::try_new()?);
 
     vm.boot().await?;
 
@@ -47,17 +52,26 @@ pub async fn boot_from_record(
         record.log_config.clone(),
     );
 
+    let pid = vm.pid().await;
+    let exec_socket_path = vm.exec_socket_path().map(PathBuf::from);
+    let pty_socket_path = vm.pty_socket_path().map(PathBuf::from);
+
     // Spawn health checker if configured (self-terminates when box stops)
     if let Some(ref hc) = record.health_check {
         crate::health::spawn_health_checker(
             record.id.clone(),
-            record.exec_socket_path.clone(),
+            exec_socket_path
+                .clone()
+                .unwrap_or_else(|| record.exec_socket_path.clone()),
             hc.clone(),
         );
     }
 
-    let pid = vm.pid().await;
-    Ok(BootResult { pid })
+    Ok(BootResult {
+        pid,
+        exec_socket_path,
+        pty_socket_path,
+    })
 }
 
 /// Build a `BoxConfig` from a `BoxRecord`.

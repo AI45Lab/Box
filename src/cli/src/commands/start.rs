@@ -49,6 +49,9 @@ async fn start_one(state: &mut StateFile, query: &str) -> Result<(), Box<dyn std
     let record = resolve::resolve_mut(state, &box_id)?;
     record.status = "running".to_string();
     record.pid = result.pid;
+    if let Some(exec_socket_path) = result.exec_socket_path {
+        record.exec_socket_path = exec_socket_path;
+    }
     record.started_at = Some(chrono::Utc::now());
     record.stopped_by_user = false;
     record.restart_count = 0;

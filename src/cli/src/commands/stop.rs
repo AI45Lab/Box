@@ -57,6 +57,7 @@ async fn stop_one(
     let pid = record.pid;
     let auto_remove = record.auto_remove;
     let box_dir = record.box_dir.clone();
+    let exec_socket_path = record.exec_socket_path.clone();
     let network_name = record.network_name.clone();
     let volume_names = record.volume_names.clone();
 
@@ -86,9 +87,11 @@ async fn stop_one(
 
     if auto_remove {
         let _ = std::fs::remove_dir_all(&box_dir);
+        cleanup::cleanup_external_socket_dir(&box_dir, &exec_socket_path);
         state.remove(&box_id)?;
         println!("{name} (auto-removed)");
     } else {
+        cleanup::cleanup_external_socket_dir(&box_dir, &exec_socket_path);
         state.save()?;
         println!("{name}");
     }

@@ -14,7 +14,7 @@ impl VmManager {
     pub(crate) async fn prepare_layout(&self) -> Result<BoxLayout> {
         // Create box-specific directories
         let box_dir = self.home_dir.join("boxes").join(&self.box_id);
-        let socket_dir = box_dir.join("sockets");
+        let socket_dir = self.socket_dir();
         let logs_dir = box_dir.join("logs");
 
         std::fs::create_dir_all(&socket_dir).map_err(|e| BoxError::BoxBootError {
@@ -89,11 +89,10 @@ impl VmManager {
                 }
                 let rootfs_path = self.rootfs_provider.prepare(&box_dir, &cached_path)?;
 
-                #[cfg(target_os = "windows")]
                 if let Ok(guest_init_path) = Self::find_guest_init() {
                     tracing::info!(
                         guest_init = %guest_init_path.display(),
-                        "Refreshing guest init on cached Windows rootfs"
+                        "Refreshing guest init on cached rootfs"
                     );
                     OciRootfsBuilder::new(&rootfs_path)
                         .with_guest_init(guest_init_path)
@@ -150,6 +149,23 @@ impl VmManager {
             oci_config,
             tee_instance_config,
         })
+    }
+
+    pub(crate) fn socket_dir(&self) -> PathBuf {
+        #[cfg(unix)]
+        {
+            PathBuf::from("/tmp")
+                .join("a3s-box-sockets")
+                .join(&self.box_id)
+        }
+
+        #[cfg(not(unix))]
+        {
+            self.home_dir
+                .join("boxes")
+                .join(&self.box_id)
+                .join("sockets")
+        }
     }
 
     /// Try to get a cached rootfs and copy it to the target path.
@@ -259,6 +275,7 @@ impl VmManager {
     }
 
     /// Generate TEE configuration file if TEE is enabled.
+    #[cfg(unix)]
     pub(crate) fn generate_tee_config(&self, box_dir: &Path) -> Result<Option<TeeInstanceConfig>> {
         match &self.config.tee {
             TeeConfig::None => Ok(None),
@@ -328,6 +345,17 @@ impl VmManager {
                     workload_id
                 )))
             }
+        }
+    }
+
+    /// Generate TEE configuration file if TEE is enabled.
+    #[cfg(windows)]
+    pub(crate) fn generate_tee_config(&self, _box_dir: &Path) -> Result<Option<TeeInstanceConfig>> {
+        match &self.config.tee {
+            TeeConfig::None => Ok(None),
+            _ => Err(BoxError::TeeConfig(
+                "TEE configuration is not supported on Windows".to_string(),
+            )),
         }
     }
 
@@ -485,10 +513,12 @@ mod tests {
             event_emitter: emitter,
             provider: None,
             handler: Arc::new(RwLock::new(None)),
+            #[cfg(unix)]
             exec_client: None,
             net_manager: None,
             home_dir: home_dir.to_path_buf(),
             anonymous_volumes: Vec::new(),
+            #[cfg(unix)]
             tee: None,
             rootfs_provider: crate::rootfs::default_provider(),
             exec_socket_path: None,
@@ -622,6 +652,7 @@ mod tests {
         assert!(cache.entry_count().unwrap() <= 2);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_exec_command_rejects_created_state() {
         let tmp = TempDir::new().unwrap();
@@ -633,6 +664,7 @@ mod tests {
         assert!(err.to_string().contains("not yet booted"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_exec_command_rejects_stopped_state() {
         let tmp = TempDir::new().unwrap();
@@ -645,6 +677,7 @@ mod tests {
         assert!(err.to_string().contains("stopped"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_exec_command_no_client() {
         let tmp = TempDir::new().unwrap();

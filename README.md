@@ -41,7 +41,7 @@ A3S Box is application-agnostic. It doesn't know what's inside the VM — web se
 | Capability | Description |
 |-----------|-------------|
 | OCI Images | Pull, push, build, tag, inspect from any registry with local LRU cache |
-| Dockerfile Build | Multi-stage builds, all instructions, `ADD <url>` HTTP download, `ONBUILD` triggers |
+| Dockerfile/Containerfile Build | Multi-stage builds, all instructions, `ADD <url>` HTTP download, `ONBUILD` triggers |
 | Multi-Platform | `--platform linux/amd64,linux/arm64` with OCI Image Index |
 | Snapshot/Restore | Configuration-based VM snapshots |
 | Cross-Platform | macOS ARM64, Linux x86_64/ARM64, Windows x86_64 |
@@ -215,7 +215,7 @@ a3s-box pull [OPTIONS] IMAGE              # Pull from registry
   --verify-issuer URL  # Keyless issuer verification
 
 a3s-box push IMAGE [TAG]                  # Push to registry
-a3s-box build [OPTIONS] -t TAG PATH      # Dockerfile build
+a3s-box build [OPTIONS] -t TAG PATH      # Dockerfile/Containerfile build
   --platform LINUX/ARCH,...  # Multi-arch
 a3s-box images                           # List cached
 a3s-box rmi IMAGE [IMAGE...]              # Remove images
