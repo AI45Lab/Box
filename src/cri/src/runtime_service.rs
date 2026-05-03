@@ -367,6 +367,62 @@ fn disconnect_cri_network_endpoint_in_store(
     Ok(())
 }
 
+fn network_ready_condition(default_sandbox_network: Option<&str>) -> RuntimeCondition {
+    let Some(network_name) = default_sandbox_network
+        .map(str::trim)
+        .filter(|network| !network.is_empty())
+    else {
+        return runtime_condition("NetworkReady", true, "", "");
+    };
+
+    match NetworkStore::default_path() {
+        Ok(store) => network_ready_condition_in_store(Some(network_name), &store),
+        Err(error) => runtime_condition(
+            "NetworkReady",
+            false,
+            "SandboxNetworkStoreError",
+            &format!("Failed to open A3S network store: {error}"),
+        ),
+    }
+}
+
+fn network_ready_condition_in_store(
+    default_sandbox_network: Option<&str>,
+    store: &NetworkStore,
+) -> RuntimeCondition {
+    let Some(network_name) = default_sandbox_network
+        .map(str::trim)
+        .filter(|network| !network.is_empty())
+    else {
+        return runtime_condition("NetworkReady", true, "", "");
+    };
+
+    match store.get(network_name) {
+        Ok(Some(_)) => runtime_condition("NetworkReady", true, "", ""),
+        Ok(None) => runtime_condition(
+            "NetworkReady",
+            false,
+            "SandboxNetworkNotFound",
+            &format!("Default sandbox network '{network_name}' was not found"),
+        ),
+        Err(error) => runtime_condition(
+            "NetworkReady",
+            false,
+            "SandboxNetworkStoreError",
+            &format!("Failed to read default sandbox network '{network_name}': {error}"),
+        ),
+    }
+}
+
+fn runtime_condition(r#type: &str, status: bool, reason: &str, message: &str) -> RuntimeCondition {
+    RuntimeCondition {
+        r#type: r#type.to_string(),
+        status,
+        reason: reason.to_string(),
+        message: message.to_string(),
+    }
+}
+
 #[tonic::async_trait]
 impl RuntimeService for BoxRuntimeService {
     // ── Version ──────────────────────────────────────────────────────
@@ -1059,18 +1115,8 @@ impl RuntimeService for BoxRuntimeService {
     ) -> Result<Response<StatusResponse>, Status> {
         let req = request.into_inner();
         let conditions = vec![
-            RuntimeCondition {
-                r#type: "RuntimeReady".to_string(),
-                status: true,
-                reason: String::new(),
-                message: String::new(),
-            },
-            RuntimeCondition {
-                r#type: "NetworkReady".to_string(),
-                status: true,
-                reason: String::new(),
-                message: String::new(),
-            },
+            runtime_condition("RuntimeReady", true, "", ""),
+            network_ready_condition(self.default_sandbox_network.as_deref()),
         ];
         let info = if req.verbose {
             self.runtime_status_info().await
@@ -1671,6 +1717,45 @@ mod tests {
             .iter()
             .any(|c| c.r#type == "NetworkReady" && c.status));
         assert!(resp.info.is_empty());
+    }
+
+    #[test]
+    fn test_network_ready_without_default_network() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = NetworkStore::new(dir.path().join("networks.json"));
+
+        let condition = network_ready_condition_in_store(None, &store);
+
+        assert_eq!(condition.r#type, "NetworkReady");
+        assert!(condition.status);
+        assert!(condition.reason.is_empty());
+    }
+
+    #[test]
+    fn test_network_ready_with_existing_default_network() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = NetworkStore::new(dir.path().join("networks.json"));
+        store
+            .create(a3s_box_core::NetworkConfig::new("k8s-pods", "10.88.0.0/24").unwrap())
+            .unwrap();
+
+        let condition = network_ready_condition_in_store(Some("k8s-pods"), &store);
+
+        assert!(condition.status);
+        assert!(condition.reason.is_empty());
+    }
+
+    #[test]
+    fn test_network_not_ready_when_default_network_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = NetworkStore::new(dir.path().join("networks.json"));
+
+        let condition = network_ready_condition_in_store(Some("missing-network"), &store);
+
+        assert_eq!(condition.r#type, "NetworkReady");
+        assert!(!condition.status);
+        assert_eq!(condition.reason, "SandboxNetworkNotFound");
+        assert!(condition.message.contains("missing-network"));
     }
 
     #[tokio::test]
