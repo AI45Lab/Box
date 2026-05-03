@@ -420,6 +420,45 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_ps_docker_compat_flags() {
+        let cli = Cli::try_parse_from(["a3s-box", "ps", "--no-trunc", "--latest"]).unwrap();
+
+        let Command::Ps(args) = cli.command else {
+            panic!("expected ps command");
+        };
+
+        assert!(args.no_trunc);
+        assert!(args.latest);
+    }
+
+    #[test]
+    fn test_parse_ps_last_flag() {
+        let cli = Cli::try_parse_from(["a3s-box", "ps", "-n", "2"]).unwrap();
+
+        let Command::Ps(args) = cli.command else {
+            panic!("expected ps command");
+        };
+
+        assert_eq!(args.last, Some(2));
+    }
+
+    #[test]
+    fn test_parse_container_ls_docker_compat_flags() {
+        let cli = Cli::try_parse_from(["a3s-box", "container", "ls", "--no-trunc", "--last", "3"])
+            .unwrap();
+
+        let Command::Container(args) = cli.command else {
+            panic!("expected container command");
+        };
+        let container::ContainerCommand::Ls(args) = args.command else {
+            panic!("expected container ls command");
+        };
+
+        assert!(args.no_trunc);
+        assert_eq!(args.last, Some(3));
+    }
+
+    #[test]
     fn test_parse_container_list_alias() {
         let cli = Cli::try_parse_from(["a3s-box", "container", "list"]).unwrap();
 
