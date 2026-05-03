@@ -64,7 +64,8 @@ pub use network::NetworkStore;
 // OCI images
 pub use a3s_box_core::StoredImage;
 pub use oci::{
-    CredentialStore, PushResult, RegistryLoginOptions, RegistryLoginVerifier, RegistryPusher,
+    CredentialStore, DockerConfigCredentialStore, PushResult, RegistryLoginOptions,
+    RegistryLoginVerifier, RegistryPusher,
 };
 pub use oci::{ImagePuller, ImageReference, ImageStore, RegistryAuth};
 pub use oci::{OciImage, SignResult, SignaturePolicy};

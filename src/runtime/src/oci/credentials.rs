@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use a3s_box_core::error::{BoxError, Result};
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 /// Per-registry credential entry.
@@ -20,6 +21,19 @@ struct CredentialEntry {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct CredentialFile {
     registries: HashMap<String, CredentialEntry>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct DockerConfigFile {
+    #[serde(default)]
+    auths: HashMap<String, DockerAuthEntry>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct DockerAuthEntry {
+    auth: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
 }
 
 /// Persistent credential store for container registries.
@@ -138,6 +152,95 @@ impl CredentialStore {
             ))
         })?;
         Ok(())
+    }
+}
+
+/// Read-only Docker CLI credential fallback.
+///
+/// Supports inline `auth` entries and `username`/`password` entries from
+/// `$DOCKER_CONFIG/config.json` or `~/.docker/config.json`. External credential
+/// helpers are intentionally not invoked.
+pub struct DockerConfigCredentialStore {
+    path: PathBuf,
+}
+
+impl DockerConfigCredentialStore {
+    /// Create a Docker config credential reader at the default path.
+    pub fn default_path() -> Result<Self> {
+        let path = match std::env::var("DOCKER_CONFIG") {
+            Ok(dir) => PathBuf::from(dir).join("config.json"),
+            Err(_) => dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".docker")
+                .join("config.json"),
+        };
+        Ok(Self { path })
+    }
+
+    /// Create a Docker config credential reader at a custom path.
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    /// Get Docker CLI credentials for a registry.
+    pub fn get(&self, registry: &str) -> Result<Option<(String, String)>> {
+        let file = self.load()?;
+        let registry = a3s_box_core::normalize_registry_server(registry);
+
+        for (key, entry) in file.auths {
+            if a3s_box_core::normalize_registry_server(&key) == registry {
+                return decode_docker_auth(entry);
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn load(&self) -> Result<DockerConfigFile> {
+        if !self.path.exists() {
+            return Ok(DockerConfigFile::default());
+        }
+
+        let data = std::fs::read_to_string(&self.path).map_err(|e| {
+            BoxError::ConfigError(format!(
+                "Failed to read Docker config {}: {}",
+                self.path.display(),
+                e
+            ))
+        })?;
+        serde_json::from_str(&data).map_err(|e| {
+            BoxError::ConfigError(format!(
+                "Failed to parse Docker config {}: {}",
+                self.path.display(),
+                e
+            ))
+        })
+    }
+}
+
+fn decode_docker_auth(entry: DockerAuthEntry) -> Result<Option<(String, String)>> {
+    if let (Some(username), Some(password)) = (entry.username, entry.password) {
+        if !username.is_empty() && !password.is_empty() {
+            return Ok(Some((username, password)));
+        }
+    }
+
+    let Some(auth) = entry.auth else {
+        return Ok(None);
+    };
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(auth.trim())
+        .map_err(|e| BoxError::ConfigError(format!("Failed to decode Docker auth entry: {e}")))?;
+    let decoded = String::from_utf8(decoded).map_err(|e| {
+        BoxError::ConfigError(format!("Failed to decode Docker auth entry as UTF-8: {e}"))
+    })?;
+    let Some((username, password)) = decoded.split_once(':') else {
+        return Ok(None);
+    };
+    if username.is_empty() || password.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some((username.to_string(), password.to_string())))
     }
 }
 
@@ -282,5 +385,51 @@ mod tests {
             store.get("ecr.aws").unwrap(),
             Some(("u3".to_string(), "p3".to_string()))
         );
+    }
+
+    #[test]
+    fn test_docker_config_auth_entry() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "auths": {
+                    "https://index.docker.io/v1/": {
+                        "auth": "ZG9ja2VyLXVzZXI6ZG9ja2VyLXBhc3M="
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let store = DockerConfigCredentialStore::new(path);
+        let creds = store.get("docker.io").unwrap();
+        assert_eq!(
+            creds,
+            Some(("docker-user".to_string(), "docker-pass".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_docker_config_username_password_entry() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "auths": {
+                    "registry.example.com": {
+                        "username": "alice",
+                        "password": "secret"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let store = DockerConfigCredentialStore::new(path);
+        let creds = store.get("registry.example.com").unwrap();
+        assert_eq!(creds, Some(("alice".to_string(), "secret".to_string())));
     }
 }

@@ -15,7 +15,7 @@ use oci_distribution::secrets::RegistryAuth as OciRegistryAuth;
 use oci_distribution::{Client, Reference};
 use reqwest::StatusCode;
 
-use super::credentials::CredentialStore;
+use super::credentials::{CredentialStore, DockerConfigCredentialStore};
 use super::reference::ImageReference;
 use super::signing::{verify_image_signature, SignaturePolicy, VerifyResult};
 
@@ -294,14 +294,46 @@ impl RegistryAuth {
     /// Create authentication from the credential store, falling back to env vars,
     /// then anonymous.
     pub fn from_credential_store(registry: &str) -> Self {
-        // Try credential store first
         if let Ok(store) = CredentialStore::default_path() {
-            if let Ok(Some((username, password))) = store.get(registry) {
-                return Self::basic(username, password);
+            let docker_store = DockerConfigCredentialStore::default_path().ok();
+            if let Some(auth) =
+                Self::from_credential_sources(registry, Some(&store), docker_store.as_ref())
+            {
+                return auth;
             }
         }
+
+        if let Ok(docker_store) = DockerConfigCredentialStore::default_path() {
+            if let Some(auth) = Self::from_credential_sources(registry, None, Some(&docker_store)) {
+                return auth;
+            }
+        }
+
         // Fall back to env vars, then anonymous
         Self::from_env()
+    }
+
+    fn from_credential_sources(
+        registry: &str,
+        store: Option<&CredentialStore>,
+        docker_store: Option<&DockerConfigCredentialStore>,
+    ) -> Option<Self> {
+        // Try the native a3s credential store first.
+        if let Some(store) = store {
+            if let Ok(Some((username, password))) = store.get(registry) {
+                return Some(Self::basic(username, password));
+            }
+        }
+
+        // Then reuse Docker CLI credentials when available. This covers users
+        // who already ran `docker login` for Docker Hub or a private registry.
+        if let Some(store) = docker_store {
+            if let Ok(Some((username, password))) = store.get(registry) {
+                return Some(Self::basic(username, password));
+            }
+        }
+
+        None
     }
 
     /// Convert to oci-distribution auth type.
@@ -756,6 +788,7 @@ fn linux_platform_resolver(manifests: &[ImageIndexEntry]) -> Option<String> {
 mod tests {
     use super::*;
     use std::sync::{Mutex, OnceLock};
+    use tempfile::TempDir;
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -774,6 +807,34 @@ mod tests {
         let auth = RegistryAuth::basic("user", "pass");
         assert_eq!(auth.username, Some("user".to_string()));
         assert_eq!(auth.password, Some("pass".to_string()));
+    }
+
+    #[test]
+    fn test_registry_auth_uses_docker_config_fallback() {
+        let docker_config = TempDir::new().unwrap();
+
+        std::fs::write(
+            docker_config.path().join("config.json"),
+            r#"{
+                "auths": {
+                    "registry.example.com": {
+                        "auth": "YWxpY2U6c2VjcmV0"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let docker_store =
+            DockerConfigCredentialStore::new(docker_config.path().join("config.json"));
+        let auth = RegistryAuth::from_credential_sources(
+            "registry.example.com",
+            None,
+            Some(&docker_store),
+        )
+        .unwrap();
+        assert_eq!(auth.username.as_deref(), Some("alice"));
+        assert_eq!(auth.password.as_deref(), Some("secret"));
     }
 
     #[test]
