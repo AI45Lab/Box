@@ -164,4 +164,40 @@ impl StateFile {
             .filter(|r| r.labels.get(key).is_some_and(|v| v == value))
             .collect()
     }
+
+    /// Mark a box as stopped and persist.
+    pub fn mark_stopped(&mut self, id: &str, exit_code: Option<i32>) {
+        if let Some(record) = self.find_by_id_mut(id) {
+            record.status = "stopped".to_string();
+            record.pid = None;
+            record.exit_code = exit_code;
+            let _ = self.save();
+        }
+    }
+
+    /// Increment restart count for a box and persist.
+    pub fn increment_restart_count(&mut self, id: &str) {
+        if let Some(record) = self.find_by_id_mut(id) {
+            record.restart_count += 1;
+            let _ = self.save();
+        }
+    }
+
+    /// Mark a box as started with a new PID and persist.
+    pub fn mark_started(&mut self, id: &str, pid: u32) {
+        if let Some(record) = self.find_by_id_mut(id) {
+            record.status = "running".to_string();
+            record.pid = Some(pid);
+            record.started_at = Some(chrono::Utc::now());
+            let _ = self.save();
+        }
+    }
+
+    /// Mark a box as stopped by user (for "unless-stopped" policy).
+    pub fn mark_stopped_by_user(&mut self, id: &str) {
+        if let Some(record) = self.find_by_id_mut(id) {
+            record.stopped_by_user = true;
+            let _ = self.save();
+        }
+    }
 }
