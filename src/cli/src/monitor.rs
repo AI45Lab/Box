@@ -328,65 +328,17 @@ async fn restart_container(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::fixtures::make_record;
+
+    fn create_test_record(restart_policy: &str) -> BoxRecord {
+        let mut record = make_record("test-id", "test-box", "running", Some(1234));
+        record.restart_policy = restart_policy.to_string();
+        record
+    }
 
     #[test]
     fn test_should_monitor() {
-        let mut record = BoxRecord {
-            id: "test".to_string(),
-            short_id: "test".to_string(),
-            name: "test".to_string(),
-            image: "alpine".to_string(),
-            status: "running".to_string(),
-            pid: Some(1234),
-            cpus: 1,
-            memory_mb: 512,
-            volumes: vec![],
-            env: Default::default(),
-            cmd: vec![],
-            entrypoint: None,
-            box_dir: PathBuf::new(),
-            exec_socket_path: PathBuf::new(),
-            console_log: PathBuf::new(),
-            created_at: Utc::now(),
-            started_at: Some(Utc::now()),
-            auto_remove: false,
-            hostname: None,
-            user: None,
-            workdir: None,
-            restart_policy: "no".to_string(),
-            port_map: vec![],
-            labels: Default::default(),
-            stopped_by_user: false,
-            restart_count: 0,
-            max_restart_count: 0,
-            exit_code: None,
-            health_check: None,
-            health_status: "none".to_string(),
-            health_retries: 0,
-            health_last_check: None,
-            network_mode: a3s_box_core::NetworkMode::Tsi,
-            network_name: None,
-            volume_names: vec![],
-            tmpfs: vec![],
-            anonymous_volumes: vec![],
-            resource_limits: Default::default(),
-            log_config: Default::default(),
-            add_host: vec![],
-            platform: None,
-            init: false,
-            read_only: false,
-            cap_add: vec![],
-            cap_drop: vec![],
-            security_opt: vec![],
-            privileged: false,
-            devices: vec![],
-            gpus: None,
-            shm_size: None,
-            stop_signal: None,
-            stop_timeout: None,
-            oom_kill_disable: false,
-            oom_score_adj: None,
-        };
+        let mut record = create_test_record("no");
 
         // Should not monitor with "no" policy
         assert!(!should_monitor(&record));
@@ -402,28 +354,14 @@ mod tests {
 
     #[test]
     fn test_should_restart_always() {
-        let record = BoxRecord {
-            restart_policy: "always".to_string(),
-            stopped_by_user: false,
-            exit_code: Some(0),
-            max_restart_count: 0,
-            ..Default::default()
-        };
-
+        let record = create_test_record("always");
         assert!(should_restart(&record, 0));
         assert!(should_restart(&record, 10));
     }
 
     #[test]
     fn test_should_restart_unless_stopped() {
-        let mut record = BoxRecord {
-            restart_policy: "unless-stopped".to_string(),
-            stopped_by_user: false,
-            exit_code: Some(0),
-            max_restart_count: 0,
-            ..Default::default()
-        };
-
+        let mut record = create_test_record("unless-stopped");
         assert!(should_restart(&record, 0));
 
         record.stopped_by_user = true;
@@ -432,13 +370,8 @@ mod tests {
 
     #[test]
     fn test_should_restart_on_failure() {
-        let mut record = BoxRecord {
-            restart_policy: "on-failure".to_string(),
-            stopped_by_user: false,
-            exit_code: Some(1),
-            max_restart_count: 0,
-            ..Default::default()
-        };
+        let mut record = create_test_record("on-failure");
+        record.exit_code = Some(1);
 
         // Should restart on non-zero exit code
         assert!(should_restart(&record, 0));
@@ -453,5 +386,6 @@ mod tests {
         assert!(should_restart(&record, 0));
         assert!(should_restart(&record, 2));
         assert!(!should_restart(&record, 3));
+        assert!(!should_restart(&record, 5));
     }
 }
