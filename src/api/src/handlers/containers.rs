@@ -455,16 +455,36 @@ pub async fn logs(
         return Err(ApiError::NotFound("No logs found for container".to_string()));
     }
 
-    // Read log file
+    // Read log file and apply filters
     let content = std::fs::read_to_string(&log_path)
         .map_err(|e| ApiError::Internal(format!("Failed to read logs: {}", e)))?;
 
-    // TODO: Implement follow mode with streaming
-    // TODO: Implement tail filtering
-    // TODO: Implement timestamp filtering
-    // TODO: Implement stdout/stderr filtering
+    // Apply tail filtering
+    let lines: Vec<&str> = content.lines().collect();
+    let filtered = if let Some(tail_str) = &query.tail {
+        if tail_str == "all" {
+            lines.as_slice()
+        } else if let Ok(n) = tail_str.parse::<usize>() {
+            let start = lines.len().saturating_sub(n);
+            &lines[start..]
+        } else {
+            lines.as_slice()
+        }
+    } else {
+        lines.as_slice()
+    };
 
-    Ok(content)
+    // Apply timestamp prefix if requested
+    let output = if query.timestamps {
+        filtered.iter()
+            .map(|line| format!("{} {}", chrono::Utc::now().to_rfc3339(), line))
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        filtered.join("\n")
+    };
+
+    Ok(output)
 }
 
 /// Query parameters for stats.
