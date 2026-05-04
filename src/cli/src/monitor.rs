@@ -300,27 +300,70 @@ async fn restart_container(
     box_id: &str,
     containers: &Arc<RwLock<HashMap<String, MonitoredContainer>>>,
     state_path: &PathBuf,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let containers_guard = containers.read().await;
     let monitored = containers_guard
         .get(box_id)
         .ok_or_else(|| format!("Container {} not found in monitor", box_id))?;
 
+    let record = monitored.record.clone();
+    let restart_attempts = monitored.restart_attempts;
+    drop(containers_guard);
+
     info!(
         box_id = %box_id,
-        name = %monitored.record.name,
-        restart_attempts = monitored.restart_attempts,
-        "Restarting container"
+        name = %record.name,
+        restart_attempts = restart_attempts,
+        restart_policy = %record.restart_policy,
+        "Restarting container due to policy"
     );
 
-    // TODO: Implement actual restart logic
-    // This will be integrated with the VmManager to restart the container
-    // For now, we just log the restart attempt
+    // Load state file
+    let mut state = StateFile::load(state_path)
+        .map_err(|e| format!("Failed to load state: {}", e))?;
 
-    // Update state file
-    let mut state = StateFile::load(state_path)?;
-    state.increment_restart_count(box_id);
-    state.save()?;
+    // Boot the container using the shared boot logic
+    let boot_result = crate::boot::boot_from_record(&record).await
+        .map_err(|e| format!("Failed to boot container: {}", e))?;
+
+    info!(
+        box_id = %box_id,
+        name = %record.name,
+        pid = ?boot_result.pid,
+        "Container restarted successfully"
+    );
+
+    // Update state to running
+    if let Some(record) = state.find_by_id_mut(box_id) {
+        record.status = "running".to_string();
+        record.pid = boot_result.pid;
+        record.started_at = Some(chrono::Utc::now());
+        record.restart_count += 1;
+
+        // Update exec socket path if available
+        if let Some(exec_socket_path) = &boot_result.exec_socket_path {
+            record.exec_socket_path = exec_socket_path.clone();
+        }
+    }
+    state.save()
+        .map_err(|e| format!("Failed to save state: {}", e))?;
+
+    // Update monitor state
+    if let Some(pid) = boot_result.pid {
+        let mut containers_guard = containers.write().await;
+        if let Some(monitored) = containers_guard.get_mut(box_id) {
+            monitored.last_pid = Some(pid);
+            monitored.restart_attempts += 1;
+            monitored.last_restart = Some(chrono::Utc::now());
+
+            // Reload record from state
+            let state = StateFile::load(state_path)
+                .map_err(|e| format!("Failed to reload state: {}", e))?;
+            if let Some(updated_record) = state.find_by_id(box_id) {
+                monitored.record = updated_record.clone();
+            }
+        }
+    }
 
     Ok(())
 }
