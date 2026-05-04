@@ -43,6 +43,10 @@ pub struct ExecArgs {
     #[arg(short = 'u', long)]
     pub user: Option<String>,
 
+    /// Run command in detached mode (background)
+    #[arg(short = 'd', long)]
+    pub detach: bool,
+
     /// Command and arguments to execute
     #[arg(last = true, required = true)]
     pub cmd: Vec<String>,
@@ -68,9 +72,22 @@ pub async fn execute(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("Box {} is not running", record.name).into());
     }
 
+    // Validate flag combinations
+    if args.tty && args.detach {
+        return Err("Cannot use -t (tty) with -d (detach)".into());
+    }
+    if args.interactive && args.detach {
+        return Err("Cannot use -i (interactive) with -d (detach)".into());
+    }
+
     // If -t is specified, use interactive PTY mode
     if args.tty {
         return execute_pty(args, record).await;
+    }
+
+    // If -d is specified, use detached mode
+    if args.detach {
+        return execute_detached(args, record).await;
     }
 
     // Non-interactive mode (original behavior)
@@ -137,6 +154,58 @@ pub async fn execute(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(output.exit_code);
     }
 
+    Ok(())
+}
+
+/// Execute a command in detached mode (background).
+///
+/// The command runs in the background and the CLI returns immediately.
+/// Output is not captured.
+#[cfg(not(windows))]
+async fn execute_detached(
+    args: ExecArgs,
+    record: &crate::state::BoxRecord,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use a3s_box_core::exec::ExecRequest;
+    use a3s_box_runtime::ExecClient;
+
+    let exec_socket_path = if !record.exec_socket_path.as_os_str().is_empty() {
+        record.exec_socket_path.clone()
+    } else {
+        record.box_dir.join("sockets").join("exec.sock")
+    };
+
+    if !exec_socket_path.exists() {
+        return Err(format!(
+            "Exec socket not found for box {} at {}",
+            record.name,
+            exec_socket_path.display()
+        )
+        .into());
+    }
+
+    let client = ExecClient::connect(&exec_socket_path).await?;
+
+    // For detached mode, use a very long timeout (24 hours)
+    let timeout_ns = 24 * 60 * 60 * 1_000_000_000u64;
+
+    let request = ExecRequest {
+        cmd: args.cmd.clone(),
+        timeout_ns,
+        env: args.envs,
+        working_dir: args.workdir,
+        stdin: None, // No stdin in detached mode
+        user: args.user,
+        streaming: false,
+    };
+
+    // Send the request but don't wait for response
+    // We spawn a background task to handle the exec
+    tokio::spawn(async move {
+        let _ = client.exec_command(&request).await;
+    });
+
+    println!("Command started in background: {}", args.cmd.join(" "));
     Ok(())
 }
 
