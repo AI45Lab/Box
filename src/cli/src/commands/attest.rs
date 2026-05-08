@@ -87,10 +87,6 @@ pub async fn execute(args: AttestArgs) -> Result<(), Box<dyn std::error::Error>>
     let state = StateFile::load_default()?;
     let record = resolve::resolve(&state, &args.r#box)?;
 
-    if record.status != "running" {
-        return Err(format!("Box {} is not running", record.name).into());
-    }
-
     // Generate or parse nonce
     let nonce_bytes = match &args.nonce {
         Some(hex_nonce) => hex_to_bytes(hex_nonce)?,
@@ -103,16 +99,12 @@ pub async fn execute(args: AttestArgs) -> Result<(), Box<dyn std::error::Error>>
         user_data: None,
     };
 
-    let attest_socket_path = crate::socket_paths::attest(record);
+    let attest_socket_path = crate::socket_paths::require_runtime_socket(
+        record,
+        crate::socket_paths::RuntimeSocket::Attest,
+    )
+    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     let socket_path = &attest_socket_path;
-    if !socket_path.exists() {
-        return Err(format!(
-            "Attestation socket not found for box {} at {}",
-            record.name,
-            socket_path.display()
-        )
-        .into());
-    }
 
     // RA-TLS mode: verify attestation via TLS handshake
     if args.ratls {

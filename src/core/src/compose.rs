@@ -63,6 +63,10 @@ pub struct ServiceConfig {
     #[serde(default)]
     pub environment: EnvVars,
 
+    /// Environment files to load before `environment` overrides.
+    #[serde(default)]
+    pub env_file: StringOrList,
+
     /// Port mappings ("host:container").
     #[serde(default)]
     pub ports: Vec<String>,
@@ -122,13 +126,25 @@ pub struct ServiceConfig {
     /// Working directory inside the container.
     #[serde(default)]
     pub working_dir: Option<String>,
+
+    /// Hostname inside the container.
+    #[serde(default)]
+    pub hostname: Option<String>,
+
+    /// Static host entries (`HOST:IP`).
+    #[serde(default)]
+    pub extra_hosts: StringOrList,
 }
 
 /// Health check configuration for a service.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthcheckConfig {
     /// Command to run (e.g., ["CMD", "curl", "-f", "http://localhost/"]).
+    #[serde(default)]
     pub test: StringOrList,
+    /// Disable the image or service health check.
+    #[serde(default)]
+    pub disable: bool,
     /// Interval between checks (e.g., "30s").
     #[serde(default)]
     pub interval: Option<String>,
@@ -297,6 +313,23 @@ pub enum Labels {
     Empty,
     Map(HashMap<String, String>),
     List(Vec<String>),
+}
+
+impl Labels {
+    /// Convert labels to key/value pairs.
+    pub fn to_map(&self) -> HashMap<String, String> {
+        match self {
+            Self::Empty => HashMap::new(),
+            Self::Map(map) => map.clone(),
+            Self::List(list) => list
+                .iter()
+                .map(|entry| {
+                    let (key, value) = entry.split_once('=').unwrap_or((entry, ""));
+                    (key.to_string(), value.to_string())
+                })
+                .collect(),
+        }
+    }
 }
 
 /// DNS config: supports both single string and list.
@@ -641,6 +674,22 @@ services:
         let hc = config.services["web"].healthcheck.as_ref().unwrap();
         assert_eq!(hc.retries, Some(3));
         assert_eq!(hc.interval.as_deref(), Some("30s"));
+        assert!(!hc.disable);
+    }
+
+    #[test]
+    fn test_healthcheck_disable() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx
+    healthcheck:
+      disable: true
+"#;
+        let config = ComposeConfig::from_yaml_str(yaml).unwrap();
+        let hc = config.services["web"].healthcheck.as_ref().unwrap();
+        assert!(hc.disable);
+        assert!(hc.test.is_empty());
     }
 
     #[test]
@@ -674,6 +723,38 @@ services:
 "#;
         let config = ComposeConfig::from_yaml_str(yaml).unwrap();
         assert!(matches!(config.services["web"].labels, Labels::Map(_)));
+        assert_eq!(
+            config.services["web"]
+                .labels
+                .to_map()
+                .get("com.example.env")
+                .map(String::as_str),
+            Some("production")
+        );
+    }
+
+    #[test]
+    fn test_labels_list() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx
+    labels:
+      - "com.example.env=production"
+      - "com.example.debug=true"
+      - "com.example.flag"
+"#;
+        let config = ComposeConfig::from_yaml_str(yaml).unwrap();
+        let labels = config.services["web"].labels.to_map();
+        assert_eq!(
+            labels.get("com.example.env").map(String::as_str),
+            Some("production")
+        );
+        assert_eq!(
+            labels.get("com.example.debug").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(labels.get("com.example.flag").map(String::as_str), Some(""));
     }
 
     #[test]

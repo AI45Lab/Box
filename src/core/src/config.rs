@@ -280,6 +280,20 @@ pub struct BoxConfig {
     #[serde(default)]
     pub entrypoint_override: Option<Vec<String>>,
 
+    /// User override for the initial container process.
+    ///
+    /// Supported runtime format is a numeric `uid` or `uid:gid`.
+    #[serde(default)]
+    pub user: Option<String>,
+
+    /// Working directory override for the initial container process.
+    #[serde(default)]
+    pub workdir: Option<String>,
+
+    /// Hostname to apply inside the box.
+    #[serde(default)]
+    pub hostname: Option<String>,
+
     /// Extra volume mounts (host_path:guest_path or host_path:guest_path:ro)
     #[serde(default)]
     pub volumes: Vec<String>,
@@ -305,6 +319,10 @@ pub struct BoxConfig {
     /// If empty, reads from host /etc/resolv.conf, falling back to 8.8.8.8.
     #[serde(default)]
     pub dns: Vec<String>,
+
+    /// Static host-to-IP mappings for `/etc/hosts` (`HOST:IP`).
+    #[serde(default)]
+    pub add_hosts: Vec<String>,
 
     /// Network mode: TSI (default), bridge (passt-based), or none.
     #[serde(default)]
@@ -375,12 +393,16 @@ impl Default for BoxConfig {
             tee: TeeConfig::default(),
             cmd: vec![],
             entrypoint_override: None,
+            user: None,
+            workdir: None,
+            hostname: None,
             volumes: vec![],
             extra_env: vec![],
             cache: CacheConfig::default(),
             pool: PoolConfig::default(),
             port_map: vec![],
             dns: vec![],
+            add_hosts: vec![],
             network: NetworkMode::default(),
             tmpfs: vec![],
             resource_limits: ResourceLimits::default(),
@@ -498,6 +520,10 @@ mod tests {
         assert_eq!(config.resources.vcpus, 2);
         assert!(!config.debug_grpc);
         assert!(!config.read_only);
+        assert!(config.user.is_none());
+        assert!(config.workdir.is_none());
+        assert!(config.hostname.is_none());
+        assert!(config.add_hosts.is_empty());
     }
 
     #[test]
@@ -521,6 +547,36 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: BoxConfig = serde_json::from_str(&json).unwrap();
         assert!(deserialized.read_only);
+    }
+
+    #[test]
+    fn test_box_config_user_workdir_serde() {
+        let config = BoxConfig {
+            user: Some("1000:1000".to_string()),
+            workdir: Some("/app".to_string()),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: BoxConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.user.as_deref(), Some("1000:1000"));
+        assert_eq!(parsed.workdir.as_deref(), Some("/app"));
+    }
+
+    #[test]
+    fn test_box_config_hostname_add_hosts_serde() {
+        let config = BoxConfig {
+            hostname: Some("web".to_string()),
+            add_hosts: vec!["db.local:10.88.0.10".to_string()],
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: BoxConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.hostname.as_deref(), Some("web"));
+        assert_eq!(parsed.add_hosts, vec!["db.local:10.88.0.10"]);
     }
 
     #[test]

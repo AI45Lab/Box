@@ -4,6 +4,7 @@
 //! network creation, dependency-ordered boot, and grouped teardown.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use a3s_box_core::compose::ComposeConfig;
 use a3s_box_core::config::{BoxConfig, ResourceConfig};
@@ -34,6 +35,8 @@ pub struct ComposeProject {
     pub service_boxes: HashMap<String, String>,
     /// Networks created for this project.
     pub networks: Vec<String>,
+    /// Base directory used to resolve relative env_file paths.
+    pub base_dir: PathBuf,
 }
 
 impl ComposeProject {
@@ -41,6 +44,16 @@ impl ComposeProject {
     ///
     /// Validates the config and computes the service boot order.
     pub fn new(name: impl Into<String>, config: ComposeConfig) -> Result<Self> {
+        let base_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        Self::with_base_dir(name, config, base_dir)
+    }
+
+    /// Create a compose project with an explicit base directory.
+    pub fn with_base_dir(
+        name: impl Into<String>,
+        config: ComposeConfig,
+        base_dir: impl Into<PathBuf>,
+    ) -> Result<Self> {
         let name = name.into();
 
         // Validate: every service must have an image
@@ -51,6 +64,13 @@ impl ComposeProject {
                     svc_name
                 )));
             }
+            a3s_box_core::normalize_port_maps(&svc.ports).map_err(|e| {
+                BoxError::ConfigError(format!(
+                    "Service '{}' has invalid port mapping: {}",
+                    svc_name, e
+                ))
+            })?;
+            validate_depends_on_conditions(svc_name, &svc.depends_on)?;
         }
 
         // Compute topological order
@@ -64,6 +84,7 @@ impl ComposeProject {
             service_order,
             service_boxes: HashMap::new(),
             networks: Vec::new(),
+            base_dir: base_dir.into(),
         })
     }
 
@@ -103,8 +124,8 @@ impl ComposeProject {
             None => 512, // default
         };
 
-        // Build environment
-        let extra_env = svc.environment.to_pairs();
+        // Build environment: env_file first, environment overrides.
+        let extra_env = self.service_env(svc)?;
 
         // Determine network mode
         let network_mode = {
@@ -132,6 +153,19 @@ impl ComposeProject {
                 Some(v)
             }
         });
+        if let Some(hostname) = svc.hostname.as_deref() {
+            a3s_box_core::dns::validate_hostname(hostname)
+                .map_err(|e| BoxError::ConfigError(format!("Invalid hostname: {e}")))?;
+        }
+        let add_hosts = svc.extra_hosts.to_vec();
+        a3s_box_core::dns::parse_add_host_entries(&add_hosts)
+            .map_err(|e| BoxError::ConfigError(format!("Invalid extra_hosts entry: {e}")))?;
+        let port_map = a3s_box_core::normalize_port_maps(&svc.ports).map_err(|e| {
+            BoxError::ConfigError(format!(
+                "Service '{}' has invalid port mapping: {}",
+                service_name, e
+            ))
+        })?;
 
         let config = BoxConfig {
             image: image.to_string(),
@@ -142,10 +176,13 @@ impl ComposeProject {
             },
             cmd,
             entrypoint_override,
+            workdir: svc.working_dir.clone(),
+            hostname: svc.hostname.clone(),
             volumes: svc.volumes.clone(),
             extra_env,
-            port_map: svc.ports.clone(),
+            port_map,
             dns: svc.dns.to_vec(),
+            add_hosts,
             network: network_mode,
             tmpfs: svc.tmpfs.to_vec(),
             cap_add: svc.cap_add.clone(),
@@ -155,6 +192,23 @@ impl ComposeProject {
         };
 
         Ok(config)
+    }
+
+    fn service_env(
+        &self,
+        svc: &a3s_box_core::compose::ServiceConfig,
+    ) -> Result<Vec<(String, String)>> {
+        let mut env = Vec::new();
+        for env_file in svc.env_file.to_vec() {
+            let path = resolve_compose_path(&self.base_dir, &env_file);
+            let entries = a3s_box_core::env::parse_env_file(&path).map_err(|e| {
+                BoxError::ConfigError(format!("Invalid env_file '{}': {}", path.display(), e))
+            })?;
+            a3s_box_core::env::merge_env_pairs(&mut env, &entries);
+        }
+        let inline_env = svc.environment.to_pairs();
+        a3s_box_core::env::merge_env_pairs(&mut env, &inline_env);
+        Ok(env)
     }
 
     /// Get the network name for this project's default network.
@@ -231,11 +285,11 @@ impl ComposeProject {
     pub fn healthcheck(&self, service_name: &str) -> Option<HealthCheckSpec> {
         let svc = self.config.services.get(service_name)?;
         let hc = svc.healthcheck.as_ref()?;
-
-        let cmd = hc.test.to_vec();
-        if cmd.is_empty() {
+        if hc.disable {
             return None;
         }
+
+        let cmd = healthcheck_command(&hc.test)?;
 
         Some(HealthCheckSpec {
             cmd,
@@ -248,7 +302,7 @@ impl ComposeProject {
                 .timeout
                 .as_deref()
                 .and_then(parse_duration_secs)
-                .unwrap_or(5),
+                .unwrap_or(30),
             retries: hc.retries.unwrap_or(3),
             start_period_secs: hc
                 .start_period
@@ -256,6 +310,27 @@ impl ComposeProject {
                 .and_then(parse_duration_secs)
                 .unwrap_or(0),
         })
+    }
+
+    /// Return true when a service explicitly disables its health check.
+    pub fn healthcheck_disabled(&self, service_name: &str) -> bool {
+        self.config
+            .services
+            .get(service_name)
+            .and_then(|svc| svc.healthcheck.as_ref())
+            .is_some_and(|hc| {
+                hc.disable
+                    || matches!(
+                        &hc.test,
+                        a3s_box_core::compose::StringOrList::List(items)
+                            if items.first().is_some_and(|value| value.eq_ignore_ascii_case("NONE"))
+                    )
+                    || matches!(
+                        &hc.test,
+                        a3s_box_core::compose::StringOrList::Single(value)
+                            if value.trim().eq_ignore_ascii_case("NONE")
+                    )
+            })
     }
 }
 
@@ -279,7 +354,7 @@ fn parse_duration_secs(s: &str) -> Option<u64> {
     let s = s.trim().to_lowercase();
     if s.ends_with("ms") {
         let n: u64 = s.trim_end_matches("ms").parse().ok()?;
-        Some(n / 1000) // round down, minimum 0
+        Some(n.div_ceil(1000))
     } else if s.ends_with('s') {
         s.trim_end_matches('s').parse().ok()
     } else if s.ends_with('m') {
@@ -292,6 +367,69 @@ fn parse_duration_secs(s: &str) -> Option<u64> {
         // Assume seconds
         s.parse().ok()
     }
+}
+
+fn healthcheck_command(test: &a3s_box_core::compose::StringOrList) -> Option<Vec<String>> {
+    use a3s_box_core::compose::StringOrList;
+
+    match test {
+        StringOrList::Empty => None,
+        StringOrList::Single(command) => {
+            let command = command.trim();
+            if command.is_empty() || command.eq_ignore_ascii_case("NONE") {
+                None
+            } else {
+                Some(vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    command.to_string(),
+                ])
+            }
+        }
+        StringOrList::List(items) => {
+            let marker = items.first()?;
+            if marker.eq_ignore_ascii_case("NONE") {
+                return None;
+            }
+            if marker.eq_ignore_ascii_case("CMD") {
+                let cmd = items.get(1..)?.to_vec();
+                return (!cmd.is_empty()).then_some(cmd);
+            }
+            if marker.eq_ignore_ascii_case("CMD-SHELL") {
+                let shell_cmd = items.get(1..)?.join(" ");
+                return (!shell_cmd.is_empty()).then_some(vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    shell_cmd,
+                ]);
+            }
+
+            Some(items.clone()).filter(|cmd| !cmd.is_empty())
+        }
+    }
+}
+
+fn validate_depends_on_conditions(
+    service_name: &str,
+    depends_on: &a3s_box_core::compose::DependsOn,
+) -> Result<()> {
+    let a3s_box_core::compose::DependsOn::Map(map) = depends_on else {
+        return Ok(());
+    };
+
+    for (dep_name, condition) in map {
+        match condition.condition.as_str() {
+            "service_started" | "service_healthy" => {}
+            other => {
+                return Err(BoxError::ConfigError(format!(
+                    "Service '{}' depends on '{}' with unsupported condition '{}' (supported: service_started, service_healthy)",
+                    service_name, dep_name, other
+                )));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Parse a compose memory string (e.g., "512m", "1g", "1024") into MB.
@@ -323,6 +461,15 @@ fn parse_compose_memory(s: &str) -> Result<u32> {
         .map_err(|_| BoxError::ConfigError(format!("Invalid memory value: {}", s)))?;
 
     Ok((num * multiplier as f64) as u32)
+}
+
+fn resolve_compose_path(base_dir: &Path, path: &str) -> PathBuf {
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        path
+    } else {
+        base_dir.join(path)
+    }
 }
 
 #[cfg(test)]
@@ -483,6 +630,111 @@ networks:
     }
 
     #[test]
+    fn test_build_box_config_env_file_with_environment_override() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("app.env"), "FOO=file\nBAR=file\n").unwrap();
+        let yaml = r#"
+services:
+  api:
+    image: myapi
+    env_file:
+      - app.env
+    environment:
+      FOO: inline
+      BAZ: inline
+"#;
+        let config = ComposeConfig::from_yaml_str(yaml).unwrap();
+        let project = ComposeProject::with_base_dir("myapp", config, dir.path()).unwrap();
+        let box_config = project
+            .build_box_config("api", Some("myapp_default"))
+            .unwrap();
+
+        assert_eq!(
+            box_config.extra_env,
+            vec![
+                ("FOO".to_string(), "inline".to_string()),
+                ("BAR".to_string(), "file".to_string()),
+                ("BAZ".to_string(), "inline".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn test_build_box_config_missing_env_file_is_rejected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let yaml = r#"
+services:
+  api:
+    image: myapi
+    env_file: missing.env
+"#;
+        let config = ComposeConfig::from_yaml_str(yaml).unwrap();
+        let project = ComposeProject::with_base_dir("myapp", config, dir.path()).unwrap();
+
+        let err = project
+            .build_box_config("api", Some("myapp_default"))
+            .unwrap_err();
+
+        assert!(err.to_string().contains("Invalid env_file"));
+    }
+
+    #[test]
+    fn test_build_box_config_working_dir() {
+        let yaml = r#"
+services:
+  worker:
+    image: myworker
+    working_dir: /srv/app
+"#;
+        let config = ComposeConfig::from_yaml_str(yaml).unwrap();
+        let project = ComposeProject::new("myapp", config).unwrap();
+        let box_config = project
+            .build_box_config("worker", Some("myapp_default"))
+            .unwrap();
+
+        assert_eq!(box_config.workdir.as_deref(), Some("/srv/app"));
+    }
+
+    #[test]
+    fn test_build_box_config_hostname_and_extra_hosts() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx
+    hostname: web-1
+    extra_hosts:
+      - "db.local:10.88.0.10"
+"#;
+        let config = ComposeConfig::from_yaml_str(yaml).unwrap();
+        let project = ComposeProject::new("myapp", config).unwrap();
+        let box_config = project
+            .build_box_config("web", Some("myapp_default"))
+            .unwrap();
+
+        assert_eq!(box_config.hostname.as_deref(), Some("web-1"));
+        assert_eq!(box_config.add_hosts, vec!["db.local:10.88.0.10"]);
+    }
+
+    #[test]
+    fn test_build_box_config_rejects_invalid_extra_hosts() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx
+    extra_hosts:
+      - "db.local:not-an-ip"
+"#;
+        let config = ComposeConfig::from_yaml_str(yaml).unwrap();
+        let project = ComposeProject::new("myapp", config).unwrap();
+
+        let err = project
+            .build_box_config("web", Some("myapp_default"))
+            .unwrap_err();
+
+        assert!(err.to_string().contains("Invalid extra_hosts"));
+    }
+
+    #[test]
     fn test_build_box_config_ports() {
         let config = sample_config();
         let project = ComposeProject::new("myapp", config).unwrap();
@@ -491,6 +743,40 @@ networks:
             .unwrap();
 
         assert_eq!(box_config.port_map, vec!["8080:80"]);
+    }
+
+    #[test]
+    fn test_build_box_config_normalizes_tcp_port_suffix() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx
+    ports:
+      - "8080:80/tcp"
+"#;
+        let config = ComposeConfig::from_yaml_str(yaml).unwrap();
+        let project = ComposeProject::new("myapp", config).unwrap();
+        let box_config = project
+            .build_box_config("web", Some("myapp_default"))
+            .unwrap();
+
+        assert_eq!(box_config.port_map, vec!["8080:80"]);
+    }
+
+    #[test]
+    fn test_compose_project_rejects_udp_ports() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx
+    ports:
+      - "8080:80/udp"
+"#;
+        let config = ComposeConfig::from_yaml_str(yaml).unwrap();
+
+        let err = ComposeProject::new("myapp", config).unwrap_err();
+
+        assert!(err.to_string().contains("only TCP is supported"));
     }
 
     #[test]
@@ -614,7 +900,7 @@ services:
         assert_eq!(parse_duration_secs("30s"), Some(30));
         assert_eq!(parse_duration_secs("1m"), Some(60));
         assert_eq!(parse_duration_secs("2h"), Some(7200));
-        assert_eq!(parse_duration_secs("500ms"), Some(0));
+        assert_eq!(parse_duration_secs("500ms"), Some(1));
         assert_eq!(parse_duration_secs("5000ms"), Some(5));
         assert_eq!(parse_duration_secs("10"), Some(10));
         assert_eq!(parse_duration_secs("abc"), None);
@@ -680,7 +966,7 @@ services:
         let config = ComposeConfig::from_yaml_str(yaml).unwrap();
         let project = ComposeProject::new("myapp", config).unwrap();
         let hc = project.healthcheck("web").unwrap();
-        assert_eq!(hc.cmd, vec!["CMD", "curl", "-f", "http://localhost/"]);
+        assert_eq!(hc.cmd, vec!["curl", "-f", "http://localhost/"]);
         assert_eq!(hc.interval_secs, 10);
         assert_eq!(hc.timeout_secs, 3);
         assert_eq!(hc.retries, 5);
@@ -699,10 +985,68 @@ services:
         let config = ComposeConfig::from_yaml_str(yaml).unwrap();
         let project = ComposeProject::new("myapp", config).unwrap();
         let hc = project.healthcheck("web").unwrap();
+        assert_eq!(hc.cmd, vec!["true"]);
         assert_eq!(hc.interval_secs, 30);
-        assert_eq!(hc.timeout_secs, 5);
+        assert_eq!(hc.timeout_secs, 30);
         assert_eq!(hc.retries, 3);
         assert_eq!(hc.start_period_secs, 0);
+    }
+
+    #[test]
+    fn test_healthcheck_cmd_shell() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost/ || exit 1"]
+"#;
+        let config = ComposeConfig::from_yaml_str(yaml).unwrap();
+        let project = ComposeProject::new("myapp", config).unwrap();
+        let hc = project.healthcheck("web").unwrap();
+        assert_eq!(
+            hc.cmd,
+            vec!["sh", "-c", "curl -f http://localhost/ || exit 1"]
+        );
+    }
+
+    #[test]
+    fn test_healthcheck_single_string_uses_shell() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx
+    healthcheck:
+      test: curl -f http://localhost/ || exit 1
+"#;
+        let config = ComposeConfig::from_yaml_str(yaml).unwrap();
+        let project = ComposeProject::new("myapp", config).unwrap();
+        let hc = project.healthcheck("web").unwrap();
+        assert_eq!(
+            hc.cmd,
+            vec!["sh", "-c", "curl -f http://localhost/ || exit 1"]
+        );
+    }
+
+    #[test]
+    fn test_healthcheck_none_and_disable() {
+        let yaml = r#"
+services:
+  none:
+    image: nginx
+    healthcheck:
+      test: ["NONE"]
+  disabled:
+    image: redis
+    healthcheck:
+      disable: true
+"#;
+        let config = ComposeConfig::from_yaml_str(yaml).unwrap();
+        let project = ComposeProject::new("myapp", config).unwrap();
+        assert!(project.healthcheck("none").is_none());
+        assert!(project.healthcheck_disabled("none"));
+        assert!(project.healthcheck("disabled").is_none());
+        assert!(project.healthcheck_disabled("disabled"));
     }
 
     #[test]
@@ -710,5 +1054,22 @@ services:
         let config = sample_config();
         let project = ComposeProject::new("myapp", config).unwrap();
         assert!(project.healthcheck("db").is_none());
+    }
+
+    #[test]
+    fn test_unsupported_depends_on_condition_rejected() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx
+    depends_on:
+      db:
+        condition: service_completed_successfully
+  db:
+    image: postgres
+"#;
+        let config = ComposeConfig::from_yaml_str(yaml).unwrap();
+        let err = ComposeProject::new("myapp", config).unwrap_err();
+        assert!(err.to_string().contains("unsupported condition"));
     }
 }

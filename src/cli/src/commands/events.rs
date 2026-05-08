@@ -102,9 +102,12 @@ fn status_to_action(old: Option<&str>, new: &str) -> Option<&'static str> {
     match (old, new) {
         (None, "created") => Some("create"),
         (None, "running") => Some("start"),
+        (None, "dead") => Some("die"),
         (Some("created"), "running") => Some("start"),
         (Some("running"), "paused") => Some("pause"),
         (Some("paused"), "running") => Some("unpause"),
+        (Some("dead"), "running") => Some("restart"),
+        (Some(old), "dead") if old != "dead" => Some("die"),
         (Some("running"), "exited") => Some("die"),
         (Some("running"), "stopped") => Some("stop"),
         (Some("exited"), "running") => Some("start"),
@@ -250,6 +253,16 @@ mod tests {
     fn test_status_to_action_stop() {
         assert_eq!(status_to_action(Some("running"), "stopped"), Some("stop"));
         assert_eq!(status_to_action(Some("running"), "exited"), Some("die"));
+    }
+
+    #[test]
+    fn test_status_to_action_dead_transitions() {
+        assert_eq!(status_to_action(Some("running"), "dead"), Some("die"));
+        assert_eq!(status_to_action(Some("paused"), "dead"), Some("die"));
+        assert_eq!(status_to_action(Some("created"), "dead"), Some("die"));
+        assert_eq!(status_to_action(None, "dead"), Some("die"));
+        assert_eq!(status_to_action(Some("dead"), "running"), Some("restart"));
+        assert_eq!(status_to_action(Some("dead"), "dead"), None);
     }
 
     #[test]

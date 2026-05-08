@@ -9,7 +9,7 @@
 //! - Reaping zombie processes and handling SIGTERM for graceful shutdown
 
 use a3s_box_guest_init::{
-    attest_server, exec_server, namespace, network, port_forward, pty_server,
+    attest_server, exec_server, host_config, namespace, network, port_forward, pty_server,
 };
 use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -182,12 +182,19 @@ fn run_init() -> Result<(), Box<dyn std::error::Error>> {
     // Step 2: Mount virtio-fs shares
     mount_virtio_fs_shares()?;
 
+    // Step 2.25: Mount devpts after the final rootfs is active so PTY
+    // allocation inside exec/attach sessions can open /dev/ptmx.
+    mount_devpts()?;
+
     // Step 2.5: Mount tmpfs volumes
     mount_tmpfs_volumes()?;
 
     // Step 3: Configure guest network (if passt mode is active).
     // Network setup may write /etc/resolv.conf — must run before read-only remount.
     network::configure_guest_network()?;
+
+    // Step 3.25: Apply hostname while the rootfs is still writable.
+    host_config::apply_from_env()?;
 
     // Step 3.5: Remount rootfs read-only if BOX_READONLY=1.
     // All writes to / (mount point creation, resolv.conf) must complete first.
@@ -254,6 +261,8 @@ fn run_init() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Container process started with PID {}", container_pid);
 
+    expose_container_env_to_exec(&exec_config);
+
     // Step 8: Start exec server in background thread
     std::thread::spawn(|| {
         if let Err(e) = exec_server::run_exec_server() {
@@ -289,6 +298,16 @@ fn run_init() -> Result<(), Box<dyn std::error::Error>> {
     wait_for_children(container_pid)?;
 
     Ok(())
+}
+
+fn expose_container_env_to_exec(config: &ExecConfig) {
+    for (key, value) in &config.env {
+        if key.is_empty() || key.contains(['=', '\0']) || value.contains('\0') {
+            warn!(key, "Skipping invalid container environment entry for exec");
+            continue;
+        }
+        std::env::set_var(key, value);
+    }
 }
 
 /// Launch the sidecar process as a background co-process.
@@ -415,6 +434,36 @@ fn mount_essential_filesystems() -> Result<(), Box<dyn std::error::Error>> {
         info!("Skipping mount on non-Linux platform (development mode)");
     }
 
+    Ok(())
+}
+
+/// Mount devpts for guest-side PTY allocation.
+#[cfg(target_os = "linux")]
+fn mount_devpts() -> Result<(), Box<dyn std::error::Error>> {
+    use nix::mount::{mount, MsFlags};
+
+    std::fs::create_dir_all("/dev/pts")?;
+    match mount(
+        Some("devpts"),
+        "/dev/pts",
+        Some("devpts"),
+        MsFlags::empty(),
+        Some("mode=0620,ptmxmode=0666"),
+    ) {
+        Ok(()) => {
+            info!("Mounted devpts at /dev/pts");
+            Ok(())
+        }
+        Err(nix::errno::Errno::EBUSY) => {
+            info!("/dev/pts already mounted, skipping");
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mount_devpts() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 

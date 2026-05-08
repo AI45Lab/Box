@@ -106,6 +106,9 @@ fn parse_platforms(
             "Multi-platform builds are not implemented yet; pass a single --platform value".into(),
         );
     }
+    if platforms.iter().any(|p| p.os != "linux") {
+        return Err("Only linux target platforms are supported for builds".into());
+    }
 
     Ok(platforms)
 }
@@ -196,6 +199,14 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("Multi-platform builds are not implemented yet"));
+    }
+
+    #[test]
+    fn test_parse_platforms_rejects_non_linux() {
+        let err = parse_platforms(Some("windows/amd64"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Only linux target platforms"));
     }
 
     #[test]

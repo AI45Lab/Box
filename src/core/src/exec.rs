@@ -45,7 +45,7 @@ pub struct ExecRequest {
     /// Keep stdin open for subsequent streaming data frames.
     #[serde(default)]
     pub stdin_streaming: bool,
-    /// User to run the command as (e.g., "root", "1000", "1000:1000").
+    /// User to run the command as (supported: "root", "1000", "1000:1000").
     #[serde(default)]
     pub user: Option<String>,
     /// Enable streaming mode (receive output chunks as they arrive).

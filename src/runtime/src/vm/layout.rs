@@ -153,7 +153,16 @@ impl VmManager {
     }
 
     pub(crate) fn socket_dir(&self) -> PathBuf {
-        #[cfg(unix)]
+        #[cfg(all(unix, target_os = "macos"))]
+        {
+            // Use the canonical short temp path so macOS HVF runs can bind
+            // Unix sockets without relying on the /tmp symlink.
+            PathBuf::from("/private/tmp")
+                .join("a3s-box-sockets")
+                .join(&self.box_id)
+        }
+
+        #[cfg(all(unix, not(target_os = "macos")))]
         {
             PathBuf::from("/tmp")
                 .join("a3s-box-sockets")
@@ -519,6 +528,8 @@ mod tests {
             net_manager: None,
             home_dir: home_dir.to_path_buf(),
             anonymous_volumes: Vec::new(),
+            created_anonymous_volumes: Vec::new(),
+            image_config: None,
             #[cfg(unix)]
             tee: None,
             rootfs_provider: crate::rootfs::default_provider(),

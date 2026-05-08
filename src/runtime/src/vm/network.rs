@@ -1,5 +1,6 @@
 //! Network setup for VM instances (bridge networking and DNS).
 
+use a3s_box_core::dns::HostEntry;
 use a3s_box_core::error::{BoxError, Result};
 
 use crate::vmm::NetworkInstanceConfig;
@@ -7,6 +8,38 @@ use crate::vmm::NetworkInstanceConfig;
 use super::VmManager;
 
 impl VmManager {
+    /// Write `/etc/hostname` when a hostname override is configured.
+    pub(crate) fn write_hostname_file(&self, layout: &super::BoxLayout) -> Result<()> {
+        let Some(hostname) = self.config.hostname.as_deref() else {
+            return Ok(());
+        };
+        a3s_box_core::dns::validate_hostname(hostname).map_err(BoxError::ConfigError)?;
+
+        let hostname_path = layout.rootfs_path.join("etc/hostname");
+        if let Some(parent) = hostname_path.parent() {
+            std::fs::create_dir_all(parent).map_err(BoxError::IoError)?;
+        }
+        std::fs::write(&hostname_path, format!("{hostname}\n")).map_err(|e| {
+            BoxError::NetworkError(format!(
+                "Failed to write {}: {}",
+                hostname_path.display(),
+                e
+            ))
+        })?;
+        Ok(())
+    }
+
+    /// Write `/etc/hosts` for boxes without bridge network peer discovery.
+    pub(crate) fn write_standalone_hosts_file(&self, layout: &super::BoxLayout) -> Result<()> {
+        let add_hosts = self.parse_add_hosts()?;
+        let aliases = self.hostname_aliases(None);
+        if aliases.is_empty() && add_hosts.is_empty() {
+            return Ok(());
+        }
+
+        self.write_hosts_content(layout, None, &aliases, &[], &add_hosts)
+    }
+
     /// Set up bridge networking by looking up the network, spawning passt,
     /// and building the NetworkInstanceConfig for the VM spec.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -135,16 +168,57 @@ impl VmManager {
         })?;
 
         let own_ip = endpoint.ip_address.to_string();
-        let own_name = endpoint.box_name.clone();
+        let own_names = self.hostname_aliases(Some(&endpoint.box_name));
         let peers = net_config.peer_endpoints(&self.box_id);
+        let add_hosts = self.parse_add_hosts()?;
 
-        let hosts_content = a3s_box_core::dns::generate_hosts_file(&own_ip, &own_name, &peers);
+        self.write_hosts_content(layout, Some(&own_ip), &own_names, &peers, &add_hosts)?;
+
+        Ok(())
+    }
+
+    fn parse_add_hosts(&self) -> Result<Vec<HostEntry>> {
+        a3s_box_core::dns::parse_add_host_entries(&self.config.add_hosts)
+            .map_err(BoxError::ConfigError)
+    }
+
+    fn hostname_aliases(&self, default_name: Option<&str>) -> Vec<String> {
+        let mut aliases = Vec::new();
+        if let Some(default_name) = default_name.filter(|name| !name.is_empty()) {
+            aliases.push(default_name.to_string());
+        }
+        if let Some(hostname) = self
+            .config
+            .hostname
+            .as_deref()
+            .filter(|name| !name.is_empty())
+        {
+            if !aliases.iter().any(|alias| alias == hostname) {
+                aliases.push(hostname.to_string());
+            }
+        }
+        aliases
+    }
+
+    fn write_hosts_content(
+        &self,
+        layout: &super::BoxLayout,
+        own_ip: Option<&str>,
+        own_names: &[String],
+        peers: &[(String, String)],
+        add_hosts: &[HostEntry],
+    ) -> Result<()> {
+        let hosts_content = a3s_box_core::dns::generate_hosts_file_with_entries(
+            own_ip, own_names, peers, add_hosts,
+        );
         let hosts_path = layout.rootfs_path.join("etc/hosts");
+        if let Some(parent) = hosts_path.parent() {
+            std::fs::create_dir_all(parent).map_err(BoxError::IoError)?;
+        }
         std::fs::write(&hosts_path, &hosts_content).map_err(|e| {
             BoxError::NetworkError(format!("Failed to write {}: {}", hosts_path.display(), e))
         })?;
         tracing::debug!(hosts = %hosts_content.trim(), "Configured guest /etc/hosts for DNS discovery");
-
         Ok(())
     }
 }
@@ -168,6 +242,21 @@ pub(crate) fn parse_mac(mac_str: &str) -> std::result::Result<[u8; 6], String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    fn test_layout(rootfs_path: std::path::PathBuf) -> super::super::BoxLayout {
+        super::super::BoxLayout {
+            rootfs_path,
+            exec_socket_path: std::path::PathBuf::new(),
+            pty_socket_path: std::path::PathBuf::new(),
+            attest_socket_path: std::path::PathBuf::new(),
+            port_forward_socket_path: std::path::PathBuf::new(),
+            workspace_path: std::path::PathBuf::new(),
+            console_output: None,
+            oci_config: None,
+            tee_instance_config: None,
+        }
+    }
 
     #[test]
     fn test_parse_mac_valid() {
@@ -200,5 +289,64 @@ mod tests {
     #[test]
     fn test_parse_mac_invalid_hex() {
         assert!(parse_mac("02:42:zz:58:00:02").is_err());
+    }
+
+    #[test]
+    fn test_hostname_aliases_include_default_and_override() {
+        let vm = VmManager::with_box_id(
+            a3s_box_core::config::BoxConfig {
+                hostname: Some("web".to_string()),
+                ..Default::default()
+            },
+            a3s_box_core::event::EventEmitter::new(16),
+            "box-id".to_string(),
+        );
+
+        assert_eq!(
+            vm.hostname_aliases(Some("box-name")),
+            vec!["box-name", "web"]
+        );
+    }
+
+    #[test]
+    fn test_write_standalone_hosts_file_with_hostname_and_add_host() {
+        let dir = TempDir::new().unwrap();
+        let layout = test_layout(dir.path().join("rootfs"));
+        let vm = VmManager::with_box_id(
+            a3s_box_core::config::BoxConfig {
+                hostname: Some("web".to_string()),
+                add_hosts: vec!["db.local:10.88.0.10".to_string()],
+                ..Default::default()
+            },
+            a3s_box_core::event::EventEmitter::new(16),
+            "box-id".to_string(),
+        );
+
+        vm.write_standalone_hosts_file(&layout).unwrap();
+
+        let hosts = std::fs::read_to_string(layout.rootfs_path.join("etc/hosts")).unwrap();
+        assert!(hosts.contains("127.0.1.1 web"));
+        assert!(hosts.contains("10.88.0.10 db.local"));
+    }
+
+    #[test]
+    fn test_write_hostname_file() {
+        let dir = TempDir::new().unwrap();
+        let layout = test_layout(dir.path().join("rootfs"));
+        let vm = VmManager::with_box_id(
+            a3s_box_core::config::BoxConfig {
+                hostname: Some("web".to_string()),
+                ..Default::default()
+            },
+            a3s_box_core::event::EventEmitter::new(16),
+            "box-id".to_string(),
+        );
+
+        vm.write_hostname_file(&layout).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(layout.rootfs_path.join("etc/hostname")).unwrap(),
+            "web\n"
+        );
     }
 }

@@ -22,16 +22,27 @@ pub struct VmController {
 }
 
 impl VmController {
-    #[cfg(target_os = "windows")]
-    fn configure_windows_shim_logs(&self, cmd: &mut Command, spec: &InstanceSpec) {
+    fn configure_shim_stdio(&self, cmd: &mut Command, spec: &InstanceSpec) {
         use std::fs::OpenOptions;
 
         let Some(console_output) = spec.console_output.as_ref() else {
+            cmd.stdout(Stdio::null()).stderr(Stdio::null());
             return;
         };
         let Some(log_dir) = console_output.parent() else {
+            cmd.stdout(Stdio::null()).stderr(Stdio::null());
             return;
         };
+        if let Err(error) = std::fs::create_dir_all(log_dir) {
+            tracing::warn!(
+                box_id = %spec.box_id,
+                path = %log_dir.display(),
+                error = %error,
+                "Failed to create shim log directory"
+            );
+            cmd.stdout(Stdio::null()).stderr(Stdio::null());
+            return;
+        }
 
         let stdout_path = log_dir.join("shim.stdout.log");
         let stderr_path = log_dir.join("shim.stderr.log");
@@ -53,7 +64,7 @@ impl VmController {
                     box_id = %spec.box_id,
                     stdout = %stdout_path.display(),
                     stderr = %stderr_path.display(),
-                    "Redirecting Windows shim logs to per-box files"
+                    "Redirecting shim stdio to per-box files"
                 );
                 cmd.stdout(Stdio::from(stdout_file))
                     .stderr(Stdio::from(stderr_file));
@@ -64,7 +75,7 @@ impl VmController {
                         box_id = %spec.box_id,
                         path = %stdout_path.display(),
                         error = %error,
-                        "Failed to open Windows shim stdout log file"
+                        "Failed to open shim stdout log file"
                     );
                 }
                 if let Err(error) = stderr_result {
@@ -72,10 +83,10 @@ impl VmController {
                         box_id = %spec.box_id,
                         path = %stderr_path.display(),
                         error = %error,
-                        "Failed to open Windows shim stderr log file"
+                        "Failed to open shim stderr log file"
                     );
                 }
-                cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+                cmd.stdout(Stdio::null()).stderr(Stdio::null());
             }
         }
     }
@@ -399,12 +410,7 @@ impl VmmProvider for VmController {
 
         let mut cmd = Command::new(&self.shim_path);
         cmd.arg("--config").arg(&config_json).stdin(Stdio::null());
-
-        #[cfg(target_os = "windows")]
-        self.configure_windows_shim_logs(&mut cmd, spec);
-
-        #[cfg(not(target_os = "windows"))]
-        cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+        self.configure_shim_stdio(&mut cmd, spec);
 
         // On macOS, set DYLD_LIBRARY_PATH to help find libkrunfw
         #[cfg(target_os = "macos")]

@@ -2,6 +2,8 @@
 
 use clap::Args;
 
+use crate::image_usage;
+
 #[derive(Args)]
 pub struct ImageInspectArgs {
     /// Image reference to inspect
@@ -11,10 +13,8 @@ pub struct ImageInspectArgs {
 pub async fn execute(args: ImageInspectArgs) -> Result<(), Box<dyn std::error::Error>> {
     let store = super::open_image_store()?;
 
-    let stored = store
-        .get(&args.image)
-        .await
-        .ok_or_else(|| format!("Image not found: {}", args.image))?;
+    let images = store.list().await;
+    let stored = image_usage::resolve_required_stored_image(&images, &args.image)?;
 
     // Load OCI image to get full config
     let oci = a3s_box_runtime::OciImage::from_path(&stored.path)?;
@@ -25,6 +25,15 @@ pub async fn execute(args: ImageInspectArgs) -> Result<(), Box<dyn std::error::E
         .iter()
         .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
         .collect();
+    let healthcheck = config.health_check.as_ref().map(|hc| {
+        serde_json::json!({
+            "Test": hc.test.clone(),
+            "Interval": hc.interval,
+            "Timeout": hc.timeout,
+            "Retries": hc.retries,
+            "StartPeriod": hc.start_period,
+        })
+    });
 
     let output = serde_json::json!({
         "Reference": stored.reference,
@@ -38,6 +47,10 @@ pub async fn execute(args: ImageInspectArgs) -> Result<(), Box<dyn std::error::E
             "WorkingDir": config.working_dir,
             "User": config.user,
             "ExposedPorts": config.exposed_ports,
+            "Volumes": config.volumes,
+            "StopSignal": config.stop_signal,
+            "Healthcheck": healthcheck,
+            "OnBuild": config.onbuild,
             "Labels": config.labels,
         },
         "LayerCount": oci.layer_paths().len(),
@@ -45,4 +58,28 @@ pub async fn execute(args: ImageInspectArgs) -> Result<(), Box<dyn std::error::E
 
     println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use a3s_box_runtime::StoredImage;
+    use chrono::Utc;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_image_inspect_resolution_accepts_normalized_alias() {
+        let images = vec![StoredImage {
+            reference: "docker.io/library/alpine:latest".to_string(),
+            digest: "sha256:abc".to_string(),
+            size_bytes: 1024,
+            pulled_at: Utc::now(),
+            last_used: Utc::now(),
+            path: PathBuf::from("/tmp/image"),
+        }];
+
+        let stored = image_usage::resolve_required_stored_image(&images, "alpine:latest").unwrap();
+
+        assert_eq!(stored.reference, "docker.io/library/alpine:latest");
+    }
 }

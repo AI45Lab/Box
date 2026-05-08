@@ -5,7 +5,7 @@
 //! - Container → Session within Box
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -22,7 +22,7 @@ use a3s_box_runtime::vm::VmManager;
 use a3s_box_runtime::NetworkStore;
 
 use crate::config_mapper::{pod_sandbox_config_to_box_config, ANN_NETWORK, DEFAULT_AGENT_IMAGE};
-use crate::container::{Container, ContainerState};
+use crate::container::{Container, ContainerMount, ContainerState};
 use crate::cri_api::runtime_service_server::RuntimeService;
 use crate::cri_api::*;
 use crate::error::box_error_to_status;
@@ -144,6 +144,83 @@ fn container_user_from_linux_config(linux: Option<&LinuxContainerConfig>) -> Opt
         Some(group) => format!("{user}:{}", group.value),
         None => user.to_string(),
     })
+}
+
+fn container_mount_from_cri(mount: &Mount) -> ContainerMount {
+    ContainerMount {
+        container_path: mount.container_path.clone(),
+        host_path: mount.host_path.clone(),
+        readonly: mount.readonly,
+        selinux_relabel: mount.selinux_relabel,
+        propagation: mount.propagation,
+    }
+}
+
+fn container_mount_to_cri(mount: &ContainerMount) -> Mount {
+    Mount {
+        container_path: mount.container_path.clone(),
+        host_path: mount.host_path.clone(),
+        readonly: mount.readonly,
+        selinux_relabel: mount.selinux_relabel,
+        propagation: mount.propagation,
+    }
+}
+
+fn validate_container_mount(mount: &Mount) -> Result<(), Status> {
+    if mount.host_path.trim().is_empty() {
+        return Err(Status::invalid_argument(
+            "CRI mount host_path must not be empty",
+        ));
+    }
+    if mount.container_path.trim().is_empty() {
+        return Err(Status::invalid_argument(
+            "CRI mount container_path must not be empty",
+        ));
+    }
+    if !Path::new(&mount.container_path).is_absolute() {
+        return Err(Status::invalid_argument(format!(
+            "CRI mount container_path must be absolute: {}",
+            mount.container_path
+        )));
+    }
+    if !mount.readonly {
+        return Err(Status::unimplemented(format!(
+            "Writable CRI mounts are not yet supported for microVM-backed containers: {}",
+            mount.container_path
+        )));
+    }
+    if mount.selinux_relabel {
+        return Err(Status::unimplemented(format!(
+            "SELinux relabeling is not supported for CRI mount {}",
+            mount.container_path
+        )));
+    }
+
+    let propagation = crate::cri_api::mount::MountPropagation::try_from(mount.propagation)
+        .map_err(|_| {
+            Status::invalid_argument(format!(
+                "Invalid CRI mount propagation value {} for {}",
+                mount.propagation, mount.container_path
+            ))
+        })?;
+    if propagation != crate::cri_api::mount::MountPropagation::PropagationPrivate {
+        return Err(Status::unimplemented(format!(
+            "CRI mount propagation {:?} is not supported for microVM-backed containers",
+            propagation
+        )));
+    }
+
+    Ok(())
+}
+
+fn resolve_container_mounts(mounts: &[Mount]) -> Result<Vec<ContainerMount>, Status> {
+    mounts
+        .iter()
+        .map(|mount| {
+            validate_container_mount(mount)?;
+            Ok(container_mount_from_cri(mount))
+        })
+        .collect()
 }
 
 fn merge_env(image_env: &[(String, String)], cri_env: &[KeyValue]) -> Vec<(String, String)> {
@@ -475,8 +552,175 @@ fn zero_memory_usage(now_ns: i64) -> MemoryUsage {
     }
 }
 
-fn container_stats(container: &Container) -> ContainerStats {
+#[derive(Debug, Clone, Copy, Default)]
+struct PathUsage {
+    used_bytes: u64,
+    inodes_used: u64,
+}
+
+impl PathUsage {
+    fn add(&mut self, other: PathUsage) {
+        self.used_bytes = self.used_bytes.saturating_add(other.used_bytes);
+        self.inodes_used = self.inodes_used.saturating_add(other.inodes_used);
+    }
+}
+
+fn should_collect_rootfs_usage(rootfs_path: &str) -> bool {
+    let trimmed = rootfs_path.trim();
+    !trimmed.is_empty() && Path::new(trimmed) != Path::new("/")
+}
+
+fn collect_path_usage(path: &Path) -> std::io::Result<PathUsage> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    let mut usage = PathUsage {
+        used_bytes: metadata.len(),
+        inodes_used: 1,
+    };
+
+    if metadata.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            usage.add(collect_path_usage(&entry?.path())?);
+        }
+    }
+
+    Ok(usage)
+}
+
+async fn rootfs_path_usage(rootfs_path: &str) -> Option<PathUsage> {
+    if !should_collect_rootfs_usage(rootfs_path) {
+        return None;
+    }
+
+    let path = PathBuf::from(rootfs_path);
+    let display_path = path.display().to_string();
+    match tokio::task::spawn_blocking(move || collect_path_usage(&path)).await {
+        Ok(Ok(usage)) => Some(usage),
+        Ok(Err(error)) => {
+            tracing::debug!(
+                rootfs_path = %display_path,
+                error = %error,
+                "Failed to collect CRI container rootfs usage"
+            );
+            None
+        }
+        Err(error) => {
+            tracing::warn!(
+                rootfs_path = %display_path,
+                error = %error,
+                "CRI container rootfs usage collection task failed"
+            );
+            None
+        }
+    }
+}
+
+fn writable_layer_usage(
+    rootfs_path: &str,
+    usage: Option<PathUsage>,
+    now_ns: i64,
+) -> FilesystemUsage {
+    FilesystemUsage {
+        timestamp: now_ns,
+        fs_id: should_collect_rootfs_usage(rootfs_path).then(|| FilesystemIdentifier {
+            mountpoint: rootfs_path.to_string(),
+        }),
+        used_bytes: Some(UInt64Value {
+            value: usage.map(|usage| usage.used_bytes).unwrap_or(0),
+        }),
+        inodes_used: usage.map(|usage| UInt64Value {
+            value: usage.inodes_used,
+        }),
+    }
+}
+
+fn container_path_inside_rootfs(rootfs: &Path, container_path: &str) -> Result<PathBuf, Status> {
+    let path = Path::new(container_path);
+    if !path.is_absolute() {
+        return Err(Status::invalid_argument(format!(
+            "CRI mount container_path must be absolute: {container_path}"
+        )));
+    }
+
+    let mut relative = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir | std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => relative.push(part),
+            std::path::Component::ParentDir | std::path::Component::Prefix(_) => {
+                return Err(Status::invalid_argument(format!(
+                    "CRI mount container_path must not escape the rootfs: {container_path}"
+                )));
+            }
+        }
+    }
+
+    if relative.as_os_str().is_empty() {
+        return Err(Status::invalid_argument(
+            "CRI mount container_path must not be the rootfs",
+        ));
+    }
+
+    Ok(rootfs.join(relative))
+}
+
+fn remove_existing_mount_target(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(path),
+        Ok(_) => std::fs::remove_file(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn copy_mount_source(source: &Path, target: &Path) -> std::io::Result<()> {
+    let metadata = std::fs::metadata(source)?;
+    if metadata.is_dir() {
+        std::fs::create_dir_all(target)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            copy_mount_source(&entry.path(), &target.join(entry.file_name()))?;
+        }
+    } else {
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(source, target)?;
+    }
+
+    Ok(())
+}
+
+fn materialize_readonly_container_mount(
+    rootfs: &Path,
+    mount: &ContainerMount,
+) -> Result<(), Status> {
+    let source = Path::new(&mount.host_path);
+    if !source.exists() {
+        return Err(Status::failed_precondition(format!(
+            "CRI mount host_path does not exist: {}",
+            mount.host_path
+        )));
+    }
+
+    let target = container_path_inside_rootfs(rootfs, &mount.container_path)?;
+    remove_existing_mount_target(&target).map_err(|e| {
+        Status::internal(format!(
+            "Failed to clear CRI mount target {}: {e}",
+            target.display()
+        ))
+    })?;
+    copy_mount_source(source, &target).map_err(|e| {
+        Status::internal(format!(
+            "Failed to materialize CRI read-only mount {} -> {}: {e}",
+            source.display(),
+            target.display()
+        ))
+    })
+}
+
+async fn container_stats(container: &Container) -> ContainerStats {
     let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let rootfs_usage = rootfs_path_usage(&container.rootfs_path).await;
     ContainerStats {
         attributes: Some(ContainerAttributes {
             id: container.id.clone(),
@@ -489,17 +733,23 @@ fn container_stats(container: &Container) -> ContainerStats {
         }),
         cpu: Some(zero_cpu_usage(now_ns)),
         memory: Some(zero_memory_usage(now_ns)),
-        writable_layer: Some(FilesystemUsage {
-            timestamp: now_ns,
-            fs_id: None,
-            used_bytes: Some(UInt64Value { value: 0 }),
-            inodes_used: None,
-        }),
+        writable_layer: Some(writable_layer_usage(
+            &container.rootfs_path,
+            rootfs_usage,
+            now_ns,
+        )),
     }
 }
 
-fn pod_sandbox_stats(sandbox: &PodSandbox, containers: Vec<Container>) -> PodSandboxStats {
+async fn pod_sandbox_stats(sandbox: &PodSandbox, containers: Vec<Container>) -> PodSandboxStats {
     let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let running_containers: Vec<Container> = containers
+        .iter()
+        .filter(|container| container.state == ContainerState::Running)
+        .cloned()
+        .collect();
+    let container_stats = join_all(running_containers.iter().map(container_stats)).await;
+
     PodSandboxStats {
         attributes: Some(PodSandboxAttributes {
             id: sandbox.id.clone(),
@@ -530,11 +780,123 @@ fn pod_sandbox_stats(sandbox: &PodSandbox, containers: Vec<Container>) -> PodSan
                 }),
             }),
         }),
-        containers: containers
-            .iter()
-            .filter(|container| container.state == ContainerState::Running)
-            .map(container_stats)
-            .collect(),
+        containers: container_stats,
+    }
+}
+
+fn metric_descriptors() -> Vec<MetricDescriptor> {
+    vec![
+        MetricDescriptor {
+            name: "a3s_box_pod_sandbox_ready".to_string(),
+            help: "Whether the CRI pod sandbox is Ready according to the runtime store."
+                .to_string(),
+            kind: "gauge".to_string(),
+            unit: "1".to_string(),
+        },
+        MetricDescriptor {
+            name: "a3s_box_pod_sandbox_vm_manager_present".to_string(),
+            help: "Whether the runtime has an in-process VM manager for the pod sandbox."
+                .to_string(),
+            kind: "gauge".to_string(),
+            unit: "1".to_string(),
+        },
+        MetricDescriptor {
+            name: "a3s_box_pod_sandbox_containers_total".to_string(),
+            help: "Number of containers tracked for the pod sandbox.".to_string(),
+            kind: "gauge".to_string(),
+            unit: "count".to_string(),
+        },
+        MetricDescriptor {
+            name: "a3s_box_pod_sandbox_containers_running".to_string(),
+            help: "Number of running containers tracked for the pod sandbox.".to_string(),
+            kind: "gauge".to_string(),
+            unit: "count".to_string(),
+        },
+        MetricDescriptor {
+            name: "a3s_box_pod_sandbox_containers_exited".to_string(),
+            help: "Number of exited containers tracked for the pod sandbox.".to_string(),
+            kind: "gauge".to_string(),
+            unit: "count".to_string(),
+        },
+    ]
+}
+
+fn pod_sandbox_metric_labels(sandbox: &PodSandbox) -> HashMap<String, String> {
+    HashMap::from([
+        ("pod_sandbox_id".to_string(), sandbox.id.clone()),
+        ("namespace".to_string(), sandbox.namespace.clone()),
+        ("name".to_string(), sandbox.name.clone()),
+        ("uid".to_string(), sandbox.uid.clone()),
+        (
+            "runtime_handler".to_string(),
+            sandbox.runtime_handler.clone(),
+        ),
+    ])
+}
+
+fn pod_metric(name: &str, labels: &HashMap<String, String>, value: f64, timestamp: i64) -> Metric {
+    Metric {
+        name: name.to_string(),
+        labels: labels.clone(),
+        value,
+        timestamp,
+    }
+}
+
+fn pod_sandbox_metrics(
+    sandbox: &PodSandbox,
+    containers: &[Container],
+    vm_manager_present: bool,
+) -> PodSandboxMetrics {
+    let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let labels = pod_sandbox_metric_labels(sandbox);
+    let running_containers = containers
+        .iter()
+        .filter(|container| container.state == ContainerState::Running)
+        .count();
+    let exited_containers = containers
+        .iter()
+        .filter(|container| container.state == ContainerState::Exited)
+        .count();
+
+    PodSandboxMetrics {
+        pod_sandbox_id: sandbox.id.clone(),
+        metrics: vec![
+            pod_metric(
+                "a3s_box_pod_sandbox_ready",
+                &labels,
+                if sandbox.state == SandboxState::Ready {
+                    1.0
+                } else {
+                    0.0
+                },
+                now_ns,
+            ),
+            pod_metric(
+                "a3s_box_pod_sandbox_vm_manager_present",
+                &labels,
+                if vm_manager_present { 1.0 } else { 0.0 },
+                now_ns,
+            ),
+            pod_metric(
+                "a3s_box_pod_sandbox_containers_total",
+                &labels,
+                containers.len() as f64,
+                now_ns,
+            ),
+            pod_metric(
+                "a3s_box_pod_sandbox_containers_running",
+                &labels,
+                running_containers as f64,
+                now_ns,
+            ),
+            pod_metric(
+                "a3s_box_pod_sandbox_containers_exited",
+                &labels,
+                exited_containers as f64,
+                now_ns,
+            ),
+        ],
     }
 }
 
@@ -1069,6 +1431,32 @@ impl BoxRuntimeService {
         .map_err(|e| {
             Status::failed_precondition(format!("Failed to prepare container rootfs: {e}"))
         })
+    }
+
+    async fn materialize_readonly_container_mounts(
+        &self,
+        rootfs_path: &str,
+        mounts: &[ContainerMount],
+    ) -> Result<(), Status> {
+        if mounts.is_empty() {
+            return Ok(());
+        }
+        if rootfs_path.trim().is_empty() {
+            return Err(Status::failed_precondition(
+                "CRI mounts require a prepared container rootfs",
+            ));
+        }
+
+        let rootfs = PathBuf::from(rootfs_path);
+        let mounts = mounts.to_vec();
+        tokio::task::spawn_blocking(move || {
+            for mount in &mounts {
+                materialize_readonly_container_mount(&rootfs, mount)?;
+            }
+            Ok::<(), Status>(())
+        })
+        .await
+        .map_err(|e| Status::internal(format!("CRI mount materialization task failed: {e}")))?
     }
 
     async fn cleanup_container_rootfs_path(&self, rootfs_path: &str) {
@@ -1747,6 +2135,12 @@ impl RuntimeService for BoxRuntimeService {
             .metadata
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("container metadata required"))?;
+        if !config.devices.is_empty() {
+            return Err(Status::unimplemented(
+                "CRI devices are not yet supported for microVM-backed containers",
+            ));
+        }
+        let mounts = resolve_container_mounts(&config.mounts)?;
 
         let image_ref = config
             .image
@@ -1799,6 +2193,15 @@ impl RuntimeService for BoxRuntimeService {
             }
             None => (String::new(), String::new()),
         };
+        if !mounts.is_empty() {
+            if let Err(status) = self
+                .materialize_readonly_container_mounts(&rootfs_path, &mounts)
+                .await
+            {
+                self.cleanup_container_rootfs_path(&rootfs_path).await;
+                return Err(status);
+            }
+        }
 
         let container = Container {
             id: container_id.clone(),
@@ -1815,6 +2218,7 @@ impl RuntimeService for BoxRuntimeService {
             stdin: config.stdin,
             stdin_once: config.stdin_once,
             tty: config.tty,
+            mounts,
             state: ContainerState::Created,
             created_at: now_ns,
             started_at: 0,
@@ -2180,6 +2584,10 @@ impl RuntimeService for BoxRuntimeService {
                 ),
                 ("arg_count".to_string(), container.args.len().to_string()),
                 ("env_count".to_string(), container.env.len().to_string()),
+                (
+                    "mount_count".to_string(),
+                    container.mounts.len().to_string(),
+                ),
                 ("tty".to_string(), container.tty.to_string()),
                 ("stdin".to_string(), container.stdin.to_string()),
                 ("stdin_once".to_string(), container.stdin_once.to_string()),
@@ -2208,7 +2616,11 @@ impl RuntimeService for BoxRuntimeService {
             message,
             labels: container.labels.clone(),
             annotations: container.annotations.clone(),
-            mounts: vec![],
+            mounts: container
+                .mounts
+                .iter()
+                .map(container_mount_to_cri)
+                .collect(),
             log_path: container.log_path.clone(),
         };
 
@@ -2487,24 +2899,61 @@ impl RuntimeService for BoxRuntimeService {
         _request: Request<ListMetricDescriptorsRequest>,
     ) -> Result<Response<ListMetricDescriptorsResponse>, Status> {
         Ok(Response::new(ListMetricDescriptorsResponse {
-            descriptors: vec![],
+            descriptors: metric_descriptors(),
         }))
     }
 
     async fn list_pod_sandbox_metrics(
         &self,
-        _request: Request<ListPodSandboxMetricsRequest>,
+        request: Request<ListPodSandboxMetricsRequest>,
     ) -> Result<Response<ListPodSandboxMetricsResponse>, Status> {
+        let req = request.into_inner();
+        let label_filter = req
+            .filter
+            .as_ref()
+            .map(|filter| &filter.label_selector)
+            .filter(|labels| !labels.is_empty());
+        let sandboxes = self.store.sandboxes.list(label_filter).await;
+        let vm_manager_ids: std::collections::HashSet<String> =
+            self.vm_managers.read().await.keys().cloned().collect();
+
+        let mut metrics = Vec::new();
+        for sandbox in sandboxes {
+            if let Some(ref filter) = req.filter {
+                if !filter.id.is_empty() && sandbox.id != filter.id {
+                    continue;
+                }
+            }
+
+            let containers = self.store.containers.list(Some(&sandbox.id), None).await;
+            metrics.push(pod_sandbox_metrics(
+                &sandbox,
+                &containers,
+                vm_manager_ids.contains(&sandbox.id),
+            ));
+        }
+
         Ok(Response::new(ListPodSandboxMetricsResponse {
-            pod_sandbox_metrics: vec![],
+            pod_sandbox_metrics: metrics,
         }))
     }
 
     async fn stream_pod_sandbox_metrics(
         &self,
-        _request: Request<StreamPodSandboxMetricsRequest>,
+        request: Request<StreamPodSandboxMetricsRequest>,
     ) -> Result<Response<Self::StreamPodSandboxMetricsStream>, Status> {
-        let stream: Self::StreamPodSandboxMetricsStream = Box::pin(tokio_stream::empty());
+        let req = request.into_inner();
+        let response = self
+            .list_pod_sandbox_metrics(Request::new(ListPodSandboxMetricsRequest {
+                filter: req.filter,
+            }))
+            .await?
+            .into_inner();
+        let stream: Self::StreamPodSandboxMetricsStream = Box::pin(tokio_stream::iter(vec![Ok(
+            StreamPodSandboxMetricsResponse {
+                pod_sandbox_metrics: response.pod_sandbox_metrics,
+            },
+        )]));
         Ok(Response::new(stream))
     }
 
@@ -2830,7 +3279,7 @@ impl RuntimeService for BoxRuntimeService {
             .ok_or_else(|| Status::not_found(format!("Container not found: {}", container_id)))?;
 
         Ok(Response::new(ContainerStatsResponse {
-            stats: Some(container_stats(&container)),
+            stats: Some(container_stats(&container).await),
         }))
     }
 
@@ -2855,7 +3304,7 @@ impl RuntimeService for BoxRuntimeService {
             .containers
             .list(sandbox_filter, label_filter)
             .await;
-        let stats = containers
+        let containers: Vec<Container> = containers
             .into_iter()
             .filter(|container| {
                 if container.state != ContainerState::Running {
@@ -2868,8 +3317,8 @@ impl RuntimeService for BoxRuntimeService {
                 }
                 true
             })
-            .map(|container| container_stats(&container))
             .collect();
+        let stats = join_all(containers.iter().map(container_stats)).await;
 
         Ok(Response::new(ListContainerStatsResponse { stats }))
     }
@@ -2907,7 +3356,7 @@ impl RuntimeService for BoxRuntimeService {
         let containers = self.store.containers.list(Some(&sandbox_id), None).await;
 
         Ok(Response::new(PodSandboxStatsResponse {
-            stats: Some(pod_sandbox_stats(&sandbox, containers)),
+            stats: Some(pod_sandbox_stats(&sandbox, containers).await),
         }))
     }
 
@@ -2932,7 +3381,7 @@ impl RuntimeService for BoxRuntimeService {
             }
 
             let containers = self.store.containers.list(Some(&sandbox.id), None).await;
-            stats.push(pod_sandbox_stats(&sandbox, containers));
+            stats.push(pod_sandbox_stats(&sandbox, containers).await);
         }
 
         Ok(Response::new(ListPodSandboxStatsResponse { stats }))
@@ -3928,6 +4377,7 @@ mod tests {
             stdin: false,
             stdin_once: false,
             tty: false,
+            mounts: vec![],
             state: ContainerState::Created,
             created_at: 1_000_000_000,
             started_at: 0,
@@ -4023,6 +4473,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_container_stats_reports_rootfs_writable_layer_usage() {
+        let svc = make_test_service();
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(dir.path().join("file.txt"), b"hello").unwrap();
+        std::fs::write(nested.join("child.txt"), b"world!").unwrap();
+
+        let mut container = test_container("c-usage", "sb-1");
+        container.state = ContainerState::Running;
+        container.rootfs_path = dir.path().to_string_lossy().to_string();
+        svc.store.containers.add(container).await;
+
+        let resp = svc
+            .container_stats(Request::new(ContainerStatsRequest {
+                container_id: "c-usage".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let writable_layer = resp.stats.unwrap().writable_layer.unwrap();
+        assert_eq!(
+            writable_layer.fs_id.unwrap().mountpoint,
+            dir.path().to_string_lossy()
+        );
+        assert!(writable_layer.used_bytes.unwrap().value >= 11);
+        assert!(writable_layer.inodes_used.unwrap().value >= 4);
+    }
+
+    #[tokio::test]
     async fn test_list_container_stats_only_reports_running_containers() {
         let svc = make_test_service();
         let mut running = test_container("c-running", "sb-1");
@@ -4040,6 +4521,115 @@ mod tests {
 
         assert_eq!(resp.stats.len(), 1);
         assert_eq!(resp.stats[0].attributes.as_ref().unwrap().id, "c-running");
+    }
+
+    fn pod_metric_value(metrics: &PodSandboxMetrics, name: &str) -> f64 {
+        metrics
+            .metrics
+            .iter()
+            .find(|metric| metric.name == name)
+            .unwrap_or_else(|| panic!("missing pod sandbox metric {name}"))
+            .value
+    }
+
+    #[tokio::test]
+    async fn test_list_metric_descriptors_reports_pod_sandbox_metrics() {
+        let svc = make_test_service();
+        let resp = svc
+            .list_metric_descriptors(Request::new(ListMetricDescriptorsRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let names: Vec<_> = resp
+            .descriptors
+            .iter()
+            .map(|descriptor| descriptor.name.as_str())
+            .collect();
+        assert!(names.contains(&"a3s_box_pod_sandbox_ready"));
+        assert!(names.contains(&"a3s_box_pod_sandbox_vm_manager_present"));
+        assert!(names.contains(&"a3s_box_pod_sandbox_containers_running"));
+    }
+
+    #[tokio::test]
+    async fn test_list_pod_sandbox_metrics_returns_lifecycle_snapshot() {
+        let svc = make_test_service();
+        svc.store.sandboxes.add(test_sandbox("sb-1")).await;
+
+        let mut running = test_container("c-running", "sb-1");
+        running.state = ContainerState::Running;
+        let mut exited = test_container("c-exited", "sb-1");
+        exited.state = ContainerState::Exited;
+        let created = test_container("c-created", "sb-1");
+        svc.store.containers.add(running).await;
+        svc.store.containers.add(exited).await;
+        svc.store.containers.add(created).await;
+        let vm = VmManager::with_box_id(
+            a3s_box_core::config::BoxConfig::default(),
+            EventEmitter::new(16),
+            "sb-1".to_string(),
+        );
+        svc.vm_managers.write().await.insert("sb-1".to_string(), vm);
+
+        let resp = svc
+            .list_pod_sandbox_metrics(Request::new(ListPodSandboxMetricsRequest {
+                filter: Some(PodSandboxStatsFilter {
+                    id: "sb-1".to_string(),
+                    label_selector: HashMap::new(),
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(resp.pod_sandbox_metrics.len(), 1);
+        let metrics = &resp.pod_sandbox_metrics[0];
+        assert_eq!(metrics.pod_sandbox_id, "sb-1");
+        assert_eq!(pod_metric_value(metrics, "a3s_box_pod_sandbox_ready"), 1.0);
+        assert_eq!(
+            pod_metric_value(metrics, "a3s_box_pod_sandbox_vm_manager_present"),
+            1.0
+        );
+        assert_eq!(
+            pod_metric_value(metrics, "a3s_box_pod_sandbox_containers_total"),
+            3.0
+        );
+        assert_eq!(
+            pod_metric_value(metrics, "a3s_box_pod_sandbox_containers_running"),
+            1.0
+        );
+        assert_eq!(
+            pod_metric_value(metrics, "a3s_box_pod_sandbox_containers_exited"),
+            1.0
+        );
+        let first_metric = metrics.metrics.first().unwrap();
+        assert_eq!(
+            first_metric.labels.get("pod_sandbox_id"),
+            Some(&"sb-1".to_string())
+        );
+        assert_eq!(
+            first_metric.labels.get("namespace"),
+            Some(&"default".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_pod_sandbox_metrics_returns_snapshot() {
+        let svc = make_test_service();
+        svc.store.sandboxes.add(test_sandbox("sb-1")).await;
+
+        let mut stream = svc
+            .stream_pod_sandbox_metrics(Request::new(StreamPodSandboxMetricsRequest {
+                filter: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let response = stream.next().await.unwrap().unwrap();
+        assert_eq!(response.pod_sandbox_metrics.len(), 1);
+        assert_eq!(response.pod_sandbox_metrics[0].pod_sandbox_id, "sb-1");
+        assert!(stream.next().await.is_none());
     }
 
     #[tokio::test]
@@ -4634,6 +5224,110 @@ mod tests {
         assert!(c.stdin);
         assert!(c.stdin_once);
         assert!(c.tty);
+    }
+
+    #[tokio::test]
+    async fn test_create_container_materializes_readonly_mount() {
+        let svc = make_test_service();
+        svc.store.sandboxes.add(test_sandbox("sb-1")).await;
+        put_test_oci_image(&svc.image_store, "nginx:latest").await;
+
+        let source = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(source.path().join("nested")).unwrap();
+        std::fs::write(source.path().join("config.txt"), b"mounted config").unwrap();
+        std::fs::write(source.path().join("nested").join("extra.txt"), b"extra").unwrap();
+
+        let resp = svc
+            .create_container(Request::new(CreateContainerRequest {
+                pod_sandbox_id: "sb-1".to_string(),
+                config: Some(ContainerConfig {
+                    metadata: Some(ContainerMetadata {
+                        name: "mounted".to_string(),
+                        attempt: 0,
+                    }),
+                    image: Some(ImageSpec {
+                        image: "nginx:latest".to_string(),
+                        annotations: HashMap::new(),
+                    }),
+                    command: vec!["nginx".to_string()],
+                    mounts: vec![Mount {
+                        container_path: "/etc/a3s-config".to_string(),
+                        host_path: source.path().to_string_lossy().to_string(),
+                        readonly: true,
+                        selinux_relabel: false,
+                        propagation: crate::cri_api::mount::MountPropagation::PropagationPrivate
+                            as i32,
+                    }],
+                    ..Default::default()
+                }),
+                sandbox_config: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let container = svc.store.containers.get(&resp.container_id).await.unwrap();
+        assert_eq!(container.mounts.len(), 1);
+        let mounted_file = PathBuf::from(&container.rootfs_path)
+            .join("etc")
+            .join("a3s-config")
+            .join("config.txt");
+        let mounted_nested = PathBuf::from(&container.rootfs_path)
+            .join("etc")
+            .join("a3s-config")
+            .join("nested")
+            .join("extra.txt");
+        assert_eq!(
+            std::fs::read_to_string(mounted_file).unwrap(),
+            "mounted config"
+        );
+        assert_eq!(std::fs::read_to_string(mounted_nested).unwrap(), "extra");
+
+        let status = svc
+            .container_status(Request::new(ContainerStatusRequest {
+                container_id: resp.container_id,
+                verbose: true,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let status = status.status.unwrap();
+        assert_eq!(status.mounts.len(), 1);
+        assert_eq!(status.mounts[0].container_path, "/etc/a3s-config");
+    }
+
+    #[tokio::test]
+    async fn test_create_container_rejects_writable_mounts() {
+        let svc = make_test_service();
+        svc.store.sandboxes.add(test_sandbox("sb-1")).await;
+
+        let result = svc
+            .create_container(Request::new(CreateContainerRequest {
+                pod_sandbox_id: "sb-1".to_string(),
+                config: Some(ContainerConfig {
+                    metadata: Some(ContainerMetadata {
+                        name: "mounted".to_string(),
+                        attempt: 0,
+                    }),
+                    command: vec!["/bin/true".to_string()],
+                    mounts: vec![Mount {
+                        container_path: "/data".to_string(),
+                        host_path: "/tmp".to_string(),
+                        readonly: false,
+                        selinux_relabel: false,
+                        propagation: crate::cri_api::mount::MountPropagation::PropagationPrivate
+                            as i32,
+                    }],
+                    ..Default::default()
+                }),
+                sandbox_config: None,
+            }))
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
+        assert!(err.message().contains("Writable CRI mounts"));
     }
 
     #[tokio::test]

@@ -3,7 +3,7 @@
 //! Provides create/ls/rm/inspect/connect/disconnect for user-defined
 //! bridge networks that enable container-to-container communication.
 
-use a3s_box_core::network::{IsolationMode, NetworkConfig};
+use a3s_box_core::network::{IsolationMode, NetworkConfig, NetworkEndpoint, NetworkMode};
 use a3s_box_runtime::NetworkStore;
 use clap::{Args, Subcommand};
 
@@ -113,6 +113,8 @@ pub async fn execute(args: NetworkArgs) -> Result<(), Box<dyn std::error::Error>
 async fn execute_create(args: CreateArgs) -> Result<(), Box<dyn std::error::Error>> {
     let store = NetworkStore::default_path()?;
 
+    validate_network_driver(&args.driver)?;
+
     let mut config = NetworkConfig::new(&args.name, &args.subnet)
         .map_err(|e| format!("Invalid network configuration: {e}"))?;
 
@@ -129,6 +131,7 @@ async fn execute_create(args: CreateArgs) -> Result<(), Box<dyn std::error::Erro
             )
         }
     };
+    validate_attachable_network(&config)?;
 
     // Parse labels
     for label in &args.labels {
@@ -141,6 +144,25 @@ async fn execute_create(args: CreateArgs) -> Result<(), Box<dyn std::error::Erro
     store.create(config)?;
     println!("{}", args.name);
     Ok(())
+}
+
+pub(crate) fn validate_attachable_network(config: &NetworkConfig) -> Result<(), String> {
+    validate_network_driver(&config.driver)?;
+    config
+        .policy
+        .validate()
+        .map_err(|e| format!("Unsupported network isolation mode: {e}"))?;
+    Ok(())
+}
+
+pub(crate) fn validate_network_driver(driver: &str) -> Result<(), String> {
+    if driver == "bridge" {
+        Ok(())
+    } else {
+        Err(format!(
+            "Unsupported network driver '{driver}'. Only 'bridge' is currently supported"
+        ))
+    }
 }
 
 async fn execute_ls(args: LsArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -188,23 +210,86 @@ async fn execute_rm(args: RmArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let store = NetworkStore::default_path()?;
+    let mut state = crate::state::StateFile::load_default()?;
+    let mut errors = Vec::new();
 
     for name in &args.names {
         if args.force {
-            // Force: disconnect all endpoints first
             if let Some(mut config) = store.get(name)? {
-                let box_ids: Vec<String> = config.endpoints.keys().cloned().collect();
-                for box_id in box_ids {
-                    config.disconnect(&box_id).ok();
+                if let Err(error) =
+                    force_disconnect_network_endpoints(&store, &mut state, name, &mut config)
+                {
+                    errors.push(format!("{name}: {error}"));
+                    continue;
                 }
-                store.update(&config)?;
             }
         }
 
         match store.remove(name) {
             Ok(_) => println!("{name}"),
-            Err(e) => eprintln!("Error removing network '{name}': {e}"),
+            Err(error) => errors.push(format!("{name}: {error}")),
         }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("\n").into())
+    }
+}
+
+fn force_disconnect_network_endpoints(
+    store: &NetworkStore,
+    state: &mut crate::state::StateFile,
+    network_name: &str,
+    config: &mut NetworkConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let configured_box_ids: Vec<String> = state
+        .records()
+        .iter()
+        .filter(|record| crate::cleanup::record_network_name(record) == Some(network_name))
+        .map(|record| record.id.clone())
+        .collect();
+
+    for endpoint in config.endpoints.values() {
+        let Some(record) = state.find_by_id(&endpoint.box_id) else {
+            continue;
+        };
+        if crate::status::is_active(record) {
+            return Err(format!(
+                "network '{network_name}' has active box {}. Stop it before force-removing the network because network hot-plug is not supported yet.",
+                record.name
+            )
+            .into());
+        }
+    }
+    for box_id in &configured_box_ids {
+        let Some(record) = state.find_by_id(box_id) else {
+            continue;
+        };
+        if crate::status::is_active(record) {
+            return Err(format!(
+                "network '{network_name}' is configured on active box {}. Stop it before force-removing the network because network hot-plug is not supported yet.",
+                record.name
+            )
+            .into());
+        }
+    }
+
+    let box_ids: Vec<String> = config.endpoints.keys().cloned().collect();
+    let mut changed_state = false;
+    for box_id in box_ids {
+        let _ = config.disconnect(&box_id);
+    }
+    for box_id in configured_box_ids {
+        if let Some(record) = state.find_by_id_mut(&box_id) {
+            clear_record_network(record);
+            changed_state = true;
+        }
+    }
+    store.update(config)?;
+    if changed_state {
+        state.save()?;
     }
 
     Ok(())
@@ -224,29 +309,37 @@ async fn execute_inspect(args: InspectArgs) -> Result<(), Box<dyn std::error::Er
 
 async fn execute_connect(args: ConnectArgs) -> Result<(), Box<dyn std::error::Error>> {
     let store = NetworkStore::default_path()?;
-    let state = crate::state::StateFile::load_default()?;
+    let mut state = crate::state::StateFile::load_default()?;
 
     // Resolve box name/ID using Docker-compatible resolution
-    let record = crate::resolve::resolve(&state, &args.container)?;
+    let record = crate::resolve::resolve(&state, &args.container)?.clone();
+    require_inactive_for_network_change(&record, "connect to a network")?;
+
+    if let Some(existing) = crate::cleanup::record_network_name(&record) {
+        if existing != args.network {
+            return Err(format!(
+                "Box {} is already configured for network '{}'. Disconnect it before connecting to '{}'.",
+                record.name, existing, args.network
+            )
+            .into());
+        }
+    }
 
     let mut config = store
         .get(&args.network)?
         .ok_or_else(|| format!("network '{}' not found", args.network))?;
 
-    // Enforce network isolation policy before connecting
-    if config.policy.isolation == IsolationMode::Strict {
-        return Err(format!(
-            "network '{}' has strict isolation — no new connections allowed",
-            args.network
-        )
-        .into());
-    }
+    validate_attachable_network(&config)?;
 
-    let endpoint = config
-        .connect(&record.id, &record.name)
+    let endpoint = ensure_endpoint(&mut config, &record.id, &record.name)
         .map_err(|e| format!("Failed to connect: {e}"))?;
-
     store.update(&config)?;
+
+    {
+        let state_record = crate::resolve::resolve_mut(&mut state, &record.id)?;
+        set_record_network(state_record, &args.network);
+    }
+    state.save()?;
 
     println!(
         "Connected {} to {} (IP: {})",
@@ -257,23 +350,86 @@ async fn execute_connect(args: ConnectArgs) -> Result<(), Box<dyn std::error::Er
 
 async fn execute_disconnect(args: DisconnectArgs) -> Result<(), Box<dyn std::error::Error>> {
     let store = NetworkStore::default_path()?;
-    let state = crate::state::StateFile::load_default()?;
+    let mut state = crate::state::StateFile::load_default()?;
 
     // Resolve box name/ID using Docker-compatible resolution
-    let record = crate::resolve::resolve(&state, &args.container)?;
+    let record = crate::resolve::resolve(&state, &args.container)?.clone();
+    require_inactive_for_network_change(&record, "disconnect from a network")?;
 
-    let mut config = store
-        .get(&args.network)?
-        .ok_or_else(|| format!("network '{}' not found", args.network))?;
+    let configured_network = crate::cleanup::record_network_name(&record).map(str::to_string);
+    if configured_network.as_deref() != Some(args.network.as_str()) && !args.force {
+        return Err(format!(
+            "Box {} is not configured for network '{}'. Use --force to remove a stale endpoint only.",
+            record.name, args.network
+        )
+        .into());
+    }
 
-    config
-        .disconnect(&record.id)
-        .map_err(|e| format!("Failed to disconnect: {e}"))?;
+    let is_configured_network = configured_network.as_deref() == Some(args.network.as_str());
 
-    store.update(&config)?;
+    if let Some(mut config) = store.get(&args.network)? {
+        match config.disconnect(&record.id) {
+            Ok(_) => store.update(&config)?,
+            Err(error) if args.force || is_configured_network => {
+                tracing::debug!(
+                    box_id = %record.id,
+                    network = %args.network,
+                    error = %error,
+                    "Ignoring missing network endpoint during forced disconnect"
+                );
+            }
+            Err(error) => return Err(format!("Failed to disconnect: {error}").into()),
+        }
+    } else if !args.force {
+        return Err(format!("network '{}' not found", args.network).into());
+    }
+
+    if is_configured_network {
+        let state_record = crate::resolve::resolve_mut(&mut state, &record.id)?;
+        clear_record_network(state_record);
+        state.save()?;
+    }
 
     println!("Disconnected {} from {}", record.name, args.network);
     Ok(())
+}
+
+fn ensure_endpoint(
+    config: &mut NetworkConfig,
+    box_id: &str,
+    box_name: &str,
+) -> Result<NetworkEndpoint, String> {
+    if let Some(endpoint) = config.endpoints.get_mut(box_id) {
+        endpoint.box_name = box_name.to_string();
+        return Ok(endpoint.clone());
+    }
+    config.connect(box_id, box_name)
+}
+
+fn require_inactive_for_network_change(
+    record: &crate::state::BoxRecord,
+    action: &str,
+) -> Result<(), String> {
+    if !crate::status::is_active(record) {
+        return Ok(());
+    }
+
+    Err(format!(
+        "Cannot {action} box {} because network hot-plug is not supported yet. Stop it first, run the network command, then start it again.",
+        record.name
+    ))
+}
+
+fn set_record_network(record: &mut crate::state::BoxRecord, network: &str) {
+    record.network_mode = NetworkMode::Bridge {
+        network: network.to_string(),
+    };
+    record.network_name = Some(network.to_string());
+}
+
+fn clear_record_network(record: &mut crate::state::BoxRecord) {
+    record.network_mode = NetworkMode::Tsi;
+    record.network_name = None;
 }
 
 #[cfg(test)]
@@ -285,6 +441,126 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = NetworkStore::new(dir.path().join("networks.json"));
         (dir, store)
+    }
+
+    #[test]
+    fn test_validate_network_driver_accepts_bridge_only() {
+        assert!(validate_network_driver("bridge").is_ok());
+
+        let error = validate_network_driver("overlay").unwrap_err();
+        assert!(error.contains("Unsupported network driver"));
+    }
+
+    #[test]
+    fn test_validate_attachable_network_rejects_unsupported_policy() {
+        let mut config = NetworkConfig::new("testnet", "10.89.0.0/24").unwrap();
+        config.policy.isolation = IsolationMode::Custom;
+
+        let error = validate_attachable_network(&config).unwrap_err();
+
+        assert!(error.contains("Unsupported network isolation mode"));
+    }
+
+    #[test]
+    fn test_ensure_endpoint_reuses_existing_endpoint_and_updates_name() {
+        let mut config = NetworkConfig::new("testnet", "10.89.0.0/24").unwrap();
+        let first = ensure_endpoint(&mut config, "box-1", "old-name").unwrap();
+        let second = ensure_endpoint(&mut config, "box-1", "new-name").unwrap();
+
+        assert_eq!(first.ip_address, second.ip_address);
+        assert_eq!(second.box_name, "new-name");
+        assert_eq!(config.endpoints.get("box-1").unwrap().box_name, "new-name");
+    }
+
+    #[test]
+    fn test_require_inactive_for_network_change_rejects_active_boxes() {
+        let running =
+            crate::test_helpers::fixtures::make_record("box-1", "web", "running", Some(123));
+        let paused =
+            crate::test_helpers::fixtures::make_record("box-2", "api", "paused", Some(124));
+        let stopped = crate::test_helpers::fixtures::make_record("box-3", "db", "stopped", None);
+
+        assert!(require_inactive_for_network_change(&running, "connect").is_err());
+        assert!(require_inactive_for_network_change(&paused, "connect").is_err());
+        assert!(require_inactive_for_network_change(&stopped, "connect").is_ok());
+    }
+
+    #[test]
+    fn test_set_and_clear_record_network() {
+        let mut record =
+            crate::test_helpers::fixtures::make_record("box-1", "web", "created", None);
+
+        set_record_network(&mut record, "backend");
+        assert_eq!(record.network_name.as_deref(), Some("backend"));
+        assert!(matches!(
+            record.network_mode,
+            NetworkMode::Bridge { ref network } if network == "backend"
+        ));
+
+        clear_record_network(&mut record);
+        assert_eq!(record.network_name, None);
+        assert!(matches!(record.network_mode, NetworkMode::Tsi));
+    }
+
+    #[test]
+    fn test_force_disconnect_network_endpoints_clears_inactive_record_network() {
+        let (_store_dir, store) = temp_store();
+        let mut config = NetworkConfig::new("testnet", "10.89.0.0/24").unwrap();
+        config.connect("box-1", "web").unwrap();
+        store.create(config.clone()).unwrap();
+
+        let mut record =
+            crate::test_helpers::fixtures::make_record("box-1", "web", "stopped", None);
+        set_record_network(&mut record, "testnet");
+        let (_state_dir, mut state) = crate::test_helpers::fixtures::setup_state(vec![record]);
+        let mut config = store.get("testnet").unwrap().unwrap();
+
+        force_disconnect_network_endpoints(&store, &mut state, "testnet", &mut config).unwrap();
+
+        let config = store.get("testnet").unwrap().unwrap();
+        assert!(config.endpoints.is_empty());
+        let record = state.find_by_id("box-1").unwrap();
+        assert_eq!(record.network_name, None);
+        assert!(matches!(record.network_mode, NetworkMode::Tsi));
+    }
+
+    #[test]
+    fn test_force_disconnect_network_endpoints_clears_stale_record_without_endpoint() {
+        let (_store_dir, store) = temp_store();
+        let config = NetworkConfig::new("testnet", "10.89.0.0/24").unwrap();
+        store.create(config).unwrap();
+
+        let mut record =
+            crate::test_helpers::fixtures::make_record("box-1", "web", "stopped", None);
+        set_record_network(&mut record, "testnet");
+        let (_state_dir, mut state) = crate::test_helpers::fixtures::setup_state(vec![record]);
+        let mut config = store.get("testnet").unwrap().unwrap();
+
+        force_disconnect_network_endpoints(&store, &mut state, "testnet", &mut config).unwrap();
+
+        let record = state.find_by_id("box-1").unwrap();
+        assert_eq!(record.network_name, None);
+        assert!(matches!(record.network_mode, NetworkMode::Tsi));
+    }
+
+    #[test]
+    fn test_force_disconnect_network_endpoints_rejects_active_record() {
+        let (_store_dir, store) = temp_store();
+        let mut config = NetworkConfig::new("testnet", "10.89.0.0/24").unwrap();
+        config.connect("box-1", "web").unwrap();
+        store.create(config.clone()).unwrap();
+
+        let mut record =
+            crate::test_helpers::fixtures::make_record("box-1", "web", "running", Some(123));
+        set_record_network(&mut record, "testnet");
+        let (_state_dir, mut state) = crate::test_helpers::fixtures::setup_state(vec![record]);
+        let mut config = store.get("testnet").unwrap().unwrap();
+
+        let error = force_disconnect_network_endpoints(&store, &mut state, "testnet", &mut config)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("active box web"));
+        assert_eq!(store.get("testnet").unwrap().unwrap().endpoints.len(), 1);
     }
 
     #[test]

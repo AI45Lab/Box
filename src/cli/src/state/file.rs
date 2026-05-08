@@ -108,37 +108,55 @@ impl StateFile {
         &self.records
     }
 
-    /// Reconcile: check PID liveness for running boxes, mark dead ones.
+    /// Reconcile: check PID liveness for active boxes, mark dead ones.
     ///
     /// Returns a list of box IDs that should be restarted based on their
     /// restart policy. The caller is responsible for actually restarting them.
     fn reconcile(&mut self) -> Vec<String> {
         let mut changed = false;
         let mut restart_candidates = Vec::new();
+        let mut auto_remove_records = Vec::new();
+        let mut stopped_resource_records = Vec::new();
 
         for record in &mut self.records {
-            if record.status == "running" {
-                if let Some(pid) = record.pid {
-                    if !is_process_alive(pid) {
-                        record.status = "dead".to_string();
-                        record.pid = None;
-                        changed = true;
+            if !matches!(record.status.as_str(), "running" | "paused") {
+                continue;
+            }
 
-                        if should_restart(record) {
-                            restart_candidates.push(record.id.clone());
-                        }
-                    }
-                } else {
-                    // Running but no PID — mark as dead
-                    record.status = "dead".to_string();
-                    changed = true;
+            let has_live_pid = record.pid.is_some_and(is_process_alive);
+            if !has_live_pid {
+                record.status = "dead".to_string();
+                record.pid = None;
+                record.health_status = "none".to_string();
+                record.health_retries = 0;
+                changed = true;
 
-                    if should_restart(record) {
-                        restart_candidates.push(record.id.clone());
-                    }
+                if record.auto_remove {
+                    auto_remove_records.push(record.clone());
+                    continue;
+                }
+
+                stopped_resource_records.push(record.clone());
+
+                if should_restart(record) {
+                    restart_candidates.push(record.id.clone());
                 }
             }
         }
+
+        for record in &stopped_resource_records {
+            crate::cleanup::cleanup_stopped_box(record);
+        }
+
+        if !auto_remove_records.is_empty() {
+            for record in &auto_remove_records {
+                crate::cleanup::cleanup_removed_box(record);
+            }
+            self.records
+                .retain(|record| !auto_remove_records.iter().any(|r| r.id == record.id));
+            changed = true;
+        }
+
         if changed {
             let _ = self.save();
         }

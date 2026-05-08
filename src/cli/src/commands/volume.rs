@@ -249,6 +249,15 @@ pub fn attach_volumes(
         return Ok(());
     }
     let store = VolumeStore::default_path()?;
+    attach_volumes_with_store(&store, volume_names, box_id)
+}
+
+/// Attach named volumes to a box in a specific VolumeStore.
+pub(crate) fn attach_volumes_with_store(
+    store: &VolumeStore,
+    volume_names: &[String],
+    box_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     for name in volume_names {
         if let Some(mut config) = store.get(name)? {
             config.attach(box_id);
@@ -344,6 +353,17 @@ mod tests {
         store.update(&updated).unwrap();
 
         assert!(store.remove("testdata", false).is_err());
+    }
+
+    #[test]
+    fn test_attach_volumes_with_store_attaches_existing_volumes() {
+        let (_dir, store) = temp_store();
+        store.create(VolumeConfig::new("testdata", "")).unwrap();
+
+        attach_volumes_with_store(&store, &["testdata".to_string()], "box-1").unwrap();
+
+        let updated = store.get("testdata").unwrap().unwrap();
+        assert!(updated.in_use_by.contains(&"box-1".to_string()));
     }
 
     #[test]

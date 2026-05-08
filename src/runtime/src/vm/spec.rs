@@ -58,14 +58,17 @@ impl VmManager {
 
                 // Create the volume via VolumeStore (best-effort)
                 match self.create_anonymous_volume(&anon_name) {
-                    Ok(host_path) => {
+                    Ok((host_path, created)) => {
                         let tag = format!("vol{}", anon_vol_offset);
                         fs_mounts.push(FsMount {
                             tag: tag.clone(),
                             host_path: PathBuf::from(&host_path),
                             read_only: false,
                         });
-                        self.anonymous_volumes.push(anon_name);
+                        self.anonymous_volumes.push(anon_name.clone());
+                        if created {
+                            self.created_anonymous_volumes.push(anon_name);
+                        }
                         anon_vol_offset += 1;
                         tracing::info!(
                             volume = %tag,
@@ -88,11 +91,13 @@ impl VmManager {
         // Determine whether guest init is installed (it becomes PID 1 and passes
         // BOX_EXEC_* env vars to the container entrypoint).
         let guest_init_exec = Self::guest_init_exec_path(&layout.rootfs_path);
+        let workdir = Self::effective_workdir(&self.config, layout.oci_config.as_ref());
+        let user = Self::effective_user(&self.config, layout.oci_config.as_ref());
 
         // Build entrypoint
         let mut entrypoint = if let Some(guest_init_exec) = guest_init_exec {
             // Guest init is PID 1. Pass container entrypoint/env via BOX_EXEC_* env vars.
-            let (exec, args, container_env) = match &layout.oci_config {
+            let (exec, args, mut container_env) = match &layout.oci_config {
                 Some(oci_config) => {
                     let (exec, args) = Self::resolve_oci_entrypoint(
                         oci_config,
@@ -110,6 +115,7 @@ impl VmManager {
                     vec![],
                 ),
             };
+            a3s_box_core::env::merge_env_pairs(&mut container_env, &self.config.extra_env);
 
             // Pass exec + args as individual env vars (avoids spaces being truncated
             // by libkrun's env serialization).
@@ -121,12 +127,9 @@ impl VmManager {
                 env.push((format!("BOX_EXEC_ARG_{}", i), arg.clone()));
             }
 
-            // Pass the OCI working directory to guest init
-            if let Some(ref oci_config) = layout.oci_config {
-                if let Some(ref wd) = oci_config.working_dir {
-                    env.push(("BOX_EXEC_WORKDIR".to_string(), wd.clone()));
-                }
-            }
+            // Pass the effective working directory to guest init so PID 1 and
+            // the container entrypoint agree even when no OCI WORKDIR is set.
+            env.push(("BOX_EXEC_WORKDIR".to_string(), workdir.clone()));
 
             // Pass container environment variables with BOX_EXEC_ENV_ prefix
             for (key, value) in container_env {
@@ -186,6 +189,10 @@ impl VmManager {
                 env.push(("BOX_READONLY".to_string(), "1".to_string()));
             }
 
+            if let Some(hostname) = self.config.hostname.as_ref() {
+                env.push(("BOX_HOSTNAME".to_string(), hostname.clone()));
+            }
+
             #[cfg(target_os = "windows")]
             env.push(("KRUN_INIT_PID1".to_string(), "1".to_string()));
 
@@ -205,7 +212,8 @@ impl VmManager {
                         &self.config.cmd,
                         self.config.entrypoint_override.as_deref(),
                     );
-                    let env = oci_config.env.clone();
+                    let mut env = oci_config.env.clone();
+                    a3s_box_core::env::merge_env_pairs(&mut env, &self.config.extra_env);
 
                     tracing::debug!(
                         executable = %executable,
@@ -227,24 +235,10 @@ impl VmManager {
                         "-c".to_string(),
                         "echo No command specified; exec /bin/sh".to_string(),
                     ],
-                    env: vec![],
+                    env: self.config.extra_env.clone(),
                 },
             }
         };
-
-        // Append user-specified environment variables (-e KEY=VALUE)
-        if !self.config.extra_env.is_empty() {
-            let mut env = entrypoint.env;
-            for (key, value) in &self.config.extra_env {
-                // Override existing keys or append new ones
-                if let Some(existing) = env.iter_mut().find(|(k, _)| k == key) {
-                    existing.1 = value.clone();
-                } else {
-                    env.push((key.clone(), value.clone()));
-                }
-            }
-            entrypoint.env = env;
-        }
 
         // Inject TEE simulation env var when simulate mode is enabled
         if matches!(self.config.tee, TeeConfig::SevSnp { simulate: true, .. })
@@ -287,18 +281,6 @@ impl VmManager {
                 sidecar.env.len().to_string(),
             ));
         }
-
-        // Determine workdir
-        let workdir = match &layout.oci_config {
-            Some(oci_config) => oci_config
-                .working_dir
-                .clone()
-                .unwrap_or_else(|| GUEST_WORKDIR.to_string()),
-            None => GUEST_WORKDIR.to_string(),
-        };
-
-        // Extract user from OCI config (USER directive)
-        let user = layout.oci_config.as_ref().and_then(|c| c.user.clone());
 
         Ok(InstanceSpec {
             box_id: self.box_id.clone(),
@@ -395,6 +377,39 @@ impl VmManager {
         }
 
         None
+    }
+
+    fn effective_workdir(
+        config: &a3s_box_core::config::BoxConfig,
+        oci_config: Option<&OciImageConfig>,
+    ) -> String {
+        config
+            .workdir
+            .as_ref()
+            .filter(|workdir| !workdir.is_empty())
+            .cloned()
+            .or_else(|| {
+                oci_config
+                    .and_then(|oci| oci.working_dir.clone())
+                    .filter(|workdir| !workdir.is_empty())
+            })
+            .unwrap_or_else(|| GUEST_WORKDIR.to_string())
+    }
+
+    fn effective_user(
+        config: &a3s_box_core::config::BoxConfig,
+        oci_config: Option<&OciImageConfig>,
+    ) -> Option<String> {
+        config
+            .user
+            .as_ref()
+            .filter(|user| !user.is_empty())
+            .cloned()
+            .or_else(|| {
+                oci_config
+                    .and_then(|oci| oci.user.clone())
+                    .filter(|user| !user.is_empty())
+            })
     }
 
     /// Parse a volume mount string into a FsMount.
@@ -541,14 +556,17 @@ impl VmManager {
     /// Create an anonymous volume via VolumeStore.
     ///
     /// Returns the host path of the created volume.
-    fn create_anonymous_volume(&self, name: &str) -> Result<String> {
+    fn create_anonymous_volume(&self, name: &str) -> Result<(String, bool)> {
         use crate::volume::VolumeStore;
 
-        let store = VolumeStore::default_path()?;
+        let store = VolumeStore::new(
+            self.home_dir.join("volumes.json"),
+            self.home_dir.join("volumes"),
+        );
 
         // If the volume already exists (e.g., from a previous run), reuse it
         if let Some(existing) = store.get(name)? {
-            return Ok(existing.mount_point);
+            return Ok((existing.mount_point, false));
         }
 
         let mut config = a3s_box_core::volume::VolumeConfig::new(name, "");
@@ -557,7 +575,7 @@ impl VmManager {
             .insert("anonymous".to_string(), "true".to_string());
         config.attach(&self.box_id);
         let created = store.create(config)?;
-        Ok(created.mount_point)
+        Ok((created.mount_point, true))
     }
 }
 
@@ -565,9 +583,57 @@ impl VmManager {
 mod tests {
     use std::fs;
 
+    use a3s_box_core::config::BoxConfig;
+    use a3s_box_core::event::EventEmitter;
+
     use super::*;
     use tempfile::tempdir;
     use tempfile::TempDir;
+
+    fn test_oci_config(workdir: Option<&str>, user: Option<&str>) -> OciImageConfig {
+        OciImageConfig {
+            entrypoint: Some(vec!["/bin/app".to_string()]),
+            cmd: Some(vec!["--serve".to_string()]),
+            env: vec![],
+            working_dir: workdir.map(str::to_string),
+            user: user.map(str::to_string),
+            exposed_ports: vec![],
+            labels: std::collections::HashMap::new(),
+            volumes: vec![],
+            stop_signal: None,
+            health_check: None,
+            onbuild: vec![],
+        }
+    }
+
+    fn test_layout(
+        base: &Path,
+        oci_config: Option<OciImageConfig>,
+        with_guest_init: bool,
+    ) -> BoxLayout {
+        let rootfs_path = base.join("rootfs");
+        fs::create_dir_all(&rootfs_path).unwrap();
+        if with_guest_init {
+            fs::create_dir_all(rootfs_path.join("sbin")).unwrap();
+            fs::write(rootfs_path.join("sbin").join("init"), b"guest-init").unwrap();
+        }
+
+        BoxLayout {
+            rootfs_path,
+            exec_socket_path: base.join("exec.sock"),
+            pty_socket_path: base.join("pty.sock"),
+            attest_socket_path: base.join("attest.sock"),
+            port_forward_socket_path: base.join("portfwd.sock"),
+            workspace_path: base.join("workspace"),
+            console_output: None,
+            oci_config,
+            tee_instance_config: None,
+        }
+    }
+
+    fn test_vm_manager(config: BoxConfig) -> VmManager {
+        VmManager::with_box_id(config, EventEmitter::new(16), "test-box".to_string())
+    }
 
     #[test]
     fn test_parse_volume_mount_host_guest() {
@@ -784,6 +850,199 @@ mod tests {
         fs::write(rootfs.join("sbin").join("init"), b"guest-init").unwrap();
 
         assert_eq!(VmManager::guest_init_exec_path(rootfs), Some("/sbin/init"));
+    }
+
+    #[test]
+    fn test_build_instance_spec_prefers_config_workdir_and_user() {
+        let dir = tempdir().unwrap();
+        let layout = test_layout(
+            dir.path(),
+            Some(test_oci_config(Some("/oci"), Some("2000:2000"))),
+            true,
+        );
+        let mut vm = test_vm_manager(BoxConfig {
+            workdir: Some("/override".to_string()),
+            user: Some("1000:1000".to_string()),
+            ..Default::default()
+        });
+
+        let spec = vm.build_instance_spec(&layout).unwrap();
+
+        assert_eq!(spec.workdir, "/override");
+        assert_eq!(spec.user.as_deref(), Some("1000:1000"));
+        assert!(spec
+            .entrypoint
+            .env
+            .iter()
+            .any(|(key, value)| key == "BOX_EXEC_WORKDIR" && value == "/override"));
+    }
+
+    #[test]
+    fn test_build_instance_spec_uses_oci_workdir_and_user_without_override() {
+        let dir = tempdir().unwrap();
+        let layout = test_layout(
+            dir.path(),
+            Some(test_oci_config(Some("/oci"), Some("2000:2000"))),
+            true,
+        );
+        let mut vm = test_vm_manager(BoxConfig::default());
+
+        let spec = vm.build_instance_spec(&layout).unwrap();
+
+        assert_eq!(spec.workdir, "/oci");
+        assert_eq!(spec.user.as_deref(), Some("2000:2000"));
+        assert!(spec
+            .entrypoint
+            .env
+            .iter()
+            .any(|(key, value)| key == "BOX_EXEC_WORKDIR" && value == "/oci"));
+    }
+
+    #[test]
+    fn test_build_instance_spec_passes_default_workdir_to_guest_init() {
+        let dir = tempdir().unwrap();
+        let layout = test_layout(dir.path(), Some(test_oci_config(None, None)), true);
+        let mut vm = test_vm_manager(BoxConfig::default());
+
+        let spec = vm.build_instance_spec(&layout).unwrap();
+
+        assert_eq!(spec.workdir, GUEST_WORKDIR);
+        assert!(spec
+            .entrypoint
+            .env
+            .iter()
+            .any(|(key, value)| key == "BOX_EXEC_WORKDIR" && value == GUEST_WORKDIR));
+    }
+
+    #[test]
+    fn test_build_instance_spec_passes_hostname_to_guest_init() {
+        let dir = tempdir().unwrap();
+        let layout = test_layout(dir.path(), Some(test_oci_config(None, None)), true);
+        let mut vm = test_vm_manager(BoxConfig {
+            hostname: Some("web".to_string()),
+            ..Default::default()
+        });
+
+        let spec = vm.build_instance_spec(&layout).unwrap();
+
+        assert!(spec
+            .entrypoint
+            .env
+            .iter()
+            .any(|(key, value)| key == "BOX_HOSTNAME" && value == "web"));
+    }
+
+    #[test]
+    fn test_build_instance_spec_guest_init_prefixes_extra_env() {
+        let dir = tempdir().unwrap();
+        let mut oci_config = test_oci_config(None, None);
+        oci_config.env = vec![
+            ("FOO".to_string(), "image".to_string()),
+            ("BAR".to_string(), "image".to_string()),
+        ];
+        let layout = test_layout(dir.path(), Some(oci_config), true);
+        let mut vm = test_vm_manager(BoxConfig {
+            extra_env: vec![
+                ("FOO".to_string(), "cli".to_string()),
+                ("BAZ".to_string(), "cli".to_string()),
+            ],
+            ..Default::default()
+        });
+
+        let spec = vm.build_instance_spec(&layout).unwrap();
+
+        assert!(spec
+            .entrypoint
+            .env
+            .iter()
+            .any(|(key, value)| key == "BOX_EXEC_ENV_FOO" && value == "cli"));
+        assert!(spec
+            .entrypoint
+            .env
+            .iter()
+            .any(|(key, value)| key == "BOX_EXEC_ENV_BAR" && value == "image"));
+        assert!(spec
+            .entrypoint
+            .env
+            .iter()
+            .any(|(key, value)| key == "BOX_EXEC_ENV_BAZ" && value == "cli"));
+        assert!(!spec
+            .entrypoint
+            .env
+            .iter()
+            .any(|(key, _)| key == "FOO" || key == "BAZ"));
+    }
+
+    #[test]
+    fn test_build_instance_spec_direct_entrypoint_merges_extra_env() {
+        let dir = tempdir().unwrap();
+        let mut oci_config = test_oci_config(None, None);
+        oci_config.env = vec![
+            ("FOO".to_string(), "image".to_string()),
+            ("BAR".to_string(), "image".to_string()),
+        ];
+        let layout = test_layout(dir.path(), Some(oci_config), false);
+        let mut vm = test_vm_manager(BoxConfig {
+            extra_env: vec![
+                ("FOO".to_string(), "cli".to_string()),
+                ("BAZ".to_string(), "cli".to_string()),
+            ],
+            ..Default::default()
+        });
+
+        let spec = vm.build_instance_spec(&layout).unwrap();
+
+        assert!(spec
+            .entrypoint
+            .env
+            .iter()
+            .any(|(key, value)| key == "FOO" && value == "cli"));
+        assert!(spec
+            .entrypoint
+            .env
+            .iter()
+            .any(|(key, value)| key == "BAR" && value == "image"));
+        assert!(spec
+            .entrypoint
+            .env
+            .iter()
+            .any(|(key, value)| key == "BAZ" && value == "cli"));
+    }
+
+    #[test]
+    fn test_build_instance_spec_tracks_new_anonymous_volumes_only() {
+        let home = tempdir().unwrap();
+        let layout_dir = tempdir().unwrap();
+        let mut oci_config = test_oci_config(None, None);
+        oci_config.volumes = vec!["/data".to_string()];
+        let layout = test_layout(layout_dir.path(), Some(oci_config), true);
+
+        let mut first_vm = test_vm_manager(BoxConfig::default());
+        first_vm.home_dir = home.path().to_path_buf();
+        let first_spec = first_vm.build_instance_spec(&layout).unwrap();
+
+        assert_eq!(first_vm.anonymous_volumes.len(), 1);
+        assert_eq!(
+            first_vm.created_anonymous_volumes,
+            first_vm.anonymous_volumes
+        );
+        assert!(first_spec.fs_mounts.iter().any(|mount| {
+            mount.tag == "vol0" && mount.host_path.starts_with(home.path().join("volumes"))
+        }));
+
+        let volume_name = first_vm.anonymous_volumes[0].clone();
+        let store = crate::volume::VolumeStore::new(
+            home.path().join("volumes.json"),
+            home.path().join("volumes"),
+        );
+        assert!(store.get(&volume_name).unwrap().is_some());
+
+        let mut second_vm = test_vm_manager(BoxConfig::default());
+        second_vm.home_dir = home.path().to_path_buf();
+        second_vm.build_instance_spec(&layout).unwrap();
+
+        assert_eq!(second_vm.anonymous_volumes, vec![volume_name]);
+        assert!(second_vm.created_anonymous_volumes.is_empty());
     }
 
     #[cfg(target_os = "windows")]

@@ -131,6 +131,7 @@ mod tests {
             stdin: false,
             stdin_once: false,
             tty: false,
+            mounts: vec![],
             state: ContainerState::Running,
             created_at: 1_000_000_000,
             started_at: 2_000_000_000,

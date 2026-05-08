@@ -4,6 +4,9 @@
 
 use clap::Args;
 
+use crate::lifecycle;
+#[cfg(unix)]
+use crate::process;
 use crate::resolve;
 use crate::state::StateFile;
 
@@ -35,26 +38,29 @@ fn pause_one(state: &mut StateFile, query: &str) -> Result<(), Box<dyn std::erro
     let record = resolve::resolve(state, query)?;
 
     if record.status != "running" {
-        return Err(format!("Box {} is not running", record.name).into());
+        return Err(format!(
+            "Cannot pause box {} because it is {}. Use `a3s-box start {}` to start it or `a3s-box ps -a` to inspect state.",
+            record.name, record.status, record.name
+        )
+        .into());
     }
 
+    let pid = lifecycle::require_live_pid(record, "pause")?;
     let box_id = record.id.clone();
     let name = record.name.clone();
 
-    if let Some(pid) = record.pid {
-        #[cfg(unix)]
-        // Safety: sending SIGSTOP to pause the process
-        unsafe {
-            libc::kill(pid as i32, libc::SIGSTOP);
-        }
-        #[cfg(windows)]
-        {
-            let _ = pid;
-            return Err(crate::platform::unsupported_command(
-                "pause",
-                "host process suspension support",
-            ));
-        }
+    #[cfg(unix)]
+    {
+        process::send_signal(pid, libc::SIGSTOP)
+            .map_err(|err| format!("Failed to pause box {name} with SIGSTOP: {err}"))?;
+    }
+    #[cfg(windows)]
+    {
+        let _ = pid;
+        return Err(crate::platform::unsupported_command(
+            "pause",
+            "host process suspension support",
+        ));
     }
 
     // Update status to paused
@@ -77,7 +83,7 @@ mod tests {
             setup_state(vec![make_record("id-1", "stopped_box", "stopped", None)]);
         let result = pause_one(&mut state, "stopped_box");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("not running"));
+        assert!(result.unwrap_err().to_string().contains("Cannot pause"));
     }
 
     #[test]
@@ -98,7 +104,25 @@ mod tests {
         )]);
         let result = pause_one(&mut state, "paused_box");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("not running"));
+        assert!(result.unwrap_err().to_string().contains("Cannot pause"));
+    }
+
+    #[test]
+    fn test_pause_rejects_running_without_pid() {
+        let (_tmp, mut state) =
+            setup_state(vec![make_record("id-1", "running_box", "running", None)]);
+
+        let result = pause_one(&mut state, "running_box");
+
+        assert!(result.is_err());
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("no recorded PID"));
+        assert!(error.contains("a3s-box ps"));
+        assert_eq!(
+            state.find_by_id("id-1").unwrap().status,
+            "running",
+            "stale PID failures must not mark the box paused"
+        );
     }
 
     #[test]

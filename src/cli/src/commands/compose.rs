@@ -5,12 +5,14 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use a3s_box_core::compose::ComposeConfig;
+use a3s_box_core::compose::{ComposeConfig, ServiceConfig};
 use a3s_box_core::event::EventEmitter;
 use a3s_box_runtime::{ComposeProject, NetworkStore, VmManager};
 use clap::{Args, Subcommand};
 
+use super::common;
 use crate::state::{BoxRecord, HealthCheck, StateFile};
+use crate::status;
 
 /// Label key for compose project name.
 const LABEL_PROJECT: &str = "com.a3s.compose.project";
@@ -99,7 +101,9 @@ pub async fn execute(args: ComposeArgs) -> Result<(), Box<dyn std::error::Error>
     });
 
     match args.command {
-        ComposeCommand::Up(up_args) => execute_up(&project_name, config, up_args).await,
+        ComposeCommand::Up(up_args) => {
+            execute_up(&project_name, config, compose_path, up_args).await
+        }
         ComposeCommand::Down(down_args) => execute_down(&project_name, down_args).await,
         ComposeCommand::Ps => execute_ps(&project_name).await,
         ComposeCommand::Config => execute_config(&project_name, config),
@@ -140,6 +144,25 @@ fn load_compose_file(
     Ok((path, config))
 }
 
+fn validate_compose_restart_policies(config: &ComposeConfig) -> Result<(), String> {
+    for (service_name, service) in &config.services {
+        service_restart_policy(service_name, Some(service))?;
+    }
+    Ok(())
+}
+
+fn service_restart_policy(
+    service_name: &str,
+    service: Option<&ServiceConfig>,
+) -> Result<(String, u32), String> {
+    let Some(restart) = service.and_then(|service| service.restart.as_deref()) else {
+        return Ok(("no".to_string(), 0));
+    };
+
+    crate::state::parse_restart_policy(restart)
+        .map_err(|error| format!("Service '{service_name}' has invalid restart policy: {error}"))
+}
+
 // ============================================================================
 // compose up
 // ============================================================================
@@ -151,21 +174,30 @@ fn load_compose_file(
 async fn execute_up(
     project_name: &str,
     config: ComposeConfig,
+    compose_path: PathBuf,
     up_args: ComposeUpArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let project = ComposeProject::new(project_name, config)?;
+    let base_dir = compose_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    validate_compose_restart_policies(&config)
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    let project = ComposeProject::with_base_dir(project_name, config, base_dir)?;
     let mut state = StateFile::load_default()?;
 
-    // Check for already-running services
+    // Check for already-active services
     let existing = state.find_by_label(LABEL_PROJECT, project_name);
-    let running: Vec<_> = existing.iter().filter(|r| r.status == "running").collect();
-    if !running.is_empty() {
-        let names: Vec<_> = running
+    let active: Vec<_> = existing
+        .iter()
+        .filter(|record| status::is_active(record))
+        .collect();
+    if !active.is_empty() {
+        let names: Vec<_> = active
             .iter()
             .filter_map(|r| r.labels.get(LABEL_SERVICE))
             .collect();
         return Err(format!(
-            "Project '{}' already has running services: {}. Run `compose down` first.",
+            "Project '{}' already has active services: {}. Run `compose down` first.",
             project_name,
             names
                 .iter()
@@ -179,12 +211,64 @@ async fn execute_up(
     // Step 1: Create networks
     let networks = project.required_networks();
     let net_store = NetworkStore::default_path()?;
+    let mut created_networks = Vec::new();
+    let mut started_services = Vec::new();
     for (i, net_name) in networks.iter().enumerate() {
-        if net_store.get(net_name)?.is_none() {
+        let existing_network = match net_store.get(net_name) {
+            Ok(network) => network,
+            Err(error) => {
+                return rollback_compose_up(
+                    &mut state,
+                    &started_services,
+                    &created_networks,
+                    error,
+                )
+                .await;
+            }
+        };
+        if let Some(config) = existing_network.as_ref() {
+            if let Err(error) = super::network::validate_attachable_network(config) {
+                return rollback_compose_up(
+                    &mut state,
+                    &started_services,
+                    &created_networks,
+                    error,
+                )
+                .await;
+            }
+        } else {
             let subnet = format!("10.89.{}.0/24", 100 + i);
-            let config = a3s_box_core::network::NetworkConfig::new(net_name, &subnet)
-                .map_err(|e| format!("Failed to create network '{}': {}", net_name, e))?;
-            net_store.create(config)?;
+            let config = match a3s_box_core::network::NetworkConfig::new(net_name, &subnet) {
+                Ok(config) => config,
+                Err(error) => {
+                    return rollback_compose_up(
+                        &mut state,
+                        &started_services,
+                        &created_networks,
+                        format!("Failed to create network '{}': {}", net_name, error),
+                    )
+                    .await;
+                }
+            };
+            if let Err(error) = super::network::validate_attachable_network(&config) {
+                return rollback_compose_up(
+                    &mut state,
+                    &started_services,
+                    &created_networks,
+                    error,
+                )
+                .await;
+            }
+            if let Err(error) = net_store.create(config) {
+                return rollback_compose_up(
+                    &mut state,
+                    &started_services,
+                    &created_networks,
+                    error,
+                )
+                .await;
+            }
+            created_networks.push(net_name.clone());
             println!("  [+] Network {} ({})", net_name, subnet);
         }
     }
@@ -207,12 +291,53 @@ async fn execute_up(
                 "  [~] Waiting for {} to be healthy...",
                 health_deps.join(", ")
             );
-            wait_for_healthy(&health_deps, up_args.timeout).await?;
+            if let Err(error) = wait_for_healthy(project_name, &health_deps, up_args.timeout).await
+            {
+                return rollback_compose_up(
+                    &mut state,
+                    &started_services,
+                    &created_networks,
+                    error,
+                )
+                .await;
+            }
             println!(" ✓");
         }
 
-        let box_config = project.build_box_config(svc_name, Some(&default_net))?;
+        let mut box_config = match project.build_box_config(svc_name, Some(&default_net)) {
+            Ok(config) => config,
+            Err(error) => {
+                return rollback_compose_up(
+                    &mut state,
+                    &started_services,
+                    &created_networks,
+                    error,
+                )
+                .await;
+            }
+        };
+        let (resolved_volumes, volume_names) = match resolve_service_volumes(&box_config.volumes) {
+            Ok(volumes) => volumes,
+            Err(error) => {
+                return rollback_compose_up(
+                    &mut state,
+                    &started_services,
+                    &created_networks,
+                    error,
+                )
+                .await;
+            }
+        };
+        box_config.volumes = resolved_volumes.clone();
         let image = box_config.image.clone();
+        let record_env: HashMap<String, String> = box_config.extra_env.iter().cloned().collect();
+        let record_hostname = box_config.hostname.clone();
+        let record_add_hosts = box_config.add_hosts.clone();
+        let network_mode = box_config.network.clone();
+        let network_name = match &network_mode {
+            a3s_box_core::NetworkMode::Bridge { network } => Some(network.clone()),
+            _ => None,
+        };
 
         // Create VmManager and boot
         let emitter = EventEmitter::new(256);
@@ -222,57 +347,141 @@ async fn execute_up(
         let box_dir = home.join("boxes").join(&box_id);
 
         // Create box directory structure
-        std::fs::create_dir_all(box_dir.join("sockets"))?;
-        std::fs::create_dir_all(box_dir.join("logs"))?;
-
-        // Connect to network before boot
-        if let Ok(Some(mut net_config)) = net_store.get(&default_net) {
-            if let Ok(endpoint) = net_config.connect(&box_id, &box_name) {
-                net_store.update(&net_config)?;
-                print!(
-                    "  [+] {} (image={}, ip={})",
-                    svc_name, image, endpoint.ip_address
-                );
-            }
+        if let Err(error) = std::fs::create_dir_all(box_dir.join("sockets")) {
+            return rollback_compose_up(&mut state, &started_services, &created_networks, error)
+                .await;
+        }
+        if let Err(error) = std::fs::create_dir_all(box_dir.join("logs")) {
+            return rollback_compose_up(&mut state, &started_services, &created_networks, error)
+                .await;
         }
 
-        vm.boot()
-            .await
-            .map_err(|e| format!("Failed to start service '{}': {}", svc_name, e))?;
+        // Connect to network before boot
+        if let Some(net_name) = network_name.as_deref() {
+            let mut net_config = match net_store.get(net_name) {
+                Ok(Some(config)) => config,
+                Ok(None) => {
+                    return rollback_compose_up(
+                        &mut state,
+                        &started_services,
+                        &created_networks,
+                        format!("Compose network '{}' was not created", net_name),
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    return rollback_compose_up(
+                        &mut state,
+                        &started_services,
+                        &created_networks,
+                        error,
+                    )
+                    .await;
+                }
+            };
+            if let Err(error) = super::network::validate_attachable_network(&net_config) {
+                return rollback_compose_up(
+                    &mut state,
+                    &started_services,
+                    &created_networks,
+                    error,
+                )
+                .await;
+            }
+            let endpoint = match net_config.connect(&box_id, &box_name) {
+                Ok(endpoint) => endpoint,
+                Err(error) => {
+                    return rollback_compose_up(
+                        &mut state,
+                        &started_services,
+                        &created_networks,
+                        format!(
+                            "Failed to connect service '{}' to network: {error}",
+                            svc_name
+                        ),
+                    )
+                    .await;
+                }
+            };
+            if let Err(error) = net_store.update(&net_config) {
+                return rollback_compose_up(
+                    &mut state,
+                    &started_services,
+                    &created_networks,
+                    error,
+                )
+                .await;
+            }
+            print!(
+                "  [+] {} (image={}, ip={})",
+                svc_name, image, endpoint.ip_address
+            );
+        }
+
+        if let Err(e) = vm.boot().await {
+            crate::cleanup::cleanup_box_resources(&box_id, &volume_names, network_name.as_deref());
+            crate::cleanup::cleanup_external_socket_dir(
+                &box_dir,
+                &box_dir.join("sockets/exec.sock"),
+            );
+            let _ = std::fs::remove_dir_all(&box_dir);
+            return rollback_compose_up(
+                &mut state,
+                &started_services,
+                &created_networks,
+                format!("Failed to start service '{}': {}", svc_name, e),
+            )
+            .await;
+        }
 
         let pid = vm.pid().await;
         let exec_socket_path = vm
             .exec_socket_path()
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| box_dir.join("sockets").join("exec.sock"));
+        let anonymous_volumes = vm.anonymous_volumes().to_vec();
+        let image_health_check = vm
+            .image_config()
+            .and_then(|config| config.health_check.clone());
+        let image_stop_signal = vm
+            .image_config()
+            .and_then(|config| config.stop_signal.clone());
 
         // Build labels with compose metadata
-        let mut labels = HashMap::new();
+        let svc = project.config.services.get(svc_name);
+        let mut labels = svc.map(|s| s.labels.to_map()).unwrap_or_default();
         labels.insert(LABEL_PROJECT.to_string(), project_name.to_string());
         labels.insert(LABEL_SERVICE.to_string(), svc_name.to_string());
 
         // Get service config for extra fields
-        let svc = project.config.services.get(svc_name);
-        let env: HashMap<String, String> = svc
-            .map(|s| s.environment.to_pairs().into_iter().collect())
-            .unwrap_or_default();
-        let volumes: Vec<String> = svc.map(|s| s.volumes.clone()).unwrap_or_default();
         let port_map: Vec<String> = svc.map(|s| s.ports.clone()).unwrap_or_default();
 
-        // Convert compose healthcheck → CLI HealthCheck
-        let health_check = project.healthcheck(svc_name).map(|hc| HealthCheck {
+        // Compose healthcheck overrides image HEALTHCHECK; disable blocks fallback.
+        let service_health_check = project.healthcheck(svc_name).map(|hc| HealthCheck {
             cmd: hc.cmd,
             interval_secs: hc.interval_secs,
             timeout_secs: hc.timeout_secs,
             retries: hc.retries,
             start_period_secs: hc.start_period_secs,
         });
+        let healthcheck_disabled = project.healthcheck_disabled(svc_name);
+        let health_check = if healthcheck_disabled {
+            None
+        } else {
+            service_health_check.or_else(|| {
+                image_health_check
+                    .as_ref()
+                    .and_then(common::health_check_from_oci)
+            })
+        };
 
         let health_status = if health_check.is_some() {
             "starting".to_string()
         } else {
             "none".to_string()
         };
+        let (restart_policy, max_restart_count) = service_restart_policy(svc_name, svc)
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
         let record = BoxRecord {
             id: box_id.clone(),
@@ -286,8 +495,8 @@ async fn execute_up(
                 .and_then(|s| s.mem_limit.as_ref())
                 .and_then(|m| crate::output::parse_memory(m).ok())
                 .unwrap_or(512),
-            volumes,
-            env,
+            volumes: resolved_volumes,
+            env: record_env,
             cmd: svc
                 .and_then(|s| s.command.as_ref())
                 .map(|c| c.to_vec())
@@ -299,33 +508,29 @@ async fn execute_up(
             created_at: chrono::Utc::now(),
             started_at: Some(chrono::Utc::now()),
             auto_remove: false,
-            hostname: None,
+            hostname: record_hostname,
             user: None,
             workdir: svc.and_then(|s| s.working_dir.clone()),
-            restart_policy: svc
-                .and_then(|s| s.restart.as_deref())
-                .unwrap_or("no")
-                .to_string(),
+            restart_policy,
             port_map,
             labels,
             stopped_by_user: false,
             restart_count: 0,
-            max_restart_count: 0,
+            max_restart_count,
             exit_code: None,
             health_check: health_check.clone(),
+            healthcheck_disabled,
             health_status,
             health_retries: 0,
             health_last_check: None,
-            network_mode: a3s_box_core::NetworkMode::Bridge {
-                network: default_net.clone(),
-            },
-            network_name: Some(default_net.clone()),
-            volume_names: vec![],
+            network_mode,
+            network_name: network_name.clone(),
+            volume_names: volume_names.clone(),
             tmpfs: svc.map(|s| s.tmpfs.to_vec()).unwrap_or_default(),
-            anonymous_volumes: vec![],
+            anonymous_volumes,
             resource_limits: Default::default(),
             log_config: Default::default(),
-            add_host: vec![],
+            add_host: record_add_hosts,
             platform: None,
             init: false,
             read_only: false,
@@ -336,13 +541,40 @@ async fn execute_up(
             devices: vec![],
             gpus: None,
             shm_size: None,
-            stop_signal: None,
+            stop_signal: image_stop_signal,
             stop_timeout: None,
             oom_kill_disable: false,
             oom_score_adj: None,
         };
 
-        state.add(record)?;
+        let service_box = ServiceBox::from_record(&record);
+        // Health checks run concurrently while `compose up` waits for later
+        // services. Reload before appending so we do not overwrite dependency
+        // health transitions captured by the checker.
+        state = match StateFile::load_default() {
+            Ok(state) => state,
+            Err(error) => {
+                let rollback_services = rollback_with_current(&started_services, service_box);
+                return rollback_compose_up(
+                    &mut state,
+                    &rollback_services,
+                    &created_networks,
+                    error,
+                )
+                .await;
+            }
+        };
+        if let Err(error) = state.add(record) {
+            let rollback_services = rollback_with_current(&started_services, service_box);
+            return rollback_compose_up(&mut state, &rollback_services, &created_networks, error)
+                .await;
+        }
+        if let Err(error) = super::volume::attach_volumes(&volume_names, &box_id) {
+            let rollback_services = rollback_with_current(&started_services, service_box);
+            return rollback_compose_up(&mut state, &rollback_services, &created_networks, error)
+                .await;
+        }
+        started_services.push(service_box);
 
         // Spawn health checker if configured
         if let Some(ref hc) = health_check {
@@ -368,10 +600,28 @@ async fn execute_up(
     Ok(())
 }
 
+fn resolve_service_volumes(
+    volume_specs: &[String],
+) -> Result<(Vec<String>, Vec<String>), Box<dyn std::error::Error>> {
+    let mut resolved = Vec::new();
+    let mut names = Vec::new();
+
+    for spec in volume_specs {
+        let (resolved_spec, volume_name) = super::volume::resolve_named_volume(spec)?;
+        if let Some(name) = volume_name {
+            names.push(name);
+        }
+        resolved.push(resolved_spec);
+    }
+
+    Ok((resolved, names))
+}
+
 /// Wait for all named services to reach "healthy" status in the state file.
 ///
 /// Polls the state file every 2 seconds until all services are healthy or timeout.
 async fn wait_for_healthy(
+    project_name: &str,
     service_names: &[String],
     timeout_secs: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -392,7 +642,10 @@ async fn wait_for_healthy(
             state
                 .find_by_label(LABEL_SERVICE, svc_name)
                 .iter()
-                .any(|r| r.health_status == "healthy")
+                .any(|r| {
+                    r.labels.get(LABEL_PROJECT).map(String::as_str) == Some(project_name)
+                        && r.health_status == "healthy"
+                })
         });
 
         if all_healthy {
@@ -408,6 +661,7 @@ async fn wait_for_healthy(
 // ============================================================================
 
 /// Snapshot of a compose service box for the `down` operation.
+#[derive(Clone)]
 struct ServiceBox {
     box_id: String,
     svc_name: String,
@@ -417,6 +671,140 @@ struct ServiceBox {
     exec_socket_path: PathBuf,
     network_name: Option<String>,
     volume_names: Vec<String>,
+    anonymous_volumes: Vec<String>,
+    stop_signal: Option<String>,
+    stop_timeout: Option<u64>,
+}
+
+impl ServiceBox {
+    fn from_record(record: &BoxRecord) -> Self {
+        Self {
+            box_id: record.id.clone(),
+            svc_name: record
+                .labels
+                .get(LABEL_SERVICE)
+                .cloned()
+                .unwrap_or_default(),
+            pid: record.pid,
+            status: record.status.clone(),
+            box_dir: record.box_dir.clone(),
+            exec_socket_path: record.exec_socket_path.clone(),
+            network_name: crate::cleanup::record_network_name(record).map(str::to_string),
+            volume_names: record.volume_names.clone(),
+            anonymous_volumes: record.anonymous_volumes.clone(),
+            stop_signal: record.stop_signal.clone(),
+            stop_timeout: record.stop_timeout,
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        status::is_active_status(&self.status)
+    }
+}
+
+fn cleanup_service_box(svc: &ServiceBox) {
+    crate::cleanup::cleanup_box_resources(
+        &svc.box_id,
+        &svc.volume_names,
+        svc.network_name.as_deref(),
+    );
+    crate::cleanup::cleanup_anonymous_volumes(&svc.anonymous_volumes);
+    let _ = std::fs::remove_dir_all(&svc.box_dir);
+    crate::cleanup::cleanup_external_socket_dir(&svc.box_dir, &svc.exec_socket_path);
+}
+
+fn rollback_with_current(started_services: &[ServiceBox], current: ServiceBox) -> Vec<ServiceBox> {
+    let mut rollback_services = started_services.to_vec();
+    rollback_services.push(current);
+    rollback_services
+}
+
+async fn rollback_compose_up<T>(
+    state: &mut StateFile,
+    started_services: &[ServiceBox],
+    created_networks: &[String],
+    error: impl Into<Box<dyn std::error::Error>>,
+) -> Result<T, Box<dyn std::error::Error>> {
+    rollback_started_services(state, started_services).await;
+    cleanup_created_networks(created_networks);
+    Err(error.into())
+}
+
+async fn rollback_started_services(state: &mut StateFile, started_services: &[ServiceBox]) {
+    if started_services.is_empty() {
+        return;
+    }
+
+    eprintln!(
+        "  [!] Rolling back {} started service(s)...",
+        started_services.len()
+    );
+
+    for svc in started_services.iter().rev() {
+        stop_service_process(svc).await;
+
+        cleanup_service_box(svc);
+        let _ = state.remove(&svc.box_id);
+    }
+}
+
+async fn stop_service_process(svc: &ServiceBox) {
+    if !svc.is_active() {
+        return;
+    }
+
+    let Some(pid) = svc.pid else {
+        eprintln!(
+            "  Warning: service {} is {} but has no recorded PID; removing stale service state.",
+            svc.svc_name, svc.status
+        );
+        return;
+    };
+
+    if svc.status == "paused" {
+        #[cfg(unix)]
+        if let Err(error) = crate::process::send_signal(pid, libc::SIGCONT) {
+            eprintln!(
+                "  Warning: failed to resume paused service {} before stopping: {}",
+                svc.svc_name, error
+            );
+        }
+    }
+
+    let stop_signal = svc
+        .stop_signal
+        .as_deref()
+        .map(a3s_box_core::vmm::parse_signal_name)
+        .unwrap_or(libc::SIGTERM);
+    let stop_timeout = svc.stop_timeout.unwrap_or(10);
+    crate::process::graceful_stop(pid, stop_signal, stop_timeout).await;
+}
+
+fn cleanup_created_networks(created_networks: &[String]) {
+    if created_networks.is_empty() {
+        return;
+    }
+
+    let Ok(net_store) = NetworkStore::default_path() else {
+        return;
+    };
+
+    for net_name in created_networks.iter().rev() {
+        if let Ok(Some(mut net_config)) = net_store.get(net_name) {
+            let endpoint_ids: Vec<_> = net_config.endpoints.keys().cloned().collect();
+            for endpoint_id in endpoint_ids {
+                let _ = net_config.disconnect(&endpoint_id);
+            }
+            let _ = net_store.update(&net_config);
+        }
+
+        if let Err(error) = net_store.remove(net_name) {
+            eprintln!(
+                "  Warning: failed to roll back network {}: {}",
+                net_name, error
+            );
+        }
+    }
 }
 
 /// `compose down` — Stop and remove all services, networks, and optionally volumes.
@@ -430,16 +818,7 @@ async fn execute_down(
     let project_boxes: Vec<ServiceBox> = state
         .find_by_label(LABEL_PROJECT, project_name)
         .iter()
-        .map(|r| ServiceBox {
-            box_id: r.id.clone(),
-            svc_name: r.labels.get(LABEL_SERVICE).cloned().unwrap_or_default(),
-            pid: r.pid,
-            status: r.status.clone(),
-            box_dir: r.box_dir.clone(),
-            exec_socket_path: r.exec_socket_path.clone(),
-            network_name: r.network_name.clone(),
-            volume_names: r.volume_names.clone(),
-        })
+        .map(|r| ServiceBox::from_record(r))
         .collect();
 
     if project_boxes.is_empty() {
@@ -457,23 +836,9 @@ async fn execute_down(
     for svc in project_boxes.iter().rev() {
         print!("  [-] Stopping {}...", svc.svc_name);
 
-        // Kill the process if running
-        if svc.status == "running" {
-            if let Some(pid) = svc.pid {
-                crate::process::graceful_stop(pid, libc::SIGTERM, 10).await;
-            }
-        }
+        stop_service_process(svc).await;
 
-        // Clean up resources
-        crate::cleanup::cleanup_box_resources(
-            &svc.box_id,
-            &svc.volume_names,
-            svc.network_name.as_deref(),
-        );
-
-        // Remove box directory and state record
-        let _ = std::fs::remove_dir_all(&svc.box_dir);
-        crate::cleanup::cleanup_external_socket_dir(&svc.box_dir, &svc.exec_socket_path);
+        cleanup_service_box(svc);
         state.remove(&svc.box_id)?;
 
         println!(" ✓");
@@ -578,6 +943,8 @@ fn execute_config(
     project_name: &str,
     config: ComposeConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    validate_compose_restart_policies(&config)
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     let project = ComposeProject::new(project_name, config)?;
 
     println!("Project: {}", project_name);
@@ -761,5 +1128,146 @@ mod tests {
     fn test_label_constants() {
         assert_eq!(LABEL_PROJECT, "com.a3s.compose.project");
         assert_eq!(LABEL_SERVICE, "com.a3s.compose.service");
+    }
+
+    #[test]
+    fn test_service_restart_policy_normalizes_on_failure_limit() {
+        let service = ServiceConfig {
+            restart: Some("on-failure:3".to_string()),
+            ..Default::default()
+        };
+
+        let (policy, max_count) = service_restart_policy("web", Some(&service)).unwrap();
+
+        assert_eq!(policy, "on-failure");
+        assert_eq!(max_count, 3);
+    }
+
+    #[test]
+    fn test_validate_compose_restart_policies_rejects_invalid_service_policy() {
+        let mut services = HashMap::new();
+        services.insert(
+            "web".to_string(),
+            ServiceConfig {
+                image: Some("docker.io/library/alpine:latest".to_string()),
+                restart: Some("never".to_string()),
+                ..Default::default()
+            },
+        );
+        let config = ComposeConfig {
+            version: None,
+            services,
+            volumes: HashMap::new(),
+            networks: HashMap::new(),
+        };
+
+        let error = validate_compose_restart_policies(&config).unwrap_err();
+
+        assert!(error.contains("Service 'web' has invalid restart policy"));
+        assert!(error.contains("Invalid restart policy"));
+    }
+
+    #[test]
+    fn test_service_box_from_record_captures_cleanup_fields() {
+        let mut record = crate::test_helpers::fixtures::make_record(
+            "compose-id",
+            "project-web",
+            "running",
+            Some(123),
+        );
+        record
+            .labels
+            .insert(LABEL_SERVICE.to_string(), "web".to_string());
+        record.network_name = Some("project_default".to_string());
+        record.volume_names = vec!["data".to_string()];
+        record.anonymous_volumes = vec!["anon".to_string()];
+        record.stop_signal = Some("SIGINT".to_string());
+        record.stop_timeout = Some(3);
+
+        let service = ServiceBox::from_record(&record);
+
+        assert_eq!(service.box_id, "compose-id");
+        assert_eq!(service.svc_name, "web");
+        assert_eq!(service.pid, Some(123));
+        assert_eq!(service.network_name.as_deref(), Some("project_default"));
+        assert_eq!(service.volume_names, vec!["data".to_string()]);
+        assert_eq!(service.anonymous_volumes, vec!["anon".to_string()]);
+        assert_eq!(service.stop_signal.as_deref(), Some("SIGINT"));
+        assert_eq!(service.stop_timeout, Some(3));
+        assert!(service.is_active());
+    }
+
+    #[test]
+    fn test_service_box_from_record_uses_network_mode_fallback() {
+        let mut record = crate::test_helpers::fixtures::make_record(
+            "compose-id",
+            "project-web",
+            "running",
+            None,
+        );
+        record.network_name = None;
+        record.network_mode = a3s_box_core::NetworkMode::Bridge {
+            network: "legacy_default".to_string(),
+        };
+
+        let service = ServiceBox::from_record(&record);
+
+        assert_eq!(service.network_name.as_deref(), Some("legacy_default"));
+    }
+
+    #[test]
+    fn test_rollback_with_current_appends_current_service() {
+        let mut first_record =
+            crate::test_helpers::fixtures::make_record("first-id", "project-db", "running", None);
+        first_record
+            .labels
+            .insert(LABEL_SERVICE.to_string(), "db".to_string());
+        let mut current_record = crate::test_helpers::fixtures::make_record(
+            "current-id",
+            "project-web",
+            "running",
+            None,
+        );
+        current_record
+            .labels
+            .insert(LABEL_SERVICE.to_string(), "web".to_string());
+
+        let first = ServiceBox::from_record(&first_record);
+        let current = ServiceBox::from_record(&current_record);
+        let rollback_services = rollback_with_current(&[first], current);
+
+        assert_eq!(rollback_services.len(), 2);
+        assert_eq!(rollback_services[0].svc_name, "db");
+        assert_eq!(rollback_services[1].svc_name, "web");
+    }
+
+    #[test]
+    fn test_service_box_paused_is_active() {
+        let mut record =
+            crate::test_helpers::fixtures::make_record("compose-id", "project-web", "paused", None);
+        record
+            .labels
+            .insert(LABEL_SERVICE.to_string(), "web".to_string());
+
+        let service = ServiceBox::from_record(&record);
+
+        assert!(service.is_active());
+    }
+
+    #[test]
+    fn test_service_box_stopped_is_not_active() {
+        let mut record = crate::test_helpers::fixtures::make_record(
+            "compose-id",
+            "project-web",
+            "stopped",
+            None,
+        );
+        record
+            .labels
+            .insert(LABEL_SERVICE.to_string(), "web".to_string());
+
+        let service = ServiceBox::from_record(&record);
+
+        assert!(!service.is_active());
     }
 }

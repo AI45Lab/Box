@@ -9,6 +9,7 @@
 
 use clap::Args;
 
+use super::common;
 #[cfg(not(windows))]
 use crate::resolve;
 #[cfg(not(windows))]
@@ -39,13 +40,41 @@ pub struct ExecArgs {
     #[arg(short = 't', long = "tty")]
     pub tty: bool,
 
-    /// Run the command as a specific user (e.g., "root", "1000:1000")
+    /// Run the command as a specific user (supported: root, UID, UID:GID)
     #[arg(short = 'u', long)]
     pub user: Option<String>,
 
     /// Command and arguments to execute
     #[arg(last = true, required = true)]
     pub cmd: Vec<String>,
+}
+
+#[cfg(not(windows))]
+pub(crate) async fn connect_pty_with_retry(
+    socket_path: &std::path::Path,
+    timeout: std::time::Duration,
+) -> Result<a3s_box_runtime::PtyClient, Box<dyn std::error::Error>> {
+    let deadline = std::time::Instant::now() + timeout;
+
+    loop {
+        match a3s_box_runtime::PtyClient::connect(socket_path).await {
+            Ok(client) => return Ok(client),
+            Err(error) => {
+                let last_error = error.to_string();
+                if std::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "Failed to connect to PTY server at {} after {:?}: {}",
+                        socket_path.display(),
+                        timeout,
+                        last_error
+                    )
+                    .into());
+                }
+            }
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 #[cfg(windows)]
@@ -61,33 +90,27 @@ pub async fn execute(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
     use a3s_box_core::exec::{ExecRequest, DEFAULT_EXEC_TIMEOUT_NS};
     use a3s_box_runtime::ExecClient;
 
+    let user = common::normalize_user_option(args.user.as_deref())
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    common::validate_workdir_option(args.workdir.as_deref())
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
     let state = StateFile::load_default()?;
     let record = resolve::resolve(&state, &args.r#box)?;
-
-    if record.status != "running" {
-        return Err(format!("Box {} is not running", record.name).into());
-    }
+    crate::socket_paths::require_running(record, "exec")
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     // If -t is specified, use interactive PTY mode
     if args.tty {
-        return execute_pty(args, record).await;
+        return execute_pty(args, record, user).await;
     }
 
     // Non-interactive mode (original behavior)
-    let exec_socket_path = if !record.exec_socket_path.as_os_str().is_empty() {
-        record.exec_socket_path.clone()
-    } else {
-        record.box_dir.join("sockets").join("exec.sock")
-    };
-
-    if !exec_socket_path.exists() {
-        return Err(format!(
-            "Exec socket not found for box {} at {}",
-            record.name,
-            exec_socket_path.display()
-        )
-        .into());
-    }
+    let exec_socket_path = crate::socket_paths::require_runtime_socket(
+        record,
+        crate::socket_paths::RuntimeSocket::Exec,
+    )
+    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     let client = ExecClient::connect(&exec_socket_path).await?;
 
@@ -119,7 +142,7 @@ pub async fn execute(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
         rootfs: None,
         stdin: stdin_data,
         stdin_streaming: false,
-        user: args.user,
+        user,
         streaming: false,
     };
 
@@ -147,26 +170,23 @@ pub async fn execute(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
 async fn execute_pty(
     args: ExecArgs,
     record: &crate::state::BoxRecord,
+    user: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::terminal;
     use a3s_box_core::pty::PtyRequest;
-    use a3s_box_runtime::PtyClient;
 
-    let pty_socket_path = crate::socket_paths::pty(record);
-    if !pty_socket_path.exists() {
-        return Err(format!(
-            "PTY socket not found for box {} at {} (guest may not support interactive mode)",
-            record.name,
-            pty_socket_path.display()
-        )
-        .into());
-    }
+    let pty_socket_path = crate::socket_paths::require_runtime_socket(
+        record,
+        crate::socket_paths::RuntimeSocket::Pty,
+    )
+    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     // Get terminal size
     let (cols, rows) = terminal::size().unwrap_or((80, 24));
 
     // Connect to PTY server
-    let mut client = PtyClient::connect(&pty_socket_path).await?;
+    let mut client =
+        connect_pty_with_retry(&pty_socket_path, std::time::Duration::from_secs(10)).await?;
 
     // Send PTY request
     let request = PtyRequest {
@@ -174,7 +194,7 @@ async fn execute_pty(
         env: args.envs,
         working_dir: args.workdir,
         rootfs: None,
-        user: args.user,
+        user,
         cols,
         rows,
     };
@@ -249,12 +269,12 @@ pub(crate) async fn run_pty_session(
     //
     // tokio::io::stdin() uses kqueue on macOS which does not generate
     // readiness events for TTY fds in raw mode, causing reads to block
-    // indefinitely. Use a dedicated blocking thread via spawn_blocking +
-    // an mpsc channel to relay stdin bytes into the async writer task.
+    // indefinitely. Use a detached OS thread instead of spawn_blocking so a
+    // blocked stdin read cannot keep the Tokio runtime alive after PTY exit.
     let writer_task = tokio::spawn(async move {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
 
-        tokio::task::spawn_blocking(move || {
+        std::thread::spawn(move || {
             use std::io::Read;
             let mut stdin = std::io::stdin();
             let mut buf = [0u8; 4096];

@@ -3,8 +3,19 @@
 //! Generates /etc/resolv.conf content from user-specified DNS servers,
 //! host configuration, or sensible defaults.
 
+use std::net::IpAddr;
+
 /// Default DNS servers (Google Public DNS).
 const DEFAULT_DNS: &[&str] = &["8.8.8.8", "8.8.4.4"];
+
+/// A static host-to-IP mapping for `/etc/hosts`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostEntry {
+    /// Hostname or DNS name.
+    pub host: String,
+    /// IP address string.
+    pub ip: String,
+}
 
 /// Generate resolv.conf content for the guest rootfs.
 ///
@@ -66,13 +77,96 @@ pub fn generate_hosts_file(
     own_name: &str,
     peers: &[(String, String)], // (ip, name)
 ) -> String {
+    generate_hosts_file_with_entries(Some(own_ip), &[own_name.to_string()], peers, &[])
+}
+
+/// Generate `/etc/hosts` content with optional own aliases and static entries.
+pub fn generate_hosts_file_with_entries(
+    own_ip: Option<&str>,
+    own_names: &[String],
+    peers: &[(String, String)], // (ip, name)
+    extra_hosts: &[HostEntry],
+) -> String {
     let mut lines = Vec::new();
     lines.push("127.0.0.1 localhost".to_string());
-    lines.push(format!("{} {}", own_ip, own_name));
+    if !own_names.is_empty() {
+        let own_names = own_names.join(" ");
+        let own_ip = own_ip.unwrap_or("127.0.1.1");
+        lines.push(format!("{} {}", own_ip, own_names));
+    }
     for (ip, name) in peers {
         lines.push(format!("{} {}", ip, name));
     }
+    for entry in extra_hosts {
+        lines.push(format!("{} {}", entry.ip, entry.host));
+    }
     lines.join("\n") + "\n"
+}
+
+/// Validate a hostname or DNS name accepted by a3s-box runtime options.
+pub fn validate_hostname(hostname: &str) -> Result<(), String> {
+    if hostname.is_empty() {
+        return Err("hostname must not be empty".to_string());
+    }
+    if hostname.len() > 253 {
+        return Err("hostname must be at most 253 characters".to_string());
+    }
+    if hostname.contains('\0') || hostname.chars().any(char::is_whitespace) {
+        return Err("hostname must not contain whitespace or NUL bytes".to_string());
+    }
+
+    for label in hostname.trim_end_matches('.').split('.') {
+        if label.is_empty() {
+            return Err(format!("hostname '{hostname}' contains an empty label"));
+        }
+        if label.len() > 63 {
+            return Err(format!(
+                "hostname label '{label}' is longer than 63 characters"
+            ));
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(format!(
+                "hostname label '{label}' must not start or end with '-'"
+            ));
+        }
+        if !label
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+        {
+            return Err(format!(
+                "hostname label '{label}' contains unsupported characters"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Parse a CLI `--add-host HOST:IP` value.
+pub fn parse_add_host_entry(entry: &str) -> Result<HostEntry, String> {
+    let (host, ip) = entry
+        .split_once(':')
+        .ok_or_else(|| format!("expected HOST:IP, got '{entry}'"))?;
+    validate_hostname(host).map_err(|e| format!("invalid host '{host}': {e}"))?;
+    let ip = ip.trim();
+    if ip.is_empty() {
+        return Err(format!("missing IP address in '{entry}'"));
+    }
+    ip.parse::<IpAddr>()
+        .map_err(|_| format!("invalid IP address '{ip}' in '{entry}'"))?;
+
+    Ok(HostEntry {
+        host: host.to_string(),
+        ip: ip.to_string(),
+    })
+}
+
+/// Parse repeated CLI `--add-host` values.
+pub fn parse_add_host_entries(entries: &[String]) -> Result<Vec<HostEntry>, String> {
+    entries
+        .iter()
+        .map(|entry| parse_add_host_entry(entry))
+        .collect()
 }
 
 #[cfg(test)]
@@ -135,5 +229,53 @@ mod tests {
         let r1 = generate_hosts_file("10.0.0.1", "self", &peers);
         let r2 = generate_hosts_file("10.0.0.1", "self", &peers);
         assert_eq!(r1, r2);
+    }
+
+    #[test]
+    fn test_hosts_file_with_hostname_without_ip() {
+        let result = generate_hosts_file_with_entries(None, &["box1".to_string()], &[], &[]);
+        assert_eq!(result, "127.0.0.1 localhost\n127.0.1.1 box1\n");
+    }
+
+    #[test]
+    fn test_hosts_file_with_extra_hosts() {
+        let result = generate_hosts_file_with_entries(
+            Some("10.88.0.2"),
+            &["web".to_string(), "custom".to_string()],
+            &[],
+            &[HostEntry {
+                host: "db.local".to_string(),
+                ip: "10.88.0.10".to_string(),
+            }],
+        );
+        assert_eq!(
+            result,
+            "127.0.0.1 localhost\n10.88.0.2 web custom\n10.88.0.10 db.local\n"
+        );
+    }
+
+    #[test]
+    fn test_validate_hostname() {
+        validate_hostname("web").unwrap();
+        validate_hostname("web-1.example").unwrap();
+        assert!(validate_hostname("").is_err());
+        assert!(validate_hostname("-web").is_err());
+        assert!(validate_hostname("web_1").is_err());
+        assert!(validate_hostname("bad host").is_err());
+    }
+
+    #[test]
+    fn test_parse_add_host_entry() {
+        let entry = parse_add_host_entry("db.local:10.88.0.10").unwrap();
+        assert_eq!(entry.host, "db.local");
+        assert_eq!(entry.ip, "10.88.0.10");
+
+        let entry = parse_add_host_entry("v6:2001:db8::1").unwrap();
+        assert_eq!(entry.host, "v6");
+        assert_eq!(entry.ip, "2001:db8::1");
+
+        assert!(parse_add_host_entry("missing-ip:").is_err());
+        assert!(parse_add_host_entry("bad_host:10.0.0.1").is_err());
+        assert!(parse_add_host_entry("host:not-an-ip").is_err());
     }
 }

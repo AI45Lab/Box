@@ -5,6 +5,8 @@
 
 use clap::Args;
 
+use crate::image_usage;
+
 #[derive(Args)]
 pub struct SaveArgs {
     /// Image reference to save
@@ -18,10 +20,8 @@ pub struct SaveArgs {
 pub async fn execute(args: SaveArgs) -> Result<(), Box<dyn std::error::Error>> {
     let store = super::open_image_store()?;
 
-    let stored = store
-        .get(&args.image)
-        .await
-        .ok_or_else(|| format!("Image not found: {}", args.image))?;
+    let images = store.list().await;
+    let stored = image_usage::resolve_required_stored_image(&images, &args.image)?;
 
     // Create tar archive of the OCI layout directory
     create_tar_archive(&stored.path, &args.output)?;
@@ -61,7 +61,10 @@ fn create_tar_archive(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use a3s_box_runtime::StoredImage;
+    use chrono::Utc;
     use std::fs;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     #[test]
@@ -108,5 +111,21 @@ mod tests {
 
         let content = fs::read_to_string(extract.path().join("data.txt")).unwrap();
         assert_eq!(content, "test content");
+    }
+
+    #[test]
+    fn test_save_resolution_accepts_digest() {
+        let images = vec![StoredImage {
+            reference: "example.com/app:latest".to_string(),
+            digest: "sha256:abc".to_string(),
+            size_bytes: 1024,
+            pulled_at: Utc::now(),
+            last_used: Utc::now(),
+            path: PathBuf::from("/tmp/image"),
+        }];
+
+        let stored = image_usage::resolve_required_stored_image(&images, "sha256:abc").unwrap();
+
+        assert_eq!(stored.reference, "example.com/app:latest");
     }
 }

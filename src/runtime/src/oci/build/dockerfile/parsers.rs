@@ -32,15 +32,16 @@ pub(super) fn parse_run(rest: &str, line_num: usize) -> Result<Instruction> {
         )));
     }
 
-    // If JSON array form, extract and join
-    let command = if rest.starts_with('[') {
-        let parts = parse_json_array(rest, line_num)?;
-        parts.join(" ")
-    } else {
-        rest.to_string()
-    };
+    if rest.starts_with('[') {
+        return Err(BoxError::BuildError(format!(
+            "Line {}: RUN exec form is not supported yet; use shell form",
+            line_num
+        )));
+    }
 
-    Ok(Instruction::Run { command })
+    Ok(Instruction::Run {
+        command: rest.to_string(),
+    })
 }
 
 pub(super) fn parse_copy(rest: &str, line_num: usize) -> Result<Instruction> {
@@ -51,14 +52,13 @@ pub(super) fn parse_copy(rest: &str, line_num: usize) -> Result<Instruction> {
         )));
     }
 
-    // Check for --from=<stage> flag
-    let (from, remaining) = if rest.starts_with("--from=") {
-        let (flag, after) = split_first_word(rest);
-        let stage = flag.strip_prefix("--from=").unwrap_or("").to_string();
-        (Some(stage), after)
-    } else {
-        (None, rest)
-    };
+    let (from, remaining) = parse_copy_flags(rest, line_num)?;
+    if remaining.starts_with('[') {
+        return Err(BoxError::BuildError(format!(
+            "Line {}: COPY JSON array form is not supported yet",
+            line_num
+        )));
+    }
 
     // Split remaining into src... dst (last element is dst)
     let parts: Vec<&str> = shell_split(remaining);
@@ -231,14 +231,13 @@ pub(super) fn parse_add(rest: &str, line_num: usize) -> Result<Instruction> {
         )));
     }
 
-    // Check for --chown=<user> flag
-    let (chown, remaining) = if rest.starts_with("--chown=") {
-        let (flag, after) = split_first_word(rest);
-        let user = flag.strip_prefix("--chown=").unwrap_or("").to_string();
-        (Some(user), after)
-    } else {
-        (None, rest)
-    };
+    let remaining = reject_add_flags(rest, line_num)?;
+    if remaining.starts_with('[') {
+        return Err(BoxError::BuildError(format!(
+            "Line {}: ADD JSON array form is not supported yet",
+            line_num
+        )));
+    }
 
     // Split remaining into src... dst (last element is dst)
     let parts: Vec<&str> = shell_split(remaining);
@@ -256,7 +255,11 @@ pub(super) fn parse_add(rest: &str, line_num: usize) -> Result<Instruction> {
         .map(|s| s.to_string())
         .collect();
 
-    Ok(Instruction::Add { src, dst, chown })
+    Ok(Instruction::Add {
+        src,
+        dst,
+        chown: None,
+    })
 }
 
 pub(super) fn parse_shell(rest: &str, line_num: usize) -> Result<Instruction> {
@@ -452,4 +455,54 @@ pub(super) fn parse_volume(rest: &str, line_num: usize) -> Result<Instruction> {
     }
 
     Ok(Instruction::Volume { paths })
+}
+
+fn parse_copy_flags(rest: &str, line_num: usize) -> Result<(Option<String>, &str)> {
+    let mut from = None;
+    let mut remaining = rest;
+
+    loop {
+        let trimmed = remaining.trim_start();
+        if !trimmed.starts_with("--") {
+            return Ok((from, trimmed));
+        }
+
+        let (flag, after) = split_first_word(trimmed);
+        if let Some(stage) = flag.strip_prefix("--from=") {
+            if stage.is_empty() {
+                return Err(BoxError::BuildError(format!(
+                    "Line {}: COPY --from requires a stage name or index",
+                    line_num
+                )));
+            }
+            if from.replace(stage.to_string()).is_some() {
+                return Err(BoxError::BuildError(format!(
+                    "Line {}: COPY specifies --from more than once",
+                    line_num
+                )));
+            }
+            remaining = after;
+            continue;
+        }
+
+        return Err(BoxError::BuildError(format!(
+            "Line {}: COPY flag '{}' is not supported yet (supported: --from=<stage>)",
+            line_num, flag
+        )));
+    }
+}
+
+fn reject_add_flags(rest: &str, line_num: usize) -> Result<&str> {
+    let trimmed = rest.trim_start();
+    if let Some(flag) = trimmed
+        .split_whitespace()
+        .next()
+        .filter(|s| s.starts_with("--"))
+    {
+        return Err(BoxError::BuildError(format!(
+            "Line {}: ADD flag '{}' is not supported yet",
+            line_num, flag
+        )));
+    }
+    Ok(trimmed)
 }

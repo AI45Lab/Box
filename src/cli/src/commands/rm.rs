@@ -5,6 +5,7 @@ use clap::Args;
 use crate::cleanup;
 use crate::resolve;
 use crate::state::StateFile;
+use crate::status;
 
 #[derive(Args)]
 pub struct RmArgs {
@@ -12,7 +13,7 @@ pub struct RmArgs {
     #[arg(required = true)]
     pub boxes: Vec<String>,
 
-    /// Force removal of running boxes (stops them first)
+    /// Force removal of active boxes (terminates them first)
     #[arg(short, long)]
     pub force: bool,
 }
@@ -39,18 +40,19 @@ fn rm_one(
     query: &str,
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let record = resolve::resolve(state, query)?;
+    let record = resolve::resolve(state, query)?.clone();
 
-    if record.status == "running" {
+    if status::is_active(&record) {
         if !force {
             return Err(format!(
-                "Box {} is running. Use --force to remove a running box.",
-                record.name
+                "Box {} is {}. Use --force to remove an active box.",
+                record.name, record.status
             )
             .into());
         }
 
-        // Force-kill the running box
+        // Force-kill the active box. A missing PID is treated as stale state;
+        // --force still removes metadata and resources below.
         if let Some(pid) = record.pid {
             crate::process::terminate_process(pid);
         }
@@ -58,35 +60,41 @@ fn rm_one(
 
     let box_id = record.id.clone();
     let name = record.name.clone();
-    let box_dir = record.box_dir.clone();
-    let exec_socket_path = record.exec_socket_path.clone();
-    let network_name = record.network_name.clone();
-    let volume_names = record.volume_names.clone();
-    let anonymous_volumes = record.anonymous_volumes.clone();
-
-    // Clean up volumes and network
-    cleanup::cleanup_box_resources(&box_id, &volume_names, network_name.as_deref());
-
-    // Remove anonymous volumes (auto-created from OCI VOLUME directives)
-    if !anonymous_volumes.is_empty() {
-        if let Ok(vol_store) = a3s_box_runtime::VolumeStore::default_path() {
-            for anon_name in &anonymous_volumes {
-                if let Err(e) = vol_store.remove(anon_name, true) {
-                    tracing::debug!(volume = anon_name, error = %e, "Failed to remove anonymous volume");
-                }
-            }
-        }
-    }
-
-    // Remove box directory
-    if box_dir.exists() {
-        let _ = std::fs::remove_dir_all(&box_dir);
-    }
-    cleanup::cleanup_external_socket_dir(&box_dir, &exec_socket_path);
+    cleanup::cleanup_removed_box(&record);
 
     // Remove from state
     state.remove(&box_id)?;
     println!("{name}");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_helpers::fixtures::{make_record, setup_state};
+
+    #[test]
+    fn test_rm_rejects_paused_without_force() {
+        let (_tmp, mut state) =
+            setup_state(vec![make_record("id-1", "paused_box", "paused", None)]);
+
+        let result = rm_one(&mut state, "paused_box", false);
+
+        assert!(result.is_err());
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("paused"));
+        assert!(error.contains("--force"));
+        assert!(state.find_by_id("id-1").is_some());
+    }
+
+    #[test]
+    fn test_rm_force_removes_paused_stale_record() {
+        let (_tmp, mut state) =
+            setup_state(vec![make_record("id-1", "paused_box", "paused", None)]);
+
+        rm_one(&mut state, "paused_box", true).unwrap();
+
+        assert!(state.find_by_id("id-1").is_none());
+    }
 }

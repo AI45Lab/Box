@@ -5,9 +5,11 @@ use clap::Args;
 use a3s_box_core::vmm::parse_signal_name;
 
 use crate::cleanup;
+use crate::lifecycle;
 use crate::process;
 use crate::resolve;
 use crate::state::StateFile;
+use crate::status;
 
 #[derive(Args)]
 pub struct StopArgs {
@@ -44,22 +46,16 @@ async fn stop_one(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let record = resolve::resolve(state, query)?;
 
-    if record.status != "running" {
-        return Err(format!(
-            "Box {} is not running (status: {})",
-            record.name, record.status
-        )
-        .into());
-    }
+    status::require_active(record, "stop")
+        .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+    let pid = lifecycle::require_live_pid(record, "stop")
+        .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
 
     let box_id = record.id.clone();
     let name = record.name.clone();
-    let pid = record.pid;
     let auto_remove = record.auto_remove;
-    let box_dir = record.box_dir.clone();
-    let exec_socket_path = record.exec_socket_path.clone();
-    let network_name = record.network_name.clone();
-    let volume_names = record.volume_names.clone();
+    let record_snapshot = record.clone();
+    let previous_exit_code = record.exit_code;
 
     // Resolve stop signal: CLI --stop-signal > BoxRecord.stop_signal > SIGTERM
     let stop_signal = record
@@ -72,29 +68,77 @@ async fn stop_one(
     let effective_timeout = timeout.or(record.stop_timeout).unwrap_or(10);
 
     // Send stop signal, then SIGKILL after timeout
-    if let Some(pid) = pid {
-        process::graceful_stop(pid, stop_signal, effective_timeout).await;
+    lifecycle::resume_paused_for_termination(record, pid, "stop")
+        .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+    let stop_outcome = Some(process::graceful_stop(pid, stop_signal, effective_timeout).await);
+
+    if auto_remove {
+        cleanup::cleanup_removed_box(&record_snapshot);
+        state.remove(&box_id)?;
+        println!("{name} (auto-removed)");
+        return Ok(());
     }
 
-    // Clean up volumes and network
-    cleanup::cleanup_box_resources(&box_id, &volume_names, network_name.as_deref());
+    cleanup::cleanup_stopped_box(&record_snapshot);
 
     // Update state
     let record = resolve::resolve_mut(state, &box_id)?;
     record.status = "stopped".to_string();
     record.pid = None;
     record.stopped_by_user = true;
+    record.exit_code = stopped_exit_code(previous_exit_code, stop_outcome, stop_signal);
+    record.health_status = "none".to_string();
+    record.health_retries = 0;
 
-    if auto_remove {
-        let _ = std::fs::remove_dir_all(&box_dir);
-        cleanup::cleanup_external_socket_dir(&box_dir, &exec_socket_path);
-        state.remove(&box_id)?;
-        println!("{name} (auto-removed)");
-    } else {
-        cleanup::cleanup_external_socket_dir(&box_dir, &exec_socket_path);
-        state.save()?;
-        println!("{name}");
-    }
+    state.save()?;
+    println!("{name}");
 
     Ok(())
+}
+
+fn stopped_exit_code(
+    previous_exit_code: Option<i32>,
+    outcome: Option<process::StopOutcome>,
+    stop_signal: i32,
+) -> Option<i32> {
+    outcome
+        .and_then(|outcome| outcome.inferred_exit_code(stop_signal))
+        .or(previous_exit_code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_helpers::fixtures::make_record;
+
+    #[test]
+    fn test_stopped_exit_code_uses_graceful_signal_code() {
+        assert_eq!(
+            stopped_exit_code(None, Some(process::StopOutcome::GracefulExit), 15),
+            Some(143)
+        );
+    }
+
+    #[test]
+    fn test_stopped_exit_code_uses_forced_kill_code() {
+        assert_eq!(
+            stopped_exit_code(Some(7), Some(process::StopOutcome::ForceKilled), 15),
+            Some(137)
+        );
+    }
+
+    #[test]
+    fn test_stopped_exit_code_preserves_previous_when_already_exited() {
+        assert_eq!(
+            stopped_exit_code(Some(7), Some(process::StopOutcome::AlreadyExited), 15),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn test_stop_accepts_paused_status_as_active() {
+        let record = make_record("id", "box", "paused", Some(1));
+
+        assert!(status::require_active(&record, "stop").is_ok());
+    }
 }

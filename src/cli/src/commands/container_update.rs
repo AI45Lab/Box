@@ -168,16 +168,17 @@ pub async fn execute(args: ContainerUpdateArgs) -> Result<(), Box<dyn std::error
         if update.has_tier2_changes() {
             #[cfg(not(windows))]
             {
-                let exec_socket_path = if !record.exec_socket_path.as_os_str().is_empty() {
-                    record.exec_socket_path.clone()
-                } else {
-                    record.box_dir.join("sockets").join("exec.sock")
-                };
+                let exec_socket_path = crate::socket_paths::runtime_socket(
+                    record,
+                    crate::socket_paths::RuntimeSocket::Exec,
+                );
 
                 if !exec_socket_path.exists() {
                     eprintln!(
-                        "Warning: exec socket not found at {}, changes saved but not applied live",
-                        exec_socket_path.display()
+                        "Warning: exec socket missing for running box {} at {}; changes saved but not applied live. Run `a3s-box ps` to reconcile state, then `a3s-box restart {}` if the control channel remains missing.",
+                        record.name,
+                        exec_socket_path.display(),
+                        record.name
                     );
                 } else {
                     let client = ExecClient::connect(&exec_socket_path).await?;

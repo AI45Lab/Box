@@ -12,6 +12,9 @@ use tracing::info;
 #[cfg(target_os = "linux")]
 use tracing::{error, warn};
 
+#[cfg(target_os = "linux")]
+use crate::user::parse_process_user;
+
 /// Run the PTY server, listening on vsock port 4090.
 ///
 /// On Linux, binds to `AF_VSOCK` with `VMADDR_CID_ANY`.
@@ -89,18 +92,16 @@ fn run_vsock_pty_server() -> Result<(), Box<dyn std::error::Error>> {
 fn handle_pty_connection(fd: std::os::fd::OwnedFd) -> Result<(), Box<dyn std::error::Error>> {
     use a3s_box_core::pty::{parse_frame, read_frame, write_error, write_exit, PtyFrame};
     use nix::pty::openpty;
-    use nix::unistd::{close, dup2, execvp, fork, setsid, ForkResult};
+    use nix::unistd::{dup2, execvp, fork, setsid, ForkResult};
     use std::ffi::CString;
-    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::fd::AsRawFd;
 
-    let raw_fd = fd.as_raw_fd();
-    let mut stream = unsafe { std::fs::File::from_raw_fd(raw_fd) };
+    let mut stream = std::fs::File::from(fd);
 
     // Step 1: Read PtyRequest
     let (frame_type, payload) = match read_frame(&mut stream)? {
         Some(f) => f,
         None => {
-            std::mem::forget(fd);
             return Ok(());
         }
     };
@@ -109,23 +110,27 @@ fn handle_pty_connection(fd: std::os::fd::OwnedFd) -> Result<(), Box<dyn std::er
         PtyFrame::Request(req) => req,
         _ => {
             write_error(&mut stream, "Expected PtyRequest frame")?;
-            std::mem::forget(fd);
             return Ok(());
         }
     };
 
     if request.cmd.is_empty() {
         write_error(&mut stream, "Empty command")?;
-        std::mem::forget(fd);
         return Ok(());
     }
     if let Err(error) =
         validate_rootfs_request(request.rootfs.as_deref(), request.working_dir.as_deref())
     {
         write_error(&mut stream, &error)?;
-        std::mem::forget(fd);
         return Ok(());
     }
+    let process_user = match parse_process_user(request.user.as_deref()) {
+        Ok(user) => user,
+        Err(error) => {
+            write_error(&mut stream, &error)?;
+            return Ok(());
+        }
+    };
 
     info!(cmd = ?request.cmd, "PTY session starting");
 
@@ -156,7 +161,7 @@ fn handle_pty_connection(fd: std::os::fd::OwnedFd) -> Result<(), Box<dyn std::er
             dup2(slave_fd.as_raw_fd(), 1).ok(); // stdout
             dup2(slave_fd.as_raw_fd(), 2).ok(); // stderr
             if slave_fd.as_raw_fd() > 2 {
-                close(slave_fd.as_raw_fd()).ok();
+                drop(slave_fd);
             }
 
             // Apply environment variables
@@ -184,27 +189,15 @@ fn handle_pty_connection(fd: std::os::fd::OwnedFd) -> Result<(), Box<dyn std::er
                 let _ = std::env::set_current_dir(dir);
             }
 
-            // Build command: if user is specified, wrap with su
-            let (program, args) = if let Some(ref user) = request.user {
-                let shell_cmd = request
-                    .cmd
-                    .iter()
-                    .map(|a| shell_escape(a))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                (
-                    "su".to_string(),
-                    vec![
-                        "-s".to_string(),
-                        "/bin/sh".to_string(),
-                        user.clone(),
-                        "-c".to_string(),
-                        shell_cmd,
-                    ],
-                )
-            } else {
-                (request.cmd[0].clone(), request.cmd[1..].to_vec())
-            };
+            if let Some(user) = process_user {
+                if let Err(error) = user.apply() {
+                    eprintln!("Failed to apply PTY user: {}", error);
+                    std::process::exit(127);
+                }
+            }
+
+            let program = request.cmd[0].clone();
+            let args = request.cmd[1..].to_vec();
 
             let c_program =
                 CString::new(program.as_str()).unwrap_or_else(|_| CString::new("/bin/sh").unwrap());
@@ -230,8 +223,6 @@ fn handle_pty_connection(fd: std::os::fd::OwnedFd) -> Result<(), Box<dyn std::er
 
             info!(exit_code, "PTY session ended");
 
-            // Prevent double-close: stream owns the fd
-            std::mem::forget(fd);
             Ok(())
         }
     }
@@ -305,9 +296,7 @@ fn relay_pty_data(
         parse_frame, read_frame, write_data, PtyFrame, FRAME_PTY_DATA, FRAME_PTY_ERROR,
         FRAME_PTY_RESIZE,
     };
-    use nix::sys::signal::{kill, Signal};
     use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-    use nix::unistd::Pid;
     use std::os::fd::{AsFd, AsRawFd};
 
     let master_raw = master.as_raw_fd();
@@ -448,6 +437,9 @@ fn relay_pty_data(
 
 #[cfg(target_os = "linux")]
 fn terminate_pty_child(child: nix::unistd::Pid) {
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::Pid;
+
     let pid = child.as_raw();
     if pid > 0 {
         let _ = kill(Pid::from_raw(-pid), Signal::SIGKILL);
@@ -484,18 +476,6 @@ fn set_blocking(fd: std::os::fd::RawFd) {
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFL);
         libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
-    }
-}
-
-/// Minimal shell escaping for a single argument.
-#[cfg(target_os = "linux")]
-fn shell_escape(s: &str) -> String {
-    if s.chars()
-        .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '/' || c == '.')
-    {
-        s.to_string()
-    } else {
-        format!("'{}'", s.replace('\'', "'\\''"))
     }
 }
 

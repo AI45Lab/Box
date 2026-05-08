@@ -2,6 +2,8 @@
 
 use clap::Args;
 
+use crate::image_usage;
+
 #[derive(Args)]
 pub struct ImageTagArgs {
     /// Source image reference
@@ -13,10 +15,9 @@ pub struct ImageTagArgs {
 
 pub async fn execute(args: ImageTagArgs) -> Result<(), Box<dyn std::error::Error>> {
     let store = super::open_image_store()?;
+    let images = store.list().await;
 
-    let source = store
-        .get(&args.source)
-        .await
+    let source = image_usage::resolve_stored_image(&images, &args.source)?
         .ok_or_else(|| format!("Image not found: {}", args.source))?;
 
     // Store with new reference pointing to the same digest directory (no disk copy)
@@ -26,4 +27,33 @@ pub async fn execute(args: ImageTagArgs) -> Result<(), Box<dyn std::error::Error
 
     println!("{}", args.target);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use a3s_box_runtime::StoredImage;
+    use chrono::Utc;
+    use std::path::PathBuf;
+
+    fn stored(reference: &str) -> StoredImage {
+        StoredImage {
+            reference: reference.to_string(),
+            digest: "sha256:abc".to_string(),
+            size_bytes: 1024,
+            pulled_at: Utc::now(),
+            last_used: Utc::now(),
+            path: PathBuf::from("/tmp/image"),
+        }
+    }
+
+    #[test]
+    fn test_tag_source_resolution_accepts_normalized_alias() {
+        let images = vec![stored("docker.io/library/alpine:latest")];
+        let source = image_usage::resolve_stored_image(&images, "alpine:latest")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(source.reference, "docker.io/library/alpine:latest");
+    }
 }

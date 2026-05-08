@@ -13,7 +13,10 @@ use std::time::{Duration, Instant};
 use clap::Args;
 
 use crate::boot;
-use crate::state::StateFile;
+#[cfg(not(windows))]
+use crate::health;
+use crate::state::{policy, BoxRecord, StateFile};
+use crate::status;
 
 /// Minimum backoff delay before retrying a restart.
 const MIN_BACKOFF: Duration = Duration::from_secs(1);
@@ -152,12 +155,14 @@ pub async fn execute(args: MonitorArgs) -> Result<(), Box<dyn std::error::Error>
 async fn poll_once(tracker: &mut BackoffTracker) -> Result<(), Box<dyn std::error::Error>> {
     let mut state = StateFile::load_default()?;
 
-    // Track running boxes for stability detection
+    // Track active boxes for stability detection.
     for record in state.records() {
-        if record.status == "running" {
+        if status::is_active(record) {
             tracker.mark_running(&record.id);
         }
     }
+
+    run_due_health_checks(&mut state).await?;
 
     // Find boxes that need restarting: dead boxes + unhealthy running boxes
     let mut candidates = state.pending_restarts();
@@ -166,43 +171,33 @@ async fn poll_once(tracker: &mut BackoffTracker) -> Result<(), Box<dyn std::erro
     let unhealthy: Vec<String> = state
         .records()
         .iter()
-        .filter(|r| {
-            r.status == "running"
-                && r.health_status == "unhealthy"
-                && r.health_check.is_some()
-                && r.restart_policy != "no"
-        })
+        .filter(|r| is_unhealthy_restart_candidate(r))
         .map(|r| r.id.clone())
         .collect();
     candidates.extend(unhealthy);
 
     for box_id in candidates {
-        // Check backoff
-        if !tracker.ready(&box_id) {
-            let delay = tracker.current_delay(&box_id);
-            eprintln!(
-                "monitor: box {} backing off ({:.0}s remaining)",
-                &box_id[..12.min(box_id.len())],
-                delay.as_secs_f64()
-            );
-            continue;
-        }
-
         let record = match state.find_by_id(&box_id) {
             Some(r) => r.clone(),
             None => continue,
         };
 
-        let name = record.name.clone();
-        let short_id = record.short_id.clone();
-        let is_unhealthy = record.status == "running" && record.health_status == "unhealthy";
+        // Check backoff
+        if !tracker.ready(&box_id) {
+            let delay = tracker.current_delay(&box_id);
+            eprintln!("{}", backoff_log_line(&record, delay));
+            continue;
+        }
+
+        let is_unhealthy = is_unhealthy_restart_candidate(&record);
 
         // If unhealthy, kill the process first before restarting
         if is_unhealthy {
-            println!("monitor: box {name} ({short_id}) is unhealthy, restarting...");
+            println!("{}", restart_log_line(&record, RestartReason::Unhealthy));
             if let Some(pid) = record.pid {
                 crate::process::graceful_stop(pid, libc::SIGTERM, 10).await;
             }
+            tracker.mark_dead(&box_id);
             // Mark as dead so boot_from_record works
             if let Some(rec) = state.find_by_id_mut(&box_id) {
                 rec.status = "dead".to_string();
@@ -213,7 +208,7 @@ async fn poll_once(tracker: &mut BackoffTracker) -> Result<(), Box<dyn std::erro
             state.save()?;
         } else {
             tracker.mark_dead(&box_id);
-            println!("monitor: restarting box {name} ({short_id})...");
+            println!("{}", restart_log_line(&record, RestartReason::Dead));
         }
 
         // Attempt restart
@@ -221,23 +216,15 @@ async fn poll_once(tracker: &mut BackoffTracker) -> Result<(), Box<dyn std::erro
             Ok(result) => {
                 // Update record to running
                 if let Some(rec) = state.find_by_id_mut(&box_id) {
-                    rec.status = "running".to_string();
-                    rec.pid = result.pid;
-                    rec.started_at = Some(chrono::Utc::now());
-                    rec.restart_count += 1;
-                    rec.stopped_by_user = false;
-                    rec.health_status = if rec.health_check.is_some() {
-                        "starting".to_string()
-                    } else {
-                        "none".to_string()
-                    };
-                    rec.health_retries = 0;
+                    boot::apply_boot_result(rec, result, boot::RestartCountUpdate::Increment);
                 }
                 state.save()?;
                 tracker.record_attempt(&box_id);
                 println!(
                     "monitor: box {name} ({short_id}) restarted (count: {})",
-                    state.find_by_id(&box_id).map_or(0, |r| r.restart_count)
+                    state.find_by_id(&box_id).map_or(0, |r| r.restart_count),
+                    name = record.name,
+                    short_id = record.short_id,
                 );
             }
             Err(e) => {
@@ -245,7 +232,9 @@ async fn poll_once(tracker: &mut BackoffTracker) -> Result<(), Box<dyn std::erro
                 let delay = tracker.current_delay(&box_id);
                 eprintln!(
                     "monitor: failed to restart box {name} ({short_id}): {e} (next retry in {:.0}s)",
-                    delay.as_secs_f64()
+                    delay.as_secs_f64(),
+                    name = record.name,
+                    short_id = record.short_id,
                 );
             }
         }
@@ -254,9 +243,97 @@ async fn poll_once(tracker: &mut BackoffTracker) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestartReason {
+    Dead,
+    Unhealthy,
+}
+
+fn is_unhealthy_restart_candidate(record: &BoxRecord) -> bool {
+    record.status == "running"
+        && record.health_status == "unhealthy"
+        && record.health_check.is_some()
+        && policy::should_restart(record)
+}
+
+fn restart_log_line(record: &BoxRecord, reason: RestartReason) -> String {
+    match reason {
+        RestartReason::Dead => format!(
+            "monitor: restarting dead box {} ({}, policy: {}, exit: {})...",
+            record.name,
+            record.short_id,
+            record.restart_policy,
+            format_exit_code(record.exit_code)
+        ),
+        RestartReason::Unhealthy => format!(
+            "monitor: box {} ({}, policy: {}) is unhealthy, restarting...",
+            record.name, record.short_id, record.restart_policy
+        ),
+    }
+}
+
+fn backoff_log_line(record: &BoxRecord, delay: Duration) -> String {
+    format!(
+        "monitor: box {} ({}) backing off ({:.0}s remaining)",
+        record.name,
+        record.short_id,
+        delay.as_secs_f64()
+    )
+}
+
+fn format_exit_code(exit_code: Option<i32>) -> String {
+    exit_code
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+#[cfg(not(windows))]
+async fn run_due_health_checks(state: &mut StateFile) -> Result<(), Box<dyn std::error::Error>> {
+    let now = chrono::Utc::now();
+    let probes: Vec<_> = state
+        .records()
+        .iter()
+        .filter(|record| health::should_probe(record, now))
+        .filter_map(|record| {
+            record.health_check.as_ref().map(|hc| {
+                (
+                    record.id.clone(),
+                    record.exec_socket_path.clone(),
+                    hc.clone(),
+                )
+            })
+        })
+        .collect();
+
+    if probes.is_empty() {
+        return Ok(());
+    }
+
+    for (box_id, exec_socket_path, health_check) in probes {
+        let healthy = health::run_probe(
+            &exec_socket_path,
+            &health_check.cmd,
+            health::probe_timeout_ns(&health_check),
+        )
+        .await;
+        if let Some(record) = state.find_by_id_mut(&box_id) {
+            health::apply_probe_result(record, healthy, chrono::Utc::now());
+        }
+    }
+
+    state.save()?;
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn run_due_health_checks(_state: &mut StateFile) -> Result<(), Box<dyn std::error::Error>> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::fixtures::make_record;
 
     // --- BackoffTracker tests ---
 
@@ -342,5 +419,56 @@ mod tests {
 
         entry.mark_dead();
         assert!(entry.last_seen_running.is_none());
+    }
+
+    fn health_check() -> crate::state::HealthCheck {
+        crate::state::HealthCheck {
+            cmd: vec!["true".to_string()],
+            interval_secs: 30,
+            timeout_secs: 5,
+            retries: 3,
+            start_period_secs: 0,
+        }
+    }
+
+    #[test]
+    fn test_unhealthy_restart_candidate_respects_restart_policy() {
+        let mut record = make_record("id-1", "box", "running", Some(1));
+        record.health_check = Some(health_check());
+        record.health_status = "unhealthy".to_string();
+        record.restart_policy = "no".to_string();
+        assert!(!is_unhealthy_restart_candidate(&record));
+
+        record.restart_policy = "on-failure:2".to_string();
+        record.restart_count = 2;
+        assert!(!is_unhealthy_restart_candidate(&record));
+
+        record.restart_count = 1;
+        assert!(is_unhealthy_restart_candidate(&record));
+    }
+
+    #[test]
+    fn test_restart_log_line_for_dead_includes_policy_and_exit_code() {
+        let mut record = make_record("id-1", "box", "dead", None);
+        record.short_id = "id1".to_string();
+        record.restart_policy = "always".to_string();
+        record.exit_code = Some(137);
+
+        let line = restart_log_line(&record, RestartReason::Dead);
+
+        assert!(line.contains("restarting dead box box (id1"));
+        assert!(line.contains("policy: always"));
+        assert!(line.contains("exit: 137"));
+    }
+
+    #[test]
+    fn test_backoff_log_line_includes_name_and_short_id() {
+        let mut record = make_record("id-1", "box", "dead", None);
+        record.short_id = "id1".to_string();
+
+        let line = backoff_log_line(&record, Duration::from_secs(4));
+
+        assert!(line.contains("box box (id1)"));
+        assert!(line.contains("4s remaining"));
     }
 }

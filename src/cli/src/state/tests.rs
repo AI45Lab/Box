@@ -51,6 +51,7 @@ fn sample_record(id: &str, name: &str, status: &str) -> BoxRecord {
         max_restart_count: 0,
         exit_code: None,
         health_check: None,
+        healthcheck_disabled: false,
         health_status: "none".to_string(),
         health_retries: 0,
         health_last_check: None,
@@ -442,6 +443,90 @@ fn test_reconcile_running_without_pid() {
         let sf = StateFile::load(&path).unwrap();
         let record = sf.find_by_id("no-pid-id").unwrap();
         assert_eq!(record.status, "dead");
+    }
+}
+
+#[test]
+fn test_reconcile_dead_running_box_removes_external_socket_dir() {
+    let tmp = TempDir::new().unwrap();
+    let path = test_state_path(&tmp);
+    let box_dir = tmp.path().join("box-dir");
+    let external_socket_dir = tmp.path().join("external-sockets");
+
+    {
+        std::fs::create_dir_all(&box_dir).unwrap();
+        std::fs::create_dir_all(&external_socket_dir).unwrap();
+        let mut sf = StateFile::load(&path).unwrap();
+        let mut record = sample_record("external-socket-id", "external_socket_box", "created");
+        record.status = "running".to_string();
+        record.pid = None;
+        record.box_dir = box_dir.clone();
+        record.exec_socket_path = external_socket_dir.join("exec.sock");
+        sf.records.push(record);
+        sf.save().unwrap();
+    }
+
+    {
+        let sf = StateFile::load(&path).unwrap();
+        let record = sf.find_by_id("external-socket-id").unwrap();
+        assert_eq!(record.status, "dead");
+        assert!(!external_socket_dir.exists());
+        assert!(box_dir.exists());
+    }
+}
+
+#[test]
+fn test_reconcile_paused_without_pid_removes_external_socket_dir() {
+    let tmp = TempDir::new().unwrap();
+    let path = test_state_path(&tmp);
+    let box_dir = tmp.path().join("paused-box-dir");
+    let external_socket_dir = tmp.path().join("paused-external-sockets");
+
+    {
+        std::fs::create_dir_all(&box_dir).unwrap();
+        std::fs::create_dir_all(&external_socket_dir).unwrap();
+        let mut sf = StateFile::load(&path).unwrap();
+        let mut record = sample_record("paused-stale-id", "paused_stale_box", "created");
+        record.status = "paused".to_string();
+        record.pid = None;
+        record.box_dir = box_dir.clone();
+        record.exec_socket_path = external_socket_dir.join("exec.sock");
+        sf.records.push(record);
+        sf.save().unwrap();
+    }
+
+    {
+        let sf = StateFile::load(&path).unwrap();
+        let record = sf.find_by_id("paused-stale-id").unwrap();
+        assert_eq!(record.status, "dead");
+        assert!(!external_socket_dir.exists());
+        assert!(box_dir.exists());
+    }
+}
+
+#[test]
+fn test_reconcile_auto_removes_dead_running_box() {
+    let tmp = TempDir::new().unwrap();
+    let path = test_state_path(&tmp);
+    let box_dir = tmp.path().join("auto-remove-box");
+
+    {
+        std::fs::create_dir_all(box_dir.join("sockets")).unwrap();
+        let mut sf = StateFile::load(&path).unwrap();
+        let mut record = sample_record("auto-rm-id", "auto_rm_box", "created");
+        record.status = "running".to_string();
+        record.pid = None;
+        record.auto_remove = true;
+        record.box_dir = box_dir.clone();
+        record.exec_socket_path = box_dir.join("sockets").join("exec.sock");
+        sf.records.push(record);
+        sf.save().unwrap();
+    }
+
+    {
+        let sf = StateFile::load(&path).unwrap();
+        assert!(sf.find_by_id("auto-rm-id").is_none());
+        assert!(!box_dir.exists());
     }
 }
 

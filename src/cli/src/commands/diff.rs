@@ -95,6 +95,21 @@ pub async fn execute(args: DiffArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Create the per-box baseline snapshot used by `a3s-box diff`.
+///
+/// The caller should invoke this after the rootfs is prepared and before user
+/// mutations that should appear in later diff output.
+pub(crate) fn create_box_baseline_snapshot(
+    box_dir: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let rootfs_dir = box_dir.join("rootfs");
+    let snapshot_path = box_dir.join("rootfs_snapshot.json");
+    if rootfs_dir.exists() && !snapshot_path.exists() {
+        create_snapshot(&rootfs_dir, &snapshot_path)?;
+    }
+    Ok(())
+}
+
 /// Minimal file metadata for comparison.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FileInfo {

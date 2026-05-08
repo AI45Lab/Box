@@ -1,6 +1,6 @@
 //! `a3s-box stats` command — Display live resource usage statistics.
 //!
-//! Shows CPU and memory usage for running boxes, similar to `docker stats`.
+//! Shows CPU and memory usage for active boxes, similar to `docker stats`.
 //! By default streams updates every second; use `--no-stream` for a single snapshot.
 
 use clap::Args;
@@ -8,11 +8,12 @@ use sysinfo::{Pid, System};
 
 use crate::output;
 use crate::resolve;
-use crate::state::StateFile;
+use crate::state::{BoxRecord, StateFile};
+use crate::status;
 
 #[derive(Args)]
 pub struct StatsArgs {
-    /// Box name or ID (shows all running boxes if omitted)
+    /// Box name or ID (shows all active boxes if omitted)
     pub r#box: Option<String>,
 
     /// Disable streaming and print a single snapshot
@@ -24,6 +25,7 @@ pub struct StatsArgs {
 struct BoxStats {
     name: String,
     short_id: String,
+    status: String,
     pid: u32,
     cpu_percent: f32,
     memory_bytes: u64,
@@ -56,6 +58,7 @@ fn print_stats(stats: &[BoxStats]) {
     let mut table = output::new_table(&[
         "BOX ID",
         "NAME",
+        "STATUS",
         "CPU %",
         "MEM USAGE / LIMIT",
         "MEM %",
@@ -72,6 +75,7 @@ fn print_stats(stats: &[BoxStats]) {
         table.add_row([
             &s.short_id,
             &s.name,
+            &s.status,
             &format!("{:.2}%", s.cpu_percent),
             &format!(
                 "{} / {}",
@@ -86,6 +90,39 @@ fn print_stats(stats: &[BoxStats]) {
     println!("{table}");
 }
 
+fn select_targets(
+    state: &StateFile,
+    query: Option<&str>,
+) -> Result<Vec<BoxRecord>, Box<dyn std::error::Error>> {
+    if let Some(name) = query {
+        let record = resolve::resolve(state, name)?;
+        status::require_active(record, "show stats for")
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        return Ok(vec![record.clone()]);
+    }
+
+    Ok(state
+        .list(true)
+        .into_iter()
+        .filter(|record| status::is_active(record))
+        .cloned()
+        .collect())
+}
+
+fn build_box_stats(sys: &mut System, record: &BoxRecord) -> Option<BoxStats> {
+    let pid = record.pid?;
+    let memory_limit_bytes = (record.memory_mb as u64) * 1024 * 1024;
+    collect_stats(sys, pid, record.memory_mb).map(|(cpu, mem)| BoxStats {
+        name: record.name.clone(),
+        short_id: record.short_id.clone(),
+        status: record.status.clone(),
+        pid,
+        cpu_percent: cpu,
+        memory_bytes: mem,
+        memory_limit_bytes,
+    })
+}
+
 pub async fn execute(args: StatsArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut sys = System::new();
 
@@ -93,36 +130,18 @@ pub async fn execute(args: StatsArgs) -> Result<(), Box<dyn std::error::Error>> 
         let state = StateFile::load_default()?;
 
         // Determine which boxes to show
-        let targets: Vec<_> = if let Some(ref name) = args.r#box {
-            let record = resolve::resolve(&state, name)?;
-            if record.status != "running" {
-                return Err(format!("Box {} is not running", record.name).into());
-            }
-            vec![record.clone()]
-        } else {
-            state.list(false).into_iter().cloned().collect()
-        };
+        let targets = select_targets(&state, args.r#box.as_deref())?;
 
         if targets.is_empty() {
-            println!("No running boxes");
+            println!("No active boxes");
             return Ok(());
         }
 
-        // Collect stats for each running box
+        // Collect stats for each active box.
         let mut stats = Vec::new();
         for record in &targets {
-            if let Some(pid) = record.pid {
-                let memory_limit_bytes = (record.memory_mb as u64) * 1024 * 1024;
-                if let Some((cpu, mem)) = collect_stats(&mut sys, pid, record.memory_mb) {
-                    stats.push(BoxStats {
-                        name: record.name.clone(),
-                        short_id: record.short_id.clone(),
-                        pid,
-                        cpu_percent: cpu,
-                        memory_bytes: mem,
-                        memory_limit_bytes,
-                    });
-                }
+            if let Some(box_stats) = build_box_stats(&mut sys, record) {
+                stats.push(box_stats);
             }
         }
 
@@ -143,4 +162,44 @@ pub async fn execute(args: StatsArgs) -> Result<(), Box<dyn std::error::Error>> 
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_helpers::fixtures::{make_record, setup_state};
+
+    #[test]
+    fn test_select_targets_without_query_includes_running_and_paused() {
+        let (_tmp, state) = setup_state(vec![
+            make_record("id-1", "running_box", "running", Some(1)),
+            make_record("id-2", "paused_box", "paused", Some(1)),
+            make_record("id-3", "stopped_box", "stopped", None),
+        ]);
+
+        let targets = select_targets(&state, None).unwrap();
+        let names: Vec<_> = targets.iter().map(|record| record.name.as_str()).collect();
+
+        assert_eq!(names, vec!["running_box", "paused_box"]);
+    }
+
+    #[test]
+    fn test_select_targets_with_query_accepts_paused() {
+        let (_tmp, state) = setup_state(vec![make_record("id-1", "paused_box", "paused", Some(1))]);
+
+        let targets = select_targets(&state, Some("paused_box")).unwrap();
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].status, "paused");
+    }
+
+    #[test]
+    fn test_select_targets_with_query_rejects_stopped() {
+        let (_tmp, state) = setup_state(vec![make_record("id-1", "stopped_box", "stopped", None)]);
+
+        let error = select_targets(&state, Some("stopped_box")).unwrap_err();
+
+        assert!(error.to_string().contains("Cannot show stats for"));
+        assert!(error.to_string().contains("a3s-box start stopped_box"));
+    }
 }

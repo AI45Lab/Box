@@ -1,7 +1,7 @@
 //! State management for box instances.
 //!
 //! Persists box metadata to `~/.a3s/boxes.json` with atomic writes.
-//! On every load, dead PIDs are reconciled to mark boxes as dead.
+//! On every load, dead active PIDs are reconciled to mark boxes as dead.
 
 mod file;
 pub(crate) mod policy;
@@ -40,7 +40,7 @@ pub struct BoxRecord {
     pub volumes: Vec<String>,
     /// Environment variables
     pub env: HashMap<String, String>,
-    /// Entrypoint override
+    /// Command override
     pub cmd: Vec<String>,
     /// Entrypoint override (if set via --entrypoint)
     #[serde(default)]
@@ -91,6 +91,9 @@ pub struct BoxRecord {
     /// Health check configuration
     #[serde(default)]
     pub health_check: Option<HealthCheck>,
+    /// Whether image-defined health checks were explicitly disabled.
+    #[serde(default)]
+    pub healthcheck_disabled: bool,
     /// Current health status: "none", "starting", "healthy", "unhealthy"
     #[serde(default = "default_health_status")]
     pub health_status: String,

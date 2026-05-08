@@ -409,25 +409,11 @@ fn extract_tar_to_dir(tar_data: &[u8], dir_path: &str) -> Result<(), Box<dyn std
 async fn connect_exec(box_name: &str) -> Result<ExecClient, Box<dyn std::error::Error>> {
     let state = StateFile::load_default()?;
     let record = resolve::resolve(&state, box_name)?;
-
-    if record.status != "running" {
-        return Err(format!("Box {} is not running", record.name).into());
-    }
-
-    let exec_socket_path = if !record.exec_socket_path.as_os_str().is_empty() {
-        record.exec_socket_path.clone()
-    } else {
-        record.box_dir.join("sockets").join("exec.sock")
-    };
-
-    if !exec_socket_path.exists() {
-        return Err(format!(
-            "Exec socket not found for box {} at {}",
-            record.name,
-            exec_socket_path.display()
-        )
-        .into());
-    }
+    let exec_socket_path = crate::socket_paths::require_runtime_socket(
+        record,
+        crate::socket_paths::RuntimeSocket::Exec,
+    )
+    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     ExecClient::connect(&exec_socket_path)
         .await

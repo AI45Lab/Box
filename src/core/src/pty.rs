@@ -44,7 +44,7 @@ pub struct PtyRequest {
     /// Optional guest-visible rootfs path to chroot into before executing.
     #[serde(default)]
     pub rootfs: Option<String>,
-    /// User to run the command as.
+    /// User to run the command as (supported: "root", "1000", "1000:1000").
     #[serde(default)]
     pub user: Option<String>,
     /// Terminal width in columns.

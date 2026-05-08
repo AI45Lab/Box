@@ -147,6 +147,8 @@ impl BuildState {
 /// stage produces the output image. `COPY --from=<stage>` copies from a
 /// previous stage's rootfs.
 pub async fn build(config: BuildConfig, store: Arc<ImageStore>) -> Result<BuildResult> {
+    validate_build_config(&config)?;
+
     // Parse Dockerfile
     let dockerfile = Dockerfile::from_file(&config.dockerfile_path)?;
 
@@ -593,7 +595,7 @@ pub async fn build(config: BuildConfig, store: Arc<ImageStore>) -> Result<BuildR
         .platforms
         .first()
         .cloned()
-        .unwrap_or_else(Platform::host);
+        .unwrap_or_else(default_target_platform);
 
     let result = assemble_image(
         &reference,
@@ -638,6 +640,9 @@ async fn handle_from(
     build_args: &HashMap<String, String>,
 ) -> Result<(Vec<LayerInfo>, Vec<String>, OciImageConfig)> {
     let image_ref = expand_args(image, build_args);
+    if image_ref == "scratch" {
+        return Ok((Vec::new(), Vec::new(), scratch_config()));
+    }
 
     // Pull the base image
     let puller = ImagePuller::new(store.clone(), RegistryAuth::from_env());
@@ -669,6 +674,47 @@ async fn handle_from(
 
     let config = oci_image.config().clone();
     Ok((base_layers, base_diff_ids, config))
+}
+
+fn validate_build_config(config: &BuildConfig) -> Result<()> {
+    if config.platforms.len() > 1 {
+        return Err(BoxError::BuildError(
+            "Multi-platform builds are not implemented yet; pass a single target platform"
+                .to_string(),
+        ));
+    }
+
+    for platform in &config.platforms {
+        if platform.os != "linux" {
+            return Err(BoxError::BuildError(format!(
+                "Only linux target platforms are supported for image builds, got {}",
+                platform
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn default_target_platform() -> Platform {
+    let host = Platform::host();
+    Platform::new("linux", host.architecture)
+}
+
+fn scratch_config() -> OciImageConfig {
+    OciImageConfig {
+        entrypoint: None,
+        cmd: None,
+        env: Vec::new(),
+        working_dir: None,
+        user: None,
+        exposed_ports: Vec::new(),
+        labels: HashMap::new(),
+        volumes: Vec::new(),
+        stop_signal: None,
+        health_check: None,
+        onbuild: Vec::new(),
+    }
 }
 
 /// Assemble the final OCI image layout and store it.

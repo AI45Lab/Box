@@ -14,6 +14,7 @@ use std::sync::{
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use sha2::{Digest, Sha256};
@@ -604,6 +605,85 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+fn assert_json_array_contains(array: &serde_json::Value, expected: &str) {
+    let values = array
+        .as_array()
+        .unwrap_or_else(|| panic!("expected JSON array, got {array}"));
+    assert!(
+        values.iter().any(|value| value.as_str() == Some(expected)),
+        "expected JSON array to contain {expected:?}, got {array}"
+    );
+}
+
+fn read_file_from_saved_oci_tar(path: &Path, file_path: &str) -> Option<String> {
+    let extract = tempfile::tempdir().expect("extract saved OCI image");
+    let file = std::fs::File::open(path).expect("open saved OCI tar");
+    let mut archive = tar::Archive::new(file);
+    archive
+        .unpack(extract.path())
+        .expect("unpack saved OCI image");
+
+    let index = read_json_file(&extract.path().join("index.json"));
+    let manifest_digest = index["manifests"][0]["digest"]
+        .as_str()
+        .expect("saved OCI index manifest digest");
+    let manifest = read_json_file(&oci_blob_path(extract.path(), manifest_digest));
+    let layers = manifest["layers"]
+        .as_array()
+        .expect("saved OCI manifest layers");
+    let expected = normalize_archive_path(file_path);
+
+    for layer in layers {
+        let digest = layer["digest"].as_str().expect("saved OCI layer digest");
+        let layer_file = std::fs::File::open(oci_blob_path(extract.path(), digest))
+            .expect("open saved OCI layer blob");
+        let decoder = GzDecoder::new(layer_file);
+        let mut layer_archive = tar::Archive::new(decoder);
+        let entries = layer_archive.entries().expect("read saved OCI layer");
+        for entry in entries {
+            let mut entry = entry.expect("read saved OCI layer entry");
+            let path = entry.path().expect("saved OCI layer entry path");
+            if normalize_archive_path(&path.to_string_lossy()) == expected {
+                let mut content = String::new();
+                entry
+                    .read_to_string(&mut content)
+                    .expect("read saved OCI layer file");
+                return Some(content);
+            }
+        }
+    }
+
+    None
+}
+
+fn read_json_file(path: &Path) -> serde_json::Value {
+    let content = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("read JSON file {}: {e}", path.display()));
+    serde_json::from_str(&content)
+        .unwrap_or_else(|e| panic!("parse JSON file {}: {e}", path.display()))
+}
+
+fn oci_blob_path(root: &Path, digest: &str) -> PathBuf {
+    let (algorithm, hex) = digest.split_once(':').unwrap_or(("sha256", digest));
+    root.join("blobs").join(algorithm).join(hex)
+}
+
+fn normalize_archive_path(path: &str) -> String {
+    path.trim_start_matches("./")
+        .trim_start_matches('/')
+        .to_string()
+}
+
+#[cfg(target_os = "linux")]
+fn is_root_user() -> bool {
+    Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .is_some_and(|uid| uid.trim() == "0")
+}
+
 fn create_minimal_oci_tar(path: &Path, reference: &str) {
     let layout = tempfile::tempdir().expect("create oci layout tempdir");
     let blobs = layout.path().join("blobs").join("sha256");
@@ -715,6 +795,9 @@ fn seed_runnable_alpine_image(cli: &CliTest, image: &str) {
 
 #[cfg(unix)]
 fn host_socket_dirs() -> std::collections::BTreeSet<PathBuf> {
+    #[cfg(target_os = "macos")]
+    let socket_root = Path::new("/private/tmp/a3s-box-sockets");
+    #[cfg(not(target_os = "macos"))]
     let socket_root = Path::new("/tmp/a3s-box-sockets");
     let Ok(entries) = std::fs::read_dir(socket_root) else {
         return std::collections::BTreeSet::new();
@@ -895,15 +978,62 @@ fn test_local_state_command_smoke() {
         "--name",
         "cov-created",
         "-p",
-        "18080:80",
+        "18080:80/tcp",
         "--label",
         "purpose=coverage",
         "docker.io/library/alpine:latest",
+        "--",
+        "/bin/sh",
+        "-c",
+        "echo created-command",
     ]);
     let inspect = cli.ok(&["inspect", "cov-created"]);
     assert!(inspect.contains("cov-created"));
-    cli.ok(&["port", "cov-created"]);
+    let inspect_json: serde_json::Value =
+        serde_json::from_str(&inspect).expect("inspect output should be JSON");
+    assert_eq!(
+        inspect_json["cmd"],
+        serde_json::json!(["/bin/sh", "-c", "echo created-command"])
+    );
+    let empty_logs = cli.ok(&["logs", "cov-created"]);
+    assert!(empty_logs.is_empty());
+    let ports = cli.ok(&["port", "cov-created"]);
+    assert!(ports.contains("80/tcp -> 0.0.0.0:18080"));
     cli.ok(&["rename", "cov-created", "cov-renamed"]);
+    cli.ok(&[
+        "network",
+        "create",
+        "covconnect",
+        "--subnet",
+        "10.124.0.0/24",
+    ]);
+    cli.ok(&["network", "connect", "covconnect", "cov-renamed"]);
+    let connected = cli.ok(&["inspect", "cov-renamed"]);
+    let connected: serde_json::Value =
+        serde_json::from_str(&connected).expect("connected inspect output should be JSON");
+    assert_eq!(connected["network_name"], "covconnect");
+    assert_eq!(
+        connected["network_mode"],
+        serde_json::json!({"bridge": {"network": "covconnect"}})
+    );
+    let connected_network = cli.ok(&["network", "inspect", "covconnect"]);
+    assert!(connected_network.contains("cov-renamed"));
+    assert!(connected_network.contains("10.124.0.2"));
+    cli.ok(&["network", "disconnect", "covconnect", "cov-renamed"]);
+    let disconnected = cli.ok(&["inspect", "cov-renamed"]);
+    let disconnected: serde_json::Value =
+        serde_json::from_str(&disconnected).expect("disconnected inspect output should be JSON");
+    assert_eq!(disconnected["network_name"], serde_json::Value::Null);
+    assert_eq!(disconnected["network_mode"], serde_json::json!("tsi"));
+    cli.ok(&["network", "rm", "covconnect"]);
+    cli.ok(&["network", "create", "covforce", "--subnet", "10.125.0.0/24"]);
+    cli.ok(&["network", "connect", "covforce", "cov-renamed"]);
+    cli.ok(&["network", "rm", "--force", "covforce"]);
+    let force_disconnected = cli.ok(&["inspect", "cov-renamed"]);
+    let force_disconnected: serde_json::Value = serde_json::from_str(&force_disconnected)
+        .expect("force-disconnected inspect output should be JSON");
+    assert_eq!(force_disconnected["network_name"], serde_json::Value::Null);
+    assert_eq!(force_disconnected["network_mode"], serde_json::json!("tsi"));
     let formatted = cli.ok(&["ps", "-a", "--format", "{{.Names}} {{.Status}}"]);
     assert!(formatted.contains("cov-renamed created"));
     cli.ok(&["rm", "cov-renamed"]);
@@ -922,6 +1052,79 @@ fn test_local_state_command_smoke() {
 }
 
 #[test]
+fn test_build_from_scratch_copy_metadata_cli_smoke() {
+    let cli = CliTest::new();
+    let image = format!("coverage-scratch:{}", unique_tag("build"));
+    let build_dir = cli.home_path().join("scratch-build");
+    std::fs::create_dir_all(&build_dir).expect("create scratch build context");
+    std::fs::write(build_dir.join("message.txt"), "scratch-copy-ok\n")
+        .expect("write scratch build input");
+    std::fs::write(
+        build_dir.join("Dockerfile"),
+        r#"FROM scratch
+COPY message.txt /opt/message.txt
+ENV A3S_BUILD_SMOKE=1
+WORKDIR /opt
+USER 1000:1000
+EXPOSE 8080/tcp
+VOLUME /data
+STOPSIGNAL SIGTERM
+HEALTHCHECK --interval=5s --timeout=2s --retries=2 CMD ["cat", "/opt/message.txt"]
+LABEL org.opencontainers.image.title="cli-scratch-smoke"
+CMD ["cat", "/opt/message.txt"]
+"#,
+    )
+    .expect("write scratch Dockerfile");
+
+    let build_dir_arg = build_dir.to_string_lossy().to_string();
+    let digest = cli.ok(&["build", "--tag", &image, "--quiet", &build_dir_arg]);
+    assert!(
+        digest.trim().starts_with("sha256:"),
+        "quiet build output should be a digest\n{digest}"
+    );
+
+    let inspect = cli.ok(&["image-inspect", &image]);
+    let inspect: serde_json::Value =
+        serde_json::from_str(&inspect).expect("image-inspect output should be JSON");
+    assert_eq!(inspect["Reference"], image);
+    assert_eq!(inspect["LayerCount"], 1);
+    assert_eq!(
+        inspect["Config"]["Cmd"],
+        serde_json::json!(["cat", "/opt/message.txt"])
+    );
+    assert_eq!(inspect["Config"]["Env"]["A3S_BUILD_SMOKE"], "1");
+    assert_eq!(inspect["Config"]["WorkingDir"], "/opt");
+    assert_eq!(inspect["Config"]["User"], "1000:1000");
+    assert_eq!(inspect["Config"]["StopSignal"], "SIGTERM");
+    assert_eq!(
+        inspect["Config"]["Labels"]["org.opencontainers.image.title"],
+        "cli-scratch-smoke"
+    );
+    assert_eq!(
+        inspect["Config"]["Healthcheck"]["Test"],
+        serde_json::json!(["cat", "/opt/message.txt"])
+    );
+    assert_eq!(inspect["Config"]["Healthcheck"]["Interval"], 5);
+    assert_eq!(inspect["Config"]["Healthcheck"]["Timeout"], 2);
+    assert_eq!(inspect["Config"]["Healthcheck"]["Retries"], 2);
+    assert_json_array_contains(&inspect["Config"]["ExposedPorts"], "8080/tcp");
+    assert_json_array_contains(&inspect["Config"]["Volumes"], "/data");
+
+    let history = cli.ok(&["history", "--no-trunc", &image]);
+    assert!(history.contains("COPY message.txt /opt/message.txt"));
+    assert!(history.contains("CMD [\"cat\", \"/opt/message.txt\"]"));
+
+    let image_tar = cli.home_path().join("scratch-build.tar");
+    let image_tar_arg = image_tar.to_string_lossy().to_string();
+    cli.ok(&["save", &image, "--output", &image_tar_arg]);
+    let copied = read_file_from_saved_oci_tar(&image_tar, "/opt/message.txt")
+        .expect("saved scratch image should contain copied file");
+    assert_eq!(copied, "scratch-copy-ok\n");
+
+    cli.ok(&["rmi", "--force", &image]);
+}
+
+#[test]
 fn test_noninteractive_boundary_command_smoke() {
     let cli = CliTest::new();
 
@@ -932,6 +1135,56 @@ fn test_noninteractive_boundary_command_smoke() {
     cli.fails(&["attach", "missing-box"], "No such box");
     cli.fails(&["shell", "missing-box"], "No such box");
     cli.fails(&["stats", "--no-stream", "missing-box"], "No such box");
+    cli.fails(
+        &["run", "-d", "-t", "docker.io/library/alpine:latest"],
+        "Cannot use -t",
+    );
+    cli.fails(
+        &[
+            "create",
+            "-p",
+            "18080:80/udp",
+            "docker.io/library/alpine:latest",
+        ],
+        "only TCP is supported",
+    );
+    cli.fails(
+        &[
+            "run",
+            "--restart",
+            "never",
+            "docker.io/library/alpine:latest",
+        ],
+        "Invalid restart policy",
+    );
+    let invalid_compose = cli.home_path().join("invalid-restart-compose.yaml");
+    std::fs::write(
+        &invalid_compose,
+        "services:\n  web:\n    image: docker.io/library/alpine:latest\n    restart: never\n",
+    )
+    .expect("write invalid compose file");
+    let invalid_compose_arg = invalid_compose.to_string_lossy().to_string();
+    cli.fails(
+        &["compose", "--file", &invalid_compose_arg, "config"],
+        "Service 'web' has invalid restart policy",
+    );
+    cli.fails(
+        &["network", "create", "bad-driver", "--driver", "overlay"],
+        "Unsupported network driver",
+    );
+    cli.fails(
+        &["network", "create", "strict-net", "--isolation", "strict"],
+        "Unsupported network isolation mode",
+    );
+    cli.fails(
+        &[
+            "create",
+            "--network",
+            "missing-net",
+            "docker.io/library/alpine:latest",
+        ],
+        "network 'missing-net' not found",
+    );
     cli.fails(
         &[
             "pool",
@@ -951,6 +1204,48 @@ fn test_noninteractive_boundary_command_smoke() {
         combined.contains("a3s-box monitor started"),
         "monitor did not announce startup\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
+}
+
+#[test]
+#[ignore]
+#[cfg(target_os = "linux")]
+fn test_linux_build_run_chroot_smoke() {
+    if !is_root_user() {
+        eprintln!("skipping Linux RUN build smoke: chroot requires root");
+        return;
+    }
+
+    let Ok(alpine_tar) = std::env::var(TEST_ALPINE_TAR_ENV) else {
+        eprintln!("skipping Linux RUN build smoke: set {TEST_ALPINE_TAR_ENV}");
+        return;
+    };
+
+    let cli = CliTest::new();
+    let base_image = format!("coverage-run-base:{}", unique_tag("base"));
+    let built_image = format!("coverage-run-built:{}", unique_tag("build"));
+    cli.ok(&["load", "--input", &alpine_tar, "--tag", &base_image]);
+
+    let build_dir = cli.home_path().join("run-build");
+    std::fs::create_dir_all(&build_dir).expect("create RUN build context");
+    std::fs::write(
+        build_dir.join("Dockerfile"),
+        format!(
+            "FROM {base_image}\nRUN printf 'run-smoke-ok\\n' > /run-smoke.txt\nCMD [\"cat\", \"/run-smoke.txt\"]\n"
+        ),
+    )
+    .expect("write RUN Dockerfile");
+
+    let build_dir_arg = build_dir.to_string_lossy().to_string();
+    cli.ok(&["build", "--tag", &built_image, "--quiet", &build_dir_arg]);
+
+    let image_tar = cli.home_path().join("run-build.tar");
+    let image_tar_arg = image_tar.to_string_lossy().to_string();
+    cli.ok(&["save", &built_image, "--output", &image_tar_arg]);
+    let copied = read_file_from_saved_oci_tar(&image_tar, "/run-smoke.txt")
+        .expect("RUN-built image should contain generated file");
+    assert_eq!(copied, "run-smoke-ok\n");
+
+    cli.ok(&["rmi", "--force", &built_image, &base_image]);
 }
 
 #[test]

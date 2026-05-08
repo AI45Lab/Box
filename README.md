@@ -41,7 +41,7 @@ A3S Box is application-agnostic. It doesn't know what's inside the VM — web se
 | Capability | Description |
 |-----------|-------------|
 | OCI Images | Pull, push, build, tag, inspect from any registry with local LRU cache |
-| Dockerfile/Containerfile Build | Multi-stage builds, all instructions, `ADD <url>` HTTP download, `ONBUILD` triggers |
+| Dockerfile/Containerfile Build | Honest Dockerfile subset with contextual errors for unsupported flags/instructions |
 | Target Platform | `--platform linux/amd64` records a single OCI target platform; multi-platform indexes are planned |
 | Snapshot/Restore | Configuration-based VM snapshots |
 | Cross-Platform | macOS ARM64, Linux x86_64/ARM64, Windows x86_64 |
@@ -72,7 +72,7 @@ A3S Box is application-agnostic. It doesn't know what's inside the VM — web se
 | Capabilities | `--cap-add/drop`, bounding + ambient set clearing |
 | Seccomp | BPF filter with architecture validation |
 | Image Signing | Cosign key-based and keyless verification on pull |
-| Network Policies | Ingress/egress rules per network |
+| Network Policies | Policy model present; strict/custom enforcement is rejected until packet filtering lands |
 
 ### TEE (Confidential Computing)
 
@@ -126,6 +126,9 @@ a3s-box run -it --name dev alpine:latest -- /bin/sh
 
 # With resources
 a3s-box run -d --name web --cpus 2 --memory 1g nginx:alpine
+
+# Image HEALTHCHECK and STOPSIGNAL are honored unless overridden
+a3s-box run -d --name api --health-cmd "curl -f http://localhost/health" myapi:latest
 ```
 
 ### Pull and inspect images
@@ -139,7 +142,15 @@ a3s-box images
 
 # Inspect image metadata
 a3s-box image-inspect myimage:latest
+# Output includes ENTRYPOINT, CMD, ENV, WORKDIR, USER, VOLUME, EXPOSE,
+# STOPSIGNAL, HEALTHCHECK, ONBUILD, and labels when present.
 ```
+
+Image commands and VM boot share Docker Hub alias resolution, so locally cached
+`alpine`, `alpine:latest`, and `docker.io/library/alpine:latest` references can
+reuse the same stored image when the match is unambiguous. Exact or abbreviated
+`sha256:` digests also resolve to local images when they identify one cached
+image.
 
 ### Execute commands
 
@@ -154,8 +165,8 @@ a3s-box exec -it -u root -e FOO=bar mybox -- /bin/sh
 ### Networking
 
 ```bash
-# Create isolated network
-a3s-box network create backend --isolation strict
+# Create a bridge network
+a3s-box network create backend
 
 # Run box in network with port mapping
 a3s-box run -d --name api --network backend -p 8080:80 myapi:latest
@@ -185,6 +196,17 @@ a3s-box inject-secret secure --secret "API_KEY=secret" --set-env --allow-simulat
 ```bash
 a3s-box run [OPTIONS] IMAGE [CMD...]        # Pull + create + start
 a3s-box create [OPTIONS] IMAGE [CMD...]     # Create without starting
+  CMD...        # Persisted command override used by start/restart
+  -u USER       # Initial user: root, UID, or UID:GID
+  -w DIR        # Absolute working directory inside the box
+  -e KEY=VAL    # Container environment override
+  --env-file F  # Read container environment from a file
+  --hostname H  # Set the in-box hostname
+  --add-host H:IP # Add a static /etc/hosts entry
+  --health-cmd C # Override image HEALTHCHECK command
+  --no-healthcheck # Disable image HEALTHCHECK
+  -p H:G[/tcp] # Publish a TCP port; UDP, host-IP binds, and ranges are rejected
+  --stop-signal S # Override image STOPSIGNAL
 a3s-box start BOX [BOX...]                  # Start stopped boxes
 a3s-box stop BOX [BOX...]                   # Graceful stop
 a3s-box restart BOX [BOX...]                # Restart
@@ -192,7 +214,7 @@ a3s-box rm BOX [BOX...]                     # Remove (-f force)
 a3s-box pause BOX [BOX...]                  # SIGSTOP
 a3s-box unpause BOX [BOX...]                # SIGCONT
 a3s-box kill BOX [BOX...]                   # Force kill
-a3s-box wait BOX [BOX...]                   # Block until stop
+a3s-box wait BOX [BOX...]                   # Block until stop, print exit code
 ```
 
 ### Execution
@@ -200,9 +222,9 @@ a3s-box wait BOX [BOX...]                   # Block until stop
 ```bash
 a3s-box exec [OPTIONS] BOX CMD [ARG...]
   -it           # Interactive PTY
-  -u USER       # User (default: root)
-  -e KEY=VAL    # Environment variable
-  -w DIR        # Working directory
+  -u USER       # User: root, UID, or UID:GID
+  -e KEY=VAL    # Environment override (container env is inherited)
+  -w DIR        # Working directory inside the box
 
 a3s-box attach BOX                        # Attach to PTY
 a3s-box top BOX                           # Show processes
@@ -217,7 +239,7 @@ a3s-box pull [OPTIONS] IMAGE              # Pull from registry
   --verify-issuer URL  # Keyless issuer verification
 
 a3s-box push IMAGE [TAG]                  # Push to registry
-a3s-box build [OPTIONS] -t TAG PATH      # Dockerfile/Containerfile build
+a3s-box build [OPTIONS] -t TAG PATH      # Dockerfile/Containerfile subset build
   --platform LINUX/ARCH      # Single target platform
 a3s-box images                           # List cached
 a3s-box rmi IMAGE [IMAGE...]              # Remove images
@@ -229,10 +251,15 @@ a3s-box save -o FILE.tar IMAGE           # Export archive
 a3s-box load -i FILE.tar                 # Import archive
 ```
 
-Build note: Dockerfile `RUN` currently requires Linux for isolated execution.
-On macOS it fails by default rather than executing on the host. For local
-experiments only, set `A3S_BOX_UNSAFE_HOST_RUN=1` to opt into unsafe host-side
-execution.
+Build subset: `FROM` (including `scratch`), shell-form `RUN`, shell-form
+`COPY`/`ADD`, `WORKDIR`, `ENV`, `ENTRYPOINT`, `CMD`, `EXPOSE`, `LABEL`,
+`USER`, `ARG`, `SHELL`, `STOPSIGNAL`, `HEALTHCHECK`, `ONBUILD` metadata
+triggers, and `VOLUME`.
+Unsupported Dockerfile flags fail explicitly; for example `COPY --chown` and
+`ADD --chown` are not silently ignored. Dockerfile `RUN` currently requires
+Linux for isolated execution. On macOS it fails by default rather than executing
+on the host. For local experiments only, set `A3S_BOX_UNSAFE_HOST_RUN=1` to opt
+into unsafe host-side execution.
 
 ### Filesystem
 
@@ -248,15 +275,19 @@ a3s-box diff BOX                          # Show fs changes (A/C/D)
 
 ```bash
 a3s-box network create NAME [OPTIONS]
-  --driver bridge|tsi|none
-  --isolation none|strict|custom
+  --driver bridge
+  --isolation none
 a3s-box network ls
 a3s-box network inspect NAME
-a3s-box network rm NAME [NAME...]
-a3s-box network connect NETWORK BOX
-a3s-box network disconnect NETWORK BOX
+a3s-box network rm [-f|--force] NAME [NAME...]
+a3s-box network connect NETWORK BOX     # Configure an inactive box for next start
+a3s-box network disconnect NETWORK BOX  # Remove inactive box network configuration
 a3s-box port BOX                         # List port mappings
 ```
+
+Published ports currently support TCP only in `host_port:guest_port[/tcp]`
+form. UDP, bind-specific host IPs such as `127.0.0.1:8080:80`, single-port
+shorthand, and port ranges fail during CLI or Compose validation.
 
 ### Volumes
 
@@ -281,11 +312,18 @@ a3s-box snapshot rm BOX SNAPSHOT
 ### Compose
 
 ```bash
-a3s-box compose -f FILE.yaml up           # Start services
+a3s-box compose -f FILE.yaml up -d        # Start services in dependency order
 a3s-box compose -f FILE.yaml down         # Stop services
 a3s-box compose -f FILE.yaml ps           # List services
-a3s-box compose -f FILE.yaml config      # Validate config
+a3s-box compose -f FILE.yaml config       # Validate config
+a3s-box compose -f FILE.yaml logs -f      # Follow service logs
 ```
+
+Supported Compose subset: `image`, `command`, `entrypoint`, `environment`,
+`env_file`, `ports`, `volumes`, `depends_on` with `service_started` or
+`service_healthy`, `networks`, `dns`, `tmpfs`, `working_dir`, `hostname`,
+`extra_hosts`, `labels`, `healthcheck`, `restart`, `cpus`, `mem_limit`,
+`cap_add`, `cap_drop`, and `privileged`.
 
 ### Observability
 
@@ -458,6 +496,18 @@ just release            # Release build
 # Test
 just test               # Unit tests (no VM required)
 A3S_DEPS_STUB=1 cargo test --workspace --lib
+# Opt-in real runtime smoke: requires registry access and HVF/KVM
+cargo test -p a3s-box-cli --test core_smoke -- --ignored --nocapture --test-threads=1
+# Offline real runtime smoke: preload an OCI archive into the isolated test home
+A3S_BOX_SMOKE_IMAGE_TAR=/path/to/alpine.tar cargo test -p a3s-box-cli --test core_smoke -- --ignored --nocapture --test-threads=1
+# The real smoke suite includes non-TTY lifecycle, PTY, published ports,
+# bridge network endpoint/hosts lifecycle, pre-start network connect/disconnect,
+# force network removal state cleanup, named-volume persistence,
+# restart-policy monitor recovery,
+# diff/export/commit/snapshot, and Compose multi-service health/volume
+# coverage on Unix HVF/KVM hosts.
+# Opt-in Linux RUN build smoke: requires root and a local Alpine OCI tar
+A3S_BOX_TEST_ALPINE_TAR=/path/to/alpine.tar cargo test -p a3s-box-cli --test command_coverage test_linux_build_run_chroot_smoke -- --ignored --nocapture
 
 # Quality
 just fmt                # Format

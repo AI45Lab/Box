@@ -21,6 +21,16 @@ pub enum ContainerState {
     Exited,
 }
 
+/// A CRI mount persisted with container metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContainerMount {
+    pub container_path: String,
+    pub host_path: String,
+    pub readonly: bool,
+    pub selinux_relabel: bool,
+    pub propagation: i32,
+}
+
 /// Represents a container (session) within a pod sandbox (Box).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Container {
@@ -62,6 +72,9 @@ pub struct Container {
     /// Whether this container requires a TTY.
     #[serde(default)]
     pub tty: bool,
+    /// CRI mounts accepted during CreateContainer.
+    #[serde(default)]
+    pub mounts: Vec<ContainerMount>,
     /// Current state.
     pub state: ContainerState,
     /// Creation timestamp in nanoseconds.
@@ -304,6 +317,7 @@ mod tests {
             stdin: false,
             stdin_once: false,
             tty: false,
+            mounts: vec![],
             state: ContainerState::Created,
             created_at: 1000000000,
             started_at: 0,

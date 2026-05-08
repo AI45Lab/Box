@@ -45,7 +45,7 @@ pub enum Instruction {
         name: String,
         default: Option<String>,
     },
-    /// `ADD [--chown=<user>] <src>... <dst>`
+    /// `ADD <src>... <dst>`
     Add {
         src: Vec<String>,
         dst: String,
@@ -174,18 +174,10 @@ pub(super) fn parse_instruction(line: &str, line_num: usize) -> Result<Instructi
         "HEALTHCHECK" => parsers::parse_healthcheck(rest, line_num),
         "ONBUILD" => parsers::parse_onbuild(rest, line_num),
         "VOLUME" => parsers::parse_volume(rest, line_num),
-        // Silently ignore unsupported instructions with a warning
-        "MAINTAINER" => {
-            tracing::warn!(
-                line = line_num,
-                instruction = keyword_upper.as_str(),
-                "Deprecated Dockerfile instruction, skipping"
-            );
-            Ok(Instruction::Label {
-                key: "a3s.build.skipped.maintainer".to_string(),
-                value: rest.to_string(),
-            })
-        }
+        "MAINTAINER" => Err(BoxError::BuildError(format!(
+            "Line {}: MAINTAINER is deprecated and not supported; use LABEL maintainer=<value>",
+            line_num
+        ))),
         _ => Err(BoxError::BuildError(format!(
             "Line {}: Unknown instruction '{}'",
             line_num, keyword

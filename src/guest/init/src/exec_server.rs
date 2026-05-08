@@ -16,6 +16,8 @@ use a3s_box_core::exec::{
 use a3s_transport::FrameType;
 use tracing::{info, warn};
 
+use crate::user::{parse_process_user, ProcessUser};
+
 /// Maximum payload bytes per streamed exec chunk.
 const STREAM_CHUNK_BYTES: usize = 16 * 1024;
 const EXEC_CONTROL_CANCEL: &[u8] = b"cancel";
@@ -318,8 +320,9 @@ fn write_exec_exit(w: &mut impl Write, exit_code: i32) -> Result<(), Box<dyn std
 
 /// Execute a command with timeout, environment variables, working directory, optional stdin, and optional user.
 ///
-/// When `user` is specified, the command is wrapped with `su -s /bin/sh <user> -c <cmd>`
-/// to run as the given user inside the guest VM.
+/// When `user` is specified, guest-init applies the numeric UID/GID in the
+/// child process before exec. Named users are rejected until passwd lookup is
+/// implemented.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn build_command(
     cmd: &[String],
@@ -346,6 +349,16 @@ fn build_command(
     };
     let timeout = Duration::from_nanos(timeout_ns);
     let workdir = working_dir.unwrap_or("/");
+    let process_user = match parse_process_user(user) {
+        Ok(process_user) => process_user,
+        Err(error) => {
+            return Err(ExecOutput {
+                stdout: vec![],
+                stderr: error.into_bytes(),
+                exit_code: 1,
+            });
+        }
+    };
 
     if let Some(rootfs) = rootfs {
         if rootfs.is_empty()
@@ -389,26 +402,8 @@ fn build_command(
         }
     }
 
-    // If a user is specified, wrap the command with `su`
-    let (program, args) = if let Some(user) = user {
-        let shell_cmd = cmd
-            .iter()
-            .map(|a| shell_escape(a))
-            .collect::<Vec<_>>()
-            .join(" ");
-        (
-            "su".to_string(),
-            vec![
-                "-s".to_string(),
-                "/bin/sh".to_string(),
-                user.to_string(),
-                "-c".to_string(),
-                shell_cmd,
-            ],
-        )
-    } else {
-        (cmd[0].clone(), cmd[1..].to_vec())
-    };
+    let program = cmd[0].clone();
+    let args = cmd[1..].to_vec();
 
     let mut command = std::process::Command::new(&program);
     command
@@ -426,7 +421,7 @@ fn build_command(
         }
     }
 
-    configure_child_process(&mut command, rootfs, workdir);
+    configure_child_process(&mut command, rootfs, workdir, process_user);
     if rootfs.is_none() {
         if let Some(dir) = working_dir {
             command.current_dir(dir);
@@ -804,6 +799,7 @@ fn configure_child_process(
     command: &mut std::process::Command,
     rootfs: Option<&str>,
     workdir: &str,
+    user: Option<ProcessUser>,
 ) {
     use std::ffi::CString;
     use std::os::unix::process::CommandExt;
@@ -825,6 +821,9 @@ fn configure_child_process(
                     return Err(std::io::Error::last_os_error());
                 }
             }
+            if let Some(user) = user {
+                user.apply()?;
+            }
             Ok(())
         });
     }
@@ -835,6 +834,7 @@ fn configure_child_process(
     _command: &mut std::process::Command,
     _rootfs: Option<&str>,
     _workdir: &str,
+    _user: Option<ProcessUser>,
 ) {
 }
 
@@ -858,18 +858,6 @@ fn truncate_output(mut data: Vec<u8>) -> Vec<u8> {
         data.truncate(MAX_OUTPUT_BYTES);
     }
     data
-}
-
-/// Minimal shell escaping for a single argument.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn shell_escape(s: &str) -> String {
-    if s.chars()
-        .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '/' || c == '.')
-    {
-        s.to_string()
-    } else {
-        format!("'{}'", s.replace('\'', "'\\''"))
-    }
 }
 
 #[cfg(test)]
@@ -987,6 +975,48 @@ mod tests {
     }
 
     #[test]
+    fn test_build_command_rejects_named_user() {
+        let output = build_command(
+            &["id".to_string()],
+            0,
+            &[],
+            None,
+            None,
+            None,
+            false,
+            Some("node"),
+        )
+        .unwrap_err();
+
+        assert_eq!(output.exit_code, 1);
+        assert!(String::from_utf8_lossy(&output.stderr).contains("named user"));
+    }
+
+    #[test]
+    fn test_build_command_keeps_original_program_with_numeric_user() {
+        let (command, _) = build_command(
+            &["echo".to_string(), "hello".to_string()],
+            0,
+            &[],
+            None,
+            None,
+            None,
+            false,
+            Some("1000:1000"),
+        )
+        .unwrap();
+
+        assert_eq!(command.get_program(), "echo");
+        assert_eq!(
+            command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().to_string())
+                .collect::<Vec<_>>(),
+            vec!["hello".to_string()]
+        );
+    }
+
+    #[test]
     fn test_execute_command_rejects_relative_rootfs() {
         let output = execute_command(
             &["true".to_string()],
@@ -1019,19 +1049,6 @@ mod tests {
         );
         assert_eq!(output.exit_code, 0);
         assert_eq!(String::from_utf8_lossy(&output.stdout), "hello from stdin");
-    }
-
-    #[test]
-    fn test_shell_escape_simple() {
-        assert_eq!(shell_escape("hello"), "hello");
-        assert_eq!(shell_escape("/usr/bin/ls"), "/usr/bin/ls");
-        assert_eq!(shell_escape("file.txt"), "file.txt");
-    }
-
-    #[test]
-    fn test_shell_escape_special_chars() {
-        assert_eq!(shell_escape("hello world"), "'hello world'");
-        assert_eq!(shell_escape("it's"), "'it'\\''s'");
     }
 
     #[test]

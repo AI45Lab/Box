@@ -7,6 +7,7 @@ pub mod audit;
 pub mod compose;
 pub mod config;
 pub mod dns;
+pub mod env;
 pub mod error;
 pub mod event;
 pub mod exec;
@@ -14,6 +15,7 @@ pub mod log;
 pub mod network;
 pub mod operator;
 pub mod platform;
+pub mod port;
 pub mod pty;
 pub mod scale;
 pub mod security;
@@ -37,6 +39,7 @@ pub use exec::{EXEC_VSOCK_PORT, PORT_FWD_VSOCK_PORT};
 pub use network::{IsolationMode, NetworkConfig, NetworkEndpoint, NetworkMode, NetworkPolicy};
 pub use operator::{BoxAutoscaler, BoxAutoscalerSpec, BoxAutoscalerStatus, MetricType};
 pub use platform::{HostGuestChannel, Platform, PlatformCapabilities, VmBackend};
+pub use port::{normalize_port_maps, parse_port_mapping, PortMapping, PortProtocol};
 pub use pty::PTY_VSOCK_PORT;
 pub use scale::{
     InstanceDeregistration, InstanceEvent, InstanceHealth, InstanceInfo, InstanceRegistration,

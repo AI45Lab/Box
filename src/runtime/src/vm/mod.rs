@@ -104,6 +104,15 @@ pub struct VmManager {
     /// Anonymous volume names created during boot (from OCI VOLUME directives)
     pub(crate) anonymous_volumes: Vec<String>,
 
+    /// Anonymous volumes newly created by the current boot attempt.
+    ///
+    /// Reused anonymous volumes must survive failed restarts because they may
+    /// contain data from an existing stopped box.
+    pub(crate) created_anonymous_volumes: Vec<String>,
+
+    /// OCI image config resolved during the last successful boot.
+    pub(crate) image_config: Option<crate::oci::OciImageConfig>,
+
     /// TEE extension (attestation, sealing, secret injection)
     #[cfg(unix)]
     pub(crate) tee: Option<Box<dyn TeeExtension>>,
@@ -148,6 +157,8 @@ impl VmManager {
             net_manager: None,
             home_dir,
             anonymous_volumes: Vec::new(),
+            created_anonymous_volumes: Vec::new(),
+            image_config: None,
             #[cfg(unix)]
             tee: None,
             rootfs_provider: crate::rootfs::default_provider(),
@@ -176,6 +187,8 @@ impl VmManager {
             net_manager: None,
             home_dir,
             anonymous_volumes: Vec::new(),
+            created_anonymous_volumes: Vec::new(),
+            image_config: None,
             #[cfg(unix)]
             tee: None,
             rootfs_provider: crate::rootfs::default_provider(),
@@ -188,30 +201,92 @@ impl VmManager {
         }
     }
 
+    /// Remove host-side boot artifacts after a failed boot attempt.
+    async fn cleanup_boot_failure(&mut self) {
+        if let Some(mut handler) = self.handler.write().await.take() {
+            if let Err(error) = handler.stop(default_stop_signal(), DEFAULT_SHUTDOWN_TIMEOUT_MS) {
+                tracing::warn!(
+                    box_id = %self.box_id,
+                    error = %error,
+                    "Failed to stop VM handler after boot failure"
+                );
+            }
+            self.shim_exit_code = handler.exit_code();
+        }
+
+        if let Some(mut net_manager) = self.net_manager.take() {
+            net_manager.stop();
+        }
+
+        self.cleanup_created_anonymous_volumes();
+        self.cleanup_box_dir();
+    }
+
+    fn cleanup_created_anonymous_volumes(&mut self) {
+        if self.created_anonymous_volumes.is_empty() {
+            return;
+        }
+
+        let created = std::mem::take(&mut self.created_anonymous_volumes);
+        let created_set: std::collections::HashSet<_> = created.iter().cloned().collect();
+        let store = crate::volume::VolumeStore::new(
+            self.home_dir.join("volumes.json"),
+            self.home_dir.join("volumes"),
+        );
+
+        for volume_name in &created {
+            if let Err(error) = store.remove(volume_name, true) {
+                tracing::debug!(
+                    box_id = %self.box_id,
+                    volume = volume_name,
+                    error = %error,
+                    "Failed to remove anonymous volume after boot failure"
+                );
+            }
+        }
+
+        self.anonymous_volumes
+            .retain(|name| !created_set.contains(name));
+    }
+
     /// Remove the box directory on the host.
-    ///
-    /// Called when boot fails after `prepare_layout` succeeded to avoid leaving
-    /// orphaned directories on disk.
     fn cleanup_box_dir(&self) {
         let box_dir = self.home_dir.join("boxes").join(&self.box_id);
-        if let Err(e) = std::fs::remove_dir_all(&box_dir) {
+        if let Err(error) = self.rootfs_provider.cleanup(&box_dir, false) {
             tracing::warn!(
                 box_id = %self.box_id,
                 path = %box_dir.display(),
-                error = %e,
-                "Failed to cleanup box directory after boot failure"
+                error = %error,
+                "Failed to cleanup rootfs provider after boot failure"
             );
+        }
+
+        match std::fs::remove_dir_all(&box_dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(
+                    box_id = %self.box_id,
+                    path = %box_dir.display(),
+                    error = %error,
+                    "Failed to cleanup box directory after boot failure"
+                );
+            }
         }
 
         let socket_dir = self.socket_dir();
         if socket_dir != box_dir.join("sockets") {
-            if let Err(e) = std::fs::remove_dir_all(&socket_dir) {
-                tracing::debug!(
-                    box_id = %self.box_id,
-                    path = %socket_dir.display(),
-                    error = %e,
-                    "Failed to cleanup socket directory after boot failure"
-                );
+            match std::fs::remove_dir_all(&socket_dir) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::debug!(
+                        box_id = %self.box_id,
+                        path = %socket_dir.display(),
+                        error = %error,
+                        "Failed to cleanup socket directory after boot failure"
+                    );
+                }
             }
         }
     }
@@ -236,6 +311,8 @@ impl VmManager {
             net_manager: None,
             home_dir,
             anonymous_volumes: Vec::new(),
+            created_anonymous_volumes: Vec::new(),
+            image_config: None,
             #[cfg(unix)]
             tee: None,
             rootfs_provider: crate::rootfs::default_provider(),
@@ -364,6 +441,11 @@ impl VmManager {
         &self.anonymous_volumes
     }
 
+    /// Get the OCI image config resolved during boot.
+    pub fn image_config(&self) -> Option<&crate::oci::OciImageConfig> {
+        self.image_config.as_ref()
+    }
+
     /// Get the exit code of the container, if it has exited.
     ///
     /// Returns `Some(code)` after `destroy()` has been called and the shim
@@ -481,25 +563,43 @@ impl VmManager {
         tracing::info!(parent: &boot_span, box_id = %self.box_id, "Booting VM");
 
         // 1. Prepare filesystem layout
-        let layout = self
+        let layout = match self
             .prepare_layout()
             .instrument(tracing::info_span!(parent: &boot_span, "prepare_layout"))
-            .await?;
+            .await
+        {
+            Ok(layout) => layout,
+            Err(error) => {
+                self.cleanup_boot_failure().await;
+                return Err(error);
+            }
+        };
+        self.image_config = layout.oci_config.clone();
 
         // 1.5. Override /etc/resolv.conf with configured DNS
         let resolv_content = a3s_box_core::dns::generate_resolv_conf(&self.config.dns);
         let resolv_path = layout.rootfs_path.join("etc/resolv.conf");
         if let Err(e) = tokio::fs::write(&resolv_path, &resolv_content).await {
-            self.cleanup_box_dir();
+            self.cleanup_boot_failure().await;
             return Err(BoxError::IoError(e));
         }
         tracing::debug!(parent: &boot_span, dns = %resolv_content.trim(), "Configured guest DNS");
+
+        // 1.6. Apply hostname and static hosts entries before the VM starts.
+        if let Err(e) = self.write_hostname_file(&layout) {
+            self.cleanup_boot_failure().await;
+            return Err(e);
+        }
+        if let Err(e) = self.write_standalone_hosts_file(&layout) {
+            self.cleanup_boot_failure().await;
+            return Err(e);
+        }
 
         // 2. Build InstanceSpec
         let mut spec = match self.build_instance_spec(&layout) {
             Ok(s) => s,
             Err(e) => {
-                self.cleanup_box_dir();
+                self.cleanup_boot_failure().await;
                 return Err(e);
             }
         };
@@ -513,7 +613,7 @@ impl VmManager {
             let net_config = match self.setup_bridge_network(&network_name) {
                 Ok(n) => n,
                 Err(e) => {
-                    self.cleanup_box_dir();
+                    self.cleanup_boot_failure().await;
                     return Err(e);
                 }
             };
@@ -522,7 +622,7 @@ impl VmManager {
             match self.write_hosts_file(&layout, &network_name) {
                 Ok(()) => (),
                 Err(e) => {
-                    self.cleanup_box_dir();
+                    self.cleanup_boot_failure().await;
                     return Err(e);
                 }
             };
@@ -555,14 +655,14 @@ impl VmManager {
             let shim_path = match VmController::find_shim() {
                 Ok(p) => p,
                 Err(e) => {
-                    self.cleanup_box_dir();
+                    self.cleanup_boot_failure().await;
                     return Err(e);
                 }
             };
             let controller = match VmController::new(shim_path) {
                 Ok(c) => c,
                 Err(e) => {
-                    self.cleanup_box_dir();
+                    self.cleanup_boot_failure().await;
                     return Err(e);
                 }
             };
@@ -585,7 +685,7 @@ impl VmManager {
             {
                 Ok(h) => h,
                 Err(e) => {
-                    self.cleanup_box_dir();
+                    self.cleanup_boot_failure().await;
                     return Err(e);
                 }
             }
@@ -608,8 +708,7 @@ impl VmManager {
             .instrument(wait_span)
             .await
             {
-                // Cleanup box_dir but leave handler for caller to destroy via destroy()
-                self.cleanup_box_dir();
+                self.cleanup_boot_failure().await;
                 return Err(e);
             }
         }
@@ -989,6 +1088,76 @@ fn default_stop_signal() -> i32 {
 mod tests {
     use super::*;
     use a3s_box_core::event::EventEmitter;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    struct RecordingHandler {
+        stopped: Arc<AtomicBool>,
+    }
+
+    impl VmHandler for RecordingHandler {
+        fn stop(&mut self, _signal: i32, _timeout_ms: u64) -> Result<()> {
+            self.stopped.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn metrics(&self) -> crate::vmm::VmMetrics {
+            crate::vmm::VmMetrics::default()
+        }
+
+        fn is_running(&self) -> bool {
+            true
+        }
+
+        fn pid(&self) -> u32 {
+            42
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_boot_failure_stops_handler_and_removes_created_volumes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let box_id = "box-test".to_string();
+        let mut vm =
+            VmManager::with_box_id(BoxConfig::default(), EventEmitter::new(16), box_id.clone());
+        vm.home_dir = tmp.path().to_path_buf();
+        vm.anonymous_volumes = vec!["created-volume".to_string(), "reused-volume".to_string()];
+        vm.created_anonymous_volumes = vec!["created-volume".to_string()];
+
+        let stopped = Arc::new(AtomicBool::new(false));
+        *vm.handler.write().await = Some(Box::new(RecordingHandler {
+            stopped: stopped.clone(),
+        }));
+
+        let box_dir = tmp.path().join("boxes").join(&box_id);
+        std::fs::create_dir_all(box_dir.join("logs")).unwrap();
+
+        let store = crate::volume::VolumeStore::new(
+            tmp.path().join("volumes.json"),
+            tmp.path().join("volumes"),
+        );
+        store
+            .create(a3s_box_core::volume::VolumeConfig::new(
+                "created-volume",
+                "",
+            ))
+            .unwrap();
+        store
+            .create(a3s_box_core::volume::VolumeConfig::new("reused-volume", ""))
+            .unwrap();
+
+        vm.cleanup_boot_failure().await;
+
+        assert!(stopped.load(Ordering::SeqCst));
+        assert!(vm.handler.read().await.is_none());
+        assert!(vm.created_anonymous_volumes.is_empty());
+        assert_eq!(vm.anonymous_volumes, vec!["reused-volume".to_string()]);
+        assert!(store.get("created-volume").unwrap().is_none());
+        assert!(store.get("reused-volume").unwrap().is_some());
+        assert!(!box_dir.exists());
+    }
 
     #[cfg(unix)]
     #[tokio::test]

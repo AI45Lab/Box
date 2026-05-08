@@ -187,6 +187,7 @@ async fn execute_restore(args: SnapshotRestoreArgs) -> Result<(), Box<dyn std::e
         max_restart_count: 0,
         exit_code: None,
         health_check: None,
+        healthcheck_disabled: false,
         health_status: "none".to_string(),
         health_retries: 0,
         health_last_check: None,

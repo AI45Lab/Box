@@ -78,14 +78,11 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_run_json() {
-        let result = parsers::parse_run(r#"["echo", "hello"]"#, 1).unwrap();
-        assert_eq!(
-            result,
-            Instruction::Run {
-                command: "echo hello".to_string(),
-            }
-        );
+    fn test_parse_run_exec_form_rejected() {
+        let err = parsers::parse_run(r#"["echo", "hello"]"#, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("RUN exec form is not supported yet"));
     }
 
     #[test]
@@ -132,6 +129,22 @@ mod tests {
                 from: Some("builder".to_string()),
             }
         );
+    }
+
+    #[test]
+    fn test_parse_copy_rejects_unsupported_flag() {
+        let err = parsers::parse_copy("--chown=1000:1000 app.py /workspace/", 1)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("COPY flag '--chown=1000:1000' is not supported yet"));
+    }
+
+    #[test]
+    fn test_parse_copy_json_form_rejected() {
+        let err = parsers::parse_copy(r#"["app.py", "/workspace/"]"#, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("COPY JSON array form is not supported yet"));
     }
 
     #[test]
@@ -464,16 +477,19 @@ CMD ["app.py"]
     }
 
     #[test]
-    fn test_parse_add_with_chown() {
-        let result = parsers::parse_add("--chown=1000:1000 files/ /data/", 1).unwrap();
-        assert_eq!(
-            result,
-            Instruction::Add {
-                src: vec!["files/".to_string()],
-                dst: "/data/".to_string(),
-                chown: Some("1000:1000".to_string()),
-            }
-        );
+    fn test_parse_add_rejects_chown() {
+        let err = parsers::parse_add("--chown=1000:1000 files/ /data/", 1)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ADD flag '--chown=1000:1000' is not supported yet"));
+    }
+
+    #[test]
+    fn test_parse_add_json_form_rejected() {
+        let err = parsers::parse_add(r#"["file.txt", "/tmp/file.txt"]"#, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ADD JSON array form is not supported yet"));
     }
 
     #[test]
@@ -497,6 +513,14 @@ CMD ["app.py"]
     #[test]
     fn test_parse_add_single_arg() {
         assert!(parsers::parse_add("onlysource", 1).is_err());
+    }
+
+    #[test]
+    fn test_parse_maintainer_is_rejected() {
+        let err = Dockerfile::parse("FROM alpine\nMAINTAINER ops@example.com")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("MAINTAINER is deprecated and not supported"));
     }
 
     // --- parse_shell ---

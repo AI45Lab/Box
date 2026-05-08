@@ -22,3 +22,6 @@ dirs = { workspace = true }
 [lib]
 name = "a3s_box_core"
 path = "src/lib.rs"
+
+[dev-dependencies]
+tempfile = { workspace = true }

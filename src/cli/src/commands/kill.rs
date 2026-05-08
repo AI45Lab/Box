@@ -1,10 +1,13 @@
-//! `a3s-box kill` command — Send a signal to one or more running boxes.
+//! `a3s-box kill` command — Send a signal to one or more active boxes.
 
 use clap::Args;
 
 use crate::cleanup;
+use crate::lifecycle;
+use crate::process;
 use crate::resolve;
 use crate::state::StateFile;
+use crate::status;
 
 // Signal constants — use libc on Unix, define numerically on Windows.
 #[cfg(unix)]
@@ -92,39 +95,85 @@ fn kill_one(
     query: &str,
     signal: i32,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let record = resolve::resolve(state, query)?;
+    let record = resolve::resolve(state, query)?.clone();
 
-    if record.status != "running" {
-        return Err(format!("Box {} is not running", record.name).into());
-    }
+    status::require_active(&record, "send a signal to")
+        .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+    let pid = lifecycle::require_live_pid(&record, "send a signal to")
+        .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
 
     let box_id = record.id.clone();
     let name = record.name.clone();
-    let network_name = record.network_name.clone();
-    let volume_names = record.volume_names.clone();
 
-    if let Some(pid) = record.pid {
-        #[cfg(unix)]
-        unsafe {
-            libc::kill(pid as i32, signal);
+    if record.status == "paused" && is_stopping_signal(signal) && signal != SIGKILL {
+        lifecycle::resume_paused_for_termination(&record, pid, "kill")
+            .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+    }
+
+    #[cfg(unix)]
+    {
+        process::send_signal(pid, signal).map_err(|err| {
+            format!(
+                "Failed to send signal {signal} to box {} (PID {pid}): {err}",
+                record.name
+            )
+        })?;
+    }
+    #[cfg(windows)]
+    {
+        if is_stopping_signal(signal) {
+            process::terminate_process(pid);
+        } else {
+            return Err(crate::platform::unsupported_command(
+                "kill",
+                "non-terminating host signals",
+            ));
         }
-        #[cfg(windows)]
-        crate::process::terminate_process(pid);
     }
 
     // Only update state to stopped for terminating signals
-    if signal == SIGKILL || signal == SIGTERM {
-        cleanup::cleanup_box_resources(&box_id, &volume_names, network_name.as_deref());
+    if is_stopping_signal(signal) {
+        if record.auto_remove {
+            cleanup::cleanup_removed_box(&record);
+            state.remove(&box_id)?;
+            println!("{name} (auto-removed)");
+            return Ok(());
+        }
 
-        let record = resolve::resolve_mut(state, &box_id)?;
-        record.status = "stopped".to_string();
-        record.pid = None;
-        record.stopped_by_user = true;
+        cleanup::cleanup_stopped_box(&record);
+
+        let state_record = resolve::resolve_mut(state, &box_id)?;
+        state_record.status = "stopped".to_string();
+        state_record.pid = None;
+        state_record.stopped_by_user = true;
+        state_record.exit_code = Some(signaled_exit_code(signal));
+        state_record.health_status = "none".to_string();
+        state_record.health_retries = 0;
+        state.save()?;
+    } else if let Some(new_status) = signal_status_transition(signal) {
+        let state_record = resolve::resolve_mut(state, &box_id)?;
+        state_record.status = new_status.to_string();
         state.save()?;
     }
 
     println!("{name}");
     Ok(())
+}
+
+fn is_stopping_signal(signal: i32) -> bool {
+    matches!(signal, SIGKILL | SIGTERM | SIGINT | SIGHUP | SIGQUIT)
+}
+
+fn signaled_exit_code(signal: i32) -> i32 {
+    128 + signal
+}
+
+fn signal_status_transition(signal: i32) -> Option<&'static str> {
+    match signal {
+        SIGSTOP => Some("paused"),
+        SIGCONT => Some("running"),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -189,5 +238,37 @@ mod tests {
         assert!(parse_signal("INVALID").is_err());
         assert!(parse_signal("SIGFOO").is_err());
         assert!(parse_signal("").is_err());
+    }
+
+    #[test]
+    fn test_is_stopping_signal() {
+        assert!(is_stopping_signal(SIGKILL));
+        assert!(is_stopping_signal(SIGTERM));
+        assert!(is_stopping_signal(SIGINT));
+        assert!(is_stopping_signal(SIGHUP));
+        assert!(is_stopping_signal(SIGQUIT));
+        assert!(!is_stopping_signal(SIGSTOP));
+        assert!(!is_stopping_signal(SIGCONT));
+        assert!(!is_stopping_signal(SIGUSR1));
+    }
+
+    #[test]
+    fn test_signaled_exit_code() {
+        assert_eq!(signaled_exit_code(SIGKILL), 137);
+        assert_eq!(signaled_exit_code(SIGTERM), 143);
+    }
+
+    #[test]
+    fn test_signal_status_transition() {
+        assert_eq!(signal_status_transition(SIGSTOP), Some("paused"));
+        assert_eq!(signal_status_transition(SIGCONT), Some("running"));
+        assert_eq!(signal_status_transition(SIGUSR1), None);
+    }
+
+    #[test]
+    fn test_kill_accepts_paused_status_as_active() {
+        let record = crate::test_helpers::fixtures::make_record("id", "box", "paused", Some(1));
+
+        assert!(status::require_active(&record, "send a signal to").is_ok());
     }
 }

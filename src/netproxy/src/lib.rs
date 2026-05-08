@@ -10,7 +10,7 @@
 //! - **Inbound TCP port-forwarding**: `host_port → guest_ip:guest_port` pairs
 //!   parsed from the box's `port_map` config (e.g. `"8088:80"`).
 //!
-//! Outbound NAT (VM → internet) is Phase 2 and not included here.
+//! General outbound NAT (VM → internet) is not provided by bridge mode yet.
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
@@ -607,17 +607,9 @@ fn parse_port_forwards(
 ) -> std::result::Result<Vec<PortForward>, String> {
     let mut forwards = Vec::new();
     for entry in port_map {
-        // Strip protocol suffix: "8088:80/tcp" → "8088:80"
-        let entry = entry.split('/').next().unwrap_or(entry);
-        let (host_str, guest_str) = entry
-            .split_once(':')
-            .ok_or_else(|| format!("expected 'host_port:guest_port', got '{}'", entry))?;
-        let host_port: u16 = host_str
-            .parse()
-            .map_err(|_| format!("invalid host port '{}'", host_str))?;
-        let guest_port: u16 = guest_str
-            .parse()
-            .map_err(|_| format!("invalid guest port '{}'", guest_str))?;
+        let mapping = a3s_box_core::parse_port_mapping(entry)?;
+        let host_port = mapping.host_port;
+        let guest_port = mapping.guest_port;
 
         let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, host_port))
             .map_err(|e| format!("cannot bind 0.0.0.0:{}: {}", host_port, e))?;
@@ -685,16 +677,15 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_port_forwards_udp_suffix() {
+    fn test_parse_port_forwards_rejects_udp_suffix() {
         let guest = Ipv4Addr::new(10, 89, 0, 2);
-        if !port_is_bindable(19990) {
-            eprintln!("skipping test: host port 19990 is not bindable");
-            return;
-        }
         let rules = vec!["19990:80/udp".to_string()];
-        let fwds = parse_port_forwards(&rules, guest).unwrap();
-        assert_eq!(fwds.len(), 1);
-        assert_eq!(fwds[0].guest_port, 80);
+        let error = match parse_port_forwards(&rules, guest) {
+            Ok(_) => panic!("UDP port mapping unexpectedly succeeded"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("only TCP is supported"));
     }
 
     #[test]

@@ -37,6 +37,7 @@ pub fn pod_sandbox_config_to_box_config(
     let tee = parse_tee_config(annotations)?;
     let port_map = parse_port_mappings(config)?;
     let network = parse_network_mode(annotations)?;
+    let hostname = parse_hostname(config)?;
 
     Ok(BoxConfig {
         image,
@@ -44,8 +45,19 @@ pub fn pod_sandbox_config_to_box_config(
         tee,
         port_map,
         network,
+        hostname,
         ..Default::default()
     })
+}
+
+fn parse_hostname(config: &PodSandboxConfig) -> Result<Option<String>> {
+    let hostname = config.hostname.trim();
+    if hostname.is_empty() {
+        return Ok(None);
+    }
+    a3s_box_core::dns::validate_hostname(hostname)
+        .map_err(|e| BoxError::ConfigError(format!("Invalid CRI sandbox hostname: {e}")))?;
+    Ok(Some(hostname.to_string()))
 }
 
 fn resolve_agent_image(
@@ -249,6 +261,26 @@ mod tests {
             box_config.network,
             NetworkMode::Bridge { ref network } if network == "cri-net"
         ));
+    }
+
+    #[test]
+    fn test_sandbox_hostname_sets_box_hostname() {
+        let mut config = make_config(HashMap::new());
+        config.hostname = "pod-web".to_string();
+
+        let box_config = pod_sandbox_config_to_box_config(&config, DEFAULT_AGENT_IMAGE).unwrap();
+
+        assert_eq!(box_config.hostname.as_deref(), Some("pod-web"));
+    }
+
+    #[test]
+    fn test_invalid_sandbox_hostname_is_rejected() {
+        let mut config = make_config(HashMap::new());
+        config.hostname = "bad_host".to_string();
+
+        let err = pod_sandbox_config_to_box_config(&config, DEFAULT_AGENT_IMAGE).unwrap_err();
+
+        assert!(err.to_string().contains("Invalid CRI sandbox hostname"));
     }
 
     #[test]

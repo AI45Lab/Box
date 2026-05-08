@@ -39,13 +39,7 @@ pub async fn execute(args: LoadArgs) -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("No manifest digest in index.json")?
         .to_string();
 
-    let reference = args.tag.unwrap_or_else(|| {
-        // Try to extract a reference from annotations, fall back to digest
-        index["manifests"][0]["annotations"]["org.opencontainers.image.ref.name"]
-            .as_str()
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| digest.clone())
-    });
+    let reference = load_reference(&index, args.tag.as_deref(), &digest)?;
 
     let stored = store.put(&reference, &digest, tmp_dir.path()).await?;
 
@@ -55,4 +49,80 @@ pub async fn execute(args: LoadArgs) -> Result<(), Box<dyn std::error::Error>> {
         crate::output::format_bytes(stored.size_bytes)
     );
     Ok(())
+}
+
+fn load_reference(
+    index: &serde_json::Value,
+    tag: Option<&str>,
+    digest: &str,
+) -> Result<String, String> {
+    if let Some(tag) = tag.map(str::trim).filter(|tag| !tag.is_empty()) {
+        return Ok(tag.to_string());
+    }
+
+    if tag.is_some() {
+        return Err("Image tag cannot be empty".to_string());
+    }
+
+    Ok(
+        index["manifests"][0]["annotations"]["org.opencontainers.image.ref.name"]
+            .as_str()
+            .map(str::trim)
+            .filter(|reference| !reference.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| digest.to_string()),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_load_reference_prefers_explicit_tag() {
+        let index = serde_json::json!({
+            "manifests": [{
+                "digest": "sha256:abc",
+                "annotations": {
+                    "org.opencontainers.image.ref.name": "from-index:latest"
+                }
+            }]
+        });
+
+        assert_eq!(
+            load_reference(&index, Some("loaded:latest"), "sha256:abc").unwrap(),
+            "loaded:latest"
+        );
+    }
+
+    #[test]
+    fn test_load_reference_uses_annotation_before_digest() {
+        let index = serde_json::json!({
+            "manifests": [{
+                "digest": "sha256:abc",
+                "annotations": {
+                    "org.opencontainers.image.ref.name": "from-index:latest"
+                }
+            }]
+        });
+
+        assert_eq!(
+            load_reference(&index, None, "sha256:abc").unwrap(),
+            "from-index:latest"
+        );
+    }
+
+    #[test]
+    fn test_load_reference_falls_back_to_digest() {
+        let index = serde_json::json!({
+            "manifests": [{
+                "digest": "sha256:abc"
+            }]
+        });
+
+        assert_eq!(
+            load_reference(&index, None, "sha256:abc").unwrap(),
+            "sha256:abc"
+        );
+    }
 }

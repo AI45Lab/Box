@@ -5,9 +5,11 @@
 use clap::Args;
 
 use crate::boot;
+use crate::lifecycle;
 use crate::process;
 use crate::resolve;
 use crate::state::StateFile;
+use crate::status;
 
 #[derive(Args)]
 pub struct RestartArgs {
@@ -46,22 +48,23 @@ async fn restart_one(
 
     let box_id = record.id.clone();
     let name = record.name.clone();
-    let was_running = record.status == "running";
-    let pid = record.pid;
+    let restart_plan = restart_plan(record)?;
     let box_dir = record.box_dir.clone();
     let exec_socket_path = record.exec_socket_path.clone();
 
-    // Phase 1: Stop the box if it's running
-    if was_running {
-        if let Some(pid) = pid {
-            let stop_signal = record
-                .stop_signal
-                .as_deref()
-                .map(a3s_box_core::vmm::parse_signal_name)
-                .unwrap_or(libc::SIGTERM);
-            let effective_timeout = record.stop_timeout.unwrap_or(timeout);
-            process::graceful_stop(pid, stop_signal, effective_timeout).await;
-        }
+    // Phase 1: Stop the box if it is active.
+    if restart_plan == RestartPlan::StopThenStart {
+        let pid = lifecycle::require_live_pid(record, "restart")
+            .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+        let stop_signal = record
+            .stop_signal
+            .as_deref()
+            .map(a3s_box_core::vmm::parse_signal_name)
+            .unwrap_or(libc::SIGTERM);
+        let effective_timeout = record.stop_timeout.unwrap_or(timeout);
+        lifecycle::resume_paused_for_termination(record, pid, "restart")
+            .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+        process::graceful_stop(pid, stop_signal, effective_timeout).await;
 
         // Update state to stopped
         let record = resolve::resolve_mut(state, &box_id)?;
@@ -69,14 +72,6 @@ async fn restart_one(
         record.pid = None;
         crate::cleanup::cleanup_external_socket_dir(&box_dir, &exec_socket_path);
         state.save()?;
-    } else {
-        // Verify the box is in a startable state
-        match record.status.as_str() {
-            "created" | "stopped" | "dead" => {}
-            other => {
-                return Err(format!("Cannot restart box in state: {other}").into());
-            }
-        }
     }
 
     // Phase 2: Start the box using shared boot logic
@@ -85,14 +80,60 @@ async fn restart_one(
 
     // Update record to running
     let record = resolve::resolve_mut(state, &box_id)?;
-    record.status = "running".to_string();
-    record.pid = result.pid;
-    if let Some(exec_socket_path) = result.exec_socket_path {
-        record.exec_socket_path = exec_socket_path;
-    }
-    record.started_at = Some(chrono::Utc::now());
+    boot::apply_boot_result(record, result, boot::RestartCountUpdate::Preserve);
     state.save()?;
 
     println!("{name}");
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestartPlan {
+    StopThenStart,
+    StartOnly,
+}
+
+fn restart_plan(record: &crate::state::BoxRecord) -> Result<RestartPlan, String> {
+    if status::is_active(record) {
+        return Ok(RestartPlan::StopThenStart);
+    }
+
+    match record.status.as_str() {
+        "created" | "stopped" | "dead" => Ok(RestartPlan::StartOnly),
+        other => Err(format!("Cannot restart box in state: {other}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_helpers::fixtures::make_record;
+
+    #[test]
+    fn test_restart_plan_stops_running_and_paused_first() {
+        assert_eq!(
+            restart_plan(&make_record("id-1", "running", "running", Some(1))).unwrap(),
+            RestartPlan::StopThenStart
+        );
+        assert_eq!(
+            restart_plan(&make_record("id-2", "paused", "paused", Some(1))).unwrap(),
+            RestartPlan::StopThenStart
+        );
+    }
+
+    #[test]
+    fn test_restart_plan_starts_inactive_boxes_directly() {
+        assert_eq!(
+            restart_plan(&make_record("id-1", "created", "created", None)).unwrap(),
+            RestartPlan::StartOnly
+        );
+        assert_eq!(
+            restart_plan(&make_record("id-2", "stopped", "stopped", None)).unwrap(),
+            RestartPlan::StartOnly
+        );
+        assert_eq!(
+            restart_plan(&make_record("id-3", "dead", "dead", None)).unwrap(),
+            RestartPlan::StartOnly
+        );
+    }
 }

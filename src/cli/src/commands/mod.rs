@@ -29,7 +29,7 @@ mod login;
 mod logout;
 mod logs;
 mod monitor;
-mod network;
+pub(crate) mod network;
 mod pause;
 mod pool;
 mod port;

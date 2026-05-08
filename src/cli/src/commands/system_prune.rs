@@ -4,10 +4,9 @@
 
 use clap::Args;
 
+use crate::image_usage::{self, ImagePruneMode, ImageReferenceScope};
 use crate::output;
 use crate::state::StateFile;
-
-use std::collections::HashSet;
 
 #[derive(Args)]
 pub struct SystemPruneArgs {
@@ -23,9 +22,9 @@ pub struct SystemPruneArgs {
 pub async fn execute(args: SystemPruneArgs) -> Result<(), Box<dyn std::error::Error>> {
     if !args.force {
         println!("WARNING: This will remove:");
-        println!("  - all stopped boxes");
+        println!("  - all created, stopped, and dead boxes");
         if args.all {
-            println!("  - all images not used by running boxes");
+            println!("  - all images not used by active boxes");
         } else {
             println!("  - all dangling images");
         }
@@ -44,7 +43,7 @@ pub async fn execute(args: SystemPruneArgs) -> Result<(), Box<dyn std::error::Er
 
     let to_remove: Vec<(String, String, std::path::PathBuf)> = all_boxes
         .iter()
-        .filter(|r| matches!(r.status.as_str(), "stopped" | "dead" | "created"))
+        .filter(|r| is_prunable_box(r))
         .map(|r| (r.id.clone(), r.name.clone(), r.box_dir.clone()))
         .collect();
 
@@ -59,13 +58,10 @@ pub async fn execute(args: SystemPruneArgs) -> Result<(), Box<dyn std::error::Er
     }
 
     // Phase 2: Remove unused images
-    // Reload state to get current running boxes after removal
+    // Reload state to get current active boxes after removal.
     let state = StateFile::load_default()?;
-    let used_images: HashSet<String> = state
-        .list(false) // only running boxes
-        .iter()
-        .map(|r| r.image.clone())
-        .collect();
+    let protected_images = active_image_references(&state);
+    let prune_mode = image_prune_mode(args.all);
 
     let images_dir = super::images_dir();
     if images_dir.exists() {
@@ -73,8 +69,11 @@ pub async fn execute(args: SystemPruneArgs) -> Result<(), Box<dyn std::error::Er
             let all_images = store.list().await;
 
             for image in &all_images {
-                if !used_images.contains(&image.reference)
-                    && store.remove(&image.reference).await.is_ok()
+                if image_usage::is_prunable_reference(
+                    &image.reference,
+                    &protected_images,
+                    prune_mode,
+                ) && store.remove(&image.reference).await.is_ok()
                 {
                     space_freed += image.size_bytes;
                     images_removed += 1;
@@ -93,4 +92,73 @@ pub async fn execute(args: SystemPruneArgs) -> Result<(), Box<dyn std::error::Er
     );
 
     Ok(())
+}
+
+fn is_prunable_box(record: &crate::state::BoxRecord) -> bool {
+    matches!(record.status.as_str(), "stopped" | "dead" | "created")
+}
+
+fn active_image_references(state: &StateFile) -> std::collections::HashSet<String> {
+    image_usage::referenced_images(state, ImageReferenceScope::ActiveBoxes)
+}
+
+fn image_prune_mode(all: bool) -> ImagePruneMode {
+    if all {
+        ImagePruneMode::Unused
+    } else {
+        ImagePruneMode::Dangling
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_helpers::fixtures::{make_record, setup_state};
+
+    #[test]
+    fn test_is_prunable_box_keeps_active_boxes() {
+        assert!(!is_prunable_box(&make_record(
+            "id-1",
+            "running",
+            "running",
+            Some(1)
+        )));
+        assert!(!is_prunable_box(&make_record(
+            "id-2",
+            "paused",
+            "paused",
+            Some(1)
+        )));
+        assert!(is_prunable_box(&make_record(
+            "id-3", "created", "created", None
+        )));
+        assert!(is_prunable_box(&make_record(
+            "id-4", "stopped", "stopped", None
+        )));
+        assert!(is_prunable_box(&make_record("id-5", "dead", "dead", None)));
+    }
+
+    #[test]
+    fn test_active_image_references_include_paused() {
+        let mut running = make_record("id-1", "running", "running", Some(1));
+        running.image = "alpine:latest".to_string();
+        let mut paused = make_record("id-2", "paused", "paused", Some(1));
+        paused.image = "redis:latest".to_string();
+        let mut stopped = make_record("id-3", "stopped", "stopped", None);
+        stopped.image = "nginx:latest".to_string();
+        let (_tmp, state) = setup_state(vec![running, paused, stopped]);
+
+        let used_images = active_image_references(&state);
+
+        assert!(used_images.contains("alpine:latest"));
+        assert!(used_images.contains("docker.io/library/alpine:latest"));
+        assert!(used_images.contains("redis:latest"));
+        assert!(!used_images.contains("nginx:latest"));
+    }
+
+    #[test]
+    fn test_image_prune_mode_defaults_to_dangling() {
+        assert_eq!(image_prune_mode(false), ImagePruneMode::Dangling);
+        assert_eq!(image_prune_mode(true), ImagePruneMode::Unused);
+    }
 }

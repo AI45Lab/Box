@@ -10,9 +10,16 @@ use crate::state::{generate_name, BoxRecord, StateFile};
 pub struct CreateArgs {
     #[command(flatten)]
     pub common: CommonBoxArgs,
+
+    /// Command to run when the box starts (override image CMD)
+    #[arg(last = true)]
+    pub cmd: Vec<String>,
 }
 
 pub async fn execute(args: CreateArgs) -> Result<(), Box<dyn std::error::Error>> {
+    common::validate_runtime_options(&args.common)
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
     // Validate restart policy
     let (restart_policy, max_restart_count) =
         crate::state::parse_restart_policy(&args.common.restart)
@@ -24,35 +31,29 @@ pub async fn execute(args: CreateArgs) -> Result<(), Box<dyn std::error::Error>>
     // Build resource limits before any partial moves of args
     let resource_limits = common::build_resource_limits(&args.common)?;
 
-    let name = args.common.name.unwrap_or_else(generate_name);
-    let mut env = common::parse_env_vars(&args.common.env)?;
-
-    // Load --env-file entries (merged into env, CLI --env takes precedence)
-    for env_file in &args.common.env_file {
-        let file_env = common::parse_env_file(env_file)?;
-        for (k, v) in file_env {
-            env.entry(k).or_insert(v);
-        }
-    }
-
+    let port_map = common::normalize_port_maps(&args.common.publish)
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    let env = common::build_env_map(&args.common)?;
     let labels = common::parse_env_vars(&args.common.labels)
         .map_err(|e| e.replace("environment variable", "label"))?;
+    if let Some(network) = args.common.network.as_deref() {
+        ensure_network_exists(network)?;
+    }
 
-    // Parse health check config (--no-healthcheck disables)
-    let health_check = if args.common.no_healthcheck {
-        None
-    } else {
-        args.common
-            .health_cmd
+    let image_config = common::cached_image_config(&args.common.image).await?;
+    let health_check = common::effective_health_check(
+        &args.common,
+        image_config
             .as_ref()
-            .map(|cmd| crate::state::HealthCheck {
-                cmd: vec!["sh".to_string(), "-c".to_string(), cmd.clone()],
-                interval_secs: args.common.health_interval,
-                timeout_secs: args.common.health_timeout,
-                retries: args.common.health_retries,
-                start_period_secs: args.common.health_start_period,
-            })
-    };
+            .and_then(|config| config.health_check.as_ref()),
+    );
+    let effective_stop_signal = common::effective_stop_signal(
+        args.common.stop_signal.as_deref(),
+        image_config
+            .as_ref()
+            .and_then(|config| config.stop_signal.as_deref()),
+    );
+    let name = args.common.name.unwrap_or_else(generate_name);
 
     // Parse --shm-size
     let shm_size = match &args.common.shm_size {
@@ -108,7 +109,7 @@ pub async fn execute(args: CreateArgs) -> Result<(), Box<dyn std::error::Error>>
         memory_mb,
         volumes: resolved_volumes,
         env,
-        cmd: vec![],
+        cmd: args.cmd.clone(),
         entrypoint,
         box_dir: box_dir.clone(),
         exec_socket_path: box_dir.join("sockets").join("exec.sock"),
@@ -120,13 +121,14 @@ pub async fn execute(args: CreateArgs) -> Result<(), Box<dyn std::error::Error>>
         user: args.common.user,
         workdir: args.common.workdir,
         restart_policy,
-        port_map: args.common.publish,
+        port_map,
         labels,
         stopped_by_user: false,
         restart_count: 0,
         max_restart_count,
         exit_code: None,
         health_check,
+        healthcheck_disabled: args.common.no_healthcheck,
         health_status: "none".to_string(),
         health_retries: 0,
         health_last_check: None,
@@ -148,18 +150,35 @@ pub async fn execute(args: CreateArgs) -> Result<(), Box<dyn std::error::Error>>
         devices: args.common.device,
         gpus: args.common.gpus,
         shm_size,
-        stop_signal: args.common.stop_signal,
+        stop_signal: effective_stop_signal,
         stop_timeout: args.common.stop_timeout,
         oom_kill_disable: args.common.oom_kill_disable,
         oom_score_adj: args.common.oom_score_adj,
     };
 
+    let record_for_cleanup = record.clone();
     let mut state = StateFile::load_default()?;
-    state.add(record)?;
+    if let Err(error) = state.add(record) {
+        crate::cleanup::cleanup_partial_box_record(&record_for_cleanup, Some(&mut state));
+        return Err(error.into());
+    }
 
     // Attach named volumes to this box
-    super::volume::attach_volumes(&volume_names, &box_id)?;
+    if let Err(error) = super::volume::attach_volumes(&volume_names, &box_id) {
+        crate::cleanup::cleanup_partial_box_record(&record_for_cleanup, Some(&mut state));
+        return Err(error);
+    }
 
     println!("{box_id}");
+    Ok(())
+}
+
+fn ensure_network_exists(network: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let store = a3s_box_runtime::NetworkStore::default_path()?;
+    let config = store
+        .get(network)?
+        .ok_or_else(|| format!("network '{}' not found", network))?;
+    super::network::validate_attachable_network(&config)
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     Ok(())
 }

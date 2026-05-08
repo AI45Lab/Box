@@ -7,7 +7,7 @@ use oci_spec::image::{ImageConfiguration, ImageIndex, ImageManifest};
 use std::path::{Path, PathBuf};
 
 /// Health check configuration from OCI image config.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OciHealthCheck {
     pub test: Vec<String>,
     pub interval: Option<u64>,
@@ -249,14 +249,22 @@ impl OciImage {
         let oci_config: ImageConfiguration = serde_json::from_str(&content)
             .map_err(|e| BoxError::OciImageError(format!("Failed to parse config: {}", e)))?;
 
-        // oci-spec 0.6 does not model OnBuild — parse it directly from raw JSON.
-        let onbuild: Vec<String> = serde_json::from_str::<serde_json::Value>(&content)
-            .ok()
-            .and_then(|v| v.get("config").and_then(|c| c.get("OnBuild")).cloned())
+        let raw_config: serde_json::Value = serde_json::from_str(&content)
+            .map_err(|e| BoxError::OciImageError(format!("Failed to parse config JSON: {}", e)))?;
+
+        // oci-spec 0.6 does not model OnBuild or Healthcheck, so parse those
+        // Docker-compatible image fields directly from raw JSON.
+        let onbuild: Vec<String> = raw_config
+            .get("config")
+            .and_then(|c| c.get("OnBuild"))
+            .cloned()
             .and_then(|v| serde_json::from_value(v).ok())
             .unwrap_or_default();
+        let health_check = Self::parse_health_check_from_raw(&raw_config);
 
-        Ok(OciImageConfig::from_oci_config(&oci_config, onbuild))
+        let mut config = OciImageConfig::from_oci_config(&oci_config, onbuild);
+        config.health_check = health_check;
+        Ok(config)
     }
 
     /// Get the path to a blob by digest.
@@ -271,6 +279,65 @@ impl OciImage {
 
         root_dir.join("blobs").join(algorithm).join(hash)
     }
+
+    /// Parse Docker-compatible Healthcheck metadata from raw image config JSON.
+    fn parse_health_check_from_raw(raw_config: &serde_json::Value) -> Option<OciHealthCheck> {
+        let health = raw_config
+            .get("config")
+            .and_then(|c| c.get("Healthcheck").or_else(|| c.get("healthcheck")))?;
+
+        let test = health.get("Test").or_else(|| health.get("test"))?;
+        let test: Vec<String> = serde_json::from_value(test.clone()).ok()?;
+        if test.is_empty() {
+            return None;
+        }
+
+        if test
+            .first()
+            .is_some_and(|marker| marker.eq_ignore_ascii_case("NONE"))
+        {
+            return None;
+        }
+
+        Some(OciHealthCheck {
+            test,
+            interval: health
+                .get("Interval")
+                .or_else(|| health.get("interval"))
+                .and_then(duration_seconds_from_json),
+            timeout: health
+                .get("Timeout")
+                .or_else(|| health.get("timeout"))
+                .and_then(duration_seconds_from_json),
+            retries: health
+                .get("Retries")
+                .or_else(|| health.get("retries"))
+                .and_then(u32_from_json)
+                .filter(|value| *value > 0),
+            start_period: health
+                .get("StartPeriod")
+                .or_else(|| health.get("start_period"))
+                .and_then(duration_seconds_from_json),
+        })
+    }
+}
+
+fn duration_seconds_from_json(value: &serde_json::Value) -> Option<u64> {
+    let nanos = u64_from_json(value)?;
+    if nanos == 0 {
+        return None;
+    }
+    Some(nanos.div_ceil(1_000_000_000).max(1))
+}
+
+fn u64_from_json(value: &serde_json::Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|s| s.parse::<u64>().ok()))
+}
+
+fn u32_from_json(value: &serde_json::Value) -> Option<u32> {
+    u64_from_json(value).and_then(|value| u32::try_from(value).ok())
 }
 
 impl OciImageConfig {
@@ -325,12 +392,8 @@ impl OciImageConfig {
         // Parse stop signal
         let stop_signal = config.as_ref().and_then(|c| c.stop_signal().clone());
 
-        // Parse ONBUILD triggers — passed in from load_config which reads raw JSON
-        // because oci-spec 0.6 does not model the OnBuild field.
-
-        // Parse health check from raw config JSON
-        // oci_spec doesn't expose Healthcheck directly, so we leave it None
-        // and let the build engine populate it
+        // Healthcheck is filled by load_config from raw JSON because oci-spec
+        // 0.6 does not expose the Docker-compatible field.
         let health_check = None;
 
         Self {
@@ -451,6 +514,17 @@ mod tests {
         // Verify labels
         assert_eq!(image.label("a3s.type"), Some("agent"));
 
+        // Verify Docker-compatible Healthcheck was parsed from raw config JSON.
+        let health_check = image.config().health_check.as_ref().unwrap();
+        assert_eq!(
+            health_check.test,
+            vec!["CMD-SHELL".to_string(), "test -f /tmp/healthy".to_string()]
+        );
+        assert_eq!(health_check.interval, Some(30));
+        assert_eq!(health_check.timeout, Some(2));
+        assert_eq!(health_check.retries, Some(2));
+        assert_eq!(health_check.start_period, Some(5));
+
         // Verify layer paths
         assert_eq!(image.layer_paths().len(), 1);
     }
@@ -499,6 +573,13 @@ mod tests {
                 "Labels": {
                     "a3s.type": "agent",
                     "a3s.version": "1.0.0"
+                },
+                "Healthcheck": {
+                    "Test": ["CMD-SHELL", "test -f /tmp/healthy"],
+                    "Interval": 30000000000,
+                    "Timeout": 1500000000,
+                    "Retries": 2,
+                    "StartPeriod": 5000000000
                 }
             },
             "rootfs": {
@@ -604,6 +685,66 @@ mod tests {
             serde_json::from_str(config_json).unwrap();
         let config = OciImageConfig::from_oci_config(&oci_config, Vec::new());
         assert!(config.volumes.is_empty());
+    }
+
+    #[test]
+    fn test_parse_health_check_cmd() {
+        let raw = serde_json::json!({
+            "config": {
+                "Healthcheck": {
+                    "Test": ["CMD", "curl", "-f", "http://localhost/"],
+                    "Interval": 30000000000u64,
+                    "Timeout": 5000000000u64,
+                    "Retries": 3u64,
+                    "StartPeriod": 0u64
+                }
+            }
+        });
+
+        let hc = OciImage::parse_health_check_from_raw(&raw).unwrap();
+        assert_eq!(hc.test, vec!["CMD", "curl", "-f", "http://localhost/"]);
+        assert_eq!(hc.interval, Some(30));
+        assert_eq!(hc.timeout, Some(5));
+        assert_eq!(hc.retries, Some(3));
+        assert_eq!(hc.start_period, None);
+    }
+
+    #[test]
+    fn test_parse_health_check_cmd_shell_and_ceil_durations() {
+        let raw = serde_json::json!({
+            "config": {
+                "Healthcheck": {
+                    "Test": ["CMD-SHELL", "wget -qO- http://localhost/health"],
+                    "Interval": 1500000000u64,
+                    "Timeout": "1",
+                    "Retries": "2",
+                    "StartPeriod": 1u64
+                }
+            }
+        });
+
+        let hc = OciImage::parse_health_check_from_raw(&raw).unwrap();
+        assert_eq!(
+            hc.test,
+            vec!["CMD-SHELL", "wget -qO- http://localhost/health"]
+        );
+        assert_eq!(hc.interval, Some(2));
+        assert_eq!(hc.timeout, Some(1));
+        assert_eq!(hc.retries, Some(2));
+        assert_eq!(hc.start_period, Some(1));
+    }
+
+    #[test]
+    fn test_parse_health_check_none_disables() {
+        let raw = serde_json::json!({
+            "config": {
+                "Healthcheck": {
+                    "Test": ["NONE"]
+                }
+            }
+        });
+
+        assert!(OciImage::parse_health_check_from_raw(&raw).is_none());
     }
 
     #[test]

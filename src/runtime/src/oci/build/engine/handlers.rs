@@ -207,7 +207,6 @@ pub(super) fn handle_run(
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = (
-            command,
             rootfs_dir,
             layers_dir,
             workdir,
@@ -216,7 +215,10 @@ pub(super) fn handle_run(
             layer_index,
             quiet,
         );
-        Ok(None)
+        Err(BoxError::BuildError(format!(
+            "Dockerfile RUN is not supported on this platform yet because isolated Linux build execution is not implemented: {}",
+            command
+        )))
     }
 }
 
@@ -332,13 +334,20 @@ fn handle_run_on_host_unsafe(
 pub(super) fn handle_add(
     src_patterns: &[String],
     dst: &str,
-    _chown: Option<&str>,
+    chown: Option<&str>,
     context_dir: &Path,
     rootfs_dir: &Path,
     layers_dir: &Path,
     workdir: &str,
     layer_index: usize,
 ) -> Result<LayerInfo> {
+    if let Some(chown) = chown {
+        return Err(BoxError::BuildError(format!(
+            "ADD --chown={} is not supported yet",
+            chown
+        )));
+    }
+
     let resolved_dst = resolve_path(workdir, dst);
     let dst_in_rootfs = rootfs_dir.join(resolved_dst.trim_start_matches('/'));
 
@@ -475,10 +484,10 @@ pub(super) fn execute_onbuild_trigger(
             state.user = Some(user.clone());
         }
         _ => {
-            tracing::warn!(
-                trigger = trigger,
-                "ONBUILD trigger requires execution context, skipping"
-            );
+            return Err(BoxError::BuildError(format!(
+                "ONBUILD trigger '{}' is not supported yet because it requires build execution context",
+                trigger
+            )));
         }
     }
 
@@ -609,7 +618,10 @@ fn download_url(url: &str) -> std::result::Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::super::super::dockerfile::Instruction;
-    use super::instruction_to_string;
+    use super::{execute_onbuild_trigger, handle_add, instruction_to_string};
+    use crate::oci::build::engine::{BuildConfig, BuildState};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
 
     #[test]
     fn test_instruction_to_string_run() {
@@ -838,6 +850,59 @@ mod tests {
             instruction: Box::new(inner),
         };
         assert_eq!(instruction_to_string(&instr), "ONBUILD RUN echo triggered");
+    }
+
+    #[test]
+    fn test_handle_add_rejects_chown() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        let layers = tmp.path().join("layers");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        std::fs::create_dir_all(&layers).unwrap();
+
+        let err = handle_add(
+            &["file.txt".to_string()],
+            "/tmp/file.txt",
+            Some("1000:1000"),
+            tmp.path(),
+            &rootfs,
+            &layers,
+            "/",
+            0,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("ADD --chown=1000:1000 is not supported yet"));
+    }
+
+    #[test]
+    fn test_execute_onbuild_trigger_rejects_execution_instruction() {
+        let mut state = BuildState::new(HashMap::new());
+        let config = BuildConfig {
+            context_dir: PathBuf::from("/tmp/context"),
+            dockerfile_path: PathBuf::from("/tmp/context/Dockerfile"),
+            tag: None,
+            build_args: HashMap::new(),
+            quiet: true,
+            platforms: vec![],
+            metrics: None,
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let err = execute_onbuild_trigger(
+            "RUN echo trigger",
+            &mut state,
+            &config,
+            tmp.path(),
+            tmp.path(),
+            &[],
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("ONBUILD trigger 'RUN echo trigger' is not supported yet"));
     }
 
     #[cfg(target_os = "macos")]

@@ -12,9 +12,9 @@
 
 use std::path::PathBuf;
 
-use crate::state::HealthCheck;
 #[cfg(not(windows))]
 use crate::state::StateFile;
+use crate::state::{BoxRecord, HealthCheck};
 
 /// Spawn a background health checker task for a running box.
 ///
@@ -50,7 +50,7 @@ async fn run_health_loop(box_id: String, exec_socket_path: PathBuf, hc: HealthCh
     }
 
     let interval = Duration::from_secs(hc.interval_secs.max(1));
-    let timeout_ns = hc.timeout_secs.saturating_mul(1_000_000_000);
+    let timeout_ns = probe_timeout_ns(&hc);
 
     loop {
         tokio::time::sleep(interval).await;
@@ -68,24 +68,22 @@ async fn run_health_loop(box_id: String, exec_socket_path: PathBuf, hc: HealthCh
         let Some(record) = state.find_by_id_mut(&box_id) else {
             break; // Box removed from state
         };
-
-        if healthy {
-            record.health_status = "healthy".to_string();
-            record.health_retries = 0;
-        } else {
-            record.health_retries += 1;
-            if record.health_retries >= hc.retries {
-                record.health_status = "unhealthy".to_string();
-            }
+        if record.status != "running" {
+            break;
         }
-        record.health_last_check = Some(chrono::Utc::now());
+
+        apply_probe_result(record, healthy, chrono::Utc::now());
 
         let _ = state.save();
     }
 }
 
 #[cfg(not(windows))]
-async fn run_probe(exec_socket_path: &std::path::Path, cmd: &[String], timeout_ns: u64) -> bool {
+pub(crate) async fn run_probe(
+    exec_socket_path: &std::path::Path,
+    cmd: &[String],
+    timeout_ns: u64,
+) -> bool {
     use a3s_box_core::exec::ExecRequest;
     use a3s_box_runtime::ExecClient;
 
@@ -112,6 +110,59 @@ async fn run_probe(exec_socket_path: &std::path::Path, cmd: &[String], timeout_n
     }
 }
 
+pub(crate) fn probe_timeout_ns(hc: &HealthCheck) -> u64 {
+    hc.timeout_secs.saturating_mul(1_000_000_000)
+}
+
+pub(crate) fn should_probe(record: &BoxRecord, now: chrono::DateTime<chrono::Utc>) -> bool {
+    let Some(hc) = record.health_check.as_ref() else {
+        return false;
+    };
+    if record.status != "running" {
+        return false;
+    }
+
+    if let Some(started_at) = record.started_at {
+        let start_period = bounded_chrono_seconds(hc.start_period_secs);
+        if now < started_at + start_period {
+            return false;
+        }
+    }
+
+    let Some(last_check) = record.health_last_check else {
+        return true;
+    };
+
+    now >= last_check + bounded_chrono_seconds(hc.interval_secs.max(1))
+}
+
+pub(crate) fn apply_probe_result(
+    record: &mut BoxRecord,
+    healthy: bool,
+    checked_at: chrono::DateTime<chrono::Utc>,
+) {
+    if record.status != "running" {
+        return;
+    }
+
+    if healthy {
+        record.health_status = "healthy".to_string();
+        record.health_retries = 0;
+    } else {
+        record.health_retries = record.health_retries.saturating_add(1);
+        if let Some(hc) = record.health_check.as_ref() {
+            if record.health_retries >= hc.retries {
+                record.health_status = "unhealthy".to_string();
+            }
+        }
+    }
+    record.health_last_check = Some(checked_at);
+}
+
+fn bounded_chrono_seconds(seconds: u64) -> chrono::Duration {
+    chrono::Duration::seconds(seconds.min(i64::MAX as u64) as i64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,10 +184,101 @@ mod tests {
     #[test]
     fn test_timeout_ns_overflow_safe() {
         // Large timeout_secs must not overflow u64
-        let timeout_ns = 5u64.saturating_mul(1_000_000_000);
-        assert_eq!(timeout_ns, 5_000_000_000);
+        let hc = HealthCheck {
+            cmd: vec!["true".to_string()],
+            interval_secs: 30,
+            timeout_secs: 5,
+            retries: 3,
+            start_period_secs: 0,
+        };
+        assert_eq!(probe_timeout_ns(&hc), 5_000_000_000);
 
-        let big_timeout_ns = u64::MAX.saturating_mul(1_000_000_000);
-        assert_eq!(big_timeout_ns, u64::MAX); // saturates instead of overflowing
+        let big_hc = HealthCheck {
+            timeout_secs: u64::MAX,
+            ..hc
+        };
+        assert_eq!(probe_timeout_ns(&big_hc), u64::MAX); // saturates instead of overflowing
+    }
+
+    #[test]
+    fn test_should_probe_respects_start_period() {
+        let now = chrono::Utc::now();
+        let mut record =
+            crate::test_helpers::fixtures::make_record("health-id", "health", "running", Some(1));
+        record.started_at = Some(now);
+        record.health_check = Some(HealthCheck {
+            cmd: vec!["true".to_string()],
+            interval_secs: 30,
+            timeout_secs: 5,
+            retries: 3,
+            start_period_secs: 10,
+        });
+
+        assert!(!should_probe(&record, now + chrono::Duration::seconds(9)));
+        assert!(should_probe(&record, now + chrono::Duration::seconds(10)));
+    }
+
+    #[test]
+    fn test_should_probe_respects_interval() {
+        let now = chrono::Utc::now();
+        let mut record =
+            crate::test_helpers::fixtures::make_record("health-id", "health", "running", Some(1));
+        record.started_at = Some(now - chrono::Duration::seconds(60));
+        record.health_last_check = Some(now);
+        record.health_check = Some(HealthCheck {
+            cmd: vec!["true".to_string()],
+            interval_secs: 30,
+            timeout_secs: 5,
+            retries: 3,
+            start_period_secs: 0,
+        });
+
+        assert!(!should_probe(&record, now + chrono::Duration::seconds(29)));
+        assert!(should_probe(&record, now + chrono::Duration::seconds(30)));
+    }
+
+    #[test]
+    fn test_apply_probe_result_tracks_retries_and_recovery() {
+        let now = chrono::Utc::now();
+        let mut record =
+            crate::test_helpers::fixtures::make_record("health-id", "health", "running", Some(1));
+        record.health_status = "starting".to_string();
+        record.health_check = Some(HealthCheck {
+            cmd: vec!["false".to_string()],
+            interval_secs: 30,
+            timeout_secs: 5,
+            retries: 2,
+            start_period_secs: 0,
+        });
+
+        apply_probe_result(&mut record, false, now);
+        assert_eq!(record.health_status, "starting");
+        assert_eq!(record.health_retries, 1);
+
+        apply_probe_result(&mut record, false, now);
+        assert_eq!(record.health_status, "unhealthy");
+        assert_eq!(record.health_retries, 2);
+
+        apply_probe_result(&mut record, true, now);
+        assert_eq!(record.health_status, "healthy");
+        assert_eq!(record.health_retries, 0);
+    }
+
+    #[test]
+    fn test_apply_probe_result_ignores_stopped_records() {
+        let now = chrono::Utc::now();
+        let mut record =
+            crate::test_helpers::fixtures::make_record("health-id", "health", "stopped", None);
+        record.health_check = Some(HealthCheck {
+            cmd: vec!["true".to_string()],
+            interval_secs: 30,
+            timeout_secs: 5,
+            retries: 1,
+            start_period_secs: 0,
+        });
+
+        apply_probe_result(&mut record, true, now);
+        assert_eq!(record.health_status, "none");
+        assert!(record.health_last_check.is_none());
     }
 }
