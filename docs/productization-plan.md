@@ -537,6 +537,9 @@ Current notes:
   diagnostics make the macOS bridge-mode boundary explicit: netproxy supports
   peer networking and published TCP ports, while outbound NAT remains
   unsupported; Linux passt reports peer networking with outbound NAT.
+- The shim now routes macOS bridge-mode published ports through the netproxy
+  path only, avoiding duplicate TSI port-map registration when a box combines
+  `--network` with `-p`.
 - User-defined bridge networks now reject unsupported drivers and unsupported
   strict/custom policy modes before persistence, preventing false isolation
   claims until packet filtering is implemented. All attach paths (`run`,

@@ -348,6 +348,37 @@ fn apply_cgroup_limits(spec: &InstanceSpec) {
     }
 }
 
+#[cfg(not(target_os = "windows"))]
+fn tsi_port_map_for_spec(spec: &InstanceSpec) -> Vec<String> {
+    if native_bridge_port_forwarding_handles_spec(spec) {
+        return Vec::new();
+    }
+
+    spec.port_map
+        .iter()
+        .filter(|mapping| !is_auto_assigned_host_port(mapping))
+        .cloned()
+        .collect()
+}
+
+#[cfg(all(not(target_os = "windows"), target_os = "macos"))]
+fn native_bridge_port_forwarding_handles_spec(spec: &InstanceSpec) -> bool {
+    spec.network.is_some()
+}
+
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+fn native_bridge_port_forwarding_handles_spec(_spec: &InstanceSpec) -> bool {
+    false
+}
+
+#[cfg(not(target_os = "windows"))]
+fn is_auto_assigned_host_port(mapping: &str) -> bool {
+    mapping
+        .split_once(':')
+        .and_then(|(host, _)| host.parse::<u16>().ok())
+        == Some(0)
+}
+
 /// Configure libkrun context and start the VM.
 ///
 /// # Safety
@@ -493,22 +524,11 @@ unsafe fn configure_and_start_vm(spec: &InstanceSpec) -> Result<()> {
     // TSI port mapping for inbound connections (host -> guest)
     // This allows external connections to reach services inside the guest.
     // Must be called before add_vsock_port to avoid EINVAL from libkrun.
-    // Skip port mappings with host_port=0 (auto-assign) - those are handled by
-    // netproxy on macOS and would fail with EINVAL in libkrun's TSI.
+    // Skip entries handled by bridge-native forwarding or host_port=0
+    // auto-assignment, which would fail with EINVAL in libkrun's TSI.
     #[cfg(not(target_os = "windows"))]
     {
-        let valid_port_map: Vec<String> = spec
-            .port_map
-            .iter()
-            .filter(|p| {
-                if let Some((host, _)) = p.split_once(':') {
-                    host.parse::<u16>() != Ok(0)
-                } else {
-                    true
-                }
-            })
-            .cloned()
-            .collect();
+        let valid_port_map = tsi_port_map_for_spec(spec);
 
         if !valid_port_map.is_empty() {
             tracing::info!(
@@ -519,7 +539,7 @@ unsafe fn configure_and_start_vm(spec: &InstanceSpec) -> Result<()> {
         } else if !spec.port_map.is_empty() {
             tracing::debug!(
                 port_map = ?spec.port_map,
-                "Skipping TSI port mapping (all host ports are 0, handled by netproxy)"
+                "Skipping TSI port mapping; native bridge port forwarding or auto-assigned host ports handle these entries"
             );
         }
     }
@@ -944,6 +964,64 @@ mod tests {
         assert!(parse_ulimit("rtprio=10:20").is_some());
         assert!(parse_ulimit("rttime=100:200").is_some());
         assert!(parse_ulimit("sigpending=100:200").is_some());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn test_tsi_port_map_for_spec_filters_auto_assigned_host_ports() {
+        let spec = InstanceSpec {
+            port_map: vec![
+                "0:80".to_string(),
+                "8080:80".to_string(),
+                "9090:90".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            tsi_port_map_for_spec(&spec),
+            vec!["8080:80".to_string(), "9090:90".to_string()]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_tsi_port_map_for_spec_skips_macos_bridge_ports() {
+        let spec = InstanceSpec {
+            port_map: vec!["8080:80".to_string()],
+            network: Some(test_network_config()),
+            ..Default::default()
+        };
+
+        assert!(tsi_port_map_for_spec(&spec).is_empty());
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    #[test]
+    fn test_tsi_port_map_for_spec_keeps_bridge_ports_without_native_forwarder() {
+        let spec = InstanceSpec {
+            port_map: vec!["8080:80".to_string()],
+            network: Some(test_network_config()),
+            ..Default::default()
+        };
+
+        assert_eq!(tsi_port_map_for_spec(&spec), vec!["8080:80".to_string()]);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn test_network_config() -> a3s_box_core::vmm::NetworkInstanceConfig {
+        a3s_box_core::vmm::NetworkInstanceConfig {
+            net_socket_path: std::path::PathBuf::from("/tmp/a3s-box-test-net.sock"),
+            #[cfg(target_os = "macos")]
+            net_socket_fd: Some(42),
+            #[cfg(target_os = "macos")]
+            net_proxy_fd: Some(43),
+            ip_address: "10.89.0.2".parse().unwrap(),
+            gateway: "10.89.0.1".parse().unwrap(),
+            prefix_len: 24,
+            mac_address: [0x02, 0x42, 0x0a, 0x59, 0x00, 0x02],
+            dns_servers: vec!["8.8.8.8".parse().unwrap()],
+        }
     }
 
     #[cfg(target_os = "linux")]
