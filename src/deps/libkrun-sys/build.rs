@@ -749,8 +749,14 @@ fn download_libkrunfw_so(install_dir: &Path) {
     let tarball_path = install_dir.join("libkrunfw.tgz");
 
     if !tarball_path.exists() {
-        download_file(LIBKRUNFW_SO_URL, &tarball_path)
-            .unwrap_or_else(|e| panic!("Failed to download libkrunfw: {}", e));
+        if let Ok(local) = env::var("LIBKRUNFW_LOCAL_PATH") {
+            println!("cargo:warning=Using local libkrunfw from {}", local);
+            std::fs::copy(&local, &tarball_path)
+                .unwrap_or_else(|e| panic!("Failed to copy local libkrunfw from {}: {}", local, e));
+        } else {
+            download_file(LIBKRUNFW_SO_URL, &tarball_path)
+                .unwrap_or_else(|e| panic!("Failed to download libkrunfw: {}", e));
+        }
 
         verify_sha256(&tarball_path, LIBKRUNFW_SHA256)
             .unwrap_or_else(|e| panic!("Failed to verify libkrunfw checksum: {}", e));
