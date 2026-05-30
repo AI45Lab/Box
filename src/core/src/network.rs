@@ -253,16 +253,21 @@ impl Ipam {
             .parse()
             .map_err(|e| format!("invalid prefix length '{}': {}", parts[1], e))?;
 
-        if prefix_len > 30 {
+        if prefix_len == 0 || prefix_len > 30 {
             return Err(format!(
-                "prefix length {} too large (max 30 for usable hosts)",
+                "prefix length {} out of range (must be 1-30 for a usable subnet)",
                 prefix_len
             ));
         }
 
-        // Gateway is network + 1
+        // Gateway is network + 1. Use checked arithmetic so a network address of
+        // 255.255.255.255 cannot overflow (panic in debug / wrap in release).
         let net_u32 = u32::from(network);
-        let gateway = Ipv4Addr::from(net_u32 + 1);
+        let gateway = Ipv4Addr::from(
+            net_u32
+                .checked_add(1)
+                .ok_or_else(|| format!("network address '{}' has no room for a gateway", network))?,
+        );
 
         Ok(Self {
             network,
@@ -580,6 +585,23 @@ mod tests {
 
         let ipam16 = Ipam::new("172.20.0.0/16").unwrap();
         assert_eq!(ipam16.broadcast(), Ipv4Addr::new(172, 20, 255, 255));
+    }
+
+    #[test]
+    fn test_ipam_rejects_zero_and_oversized_prefix() {
+        // /0 previously caused a shift-overflow panic in broadcast()/capacity().
+        assert!(Ipam::new("0.0.0.0/0").is_err());
+        assert!(Ipam::new("10.0.0.0/31").is_err());
+        assert!(Ipam::new("10.0.0.0/32").is_err());
+        // Valid bounds still parse.
+        assert!(Ipam::new("10.0.0.0/1").is_ok());
+        assert!(Ipam::new("10.0.0.0/30").is_ok());
+    }
+
+    #[test]
+    fn test_ipam_gateway_overflow_is_rejected_not_panic() {
+        // 255.255.255.255 + 1 would overflow; must error, not panic.
+        assert!(Ipam::new("255.255.255.255/30").is_err());
     }
 
     #[test]

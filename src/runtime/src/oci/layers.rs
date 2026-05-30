@@ -52,15 +52,72 @@ pub fn extract_layer(layer_path: &Path, target_dir: &Path) -> Result<()> {
     // Decompress gzip
     let decoder = GzDecoder::new(file);
 
-    // Extract tar archive
+    // Extract the tar archive, applying OCI whiteout semantics so files deleted
+    // in an upper layer do not reappear from lower layers:
+    //   - `.wh.<name>`    deletes the sibling `<name>` already materialized
+    //   - `.wh..wh..opq`  clears all prior contents of its parent directory
+    // Whiteout markers themselves are never written into the rootfs. Normal
+    // entries are delegated to `unpack_in`, preserving the same symlink /
+    // hardlink / permission / mtime fidelity that `unpack` provides.
     let mut archive = Archive::new(decoder);
-    archive.unpack(target_dir).map_err(|e| {
-        BoxError::OciImageError(format!(
-            "Failed to extract layer to {}: {}",
-            target_dir.display(),
-            e
-        ))
-    })?;
+    archive.set_preserve_permissions(true);
+    archive.set_preserve_mtime(true);
+    archive.set_overwrite(true);
+    #[cfg(unix)]
+    archive.set_unpack_xattrs(true);
+
+    let entries = archive
+        .entries()
+        .map_err(|e| BoxError::OciImageError(format!("Failed to read layer entries: {e}")))?;
+
+    for entry in entries {
+        let mut entry = entry
+            .map_err(|e| BoxError::OciImageError(format!("Failed to read layer entry: {e}")))?;
+        let path = entry
+            .path()
+            .map_err(|e| BoxError::OciImageError(format!("Invalid layer entry path: {e}")))?
+            .into_owned();
+
+        // Defensively reject path-traversal entries (`unpack_in` also guards this).
+        if path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            tracing::warn!(path = %path.display(), "Skipping layer entry with '..' component");
+            continue;
+        }
+
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+        if file_name == ".wh..wh..opq" {
+            // Opaque directory marker: discard everything already extracted into
+            // the parent directory from lower layers, keeping the directory.
+            if let Some(parent) = path.parent() {
+                if let Ok(read) = std::fs::read_dir(target_dir.join(parent)) {
+                    for child in read.flatten() {
+                        remove_path(&child.path());
+                    }
+                }
+            }
+            continue;
+        }
+
+        if let Some(victim_name) = file_name.strip_prefix(".wh.") {
+            // Whiteout marker: remove the named sibling from a lower layer.
+            if let Some(parent) = path.parent() {
+                remove_path(&target_dir.join(parent).join(victim_name));
+            }
+            continue;
+        }
+
+        entry.unpack_in(target_dir).map_err(|e| {
+            BoxError::OciImageError(format!(
+                "Failed to extract layer to {}: {}",
+                target_dir.display(),
+                e
+            ))
+        })?;
+    }
 
     tracing::debug!(
         layer = %layer_path.display(),
@@ -69,6 +126,23 @@ pub fn extract_layer(layer_path: &Path, target_dir: &Path) -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Remove a file or directory tree for an applied whiteout, ignoring a missing
+/// target. Uses `symlink_metadata` so a symlink is removed as a link, not
+/// followed into a lower layer.
+fn remove_path(path: &Path) {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    let result = if meta.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    };
+    if let Err(e) = result {
+        tracing::warn!(path = %path.display(), error = %e, "Failed to apply whiteout deletion");
+    }
 }
 
 #[cfg(test)]
@@ -177,6 +251,55 @@ mod tests {
         extract_layer(&layer2_path, &target_dir).unwrap();
         let content2 = fs::read_to_string(target_dir.join("file.txt")).unwrap();
         assert_eq!(content2, "version 2");
+    }
+
+    #[test]
+    fn test_extract_layer_applies_whiteout() {
+        let temp_dir = TempDir::new().unwrap();
+        let layer1 = temp_dir.path().join("layer1.tar.gz");
+        let layer2 = temp_dir.path().join("layer2.tar.gz");
+        let target = temp_dir.path().join("extracted");
+
+        create_test_layer(
+            &layer1,
+            &[("dir/keep.txt", b"keep"), ("dir/removed.txt", b"bye")],
+        );
+        // Upper layer whites out dir/removed.txt
+        create_test_layer(&layer2, &[("dir/.wh.removed.txt", b"")]);
+
+        extract_layer(&layer1, &target).unwrap();
+        assert!(target.join("dir/removed.txt").exists());
+
+        extract_layer(&layer2, &target).unwrap();
+        assert!(target.join("dir/keep.txt").exists(), "sibling must survive");
+        assert!(
+            !target.join("dir/removed.txt").exists(),
+            "whiteout must delete the file from the lower layer"
+        );
+        assert!(
+            !target.join("dir/.wh.removed.txt").exists(),
+            "whiteout marker must not be written to the rootfs"
+        );
+    }
+
+    #[test]
+    fn test_extract_layer_applies_opaque_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let layer1 = temp_dir.path().join("l1.tar.gz");
+        let layer2 = temp_dir.path().join("l2.tar.gz");
+        let target = temp_dir.path().join("ex");
+
+        create_test_layer(&layer1, &[("d/old1.txt", b"a"), ("d/old2.txt", b"b")]);
+        // Opaque marker clears prior dir contents; new.txt is added afterward.
+        create_test_layer(&layer2, &[("d/.wh..wh..opq", b""), ("d/new.txt", b"c")]);
+
+        extract_layer(&layer1, &target).unwrap();
+        extract_layer(&layer2, &target).unwrap();
+
+        assert!(!target.join("d/old1.txt").exists());
+        assert!(!target.join("d/old2.txt").exists());
+        assert!(target.join("d/new.txt").exists());
+        assert!(!target.join("d/.wh..wh..opq").exists());
     }
 
     // Helper function to create a test tar.gz layer

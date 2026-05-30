@@ -25,6 +25,30 @@ fn registry_protocol_from_env() -> ClientProtocol {
     }
 }
 
+/// Verify that `data` hashes to the `expected` content digest before it is
+/// stored content-addressed. Unknown digest algorithms are skipped with a
+/// warning rather than silently trusted.
+fn verify_blob_digest(data: &[u8], expected: &str, what: &str, registry: &str) -> Result<()> {
+    let Some(expected_hex) = expected.strip_prefix("sha256:") else {
+        tracing::warn!(
+            digest = %expected,
+            "Unrecognized digest algorithm; skipping {what} content verification"
+        );
+        return Ok(());
+    };
+    use sha2::{Digest, Sha256};
+    let actual_hex = format!("{:x}", Sha256::digest(data));
+    if !actual_hex.eq_ignore_ascii_case(expected_hex) {
+        return Err(BoxError::RegistryError {
+            registry: registry.to_string(),
+            message: format!(
+                "{what} digest mismatch: expected sha256:{expected_hex}, computed sha256:{actual_hex}"
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Callback type for layer pull progress: `(current, total, digest, size_bytes)`.
 type PullProgressFn = Arc<dyn Fn(usize, usize, &str, i64) + Send + Sync>;
 
@@ -291,6 +315,12 @@ impl RegistryPuller {
                 message: format!("Failed to pull config blob: {}", e),
             })?;
 
+        // Verify the received bytes match the digest the manifest advertises.
+        // pull_blob streams raw bytes without validation, so without this a
+        // buggy/malicious registry or a corrupted transfer could be stored
+        // content-addressed-by-filename and later extracted into the guest.
+        verify_blob_digest(&config_data, &config_descriptor.digest, "config blob", registry)?;
+
         let config_digest_hex = config_descriptor
             .digest
             .strip_prefix("sha256:")
@@ -323,6 +353,9 @@ impl RegistryPuller {
                     registry: registry.to_string(),
                     message: format!("Failed to pull layer {}: {}", layer.digest, e),
                 })?;
+
+            // Verify the layer content matches its advertised digest before storing.
+            verify_blob_digest(&layer_data, &layer.digest, "layer", registry)?;
 
             // Call progress callback again with negative size to signal completion
             if let Some(ref f) = self.progress_fn {
