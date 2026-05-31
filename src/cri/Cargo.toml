@@ -52,6 +52,9 @@ uuid = { workspace = true }
 parking_lot = { workspace = true }
 dashmap = { workspace = true }
 
+# Compression (SPDY streaming header blocks)
+flate2 = "1"
+
 # System
 dirs = { workspace = true }
 

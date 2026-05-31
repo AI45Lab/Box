@@ -259,6 +259,9 @@ async fn handle_connection(
     let mut buf = vec![0u8; 8192];
     let n = stream.read(&mut buf).await?;
     let request = String::from_utf8_lossy(&buf[..n]);
+    tracing::debug!(peer = %peer, request = %request, "Streaming request received");
+    // crictl/kubelet upgrade exec/attach to the SPDY/3.1 remotecommand protocol.
+    let upgrade_spdy = request.to_ascii_lowercase().contains("upgrade: spdy");
 
     // Parse request line: GET /exec/<token> HTTP/1.1
     let first_line = request.lines().next().unwrap_or("");
@@ -307,6 +310,9 @@ async fn handle_connection(
     );
 
     match session.kind {
+        // Real clients (crictl, kubelet) always speak SPDY/3.1 remotecommand.
+        // The legacy bespoke handler is kept as a fallback for non-SPDY callers.
+        SessionKind::Exec if upgrade_spdy => crate::spdy::serve_exec(stream, &session).await,
         SessionKind::Exec => handle_exec_stream(&mut stream, &session).await,
         SessionKind::Attach => handle_attach_stream(&mut stream, &session).await,
         SessionKind::PortForward => handle_port_forward_stream(&mut stream, &session).await,
