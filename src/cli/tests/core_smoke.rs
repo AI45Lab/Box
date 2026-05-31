@@ -324,7 +324,7 @@ impl CoreSmoke {
         fn open_pty() -> Result<(RawFd, RawFd), String> {
             let mut master: libc::c_int = -1;
             let mut slave: libc::c_int = -1;
-            let mut winsize = libc::winsize {
+            let winsize = libc::winsize {
                 ws_row: 24,
                 ws_col: 80,
                 ws_xpixel: 0,
@@ -337,7 +337,7 @@ impl CoreSmoke {
                     &mut slave,
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
-                    &mut winsize,
+                    &winsize,
                 )
             };
             if rc != 0 {
