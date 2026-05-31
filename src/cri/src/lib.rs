@@ -14,6 +14,7 @@ pub mod persistent_store;
 pub mod runtime_service;
 pub mod sandbox;
 pub mod server;
+pub mod spdy;
 pub mod state;
 pub mod streaming;
 
