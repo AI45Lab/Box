@@ -40,7 +40,7 @@ pub enum StreamingInput {
 }
 
 impl StreamingInput {
-    async fn write_stdin(
+    pub(crate) async fn write_stdin(
         &self,
         data: &[u8],
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -51,7 +51,7 @@ impl StreamingInput {
         Ok(())
     }
 
-    async fn close_stdin(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub(crate) async fn close_stdin(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match self {
             Self::Exec(input) => input.close_stdin().await?,
             Self::Pty(input) => input.close().await?,
@@ -255,10 +255,26 @@ async fn handle_connection(
     peer: SocketAddr,
     sessions: StreamingSessionStore,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Read HTTP request
-    let mut buf = vec![0u8; 8192];
-    let n = stream.read(&mut buf).await?;
-    let request = String::from_utf8_lossy(&buf[..n]);
+    // Read ONLY the HTTP request headers, up to and including the terminating
+    // CRLFCRLF. A greedy read would race with the client's pipelined SPDY
+    // frames (which it sends right after the upgrade request) and swallow part
+    // of the stream, leaving the SPDY handler with a truncated/misaligned frame
+    // sequence. The upgrade request carries no body (Content-Length: 0), so
+    // everything after the header terminator belongs to the SPDY handler and is
+    // left untouched in the socket.
+    let mut raw = Vec::with_capacity(1024);
+    let mut byte = [0u8; 1];
+    loop {
+        let n = stream.read(&mut byte).await?;
+        if n == 0 {
+            break;
+        }
+        raw.push(byte[0]);
+        if raw.ends_with(b"\r\n\r\n") || raw.len() > 16 * 1024 {
+            break;
+        }
+    }
+    let request = String::from_utf8_lossy(&raw);
     tracing::debug!(peer = %peer, request = %request, "Streaming request received");
     // crictl/kubelet upgrade exec/attach to the SPDY/3.1 remotecommand protocol.
     let upgrade_spdy = request.to_ascii_lowercase().contains("upgrade: spdy");
@@ -314,6 +330,7 @@ async fn handle_connection(
         // The legacy bespoke handler is kept as a fallback for non-SPDY callers.
         SessionKind::Exec if upgrade_spdy => crate::spdy::serve_exec(stream, &session).await,
         SessionKind::Exec => handle_exec_stream(&mut stream, &session).await,
+        SessionKind::Attach if upgrade_spdy => crate::spdy::serve_attach(stream, &session).await,
         SessionKind::Attach => handle_attach_stream(&mut stream, &session).await,
         SessionKind::PortForward => handle_port_forward_stream(&mut stream, &session).await,
     }

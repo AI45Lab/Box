@@ -63,7 +63,7 @@ impl HeaderCompressor {
     fn compress(&mut self, input: &[u8]) -> Vec<u8> {
         let mut output = Vec::with_capacity(input.len() + 64);
         let mut in_pos = 0usize;
-        let mut buf = [0u8; 2048];
+        let mut buf = [0u8; 4096];
         loop {
             let in_before = self.deflate.total_in();
             let out_before = self.deflate.total_out();
@@ -74,7 +74,12 @@ impl HeaderCompressor {
             in_pos += (self.deflate.total_in() - in_before) as usize;
             let produced = (self.deflate.total_out() - out_before) as usize;
             output.extend_from_slice(&buf[..produced]);
-            if matches!(status, Status::StreamEnd) || (in_pos >= input.len() && produced == 0) {
+            // `Sync` re-emits a sync marker on every call, so `produced` is never
+            // zero — terminate once all input is consumed and the flush stopped
+            // filling the whole buffer (nothing left pending). Guarding on
+            // `produced == 0` here would busy-loop forever.
+            if matches!(status, Status::StreamEnd) || (in_pos >= input.len() && produced < buf.len())
+            {
                 break;
             }
         }
@@ -141,6 +146,7 @@ async fn read_frame<R: AsyncReadExt + Unpin>(reader: &mut R) -> std::io::Result<
         }
         return Err(error);
     }
+    tracing::trace!(hdr = ?hdr, "spdy read_frame: header");
     let flags = hdr[4];
     let len = ((hdr[5] as usize) << 16) | ((hdr[6] as usize) << 8) | (hdr[7] as usize);
     let mut data = vec![0u8; len];
@@ -219,6 +225,7 @@ async fn collect_streams<R: AsyncReadExt + Unpin, W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     expected: &[Channel],
 ) -> Result<HashMap<Channel, u32>, DynError> {
+    tracing::debug!(expecting = expected.len(), "spdy collect_streams: start");
     let mut compressor = HeaderCompressor::new();
     let mut ids = HashMap::new();
     let mut opened = 0usize;
@@ -273,10 +280,18 @@ fn exit_status_payload(exit_code: i32) -> Option<Vec<u8>> {
 /// Serve a CRI exec over SPDY. Handles non-TTY exec (with optional stdin);
 /// TTY exec falls back to the dedicated PTY bridge.
 pub async fn serve_exec(mut stream: TcpStream, session: &StreamingSession) -> Result<(), DynError> {
+    tracing::debug!(
+        stdin = session.stdin,
+        stdout = session.stdout,
+        stderr = session.stderr,
+        tty = session.tty,
+        "spdy serve_exec: enter"
+    );
     // Small control/data frames must not be delayed by Nagle's algorithm or the
     // client's per-stream reply wait can time out.
     let _ = stream.set_nodelay(true);
     stream.write_all(UPGRADE_RESPONSE.as_bytes()).await?;
+    tracing::debug!("spdy serve_exec: 101 sent, awaiting SPDY frames");
 
     if session.tty {
         return serve_exec_tty(stream, session).await;
@@ -473,11 +488,7 @@ async fn serve_exec_tty(stream: TcpStream, session: &StreamingSession) -> Result
         let writer = writer.clone();
         async move {
             let mut header = [0u8; 5];
-            loop {
-                match pty_read.read_exact(&mut header).await {
-                    Ok(_) => {}
-                    Err(_) => break,
-                }
+            while pty_read.read_exact(&mut header).await.is_ok() {
                 let frame_type = header[0];
                 let len =
                     u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
@@ -515,6 +526,120 @@ async fn serve_exec_tty(stream: TcpStream, session: &StreamingSession) -> Result
     tokio::select! {
         _ = pty_to_client => {}
         _ = client_to_pty => {}
+    }
+    Ok(())
+}
+
+/// Serve a CRI attach over SPDY: bridge the running container's broadcast
+/// output to the client's stdout/stderr streams and the client's stdin to the
+/// workload's stdin sink. Unlike exec, there is no command — output comes from
+/// the supervisor's broadcast channel registered when the container started.
+pub async fn serve_attach(
+    mut stream: TcpStream,
+    session: &StreamingSession,
+) -> Result<(), DynError> {
+    use tokio::sync::broadcast::error::RecvError;
+
+    let Some(attach_stream) = session.attach_stream.as_ref() else {
+        let body = "Attach is not available: no running workload stream is registered.";
+        let resp = format!(
+            "HTTP/1.1 501 Not Implemented\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(resp.as_bytes()).await?;
+        return Ok(());
+    };
+
+    let _ = stream.set_nodelay(true);
+    stream.write_all(UPGRADE_RESPONSE.as_bytes()).await?;
+    tracing::debug!("spdy serve_attach: 101 sent, awaiting SPDY frames");
+
+    let expected = expected_channels(session);
+    let (mut reader, writer) = tokio::io::split(stream);
+    let writer = std::sync::Arc::new(tokio::sync::Mutex::new(writer));
+    let ids = {
+        let mut guard = writer.lock().await;
+        collect_streams(&mut reader, &mut *guard, &expected).await?
+    };
+    let stdin_id = ids.get(&Channel::Stdin).copied();
+    let stdout_id = ids.get(&Channel::Stdout).copied();
+    let stderr_id = ids.get(&Channel::Stderr).copied();
+    let error_id = ids.get(&Channel::Error).copied();
+
+    let mut receiver = attach_stream.subscribe();
+    let stdin = session.attach_stdin.clone();
+    let stdin_once = session.stdin_once;
+
+    // Client → workload stdin.
+    let reader_task = {
+        let writer = writer.clone();
+        async move {
+            let mut closed = false;
+            loop {
+                match read_frame(&mut reader).await {
+                    Ok(Some(Frame::Data {
+                        stream_id,
+                        fin,
+                        data,
+                    })) if Some(stream_id) == stdin_id => {
+                        if !data.is_empty() {
+                            if let Some(input) = stdin.as_ref() {
+                                let _ = input.write_stdin(&data).await;
+                            }
+                        }
+                        if fin && !closed {
+                            closed = true;
+                            if stdin_once {
+                                if let Some(input) = stdin.as_ref() {
+                                    let _ = input.close_stdin().await;
+                                }
+                            }
+                        }
+                    }
+                    Ok(Some(Frame::Ping { id })) => {
+                        let _ = writer.lock().await.write_all(&ping_frame(id)).await;
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => break,
+                }
+            }
+        }
+    };
+
+    // Running container output → client.
+    let writer_task = {
+        let writer = writer.clone();
+        async move {
+            loop {
+                match receiver.recv().await {
+                    Ok(ExecEvent::Chunk(chunk)) => {
+                        let target = match chunk.stream {
+                            ExecStream::Stdout => stdout_id,
+                            ExecStream::Stderr => stderr_id,
+                        };
+                        if let Some(id) = target {
+                            let _ = writer
+                                .lock()
+                                .await
+                                .write_all(&data_frame(id, false, &chunk.data))
+                                .await;
+                        }
+                    }
+                    Ok(ExecEvent::Exit(_)) => break,
+                    Err(RecvError::Lagged(_)) => continue,
+                    Err(RecvError::Closed) => break,
+                }
+            }
+            let mut guard = writer.lock().await;
+            for id in [error_id, stdout_id, stderr_id].into_iter().flatten() {
+                let _ = guard.write_all(&data_frame(id, true, &[])).await;
+            }
+        }
+    };
+
+    tokio::select! {
+        _ = writer_task => {}
+        _ = reader_task => {}
     }
     Ok(())
 }
