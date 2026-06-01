@@ -100,12 +100,46 @@ impl CriServer {
             "CRI server listening"
         );
 
+        // Keep a handle so we can reap sandbox VMs once the server stops; the
+        // service itself is moved into the gRPC server below.
+        let shutdown_service = runtime_service.clone();
         Server::builder()
             .add_service(RuntimeServiceServer::new(runtime_service))
             .add_service(ImageServiceServer::new(image_service))
-            .serve_with_incoming(uds_stream)
+            .serve_with_incoming_shutdown(uds_stream, shutdown_signal())
             .await?;
 
+        // The server stopped (SIGTERM/SIGINT): tear down sandbox VMs and unmount
+        // their overlays so they do not orphan across restarts.
+        tracing::info!("CRI server stopping — reaping sandbox VMs");
+        shutdown_service.shutdown_all_sandboxes().await;
+
         Ok(())
+    }
+}
+
+/// Resolves when the process receives a termination signal, driving a graceful
+/// gRPC server shutdown so the CRI can reap its sandbox VMs.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) {
+            (Ok(mut sigterm), Ok(mut sigint)) => {
+                tokio::select! {
+                    _ = sigterm.recv() => tracing::info!("Received SIGTERM, shutting down CRI"),
+                    _ = sigint.recv() => tracing::info!("Received SIGINT, shutting down CRI"),
+                }
+            }
+            _ => {
+                tracing::error!("Failed to install signal handlers; graceful shutdown disabled");
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("Received Ctrl-C, shutting down CRI");
     }
 }

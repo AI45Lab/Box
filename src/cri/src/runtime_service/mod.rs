@@ -104,6 +104,10 @@ impl CriRuntimeOptions {
 }
 
 /// A3S Box implementation of the CRI RuntimeService.
+///
+/// Cheaply cloneable (all state is `Arc`-shared): the gRPC server takes one
+/// clone while a second handle drives graceful shutdown reaping.
+#[derive(Clone)]
 pub struct BoxRuntimeService {
     store: Arc<PersistentCriStore>,
     /// Shared image store used to resolve image default command metadata.
@@ -253,6 +257,39 @@ impl BoxRuntimeService {
                 count = reconciled,
                 "Reconciled containers without a live VM to Exited after CRI restart"
             );
+        }
+    }
+
+    /// Tear down every live sandbox VM on CRI shutdown.
+    ///
+    /// Without this, a SIGTERM kills the CRI process but leaves its sandbox
+    /// shim microVMs running (reparented to init) and their overlay mounts
+    /// dangling — they orphan and accumulate across restarts. The microVMs do
+    /// not survive a CRI restart anyway (`vm_managers` is in-memory and
+    /// `load_state` marks everything NotReady), so reaping them on graceful
+    /// shutdown is the clean behaviour: `destroy()` kills each shim and unmounts
+    /// its overlay, and the container rootfs directory is removed.
+    pub async fn shutdown_all_sandboxes(&self) {
+        let sandbox_ids: Vec<String> = {
+            let vm_managers = self.vm_managers.read().await;
+            vm_managers.keys().cloned().collect()
+        };
+        if sandbox_ids.is_empty() {
+            return;
+        }
+        tracing::info!(
+            count = sandbox_ids.len(),
+            "Reaping sandbox VMs on CRI shutdown"
+        );
+        for sandbox_id in sandbox_ids {
+            if let Err(e) = self.destroy_sandbox_vm(&sandbox_id, None).await {
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    error = %e,
+                    "Failed to destroy sandbox VM during shutdown"
+                );
+            }
+            self.cleanup_sandbox_rootfs(&sandbox_id).await;
         }
     }
 }
