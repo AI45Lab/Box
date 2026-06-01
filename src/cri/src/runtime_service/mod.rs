@@ -465,6 +465,15 @@ impl RuntimeService for BoxRuntimeService {
             runtime_handler: req.runtime_handler,
             network_ip,
             additional_ips,
+            dns: config
+                .dns_config
+                .as_ref()
+                .map(|dns| crate::sandbox::SandboxDns {
+                    servers: dns.servers.clone(),
+                    searches: dns.searches.clone(),
+                    options: dns.options.clone(),
+                })
+                .unwrap_or_default(),
         };
 
         self.store.add_sandbox(sandbox).await;
@@ -958,7 +967,25 @@ impl RuntimeService for BoxRuntimeService {
         let (rootfs_path, rootfs_guest_path) = match resolved_image.as_ref() {
             Some(image) => {
                 let paths = self.container_rootfs_paths(sandbox_id, &container_id);
-                if let Err(status) = self.prepare_container_rootfs(image, &paths).await {
+                // Render the pod's DNS config into the container's resolv.conf
+                // (empty -> the builder writes its default).
+                let resolv_conf = self
+                    .store
+                    .sandboxes
+                    .get(sandbox_id)
+                    .await
+                    .map(|sb| {
+                        a3s_box_core::dns::render_resolv_conf(
+                            &sb.dns.servers,
+                            &sb.dns.searches,
+                            &sb.dns.options,
+                        )
+                    })
+                    .unwrap_or_default();
+                if let Err(status) = self
+                    .prepare_container_rootfs(image, &paths, resolv_conf)
+                    .await
+                {
                     let failed_path = paths.host_path.to_string_lossy().to_string();
                     self.cleanup_container_rootfs_path(&failed_path).await;
                     return Err(status);

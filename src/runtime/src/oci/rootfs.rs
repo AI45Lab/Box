@@ -22,6 +22,10 @@ pub struct OciRootfsBuilder {
 
     /// Path to guest init binary (optional)
     guest_init_path: Option<PathBuf>,
+
+    /// Override for `/etc/resolv.conf` content (e.g. the pod's DNS config).
+    /// When `None`, a default resolv.conf is written.
+    resolv_conf: Option<String>,
 }
 
 impl OciRootfsBuilder {
@@ -31,7 +35,20 @@ impl OciRootfsBuilder {
             rootfs_path: rootfs_path.into(),
             image_path: PathBuf::new(),
             guest_init_path: None,
+            resolv_conf: None,
         }
+    }
+
+    /// Override the `/etc/resolv.conf` written into the rootfs.
+    ///
+    /// Used to apply a pod's CRI `DNSConfig`. An empty string is ignored so the
+    /// default resolv.conf is written instead.
+    pub fn with_resolv_conf(mut self, content: impl Into<String>) -> Self {
+        let content = content.into();
+        if !content.is_empty() {
+            self.resolv_conf = Some(content);
+        }
+        self
     }
 
     /// Set the OCI image path to extract.
@@ -264,10 +281,11 @@ impl OciRootfsBuilder {
         self.ensure_group_entries(&[("root", "root:x:0:"), ("nogroup", "nogroup:x:65534:")])?;
 
         self.write_file("etc/hosts", "127.0.0.1\tlocalhost\n::1\t\tlocalhost\n")?;
-        self.write_file(
-            "etc/resolv.conf",
-            "nameserver 8.8.8.8\nnameserver 8.8.4.4\n",
-        )?;
+        let resolv_conf = self
+            .resolv_conf
+            .as_deref()
+            .unwrap_or("nameserver 8.8.8.8\nnameserver 8.8.4.4\n");
+        self.write_file("etc/resolv.conf", resolv_conf)?;
         self.write_file(
             "etc/nsswitch.conf",
             "passwd: files\ngroup: files\nhosts: files dns\n",

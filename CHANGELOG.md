@@ -14,6 +14,9 @@ All notable changes to A3S Box will be documented in this file.
 - CRI `SecurityContext.readonly_rootfs`: the guest remounts the container root
   read-only before exec (writes to `/` fail), while `/proc`, `/sys`, and inner
   mounts stay writable.
+- CRI pod DNS config: a pod's `DNSConfig` (servers, searches, options) is
+  captured on the sandbox and rendered into each container's `/etc/resolv.conf`
+  (falling back to the default when unset).
 
 ### Fixed
 - CRI image identity now follows the digest, matching real runtimes:

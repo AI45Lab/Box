@@ -112,6 +112,7 @@ mod tests {
             runtime_handler: "a3s".to_string(),
             network_ip: String::new(),
             additional_ips: vec![],
+            dns: crate::sandbox::SandboxDns::default(),
         }
     }
 

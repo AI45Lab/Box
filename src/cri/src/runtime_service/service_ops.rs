@@ -136,6 +136,7 @@ impl BoxRuntimeService {
         &self,
         image: &ResolvedContainerImage,
         paths: &ContainerRootfsPaths,
+        resolv_conf: String,
     ) -> Result<(), Status> {
         let image_path = PathBuf::from(&image.path);
         let rootfs_path = paths.host_path.clone();
@@ -143,6 +144,7 @@ impl BoxRuntimeService {
         tokio::task::spawn_blocking(move || {
             OciRootfsBuilder::new(&rootfs_path)
                 .with_image(&image_path)
+                .with_resolv_conf(resolv_conf)
                 .build()
         })
         .await
