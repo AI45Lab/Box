@@ -17,7 +17,7 @@ suite so regressions are visible and progress is measurable.
 | `critest` | v1.30.1 |
 | a3s-box | 2.0.5 (+ unreleased CRI maturity work, heading to 2.0.6) |
 | Host | Linux KVM node (`/dev/kvm`), Ubuntu 24.04 |
-| Result | **42 Passed · 40 Failed · 15 Skipped** (ran 82 of 97 specs, ~18 min) |
+| Result | **~44 Passed · ~38 Failed · 15 Skipped** (42/40 measured at the full re-run; +2 from writable volume mounts landed since) |
 
 This is up from the original **21 Passed / 59 Failed** baseline (2.0.4): streaming
 exec/attach, container logs + reopen, force-RemoveContainer, safe sysctls,
@@ -62,6 +62,8 @@ critest --runtime-endpoint unix:///tmp/a3s-box.sock \
   filter → `Seccomp: 2`). `/proc` + `/sys` are mounted inside the container
   chroot.
 - **Pod sysctls:** safe sysctls applied at VM boot (`/proc/sys` writes).
+- **Volumes:** read-only and writable mounts (incl. host-path symlink) are
+  materialized by copying the source into the rootfs (no host write-propagation).
 - Basic `ImageStatus`/`ListImages`.
 
 ## Real gaps (failures grouped by cause)
@@ -69,7 +71,7 @@ critest --runtime-endpoint unix:///tmp/a3s-box.sock \
 | Category | Failing specs (examples) | Root cause | Fixable here? |
 |----------|--------------------------|------------|---------------|
 | **Registry egress** (~22) | Multiple-Containers exec/log/network, image pull/list/status, DNS, port-mapping, port-forward, HostNetwork/PID/IPC, Privileged, ReadOnlyRootfs, NoNewPrivs, image-group SupplementalGroups | webserver/helper images on `registry.k8s.io`/`gcr.io` are unreachable and not overridable via the images file | ❌ environmental |
-| **Writable volume mounts** (~6) | starting container with volume (+ host-path symlink), mount propagation rshared/rslave/rprivate, non-recursive readonly mounts | only read-only mounts (materialized by copy) are supported; writable host-path volumes need a virtio-fs share into the VM, which libkrun configures at boot (containers are created post-boot) | ⚠️ architectural |
+| **Mount propagation** (~3) | mount propagation rshared/rslave/rprivate, non-recursive readonly mounts | basic volume mounts (incl. writable + host-path symlink) now PASS — both read-only and writable mounts are materialized by COPY into the rootfs; bidirectional host↔container propagation needs a real shared mount, which libkrun would have to configure at VM boot (containers are created post-boot) | ⚠️ architectural |
 | **seccomp localhost profiles** (2) | localhost profile, SYS_ADMIN-block | RuntimeDefault now installs the default BPF filter (`Seccomp: 2`); localhost profiles need the host profile file plumbed into the VM + compiled | ⚠️ host-file plumbing |
 | **unsafe sysctls** (1) | `fs.mqueue.msg_max` | safe sysctls are applied (`/proc/sys` writes); the guest kernel lacks `CONFIG_POSIX_MQUEUE` so `/proc/sys/fs/mqueue/` is absent | ❌ guest-kernel |
 | **AppArmor** (~2) | unloaded profile, profile blocking writes | LSM not wired in the guest | ✅ guest feature |
