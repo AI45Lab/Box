@@ -22,6 +22,26 @@ pub struct ImagePuller {
     store: Arc<ImageStore>,
     puller: RegistryPuller,
     metrics: Option<crate::prom::RuntimeMetrics>,
+    /// Registry mirror map (original host → mirror host). Pulls fetch layers and
+    /// manifests from the mirror while the image keeps its canonical reference
+    /// for storage and identity. Parsed from `A3S_REGISTRY_MIRRORS`
+    /// (`host=mirror,host=mirror`) — lets a3s-box pull in registry-restricted
+    /// environments, like containerd's registry mirrors.
+    mirrors: std::collections::HashMap<String, String>,
+}
+
+/// Parse `A3S_REGISTRY_MIRRORS=host=mirror,host=mirror` into a map.
+fn parse_registry_mirrors() -> std::collections::HashMap<String, String> {
+    std::env::var("A3S_REGISTRY_MIRRORS")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .filter_map(|pair| pair.split_once('='))
+                .map(|(host, mirror)| (host.trim().to_string(), mirror.trim().to_string()))
+                .filter(|(host, mirror)| !host.is_empty() && !mirror.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 impl ImagePuller {
@@ -31,6 +51,26 @@ impl ImagePuller {
             store,
             puller: RegistryPuller::with_auth(auth),
             metrics: None,
+            mirrors: parse_registry_mirrors(),
+        }
+    }
+
+    /// Resolve a reference to its fetch target, applying a configured registry
+    /// mirror. The returned reference is used only for the registry HTTP
+    /// fetch — storage and identity always use the original canonical reference.
+    fn mirror_reference(&self, reference: &ImageReference) -> ImageReference {
+        match self.mirrors.get(&reference.registry) {
+            Some(mirror) if !mirror.is_empty() => {
+                tracing::info!(
+                    registry = %reference.registry,
+                    mirror = %mirror,
+                    "Pulling via configured registry mirror"
+                );
+                let mut mirrored = reference.clone();
+                mirror.clone_into(&mut mirrored.registry);
+                mirrored
+            }
+            _ => reference.clone(),
         }
     }
 
@@ -161,8 +201,12 @@ impl ImagePuller {
     async fn pull_and_store(&self, reference: &ImageReference) -> Result<OciImage> {
         let full_ref = reference.full_reference();
 
+        // Fetch from a configured registry mirror when one applies; the image
+        // keeps its canonical reference (full_ref) for storage and identity.
+        let fetch = self.mirror_reference(reference);
+
         // Get the manifest digest for storage key
-        let digest = self.puller.pull_manifest_digest(reference).await?;
+        let digest = self.puller.pull_manifest_digest(&fetch).await?;
 
         // Check if we already have this digest (different tag, same content)
         if let Some(stored) = self.store.get_by_digest(&digest).await {
@@ -196,7 +240,7 @@ impl ImagePuller {
         // pulls (network error, signature failure, disk error) don't accumulate
         // under store_dir/tmp — each can be hundreds of MB and is never counted
         // toward the cache size or evicted by the LRU.
-        if let Err(e) = self.puller.pull(reference, &tmp_dir).await {
+        if let Err(e) = self.puller.pull(&fetch, &tmp_dir).await {
             let _ = std::fs::remove_dir_all(&tmp_dir);
             return Err(e);
         }

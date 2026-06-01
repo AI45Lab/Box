@@ -4,6 +4,24 @@ All notable changes to A3S Box will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- Registry mirrors: `A3S_REGISTRY_MIRRORS=host=mirror,...` pulls image content
+  from a configured mirror while preserving the canonical image identity in the
+  store (e.g. fetch `registry.k8s.io`/`gcr.io` images via an accessible mirror).
+
+### Fixed
+- CRI image identity now follows the digest, matching real runtimes:
+  - `ListImages`/`ImageStatus` coalesce references by content digest, so an
+    image with multiple tags appears once with all `repo_tags`.
+  - `ImageStatus` resolves an image by exact reference, image id (digest), or an
+    unnormalized name (e.g. a tagless name defaulting to `:latest`).
+  - `RemoveImage` accepts an image id (digest), not just a tag/reference.
+  - `PullImage` returns the content digest as `image_ref`, so different tags of
+    the same image dedupe to one image id.
+  - Together these pass the critest Image Manager conformance specs (public
+    image pull/remove with and without tag, and the listImage tag/repoTag
+    counts).
+
 ## [2.0.6] — 2026-06-01
 
 ### Added

@@ -9,7 +9,7 @@ use futures::Stream;
 use tonic::{Request, Response, Status};
 
 use a3s_box_core::StoredImage;
-use a3s_box_runtime::oci::{ImagePuller, ImageStore, RegistryAuth};
+use a3s_box_runtime::oci::{ImagePuller, ImageReference, ImageStore, RegistryAuth};
 
 use crate::cri_api::image_service_server::ImageService;
 use crate::cri_api::*;
@@ -17,20 +17,69 @@ use crate::error::box_error_to_status;
 
 type CriImageResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 
-fn image_summary(img: StoredImage) -> Image {
+/// Strip a `:tag` suffix from an image reference, leaving the repository name.
+///
+/// A `:` only separates a tag when it appears in the final path segment, so
+/// registry ports such as `host:5000/img` are preserved.
+fn repo_name(reference: &str) -> &str {
+    let segment_start = reference.rfind('/').map_or(0, |i| i + 1);
+    match reference[segment_start..].find(':') {
+        Some(rel) => &reference[..segment_start + rel],
+        None => reference,
+    }
+}
+
+/// Build a single CRI [`Image`] from one or more stored images that share a
+/// content digest.
+///
+/// CRI identifies an image by its digest (`id`); multiple tags pointing at the
+/// same digest collapse into one image whose `repo_tags` lists every tag. The
+/// group must be non-empty.
+fn coalesced_image(group: &[StoredImage]) -> Image {
+    let first = &group[0];
+    let mut repo_tags: Vec<String> = group.iter().map(|i| i.reference.clone()).collect();
+    repo_tags.sort();
+    repo_tags.dedup();
+    let mut repo_digests: Vec<String> = group
+        .iter()
+        .map(|i| format!("{}@{}", repo_name(&i.reference), first.digest))
+        .collect();
+    repo_digests.sort();
+    repo_digests.dedup();
     Image {
-        id: img.digest.clone(),
-        repo_tags: vec![img.reference.clone()],
-        repo_digests: vec![format!("{}@{}", img.reference, img.digest)],
-        size: img.size_bytes,
+        id: first.digest.clone(),
+        repo_tags,
+        repo_digests,
+        size: first.size_bytes,
         uid: None,
         username: String::new(),
         spec: Some(ImageSpec {
-            image: img.reference,
+            image: first.reference.clone(),
             annotations: Default::default(),
         }),
         pinned: false,
     }
+}
+
+/// Group stored images by digest into coalesced CRI images.
+fn coalesce_images(stored: Vec<StoredImage>) -> Vec<Image> {
+    let mut by_digest: std::collections::BTreeMap<String, Vec<StoredImage>> =
+        std::collections::BTreeMap::new();
+    for img in stored {
+        by_digest.entry(img.digest.clone()).or_default().push(img);
+    }
+    by_digest
+        .into_values()
+        .map(|group| coalesced_image(&group))
+        .collect()
+}
+
+/// Whether an image matches a CRI `ImageFilter` image reference (by id, tag,
+/// or digest).
+fn image_matches_filter(image: &Image, filter: &str) -> bool {
+    image.id == filter
+        || image.repo_tags.iter().any(|t| t == filter)
+        || image.repo_digests.iter().any(|d| d == filter)
 }
 
 /// A3S Box implementation of the CRI ImageService.
@@ -48,6 +97,32 @@ impl BoxImageService {
             image_puller,
         }
     }
+
+    /// Resolve a CRI image reference to its stored content digest (the image
+    /// id used by ListImages / ImageStatus).
+    ///
+    /// CRI may address an image by its exact stored reference, by its image id
+    /// (digest), or by an unnormalized name (e.g. without a tag, which
+    /// defaults to `:latest`).
+    async fn resolve_digest(&self, image: &str) -> Option<String> {
+        // Exact stored reference (e.g. `repo:tag`).
+        if let Some(img) = self.image_store.get(image).await {
+            return Some(img.digest);
+        }
+        // Image id (a bare `sha256:...`) or a `name@sha256:...` digest pin —
+        // match on the digest component.
+        let digest_part = image.rsplit_once('@').map_or(image, |(_, digest)| digest);
+        if let Some(img) = self.image_store.get_by_digest(digest_part).await {
+            return Some(img.digest);
+        }
+        // Unnormalized name (e.g. a tagless name defaulting to `:latest`).
+        if let Ok(parsed) = ImageReference::parse(image) {
+            if let Some(img) = self.image_store.get(&parsed.full_reference()).await {
+                return Some(img.digest);
+            }
+        }
+        None
+    }
 }
 
 #[tonic::async_trait]
@@ -58,11 +133,17 @@ impl ImageService for BoxImageService {
         &self,
         request: Request<ListImagesRequest>,
     ) -> Result<Response<ListImagesResponse>, Status> {
-        let _req = request.into_inner();
+        let req = request.into_inner();
+        let filter = req
+            .filter
+            .and_then(|filter| filter.image)
+            .map(|image| image.image)
+            .filter(|image| !image.is_empty());
 
-        let stored_images = self.image_store.list().await;
-
-        let images: Vec<Image> = stored_images.into_iter().map(image_summary).collect();
+        let mut images = coalesce_images(self.image_store.list().await);
+        if let Some(filter) = filter {
+            images.retain(|image| image_matches_filter(image, &filter));
+        }
 
         Ok(Response::new(ListImagesResponse { images }))
     }
@@ -78,20 +159,9 @@ impl ImageService for BoxImageService {
             .map(|image| image.image)
             .filter(|image| !image.is_empty());
 
-        let mut images: Vec<Image> = self
-            .image_store
-            .list()
-            .await
-            .into_iter()
-            .map(image_summary)
-            .collect();
+        let mut images = coalesce_images(self.image_store.list().await);
         if let Some(image_filter) = image_filter {
-            images.retain(|image| {
-                image
-                    .spec
-                    .as_ref()
-                    .is_some_and(|spec| spec.image == image_filter)
-            });
+            images.retain(|image| image_matches_filter(image, &image_filter));
         }
 
         let stream: Self::StreamImagesStream =
@@ -110,9 +180,23 @@ impl ImageService for BoxImageService {
             .image
             .ok_or_else(|| Status::invalid_argument("image spec required"))?;
 
-        let stored = self.image_store.get(&image_spec.image).await;
+        let digest = self.resolve_digest(&image_spec.image).await;
 
-        let image = stored.map(image_summary);
+        // Coalesce every reference sharing the digest into one image so
+        // `repo_tags` reflects all tags (CRI identifies images by digest).
+        let image = match digest {
+            Some(digest) => {
+                let group: Vec<StoredImage> = self
+                    .image_store
+                    .list()
+                    .await
+                    .into_iter()
+                    .filter(|img| img.digest == digest)
+                    .collect();
+                (!group.is_empty()).then(|| coalesced_image(&group))
+            }
+            None => None,
+        };
 
         Ok(Response::new(ImageStatusResponse {
             image,
@@ -131,16 +215,20 @@ impl ImageService for BoxImageService {
 
         tracing::info!(image = %image_spec.image, "CRI PullImage");
 
-        let _oci_image = self
-            .image_puller
+        self.image_puller
             .pull(&image_spec.image)
             .await
             .map_err(box_error_to_status)?;
 
-        // Return the image reference as the image_ref
-        Ok(Response::new(PullImageResponse {
-            image_ref: image_spec.image,
-        }))
+        // CRI uses the content-addressable image id (digest) as the canonical
+        // image_ref, so callers can dedupe different tags of the same image.
+        // Fall back to the requested reference if the digest can't be resolved.
+        let image_ref = self
+            .resolve_digest(&image_spec.image)
+            .await
+            .unwrap_or(image_spec.image);
+
+        Ok(Response::new(PullImageResponse { image_ref }))
     }
 
     async fn remove_image(
@@ -255,6 +343,99 @@ mod tests {
             .collect();
         assert!(refs.contains(&"nginx:latest"));
         assert!(refs.contains(&"alpine:3.18"));
+    }
+
+    #[tokio::test]
+    async fn test_list_images_coalesces_tags_by_digest() {
+        // Three tags of one digest must collapse into a single image whose
+        // repo_tags lists all three (CRI identifies images by digest).
+        let (svc, _tmp) = make_test_service();
+        put_test_image(&svc.image_store, "img:1", "sha256:same").await;
+        put_test_image(&svc.image_store, "img:2", "sha256:same").await;
+        put_test_image(&svc.image_store, "img:3", "sha256:same").await;
+
+        let resp = svc
+            .list_images(Request::new(ListImagesRequest { filter: None }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(resp.images.len(), 1, "one digest => one image");
+        let mut tags = resp.images[0].repo_tags.clone();
+        tags.sort();
+        assert_eq!(tags, vec!["img:1", "img:2", "img:3"]);
+        assert_eq!(resp.images[0].id, "sha256:same");
+    }
+
+    #[tokio::test]
+    async fn test_image_status_resolves_untagged_name() {
+        // CRI ImageStatus may be queried by an untagged name; it must resolve
+        // to the stored `:latest` reference and report it in repo_tags.
+        let (svc, _tmp) = make_test_service();
+        put_test_image(&svc.image_store, "docker.io/library/nginx:latest", "sha256:n1").await;
+
+        let resp = svc
+            .image_status(Request::new(ImageStatusRequest {
+                image: Some(ImageSpec {
+                    image: "nginx".to_string(),
+                    annotations: Default::default(),
+                }),
+                verbose: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let image = resp.image.expect("untagged name should resolve");
+        assert_eq!(image.id, "sha256:n1");
+        assert!(image
+            .repo_tags
+            .contains(&"docker.io/library/nginx:latest".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_image_status_resolves_by_digest() {
+        // ImageStatus queried by image id (digest) must return the image.
+        let (svc, _tmp) = make_test_service();
+        put_test_image(&svc.image_store, "redis:7", "sha256:r7").await;
+
+        let resp = svc
+            .image_status(Request::new(ImageStatusRequest {
+                image: Some(ImageSpec {
+                    image: "sha256:r7".to_string(),
+                    annotations: Default::default(),
+                }),
+                verbose: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let image = resp.image.expect("digest should resolve");
+        assert_eq!(image.id, "sha256:r7");
+        assert!(image.repo_tags.contains(&"redis:7".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_image_status_resolves_by_name_at_digest() {
+        // ImageStatus queried by a `name@sha256:...` digest pin must resolve.
+        let (svc, _tmp) = make_test_service();
+        put_test_image(&svc.image_store, "busybox:1.36", "sha256:bb36").await;
+
+        let resp = svc
+            .image_status(Request::new(ImageStatusRequest {
+                image: Some(ImageSpec {
+                    image: "busybox@sha256:bb36".to_string(),
+                    annotations: Default::default(),
+                }),
+                verbose: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let image = resp.image.expect("name@digest should resolve");
+        assert_eq!(image.id, "sha256:bb36");
     }
 
     #[tokio::test]

@@ -139,33 +139,54 @@ impl ImageStore {
         Ok(stored)
     }
 
-    /// Remove an image by reference.
-    pub async fn remove(&self, reference: &str) -> Result<()> {
+    /// Remove an image by reference or by image ID (digest).
+    ///
+    /// The CRI `RemoveImage` may identify an image either by a repo
+    /// reference/tag or by its image ID (`sha256:<digest>`, as returned in
+    /// `ImageStatus`). When `image` does not match a stored reference key,
+    /// fall back to removing every reference that points at the matching
+    /// digest.
+    pub async fn remove(&self, image: &str) -> Result<()> {
         let mut index = self.index.write().await;
-        if let Some(image) = index.remove(reference) {
-            // Check if any other reference points to the same digest
-            let digest_still_used = index.values().any(|img| img.digest == image.digest);
-            drop(index);
 
-            if !digest_still_used && image.path.exists() {
-                std::fs::remove_dir_all(&image.path).map_err(|e| {
+        // Resolve the reference keys to remove: the exact reference if it is
+        // a known key, otherwise every key sharing the requested digest.
+        let keys: Vec<String> = if index.contains_key(image) {
+            vec![image.to_string()]
+        } else {
+            index
+                .values()
+                .filter(|img| img.digest == image)
+                .map(|img| img.reference.clone())
+                .collect()
+        };
+
+        if keys.is_empty() {
+            drop(index);
+            return Err(BoxError::OciImageError(format!("Image not found: {}", image)));
+        }
+
+        let removed: Vec<StoredImage> = keys.iter().filter_map(|k| index.remove(k)).collect();
+
+        // Delete each image's on-disk layout once no remaining reference
+        // points at the same digest. References sharing a digest share the
+        // same directory, so the `path.exists()` guard makes this idempotent.
+        for img in removed {
+            let digest_still_used = index.values().any(|other| other.digest == img.digest);
+            if !digest_still_used && img.path.exists() {
+                std::fs::remove_dir_all(&img.path).map_err(|e| {
                     BoxError::OciImageError(format!(
                         "Failed to remove image directory {}: {}",
-                        image.path.display(),
+                        img.path.display(),
                         e
                     ))
                 })?;
             }
-
-            self.save_index_inner().await?;
-            Ok(())
-        } else {
-            drop(index);
-            Err(BoxError::OciImageError(format!(
-                "Image not found: {}",
-                reference
-            )))
         }
+
+        drop(index);
+        self.save_index_inner().await?;
+        Ok(())
     }
 
     /// List all stored images.
@@ -418,6 +439,54 @@ mod tests {
 
         store.remove("nginx:latest").await.unwrap();
         assert!(store.get("nginx:latest").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_remove_by_digest() {
+        // CRI RemoveImage identifies the image by its ID (sha256 digest),
+        // not its tag. Removing by digest must drop the reference + layout.
+        let tmp = TempDir::new().unwrap();
+        let store_dir = tmp.path().join("store");
+        let source_dir = tmp.path().join("source");
+        create_test_oci_layout(&source_dir);
+
+        let store = ImageStore::new(&store_dir, 10 * 1024 * 1024).unwrap();
+        let stored = store
+            .put("gcr.io/test/img:test", "sha256:deadbeef", &source_dir)
+            .await
+            .unwrap();
+        let path = stored.path.clone();
+
+        store.remove("sha256:deadbeef").await.unwrap();
+        assert!(store.get("gcr.io/test/img:test").await.is_none());
+        assert!(store.get_by_digest("sha256:deadbeef").await.is_none());
+        assert!(!path.exists(), "on-disk layout should be deleted");
+    }
+
+    #[tokio::test]
+    async fn test_remove_by_digest_removes_all_tags() {
+        // Two tags sharing one digest: removing by digest drops both and
+        // deletes the shared layout exactly once.
+        let tmp = TempDir::new().unwrap();
+        let store_dir = tmp.path().join("store");
+        let source_dir = tmp.path().join("source");
+        create_test_oci_layout(&source_dir);
+
+        let store = ImageStore::new(&store_dir, 10 * 1024 * 1024).unwrap();
+        store
+            .put("img:v1", "sha256:shared", &source_dir)
+            .await
+            .unwrap();
+        let stored = store
+            .put("img:latest", "sha256:shared", &source_dir)
+            .await
+            .unwrap();
+        let path = stored.path.clone();
+
+        store.remove("sha256:shared").await.unwrap();
+        assert!(store.get("img:v1").await.is_none());
+        assert!(store.get("img:latest").await.is_none());
+        assert!(!path.exists(), "shared layout should be deleted");
     }
 
     #[tokio::test]
