@@ -175,6 +175,12 @@ impl VmManager {
                 env.push((format!("BOX_TMPFS_{}", i), tmpfs_spec.clone()));
             }
 
+            // Pass pod sysctls to guest init.
+            // Format: BOX_SYSCTL_<index>=<name>=<value>
+            for (i, (name, value)) in self.config.sysctls.iter().enumerate() {
+                env.push((format!("BOX_SYSCTL_{}", i), format!("{}={}", name, value)));
+            }
+
             // Pass security configuration to guest init
             let security_config = a3s_box_core::SecurityConfig::from_options(
                 &self.config.security_opt,

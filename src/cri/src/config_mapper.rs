@@ -46,8 +46,25 @@ pub fn pod_sandbox_config_to_box_config(
         port_map,
         network,
         hostname,
+        sysctls: parse_sysctls(config),
         ..Default::default()
     })
+}
+
+/// Extract pod-level sysctls from the CRI sandbox config.
+///
+/// Sorted by name for deterministic ordering (the guest applies them in order).
+fn parse_sysctls(config: &PodSandboxConfig) -> Vec<(String, String)> {
+    let Some(linux) = config.linux.as_ref() else {
+        return Vec::new();
+    };
+    let mut sysctls: Vec<(String, String)> = linux
+        .sysctls
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    sysctls.sort();
+    sysctls
 }
 
 fn parse_hostname(config: &PodSandboxConfig) -> Result<Option<String>> {
@@ -230,6 +247,40 @@ mod tests {
         let config = make_config(HashMap::new());
         let box_config = pod_sandbox_config_to_box_config(&config, DEFAULT_AGENT_IMAGE).unwrap();
         assert_eq!(box_config.image, DEFAULT_AGENT_IMAGE);
+    }
+
+    #[test]
+    fn test_sysctls_extracted_and_sorted() {
+        use crate::cri_api::LinuxPodSandboxConfig;
+        let mut config = make_config(HashMap::new());
+        config.linux = Some(LinuxPodSandboxConfig {
+            sysctls: HashMap::from([
+                (
+                    "net.ipv4.ip_local_port_range".to_string(),
+                    "1024 65000".to_string(),
+                ),
+                ("kernel.shm_rmid_forced".to_string(), "1".to_string()),
+            ]),
+            ..Default::default()
+        });
+        let box_config = pod_sandbox_config_to_box_config(&config, DEFAULT_AGENT_IMAGE).unwrap();
+        assert_eq!(
+            box_config.sysctls,
+            vec![
+                ("kernel.shm_rmid_forced".to_string(), "1".to_string()),
+                (
+                    "net.ipv4.ip_local_port_range".to_string(),
+                    "1024 65000".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_sysctls_empty_without_linux_config() {
+        let config = make_config(HashMap::new());
+        let box_config = pod_sandbox_config_to_box_config(&config, DEFAULT_AGENT_IMAGE).unwrap();
+        assert!(box_config.sysctls.is_empty());
     }
 
     #[test]

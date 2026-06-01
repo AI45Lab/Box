@@ -349,6 +349,13 @@ pub struct BoxConfig {
     #[serde(default)]
     pub security_opt: Vec<String>,
 
+    /// Kernel sysctls (name → value) applied in the guest at boot.
+    ///
+    /// Pod-level sysctls from the CRI `PodSandboxConfig`; the guest writes each
+    /// to `/proc/sys/<name with '.' as '/'>` once the VM is up.
+    #[serde(default)]
+    pub sysctls: Vec<(String, String)>,
+
     /// Run in privileged mode (disables all security restrictions)
     #[serde(default)]
     pub privileged: bool,
@@ -409,6 +416,7 @@ impl Default for BoxConfig {
             cap_add: vec![],
             cap_drop: vec![],
             security_opt: vec![],
+            sysctls: vec![],
             privileged: false,
             read_only: false,
             sidecar: None,

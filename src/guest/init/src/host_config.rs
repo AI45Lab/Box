@@ -1,13 +1,39 @@
-//! Guest hostname configuration.
+//! Guest hostname and sysctl configuration.
 
 use std::path::Path;
 
-/// Apply hostname configuration from `BOX_HOSTNAME`, if present.
+/// Apply host configuration from the boot environment: pod sysctls and, if
+/// present, the hostname.
 pub fn apply_from_env() -> Result<(), Box<dyn std::error::Error>> {
+    apply_sysctls_from_env();
+
     let Ok(hostname) = std::env::var("BOX_HOSTNAME") else {
         return Ok(());
     };
     apply_hostname(&hostname, Path::new("/etc/hostname"))
+}
+
+/// Apply pod sysctls passed as `BOX_SYSCTL_<index>=<name>=<value>`.
+///
+/// Each is written to `/proc/sys/<name with '.' as '/'>`. Best-effort: a sysctl
+/// the guest kernel does not expose is logged and skipped rather than aborting
+/// VM startup.
+fn apply_sysctls_from_env() {
+    let mut index = 0;
+    loop {
+        let Ok(spec) = std::env::var(format!("BOX_SYSCTL_{index}")) else {
+            break;
+        };
+        index += 1;
+        let Some((name, value)) = spec.split_once('=') else {
+            continue;
+        };
+        let path = format!("/proc/sys/{}", name.trim().replace('.', "/"));
+        match std::fs::write(&path, value) {
+            Ok(()) => tracing::info!("Applied sysctl {name}={value}"),
+            Err(e) => tracing::warn!("Failed to apply sysctl {name}={value} ({path}): {e}"),
+        }
+    }
 }
 
 fn apply_hostname(hostname: &str, hostname_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
