@@ -1176,11 +1176,16 @@ impl RuntimeService for BoxRuntimeService {
             return Ok(Response::new(RemoveContainerResponse {}));
         };
 
+        // CRI RemoveContainer force-removes: a still-running container is
+        // stopped first (timeout 0), then deleted — matching containerd/cri-o.
+        // stop_container handles the workload stop + sandbox VM teardown
+        // fallback and the multi-container guard.
         if container.state == ContainerState::Running {
-            return Err(Status::failed_precondition(format!(
-                "RemoveContainer requires a stopped container; container {} is Running",
-                container_id
-            )));
+            self.stop_container(Request::new(StopContainerRequest {
+                container_id: container_id.clone(),
+                timeout: 0,
+            }))
+            .await?;
         }
 
         if let Some(removed) = self.store.remove_container(container_id).await {

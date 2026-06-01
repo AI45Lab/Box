@@ -2650,7 +2650,7 @@ async fn test_remove_container_missing_is_idempotent() {
 }
 
 #[tokio::test]
-async fn test_remove_container_rejects_running_container() {
+async fn test_remove_container_force_stops_running_container() {
     let svc = make_test_service();
     svc.store
         .containers
@@ -2661,17 +2661,16 @@ async fn test_remove_container_rejects_running_container() {
         .mark_started("c-1", 2_000_000_000)
         .await;
 
+    // CRI RemoveContainer force-removes: a running container is stopped first,
+    // then deleted (no VM manager in the test, so the stop reconciles it).
     let result = svc
         .remove_container(Request::new(RemoveContainerRequest {
             container_id: "c-1".to_string(),
         }))
         .await;
 
-    assert!(result.is_err());
-    let err = result.unwrap_err();
-    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-    assert!(err.message().contains("requires a stopped container"));
-    assert!(svc.store.containers.get("c-1").await.is_some());
+    assert!(result.is_ok());
+    assert!(svc.store.containers.get("c-1").await.is_none());
 }
 
 // ── Container Status ─────────────────────────────────────────────
