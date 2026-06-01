@@ -145,6 +145,21 @@ fn kept_capabilities(capabilities: Option<&Capability>) -> Option<Vec<String>> {
     Some(kept.into_iter().collect())
 }
 
+/// Whether an AppArmor profile of the given name is currently loaded on the
+/// host (listed in `/sys/kernel/security/apparmor/profiles`).
+///
+/// Returns `false` when AppArmor is unavailable (file absent/unreadable), which
+/// makes a requested Localhost profile fail closed rather than run unconfined.
+fn apparmor_profile_loaded(name: &str) -> bool {
+    let Ok(content) = std::fs::read_to_string("/sys/kernel/security/apparmor/profiles") else {
+        return false;
+    };
+    // Each line is `<profile-name> (<mode>)`.
+    content
+        .lines()
+        .any(|line| line.split_whitespace().next() == Some(name))
+}
+
 #[derive(serde::Deserialize)]
 struct OciSeccompProfile {
     #[serde(rename = "defaultAction")]
@@ -1008,6 +1023,42 @@ impl RuntimeService for BoxRuntimeService {
             // so it applies to privileged containers too.
             if sc.readonly_rootfs {
                 env.push(("A3S_SEC_READONLY_ROOTFS".to_string(), "1".to_string()));
+            }
+            // AppArmor: a microVM cannot enforce an in-guest LSM profile, but a
+            // requested Localhost profile must not be silently ignored. Validate
+            // it against the host's loaded profiles and reject when it is not
+            // loaded (the CRI contract: an unloaded profile fails). A loaded
+            // profile is accepted but cannot be enforced in-guest. The modern
+            // `apparmor` SecurityProfile takes precedence over the deprecated
+            // `apparmor_profile` string.
+            #[allow(deprecated)] // clients (incl. critest) still send apparmor_profile
+            let apparmor_localhost = sc
+                .apparmor
+                .as_ref()
+                .filter(|profile| {
+                    profile.profile_type()
+                        == crate::cri_api::security_profile::ProfileType::Localhost
+                })
+                .map(|profile| profile.localhost_ref.clone())
+                .or_else(|| {
+                    sc.apparmor_profile
+                        .strip_prefix("localhost/")
+                        .map(|name| name.to_string())
+                });
+            if let Some(profile) = apparmor_localhost {
+                let profile = profile.trim();
+                if profile.is_empty() || !apparmor_profile_loaded(profile) {
+                    return Err(Status::failed_precondition(format!(
+                        "AppArmor profile 'localhost/{profile}' is not loaded"
+                    )));
+                }
+                tracing::warn!(
+                    container = %metadata.name,
+                    profile = %profile,
+                    "AppArmor localhost profile is loaded on the host but the microVM \
+                     runtime cannot enforce it in-guest; the container runs without \
+                     AppArmor confinement"
+                );
             }
         }
         let user = container_user_from_linux_config(config.linux.as_ref())

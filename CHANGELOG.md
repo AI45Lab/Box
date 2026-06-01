@@ -23,6 +23,12 @@ All notable changes to A3S Box will be documented in this file.
   `/etc/passwd` group when no `RunAsGroup` is set.
 
 ### Security
+- AppArmor: a requested Localhost profile (modern `apparmor` SecurityProfile or
+  the deprecated `apparmor_profile` string) is now validated against the host's
+  loaded profiles and the container is rejected when the profile is not loaded,
+  instead of being silently ignored. The microVM cannot enforce an in-guest LSM
+  profile, so a loaded profile is accepted with a warning that it is not
+  enforced. Passes critest "should fail with an unloaded profile".
 - Non-privileged containers are now restricted to the runtime default
   capability set (e.g. no `CAP_NET_ADMIN`/`CAP_SYS_ADMIN`), adjusted by the
   container's `add`/`drop` capabilities; privileged containers keep the full
