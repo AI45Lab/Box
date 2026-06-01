@@ -851,7 +851,13 @@ fn configure_child_process(
 
     let rootfs = rootfs
         .map(|rootfs| CString::new(rootfs.as_bytes()).expect("rootfs path was pre-validated"));
-    let workdir = CString::new(workdir.as_bytes()).expect("working directory was pre-validated");
+    // workdir (for chdir) is only used when chrooting into a rootfs, where
+    // build_command has already rejected an embedded NUL. Build the CString only
+    // in that case so a workdir containing a NUL with no rootfs set cannot panic
+    // this exec thread.
+    let workdir = rootfs
+        .as_ref()
+        .map(|_| CString::new(workdir.as_bytes()).expect("working directory was pre-validated"));
 
     // Build the seccomp BPF filter BEFORE fork: building allocates, and
     // allocating in the post-fork child is not async-signal-safe (malloc may
@@ -870,8 +876,10 @@ fn configure_child_process(
                 if libc::chroot(rootfs.as_ptr()) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-                if libc::chdir(workdir.as_ptr()) != 0 {
-                    return Err(std::io::Error::last_os_error());
+                if let Some(workdir) = workdir.as_ref() {
+                    if libc::chdir(workdir.as_ptr()) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
                 }
             }
             // Apply supplemental groups while still privileged — setgroups
