@@ -848,6 +848,18 @@ impl RuntimeService for BoxRuntimeService {
                     ProfileType::Unconfined => {}
                 }
             }
+            // CRI capabilities: drop the requested capabilities in the guest
+            // (effective/permitted/inheritable + bounding sets). "ALL" drops
+            // everything. Added capabilities need no action — the container
+            // already runs as full-capability root in the microVM.
+            if let Some(capabilities) = sc.capabilities.as_ref() {
+                if !capabilities.drop_capabilities.is_empty() {
+                    env.push((
+                        "A3S_SEC_CAP_DROP".to_string(),
+                        capabilities.drop_capabilities.join(","),
+                    ));
+                }
+            }
         }
         let user = container_user_from_linux_config(config.linux.as_ref())
             .or_else(|| image_config.and_then(|image| image.user.clone()));

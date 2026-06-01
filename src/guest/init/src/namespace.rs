@@ -396,7 +396,7 @@ fn should_drop_caps(cap_drop: &[String]) -> bool {
 /// permitted, and inheritable sets to prevent retention of already-held caps.
 /// Supports "ALL" to drop all capabilities, or individual capability names.
 #[cfg(target_os = "linux")]
-fn drop_capabilities(cap_drop: &[String]) -> Result<(), std::io::Error> {
+pub(crate) fn drop_capabilities(cap_drop: &[String]) -> Result<(), std::io::Error> {
     // Map capability names to their Linux constants
     let drop_all = cap_drop.iter().any(|c| c == "ALL");
 
@@ -428,9 +428,11 @@ fn drop_capabilities(cap_drop: &[String]) -> Result<(), std::io::Error> {
         }
     }
 
-    // Also clear the effective, permitted, and inheritable capability sets.
-    // The bounding set only limits future execve() — processes that already
-    // hold capabilities in their effective set retain them without this step.
+    // The bounding-set drop above only limits future execve(); a process that
+    // already holds the capabilities keeps them. Clear them from the effective,
+    // permitted, and inheritable sets so the drop actually takes effect, then
+    // clear the ambient set so they cannot be re-acquired.
+    clear_effective_caps(cap_drop)?;
     clear_ambient_and_inheritable_caps()?;
 
     Ok(())
@@ -454,9 +456,92 @@ fn clear_ambient_and_inheritable_caps() -> Result<(), std::io::Error> {
     Ok(())
 }
 
+/// Clear the dropped capabilities from the **effective, permitted, and
+/// inheritable** sets via `capset(2)`.
+///
+/// `PR_CAPBSET_DROP` only limits what a future `execve` can gain — it does NOT
+/// remove a capability the process currently holds. A privileged (root)
+/// container therefore keeps e.g. `CAP_NET_ADMIN` in its effective set unless we
+/// clear it here, so `capset` is required for `drop_capabilities` to actually
+/// take effect. Async-signal-safe: only `capget`/`capset` syscalls over
+/// stack-resident structs, no allocation, so it is safe in a post-fork child.
+#[cfg(target_os = "linux")]
+fn clear_effective_caps(cap_drop: &[String]) -> Result<(), std::io::Error> {
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+    // Defined locally — this libc version does not export the capability structs.
+    // Stable kernel ABI: capget/capset(hdr {version,pid}, data[2] {eff,perm,inh}).
+    #[repr(C)]
+    struct CapHeader {
+        version: u32,
+        pid: i32,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CapData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+
+    let mut header = CapHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let mut data = [CapData {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; 2];
+
+    if unsafe {
+        libc::syscall(
+            libc::SYS_capget,
+            &mut header as *mut CapHeader,
+            data.as_mut_ptr(),
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    if cap_drop.iter().any(|c| c == "ALL") {
+        for word in data.iter_mut() {
+            word.effective = 0;
+            word.permitted = 0;
+            word.inheritable = 0;
+        }
+    } else {
+        for name in cap_drop {
+            if let Some(cap) = cap_name_to_number(name) {
+                let word = (cap / 32) as usize;
+                if word < data.len() {
+                    let mask = !(1u32 << (cap % 32));
+                    data[word].effective &= mask;
+                    data[word].permitted &= mask;
+                    data[word].inheritable &= mask;
+                }
+            }
+        }
+    }
+
+    if unsafe {
+        libc::syscall(
+            libc::SYS_capset,
+            &mut header as *mut CapHeader,
+            data.as_ptr(),
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Map a Linux capability name to its numeric value.
 #[cfg(target_os = "linux")]
 fn cap_name_to_number(name: &str) -> Option<i32> {
+    // Accept both "NET_ADMIN" and "CAP_NET_ADMIN" (CRI naming varies).
+    let name = name.strip_prefix("CAP_").unwrap_or(name);
     // Standard Linux capability constants
     match name {
         "CHOWN" => Some(0),

@@ -473,6 +473,20 @@ fn build_command(
         .env
         .iter()
         .any(|entry| entry == "A3S_SEC_SECCOMP=default");
+    // CRI capability drop: A3S_SEC_CAP_DROP=NAME,NAME,... (or ALL) — the guest
+    // clears these from the child's effective/permitted/inheritable + bounding
+    // sets before exec.
+    let cap_drop: Vec<String> = spec
+        .env
+        .iter()
+        .find_map(|entry| entry.strip_prefix("A3S_SEC_CAP_DROP="))
+        .map(|csv| {
+            csv.split(',')
+                .map(|name| name.trim().to_string())
+                .filter(|name| !name.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
     configure_child_process(
         &mut command,
         spec.rootfs,
@@ -480,6 +494,7 @@ fn build_command(
         process_user,
         supplemental_groups,
         apply_seccomp,
+        cap_drop,
     );
     if spec.rootfs.is_none() {
         if let Some(dir) = spec.working_dir {
@@ -845,6 +860,7 @@ fn configure_child_process(
     user: Option<ProcessUser>,
     supplemental_groups: Vec<u32>,
     apply_seccomp: bool,
+    cap_drop: Vec<String>,
 ) {
     use std::ffi::CString;
     use std::os::unix::process::CommandExt;
@@ -866,6 +882,8 @@ fn configure_child_process(
     let seccomp_filter = apply_seccomp.then(crate::namespace::build_default_bpf_filter);
     #[cfg(not(target_os = "linux"))]
     let _ = apply_seccomp;
+    #[cfg(not(target_os = "linux"))]
+    let _ = &cap_drop;
 
     unsafe {
         command.pre_exec(move || {
@@ -896,6 +914,12 @@ fn configure_child_process(
             if let Some(user) = user {
                 user.apply()?;
             }
+            // Drop capabilities after the uid/gid switch (capset/prctl only —
+            // async-signal-safe) so a privileged container actually loses them.
+            #[cfg(target_os = "linux")]
+            if !cap_drop.is_empty() {
+                crate::namespace::drop_capabilities(&cap_drop)?;
+            }
             // Install the seccomp filter last — after chroot and the privilege
             // drop — so it is active across execve. Only the prebuilt filter is
             // installed here; no allocation happens in the post-fork child.
@@ -916,6 +940,7 @@ fn configure_child_process(
     _user: Option<ProcessUser>,
     _supplemental_groups: Vec<u32>,
     _apply_seccomp: bool,
+    _cap_drop: Vec<String>,
 ) {
 }
 
