@@ -1726,11 +1726,19 @@ async fn test_create_container_materializes_readonly_mount() {
 }
 
 #[tokio::test]
-async fn test_create_container_rejects_writable_mounts() {
+async fn test_create_container_materializes_writable_mount() {
     let svc = make_test_service();
     svc.store.sandboxes.add(test_sandbox("sb-1")).await;
+    put_test_oci_image(&svc.image_store, "nginx:latest").await;
 
-    let result = svc
+    // Mirrors the CRI volume conformance: a writable mount with selinux_relabel
+    // set. Both are now accepted (relabel is a no-op on this non-SELinux
+    // runtime); the source is materialized by copy into the rootfs so the
+    // host-created file is visible in the container.
+    let source = tempfile::tempdir().unwrap();
+    std::fs::write(source.path().join("testVolume.file"), b"data").unwrap();
+
+    let resp = svc
         .create_container(Request::new(CreateContainerRequest {
             pod_sandbox_id: "sb-1".to_string(),
             config: Some(ContainerConfig {
@@ -1738,24 +1746,32 @@ async fn test_create_container_rejects_writable_mounts() {
                     name: "mounted".to_string(),
                     attempt: 0,
                 }),
-                command: vec!["/bin/true".to_string()],
+                image: Some(ImageSpec {
+                    image: "nginx:latest".to_string(),
+                    annotations: HashMap::new(),
+                }),
+                command: vec!["nginx".to_string()],
                 mounts: vec![Mount {
                     container_path: "/data".to_string(),
-                    host_path: "/tmp".to_string(),
+                    host_path: source.path().to_string_lossy().to_string(),
                     readonly: false,
-                    selinux_relabel: false,
+                    selinux_relabel: true,
                     propagation: crate::cri_api::mount::MountPropagation::PropagationPrivate as i32,
                 }],
                 ..Default::default()
             }),
             sandbox_config: None,
         }))
-        .await;
+        .await
+        .unwrap()
+        .into_inner();
 
-    assert!(result.is_err());
-    let err = result.unwrap_err();
-    assert_eq!(err.code(), tonic::Code::Unimplemented);
-    assert!(err.message().contains("Writable CRI mounts"));
+    let container = svc.store.containers.get(&resp.container_id).await.unwrap();
+    assert_eq!(container.mounts.len(), 1);
+    let mounted_file = PathBuf::from(&container.rootfs_path)
+        .join("data")
+        .join("testVolume.file");
+    assert_eq!(std::fs::read_to_string(mounted_file).unwrap(), "data");
 }
 
 #[tokio::test]
