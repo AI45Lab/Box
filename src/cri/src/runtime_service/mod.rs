@@ -352,6 +352,12 @@ impl BoxRuntimeService {
                 self.store
                     .update_sandbox_state(&sandbox.id, SandboxState::NotReady)
                     .await;
+                // Crash recovery: a graceful shutdown already destroyed the VMs,
+                // but a crash (SIGKILL/OOM) leaves the shim microVM, its overlay
+                // mount, and the rootfs dirs orphaned. Reap them so they do not
+                // leak across restarts. No-op when nothing is left behind.
+                a3s_box_runtime::vm::reap::reap_orphaned_box(&sandbox.id);
+                self.cleanup_sandbox_rootfs(&sandbox.id).await;
             }
         }
 

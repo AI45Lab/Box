@@ -31,6 +31,13 @@ All notable changes to A3S Box will be documented in this file.
   network bridge). The guest applies an exact keep-set via `capset` + bounding
   drop before exec.
 
+### Added
+- Crash recovery: on startup the CRI reaps sandbox microVMs orphaned by a
+  previous crash/SIGKILL — it kills the leftover `a3s-box-shim` (matched by the
+  box id in its argv), unmounts its overlay, and removes its box directory —
+  instead of leaking the VM, mount, and disk across restarts. A graceful
+  shutdown already reaps VMs, so this is a no-op then.
+
 ### Fixed
 - The container log file is now created eagerly at `StartContainer` (instead of
   lazily when the first output arrives), so a caller that opens the log

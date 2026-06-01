@@ -3,6 +3,7 @@
 mod layout;
 mod network;
 mod ready;
+pub mod reap;
 mod spec;
 
 use std::path::{Path, PathBuf};
