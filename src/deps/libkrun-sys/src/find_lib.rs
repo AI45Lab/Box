@@ -195,17 +195,15 @@ mod tests {
         assert!(!has_exact_library(temp.path(), "krun"));
     }
 
+    // macOS-only: exercises `.dylib` matching; `temp` would be unused on other
+    // platforms (clippy `-D warnings`).
     #[test]
+    #[cfg(target_os = "macos")]
     fn test_has_exact_library_substring_prefix_issue() {
-        // This tests for a specific bug where "libkrunner" might incorrectly
-        // match when looking for "libkrun" due to substring matching
+        // Regression: "libkrunner" must not match a lookup for "libkrun" via
+        // substring — the rest is "er", not a valid extension.
         let temp = create_temp_lib_dir(&["libkrunner.dylib"]);
-
-        #[cfg(target_os = "macos")]
-        {
-            // libkrunner starts with libkrun but rest is "er", not a valid extension
-            assert!(!has_exact_library(temp.path(), "krun"));
-        }
+        assert!(!has_exact_library(temp.path(), "krun"));
     }
 
     #[test]

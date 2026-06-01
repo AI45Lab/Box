@@ -126,7 +126,10 @@ async fn shutdown_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
-        match (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) {
+        match (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::interrupt()),
+        ) {
             (Ok(mut sigterm), Ok(mut sigint)) => {
                 tokio::select! {
                     _ = sigterm.recv() => tracing::info!("Received SIGTERM, shutting down CRI"),

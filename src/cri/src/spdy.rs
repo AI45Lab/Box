@@ -78,7 +78,8 @@ impl HeaderCompressor {
             // zero — terminate once all input is consumed and the flush stopped
             // filling the whole buffer (nothing left pending). Guarding on
             // `produced == 0` here would busy-loop forever.
-            if matches!(status, Status::StreamEnd) || (in_pos >= input.len() && produced < buf.len())
+            if matches!(status, Status::StreamEnd)
+                || (in_pos >= input.len() && produced < buf.len())
             {
                 break;
             }
@@ -130,7 +131,11 @@ enum Frame {
     /// Client opened a new stream; the compressed header block is skipped.
     SynStream { stream_id: u32 },
     /// Stream data (or a half-close when `data` is empty and `fin` is set).
-    Data { stream_id: u32, fin: bool, data: Vec<u8> },
+    Data {
+        stream_id: u32,
+        fin: bool,
+        data: Vec<u8>,
+    },
     /// PING control frame; echoed back to keep the connection alive.
     Ping { id: u32 },
     /// SETTINGS / WINDOW_UPDATE / RST_STREAM / GOAWAY / HEADERS — ignored.
@@ -254,7 +259,11 @@ async fn collect_streams<R: AsyncReadExt + Unpin, W: AsyncWriteExt + Unpin>(
             }
         }
     }
-    tracing::debug!(collected = opened, expected = expected.len(), "spdy: streams collected");
+    tracing::debug!(
+        collected = opened,
+        expected = expected.len(),
+        "spdy: streams collected"
+    );
     Ok(ids)
 }
 
@@ -446,16 +455,19 @@ async fn serve_exec_tty(stream: TcpStream, session: &StreamingSession) -> Result
         rows: 24,
     };
     let (mut pty_read, mut pty_write) = tokio::io::split(pty_stream);
-    write_pty_frame(&mut pty_write, pty::FRAME_PTY_REQUEST, &serde_json::to_vec(&request)?).await?;
+    write_pty_frame(
+        &mut pty_write,
+        pty::FRAME_PTY_REQUEST,
+        &serde_json::to_vec(&request)?,
+    )
+    .await?;
 
     // Client → guest PTY: stdin data and resize requests.
     let client_to_pty = async move {
         loop {
             match read_frame(&mut reader).await {
                 Ok(Some(Frame::Data {
-                    stream_id,
-                    data,
-                    ..
+                    stream_id, data, ..
                 })) if Some(stream_id) == stdin_id && !data.is_empty() => {
                     if write_pty_frame(&mut pty_write, pty::FRAME_PTY_DATA, &data)
                         .await
@@ -464,16 +476,18 @@ async fn serve_exec_tty(stream: TcpStream, session: &StreamingSession) -> Result
                         break;
                     }
                 }
-                Ok(Some(Frame::Data { stream_id, data, .. }))
-                    if Some(stream_id) == resize_id && !data.is_empty() =>
-                {
+                Ok(Some(Frame::Data {
+                    stream_id, data, ..
+                })) if Some(stream_id) == resize_id && !data.is_empty() => {
                     if let Ok(size) = serde_json::from_slice::<TerminalSize>(&data) {
                         let resize = pty::PtyResize {
                             cols: size.width,
                             rows: size.height,
                         };
                         if let Ok(payload) = serde_json::to_vec(&resize) {
-                            let _ = write_pty_frame(&mut pty_write, pty::FRAME_PTY_RESIZE, &payload).await;
+                            let _ =
+                                write_pty_frame(&mut pty_write, pty::FRAME_PTY_RESIZE, &payload)
+                                    .await;
                         }
                     }
                 }
@@ -490,8 +504,7 @@ async fn serve_exec_tty(stream: TcpStream, session: &StreamingSession) -> Result
             let mut header = [0u8; 5];
             while pty_read.read_exact(&mut header).await.is_ok() {
                 let frame_type = header[0];
-                let len =
-                    u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+                let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
                 if len > pty::MAX_FRAME_PAYLOAD {
                     break;
                 }
@@ -660,7 +673,9 @@ async fn write_pty_frame<W: AsyncWriteExt + Unpin>(
     payload: &[u8],
 ) -> std::io::Result<()> {
     writer.write_all(&[frame_type]).await?;
-    writer.write_all(&(payload.len() as u32).to_be_bytes()).await?;
+    writer
+        .write_all(&(payload.len() as u32).to_be_bytes())
+        .await?;
     writer.write_all(payload).await?;
     Ok(())
 }

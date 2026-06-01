@@ -308,7 +308,7 @@ mod tests {
         assert!(parse_time_arg("2h").is_some());
         assert!(parse_time_arg("1d").is_some());
         assert!(parse_time_arg("30").is_some()); // bare number = seconds
-        // RFC3339 parses exactly.
+                                                 // RFC3339 parses exactly.
         assert_eq!(
             parse_time_arg("2024-01-15T10:30:00Z").unwrap(),
             chrono::DateTime::parse_from_rfc3339("2024-01-15T10:30:00Z")

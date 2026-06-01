@@ -112,7 +112,9 @@ pub(super) fn verify_fulcio_identity(
 }
 
 /// Extract the public key bytes (SEC1 uncompressed point) from an X.509 certificate.
-pub(super) fn extract_cert_public_key(cert: &x509_cert::Certificate) -> std::result::Result<Vec<u8>, String> {
+pub(super) fn extract_cert_public_key(
+    cert: &x509_cert::Certificate,
+) -> std::result::Result<Vec<u8>, String> {
     cert.tbs_certificate
         .subject_public_key_info
         .subject_public_key

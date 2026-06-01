@@ -136,7 +136,9 @@ pub async fn sign_image(
 /// Parse a PEM-encoded ECDSA P-256 private key.
 ///
 /// Supports "EC PRIVATE KEY" (SEC1) and "PRIVATE KEY" (PKCS#8) PEM formats.
-pub(super) fn parse_pem_private_key(pem_bytes: &[u8]) -> std::result::Result<p256::ecdsa::SigningKey, String> {
+pub(super) fn parse_pem_private_key(
+    pem_bytes: &[u8],
+) -> std::result::Result<p256::ecdsa::SigningKey, String> {
     let pem_str = std::str::from_utf8(pem_bytes)
         .map_err(|e| format!("PEM file is not valid UTF-8: {}", e))?;
 

@@ -20,10 +20,9 @@ mod crypto;
 mod sign;
 
 use crypto::*;
-pub use sign::{sign_image, SignResult};
 #[cfg(test)]
 use sign::{extract_pem_content, parse_pem_private_key};
-
+pub use sign::{sign_image, SignResult};
 
 /// Image signature verification policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -458,7 +457,6 @@ async fn verify_cosign_keyless(
 
 /// Fulcio OIDC issuer extension OID: 1.3.6.1.4.1.57264.1.1
 const FULCIO_ISSUER_OID: &str = "1.3.6.1.4.1.57264.1.1";
-
 
 /// Cosign signature envelope stored in the OCI layer.
 #[derive(Debug, Serialize, Deserialize)]
@@ -1051,4 +1049,3 @@ mod tests {
         assert_eq!(result.signature_tag, "sha256-abc123.sig");
     }
 }
-

@@ -672,7 +672,10 @@ mod tests {
         let streamed = writer.finalize_hex();
 
         let expected = format!("{:x}", Sha256::digest(payload));
-        assert_eq!(streamed, expected, "streamed hash must equal sha256(payload)");
+        assert_eq!(
+            streamed, expected,
+            "streamed hash must equal sha256(payload)"
+        );
         // The file on disk must contain exactly the written bytes.
         assert_eq!(std::fs::read(&path).unwrap(), payload);
     }

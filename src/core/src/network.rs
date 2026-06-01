@@ -263,11 +263,10 @@ impl Ipam {
         // Gateway is network + 1. Use checked arithmetic so a network address of
         // 255.255.255.255 cannot overflow (panic in debug / wrap in release).
         let net_u32 = u32::from(network);
-        let gateway = Ipv4Addr::from(
-            net_u32
-                .checked_add(1)
-                .ok_or_else(|| format!("network address '{}' has no room for a gateway", network))?,
-        );
+        let gateway =
+            Ipv4Addr::from(net_u32.checked_add(1).ok_or_else(|| {
+                format!("network address '{}' has no room for a gateway", network)
+            })?);
 
         Ok(Self {
             network,

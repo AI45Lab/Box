@@ -181,7 +181,10 @@ impl PasstManager {
     /// after dropping privileges) so the real cause is surfaced instead of a
     /// misleading 5-second timeout.
     fn wait_for_socket(&mut self) -> Result<()> {
-        let stderr_path = self.socket_path.parent().map(|p| p.join("passt.stderr.log"));
+        let stderr_path = self
+            .socket_path
+            .parent()
+            .map(|p| p.join("passt.stderr.log"));
         let read_stderr = |path: &Option<PathBuf>| -> String {
             path.as_ref()
                 .and_then(|p| std::fs::read_to_string(p).ok())

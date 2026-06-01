@@ -3205,7 +3205,10 @@ async fn test_reopen_container_log_empty_path() {
 #[tokio::test]
 async fn test_reopen_container_log_signals_supervisor() {
     let svc = make_test_service();
-    svc.store.containers.add(test_container("c-1", "sb-1")).await;
+    svc.store
+        .containers
+        .add(test_container("c-1", "sb-1"))
+        .await;
 
     // Register a reopen handle as StartContainer does for a running container.
     // The actual file reopen happens in the exit supervisor (integration-tested
