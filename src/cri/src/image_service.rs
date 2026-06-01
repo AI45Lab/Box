@@ -9,7 +9,7 @@ use futures::Stream;
 use tonic::{Request, Response, Status};
 
 use a3s_box_core::StoredImage;
-use a3s_box_runtime::oci::{ImagePuller, ImageReference, ImageStore, RegistryAuth};
+use a3s_box_runtime::oci::{ImagePuller, ImageReference, ImageStore, OciImage, RegistryAuth};
 
 use crate::cri_api::image_service_server::ImageService;
 use crate::cri_api::*;
@@ -29,6 +29,34 @@ fn repo_name(reference: &str) -> &str {
     }
 }
 
+/// Split an OCI config `User` string into a CRI uid / username.
+///
+/// The user may be `uid`, `uid:gid`, `name`, or `name:group`. A numeric
+/// principal yields a uid; a named principal yields a username.
+fn parse_image_user(user: &str) -> (Option<i64>, String) {
+    let principal = user.split(':').next().unwrap_or(user);
+    if principal.is_empty() {
+        return (None, String::new());
+    }
+    match principal.parse::<i64>() {
+        Ok(uid) => (Some(uid), String::new()),
+        Err(_) => (None, principal.to_string()),
+    }
+}
+
+/// Read the configured user of a stored image from its on-disk OCI config.
+///
+/// Returns empty values when the image declares no user or its config can't be
+/// read (the CRI `Image` then reports neither a uid nor a username).
+fn image_user(path: &std::path::Path) -> (Option<i64>, String) {
+    OciImage::from_path(path)
+        .ok()
+        .and_then(|image| image.config().user.clone())
+        .filter(|user| !user.is_empty())
+        .map(|user| parse_image_user(&user))
+        .unwrap_or((None, String::new()))
+}
+
 /// Build a single CRI [`Image`] from one or more stored images that share a
 /// content digest.
 ///
@@ -37,22 +65,30 @@ fn repo_name(reference: &str) -> &str {
 /// group must be non-empty.
 fn coalesced_image(group: &[StoredImage]) -> Image {
     let first = &group[0];
-    let mut repo_tags: Vec<String> = group.iter().map(|i| i.reference.clone()).collect();
+    let mut repo_tags: Vec<String> = Vec::new();
+    let mut repo_digests: Vec<String> = Vec::new();
+    for img in group {
+        if img.reference.contains('@') {
+            // A digest-pinned reference (`repo@sha256:...`) is a repo digest,
+            // not a tag — an image pulled by digest has no repo tags.
+            repo_digests.push(img.reference.clone());
+        } else {
+            repo_tags.push(img.reference.clone());
+            repo_digests.push(format!("{}@{}", repo_name(&img.reference), first.digest));
+        }
+    }
     repo_tags.sort();
     repo_tags.dedup();
-    let mut repo_digests: Vec<String> = group
-        .iter()
-        .map(|i| format!("{}@{}", repo_name(&i.reference), first.digest))
-        .collect();
     repo_digests.sort();
     repo_digests.dedup();
+    let (uid, username) = image_user(&first.path);
     Image {
         id: first.digest.clone(),
         repo_tags,
         repo_digests,
         size: first.size_bytes,
-        uid: None,
-        username: String::new(),
+        uid: uid.map(|value| Int64Value { value }),
+        username,
         spec: Some(ImageSpec {
             image: first.reference.clone(),
             annotations: Default::default(),
@@ -310,6 +346,18 @@ mod tests {
 
     // ── ListImages ───────────────────────────────────────────────────
 
+    #[test]
+    fn test_parse_image_user() {
+        assert_eq!(parse_image_user("1002"), (Some(1002), String::new()));
+        assert_eq!(parse_image_user("1002:1002"), (Some(1002), String::new()));
+        assert_eq!(parse_image_user("nobody"), (None, "nobody".to_string()));
+        assert_eq!(
+            parse_image_user("nobody:nogroup"),
+            (None, "nobody".to_string())
+        );
+        assert_eq!(parse_image_user(""), (None, String::new()));
+    }
+
     #[tokio::test]
     async fn test_list_images_empty() {
         let (svc, _tmp) = make_test_service();
@@ -365,6 +413,31 @@ mod tests {
         tags.sort();
         assert_eq!(tags, vec!["img:1", "img:2", "img:3"]);
         assert_eq!(resp.images[0].id, "sha256:same");
+    }
+
+    #[tokio::test]
+    async fn test_list_images_digest_pin_is_repo_digest_not_tag() {
+        // An image pulled by digest (`repo@sha256:...`) has no repo tag; the
+        // pinned reference must be reported as a repo digest.
+        let (svc, _tmp) = make_test_service();
+        put_test_image(
+            &svc.image_store,
+            "gcr.io/x/img@sha256:pinned",
+            "sha256:pinned",
+        )
+        .await;
+
+        let resp = svc
+            .list_images(Request::new(ListImagesRequest { filter: None }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(resp.images.len(), 1);
+        assert!(resp.images[0].repo_tags.is_empty(), "no tag for a digest pin");
+        assert!(resp.images[0]
+            .repo_digests
+            .contains(&"gcr.io/x/img@sha256:pinned".to_string()));
     }
 
     #[tokio::test]

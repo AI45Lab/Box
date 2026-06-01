@@ -13,14 +13,20 @@ All notable changes to A3S Box will be documented in this file.
 - CRI image identity now follows the digest, matching real runtimes:
   - `ListImages`/`ImageStatus` coalesce references by content digest, so an
     image with multiple tags appears once with all `repo_tags`.
-  - `ImageStatus` resolves an image by exact reference, image id (digest), or an
-    unnormalized name (e.g. a tagless name defaulting to `:latest`).
+  - `ImageStatus` resolves an image by exact reference, image id (digest), a
+    `name@sha256:...` digest pin, or an unnormalized name (e.g. a tagless name
+    defaulting to `:latest`).
   - `RemoveImage` accepts an image id (digest), not just a tag/reference.
   - `PullImage` returns the content digest as `image_ref`, so different tags of
     the same image dedupe to one image id.
-  - Together these pass the critest Image Manager conformance specs (public
-    image pull/remove with and without tag, and the listImage tag/repoTag
-    counts).
+  - An image pulled by digest (`repo@sha256:...`) is reported with that
+    reference as a `repo_digest` and empty `repo_tags` (digest pins have no tag).
+  - `ImageStatus`/`ListImages` surface the image's configured user as `uid`
+    (numeric `uid`/`uid:gid`) or `username` (named user), from the OCI config.
+  - The full critest Image Manager conformance suite now passes (7/7): public
+    image pull/remove by tag, without tag, and by digest; image status across
+    all reference kinds; non-empty uid/username; and the listImage image and
+    repoTag counts.
 
 ## [2.0.6] — 2026-06-01
 
