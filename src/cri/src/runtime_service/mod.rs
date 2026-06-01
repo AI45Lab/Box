@@ -87,6 +87,64 @@ const CRI_CONTAINER_ROOTFS_HOST_DIR: &str = "cri-container-rootfs";
 const CRI_CONTAINER_ROOTFS_GUEST_BASE: &str = "/run/a3s/cri/container-rootfs";
 const CONTAINER_EVENT_BUFFER: usize = 1024;
 
+/// Capabilities a non-privileged container keeps by default (matches the
+/// containerd/runc default set). A privileged container keeps the full set.
+const DEFAULT_CAPABILITIES: &[&str] = &[
+    "CHOWN",
+    "DAC_OVERRIDE",
+    "FSETID",
+    "FOWNER",
+    "MKNOD",
+    "NET_RAW",
+    "SETGID",
+    "SETUID",
+    "SETFCAP",
+    "SETPCAP",
+    "NET_BIND_SERVICE",
+    "SYS_CHROOT",
+    "KILL",
+    "AUDIT_WRITE",
+];
+
+/// Compute the capability set a non-privileged container keeps: the default set
+/// unioned with `add_capabilities` and minus `drop_capabilities` (`ALL` is
+/// honored on either side). Returns `None` when the container should keep the
+/// full set (an `add` of `ALL`), in which case no keep-set is emitted.
+fn kept_capabilities(capabilities: Option<&Capability>) -> Option<Vec<String>> {
+    let normalize = |cap: &str| {
+        cap.trim()
+            .strip_prefix("CAP_")
+            .unwrap_or(cap.trim())
+            .to_uppercase()
+    };
+    let mut kept: std::collections::BTreeSet<String> =
+        DEFAULT_CAPABILITIES.iter().map(|c| c.to_string()).collect();
+    if let Some(capabilities) = capabilities {
+        if capabilities
+            .add_capabilities
+            .iter()
+            .any(|c| normalize(c) == "ALL")
+        {
+            return None;
+        }
+        if capabilities
+            .drop_capabilities
+            .iter()
+            .any(|c| normalize(c) == "ALL")
+        {
+            kept.clear();
+        } else {
+            for cap in &capabilities.drop_capabilities {
+                kept.remove(&normalize(cap));
+            }
+        }
+        for cap in &capabilities.add_capabilities {
+            kept.insert(normalize(cap));
+        }
+    }
+    Some(kept.into_iter().collect())
+}
+
 #[derive(serde::Deserialize)]
 struct OciSeccompProfile {
     #[serde(rename = "defaultAction")]
@@ -922,16 +980,15 @@ impl RuntimeService for BoxRuntimeService {
                     ProfileType::Unconfined => {}
                 }
             }
-            // CRI capabilities: drop the requested capabilities in the guest
-            // (effective/permitted/inheritable + bounding sets). "ALL" drops
-            // everything. Added capabilities need no action — the container
-            // already runs as full-capability root in the microVM.
-            if let Some(capabilities) = sc.capabilities.as_ref() {
-                if !capabilities.drop_capabilities.is_empty() {
-                    env.push((
-                        "A3S_SEC_CAP_DROP".to_string(),
-                        capabilities.drop_capabilities.join(","),
-                    ));
+            // CRI capabilities: a privileged container keeps the full set; a
+            // non-privileged one is restricted to the runtime default set,
+            // adjusted by add/drop (A3S_SEC_CAP_KEEP — the guest drops every
+            // capability not listed). This is what stops a non-privileged
+            // container from doing privileged operations (e.g. creating a bridge
+            // with CAP_NET_ADMIN). An `add` of `ALL` keeps the full set.
+            if !sc.privileged {
+                if let Some(kept) = kept_capabilities(sc.capabilities.as_ref()) {
+                    env.push(("A3S_SEC_CAP_KEEP".to_string(), kept.join(",")));
                 }
             }
             // no_new_privs: the guest sets PR_SET_NO_NEW_PRIVS before exec so a

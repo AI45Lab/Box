@@ -22,6 +22,15 @@ All notable changes to A3S Box will be documented in this file.
   (runc-style initgroups) and defaults the primary gid to the user's
   `/etc/passwd` group when no `RunAsGroup` is set.
 
+### Security
+- Non-privileged containers are now restricted to the runtime default
+  capability set (e.g. no `CAP_NET_ADMIN`/`CAP_SYS_ADMIN`), adjusted by the
+  container's `add`/`drop` capabilities; privileged containers keep the full
+  set. Previously every container ran as full-capability root, so a
+  non-privileged container could perform privileged operations (e.g. create a
+  network bridge). The guest applies an exact keep-set via `capset` + bounding
+  drop before exec.
+
 ### Fixed
 - CRI image identity now follows the digest, matching real runtimes:
   - `ListImages`/`ImageStatus` coalesce references by content digest, so an

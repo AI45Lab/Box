@@ -11,6 +11,39 @@ use tokio::time::{sleep, Duration};
 
 use crate::streaming::StreamingServer;
 
+#[test]
+fn test_kept_capabilities() {
+    let cap = |add: &[&str], drop: &[&str]| Capability {
+        add_capabilities: add.iter().map(|s| s.to_string()).collect(),
+        drop_capabilities: drop.iter().map(|s| s.to_string()).collect(),
+        ..Default::default()
+    };
+    let has = |v: &[String], c: &str| v.iter().any(|x| x == c);
+
+    // No capabilities field -> the runtime default set (no NET_ADMIN/SYS_ADMIN).
+    let kept = kept_capabilities(None).unwrap();
+    assert!(has(&kept, "CHOWN") && has(&kept, "NET_BIND_SERVICE"));
+    assert!(!has(&kept, "NET_ADMIN") && !has(&kept, "SYS_ADMIN"));
+
+    // add NET_ADMIN -> present; drop CHOWN -> removed.
+    let kept = kept_capabilities(Some(&cap(&["CAP_NET_ADMIN"], &["CHOWN"]))).unwrap();
+    assert!(has(&kept, "NET_ADMIN") && !has(&kept, "CHOWN"));
+
+    // drop ALL (no add) -> empty.
+    assert!(kept_capabilities(Some(&cap(&[], &["ALL"])))
+        .unwrap()
+        .is_empty());
+
+    // drop ALL + add NET_ADMIN -> only NET_ADMIN.
+    assert_eq!(
+        kept_capabilities(Some(&cap(&["NET_ADMIN"], &["ALL"]))).unwrap(),
+        vec!["NET_ADMIN".to_string()]
+    );
+
+    // add ALL -> None (keep the full set, no restriction emitted).
+    assert!(kept_capabilities(Some(&cap(&["ALL"], &[]))).is_none());
+}
+
 /// Create a BoxRuntimeService for testing.
 /// Uses NoopStateStore (no disk I/O) and a dummy StreamingHandle.
 fn make_test_service() -> BoxRuntimeService {

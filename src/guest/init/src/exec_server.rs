@@ -533,6 +533,20 @@ fn build_command(
                 .collect()
         })
         .unwrap_or_default();
+    // CRI capability keep-set: A3S_SEC_CAP_KEEP=NAME,NAME,... restricts a
+    // non-privileged container to exactly these capabilities (the runtime
+    // default adjusted by add/drop), dropping all others. Present-but-empty
+    // means drop everything; absent means leave the full set (privileged).
+    let cap_keep: Option<Vec<String>> = spec
+        .env
+        .iter()
+        .find_map(|entry| entry.strip_prefix("A3S_SEC_CAP_KEEP="))
+        .map(|csv| {
+            csv.split(',')
+                .map(|name| name.trim().to_string())
+                .filter(|name| !name.is_empty())
+                .collect()
+        });
     // CRI no_new_privs: A3S_SEC_NO_NEW_PRIVS=1 sets PR_SET_NO_NEW_PRIVS in the
     // child before exec, so a setuid/file-capability binary cannot raise privs.
     let no_new_privs = spec
@@ -547,6 +561,7 @@ fn build_command(
         supplemental_groups,
         apply_seccomp,
         cap_drop,
+        cap_keep,
         seccomp_localhost,
         no_new_privs,
     );
@@ -916,6 +931,7 @@ fn configure_child_process(
     supplemental_groups: Vec<u32>,
     apply_seccomp: bool,
     cap_drop: Vec<String>,
+    cap_keep: Option<Vec<String>>,
     seccomp_localhost: Vec<String>,
     no_new_privs: bool,
 ) {
@@ -953,6 +969,7 @@ fn configure_child_process(
     {
         let _ = apply_seccomp;
         let _ = &cap_drop;
+        let _ = &cap_keep;
         let _ = &seccomp_localhost;
         let _ = no_new_privs;
     }
@@ -986,10 +1003,14 @@ fn configure_child_process(
             if let Some(user) = user {
                 user.apply()?;
             }
-            // Drop capabilities after the uid/gid switch (capset/prctl only —
-            // async-signal-safe) so a privileged container actually loses them.
+            // Apply capabilities after the uid/gid switch (capset/prctl only —
+            // async-signal-safe). A keep-set (the CRI default for a
+            // non-privileged container) restricts to exactly those caps; the
+            // legacy drop-list path remains for explicit-drop-only callers.
             #[cfg(target_os = "linux")]
-            if !cap_drop.is_empty() {
+            if let Some(cap_keep) = &cap_keep {
+                crate::namespace::restrict_capabilities_to_keep(cap_keep)?;
+            } else if !cap_drop.is_empty() {
                 crate::namespace::drop_capabilities(&cap_drop)?;
             }
             // Set no_new_privs before installing seccomp: a single prctl
@@ -1020,6 +1041,7 @@ fn configure_child_process(
     _supplemental_groups: Vec<u32>,
     _apply_seccomp: bool,
     _cap_drop: Vec<String>,
+    _cap_keep: Option<Vec<String>>,
     _seccomp_localhost: Vec<String>,
     _no_new_privs: bool,
 ) {

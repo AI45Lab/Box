@@ -552,6 +552,95 @@ fn clear_effective_caps(cap_drop: &[String]) -> Result<(), std::io::Error> {
     Ok(())
 }
 
+/// Restrict the process to exactly the capability set named in `keep`.
+///
+/// This is how a **non-privileged** CRI container gets the runtime default
+/// capability set (e.g. without `CAP_NET_ADMIN`/`CAP_SYS_ADMIN`): the CRI
+/// resolves `(default ∪ add) − drop` and passes it here. Every capability NOT
+/// in `keep` is dropped from the bounding set, and the effective/permitted/
+/// inheritable sets are reduced to exactly `keep` — a reduction from the full
+/// root set, which is always permitted. An empty `keep` drops everything.
+///
+/// Async-signal-safe: only `prctl` + `capset` over stack-resident structs, no
+/// allocation (names are resolved into a fixed-size bitmask), so it is safe in
+/// the post-fork child.
+#[cfg(target_os = "linux")]
+pub(crate) fn restrict_capabilities_to_keep(keep: &[String]) -> Result<(), std::io::Error> {
+    // Resolve the keep names into a 64-bit capability bitmask.
+    let mut mask = [0u32; 2];
+    for name in keep {
+        if let Some(cap) = cap_name_to_number(name) {
+            let word = (cap / 32) as usize;
+            if word < mask.len() {
+                mask[word] |= 1u32 << (cap % 32);
+            }
+        }
+    }
+
+    // Drop every capability not kept from the bounding set so a future execve
+    // cannot regain it.
+    for cap in 0..=40_i32 {
+        let word = (cap / 32) as usize;
+        let kept = word < mask.len() && (mask[word] & (1u32 << (cap % 32))) != 0;
+        if !kept {
+            let ret = unsafe { libc::prctl(24, cap, 0, 0, 0) }; // PR_CAPBSET_DROP
+            if ret != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::EINVAL) {
+                    return Err(err);
+                }
+            }
+        }
+    }
+
+    set_capability_sets(mask)?;
+    clear_ambient_and_inheritable_caps()?;
+    Ok(())
+}
+
+/// Set the effective/permitted/inheritable capability sets to exactly `mask`
+/// via `capset(2)`. Reducing the sets from the inherited (full-root) set is
+/// always permitted; this never tries to raise a capability the process lacks.
+#[cfg(target_os = "linux")]
+fn set_capability_sets(mask: [u32; 2]) -> Result<(), std::io::Error> {
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+    #[repr(C)]
+    struct CapHeader {
+        version: u32,
+        pid: i32,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CapData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+
+    let mut header = CapHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let data = [
+        CapData {
+            effective: mask[0],
+            permitted: mask[0],
+            inheritable: mask[0],
+        },
+        CapData {
+            effective: mask[1],
+            permitted: mask[1],
+            inheritable: mask[1],
+        },
+    ];
+
+    if unsafe { libc::syscall(libc::SYS_capset, &mut header as *mut CapHeader, data.as_ptr()) } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Map a Linux capability name to its numeric value.
 #[cfg(target_os = "linux")]
 fn cap_name_to_number(name: &str) -> Option<i32> {
