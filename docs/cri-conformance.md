@@ -15,7 +15,7 @@ suite so regressions are visible and progress is measurable.
 |-------|-------|
 | Date | 2026-06-01 |
 | `critest` | v1.30.1 |
-| a3s-box | 2.0.5 (+ unreleased CRI maturity work, heading to 2.0.6) |
+| a3s-box | 2.0.6 |
 | Host | Linux KVM node (`/dev/kvm`), Ubuntu 24.04 |
 | Result | **44 Passed · 38 Failed · 15 Skipped** (ran 82 of 97 specs; full re-run at the hardened HEAD, no regressions) |
 

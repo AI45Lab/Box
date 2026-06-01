@@ -4,6 +4,42 @@ All notable changes to A3S Box will be documented in this file.
 
 ## [Unreleased]
 
+## [2.0.6] — 2026-06-01
+
+### Added
+- CRI Linux SecurityContext: `RunAsUser`/`RunAsGroup`/`RunAsUserName` (passwd
+  lookup), `SupplementalGroups` (setgroups), `MaskedPaths`/`ReadonlyPaths`, and
+  the `RuntimeDefault` seccomp profile (default BPF filter → `Seccomp: 2`).
+- `/proc` and `/sys` are now mounted inside the container chroot, so in-container
+  reads of `/proc/self/*` and `/sys/class/*` work like any container runtime.
+- Pod sysctls: safe sysctls from `PodSandboxConfig` are applied in the guest at
+  VM boot.
+- Writable CRI volume mounts (materialized by copy into the rootfs; read-only
+  and host-path-symlink volumes included).
+- Graceful shutdown: on SIGTERM/SIGINT the CRI reaps every sandbox VM and
+  unmounts its overlay, so microVMs/overlays no longer orphan across restarts.
+
+### Fixed
+- Corrected the CRI v1 `LinuxContainerSecurityContext` proto field numbers to the
+  official spec (kubelet/critest can now decode security-context pods).
+- `RemoveContainer` force-removes a running container (stops it first), per the
+  CRI contract.
+- Security & safety hardening from an adversarial code review (16 confirmed
+  findings): a container image/pod env can no longer spoof the `A3S_SEC_*`
+  security envelope (privilege escalation); the seccomp BPF filter is built
+  before `fork` (no async-signal-unsafe allocation in the post-fork child —
+  a musl malloc-deadlock risk); MaskedPaths/ReadonlyPaths mounts are idempotent
+  (no per-exec mount leak); MaskedPaths/ReadonlyPaths/sysctl names are
+  path-traversal validated; plus panic/leak/non-Linux-build fixes.
+- `ReopenContainerLog` is now synchronous (waits for the supervisor to reopen the
+  log) — correct CRI semantics for log rotation.
+
+### Conformance
+- `critest` v1.30.1: 44 of 82 runnable specs pass (up from 21), with no
+  regressions. Remaining failures are environmental (registry egress),
+  guest-kernel-limited (bridge/mqueue/AppArmor), architectural (mount
+  propagation), or test-image artifacts — see `docs/cri-conformance.md`.
+
 ## [2.0.5] — 2026-05-31
 
 ### Added
