@@ -809,6 +809,15 @@ impl RuntimeService for BoxRuntimeService {
                     sc.readonly_paths.join(":"),
                 ));
             }
+            // CRI seccomp: RuntimeDefault installs the default BPF filter in the
+            // guest (Seccomp: 2); Unconfined / unset leave the container
+            // unconfined. Localhost profiles are not yet plumbed into the VM.
+            if let Some(profile) = sc.seccomp.as_ref() {
+                use crate::cri_api::security_profile::ProfileType;
+                if profile.profile_type() == ProfileType::RuntimeDefault {
+                    env.push(("A3S_SEC_SECCOMP".to_string(), "default".to_string()));
+                }
+            }
         }
         let user = container_user_from_linux_config(config.linux.as_ref())
             .or_else(|| image_config.and_then(|image| image.user.clone()));

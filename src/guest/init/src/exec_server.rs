@@ -461,12 +461,20 @@ fn build_command(
                 .collect()
         })
         .unwrap_or_default();
+    // CRI seccomp: A3S_SEC_SECCOMP=default applies the default BPF filter
+    // (RuntimeDefault) in the child; unconfined/unset leave the process
+    // unfiltered.
+    let apply_seccomp = spec
+        .env
+        .iter()
+        .any(|entry| entry == "A3S_SEC_SECCOMP=default");
     configure_child_process(
         &mut command,
         spec.rootfs,
         workdir,
         process_user,
         supplemental_groups,
+        apply_seccomp,
     );
     if spec.rootfs.is_none() {
         if let Some(dir) = spec.working_dir {
@@ -831,6 +839,7 @@ fn configure_child_process(
     workdir: &str,
     user: Option<ProcessUser>,
     supplemental_groups: Vec<u32>,
+    apply_seccomp: bool,
 ) {
     use std::ffi::CString;
     use std::os::unix::process::CommandExt;
@@ -866,6 +875,15 @@ fn configure_child_process(
             if let Some(user) = user {
                 user.apply()?;
             }
+            // Install the seccomp filter last — after chroot and the privilege
+            // drop — so it is active across execve. The default filter allows
+            // execve and the syscalls the child still needs.
+            #[cfg(target_os = "linux")]
+            if apply_seccomp {
+                crate::namespace::apply_default_seccomp()?;
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = apply_seccomp;
             Ok(())
         });
     }
@@ -878,6 +896,7 @@ fn configure_child_process(
     _workdir: &str,
     _user: Option<ProcessUser>,
     _supplemental_groups: Vec<u32>,
+    _apply_seccomp: bool,
 ) {
 }
 

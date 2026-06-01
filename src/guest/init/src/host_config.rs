@@ -20,10 +20,7 @@ pub fn apply_from_env() -> Result<(), Box<dyn std::error::Error>> {
 /// VM startup.
 fn apply_sysctls_from_env() {
     let mut index = 0;
-    loop {
-        let Ok(spec) = std::env::var(format!("BOX_SYSCTL_{index}")) else {
-            break;
-        };
+    while let Ok(spec) = std::env::var(format!("BOX_SYSCTL_{index}")) {
         index += 1;
         let Some((name, value)) = spec.split_once('=') else {
             continue;

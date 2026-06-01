@@ -497,7 +497,7 @@ fn cap_name_to_number(name: &str) -> Option<i32> {
 /// Based on Docker's default seccomp profile — blocks syscalls that could
 /// escape the sandbox or compromise the host.
 #[cfg(target_os = "linux")]
-fn apply_default_seccomp() -> Result<(), std::io::Error> {
+pub(crate) fn apply_default_seccomp() -> Result<(), std::io::Error> {
     // Use SECCOMP_SET_MODE_FILTER via prctl
     // The default profile uses a BPF filter that blocks:
     // - kexec_load, kexec_file_load (kernel replacement)
