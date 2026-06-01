@@ -1,7 +1,9 @@
-//! Read-only container mount materialization for the CRI runtime service.
+//! Container mount materialization for the CRI runtime service.
 //!
 //! Copies CRI mount sources into a prepared rootfs, since microVM-backed
-//! containers cannot bind-mount host paths directly.
+//! containers cannot bind-mount host paths directly. This serves both read-only
+//! and writable mounts; for writable mounts the container writes to its private
+//! copy and those writes do NOT propagate back to the host source.
 
 use std::path::{Path, PathBuf};
 
@@ -66,7 +68,7 @@ fn copy_mount_source(source: &Path, target: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-pub(super) fn materialize_readonly_container_mount(
+pub(super) fn materialize_container_mount(
     rootfs: &Path,
     mount: &ContainerMount,
 ) -> Result<(), Status> {
@@ -78,6 +80,14 @@ pub(super) fn materialize_readonly_container_mount(
         )));
     }
 
+    if !mount.readonly {
+        tracing::warn!(
+            host_path = %mount.host_path,
+            container_path = %mount.container_path,
+            "Writable CRI mount is materialized by copy; in-container writes do not propagate to the host source"
+        );
+    }
+
     let target = container_path_inside_rootfs(rootfs, &mount.container_path)?;
     remove_existing_mount_target(&target).map_err(|e| {
         Status::internal(format!(
@@ -87,7 +97,7 @@ pub(super) fn materialize_readonly_container_mount(
     })?;
     copy_mount_source(source, &target).map_err(|e| {
         Status::internal(format!(
-            "Failed to materialize CRI read-only mount {} -> {}: {e}",
+            "Failed to materialize CRI mount {} -> {}: {e}",
             source.display(),
             target.display()
         ))

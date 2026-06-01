@@ -55,7 +55,7 @@ use convert::{
 };
 #[cfg(test)]
 use log_writer::CriLogWriter;
-use mounts::materialize_readonly_container_mount;
+use mounts::materialize_container_mount;
 use network::{
     bridge_network_name, connect_sandbox_to_network_store, default_network_store,
     disconnect_sandbox_from_network_store, sandbox_network_name,
@@ -880,7 +880,7 @@ impl RuntimeService for BoxRuntimeService {
         };
         if !mounts.is_empty() {
             if let Err(status) = self
-                .materialize_readonly_container_mounts(&rootfs_path, &mounts)
+                .materialize_container_mounts(&rootfs_path, &mounts)
                 .await
             {
                 self.cleanup_container_rootfs_path(&rootfs_path).await;

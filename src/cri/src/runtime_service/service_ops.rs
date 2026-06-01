@@ -152,7 +152,7 @@ impl BoxRuntimeService {
         })
     }
 
-    pub(super) async fn materialize_readonly_container_mounts(
+    pub(super) async fn materialize_container_mounts(
         &self,
         rootfs_path: &str,
         mounts: &[ContainerMount],
@@ -170,7 +170,7 @@ impl BoxRuntimeService {
         let mounts = mounts.to_vec();
         tokio::task::spawn_blocking(move || {
             for mount in &mounts {
-                materialize_readonly_container_mount(&rootfs, mount)?;
+                materialize_container_mount(&rootfs, mount)?;
             }
             Ok::<(), Status>(())
         })
