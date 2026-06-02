@@ -79,6 +79,29 @@ fn write_cgroup_file(path: &str, value: &str) -> std::io::Result<()> {
     file.write_all(value.as_bytes())
 }
 
+/// Map a CRI `cpu_shares` value (cgroup v1 range [2, 262144], default 1024) to a
+/// cgroup v2 `cpu.weight` (range [1, 10000]), using runc's conversion.
+fn shares_to_weight(shares: u64) -> u64 {
+    let shares = shares.clamp(2, 262_144);
+    (1 + ((shares - 2) * 9999) / 262_142).clamp(1, 10_000)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shares_to_weight;
+
+    #[test]
+    fn test_shares_to_weight_mapping() {
+        // Endpoints + the cgroup v1 default map to the runc-equivalent weights.
+        assert_eq!(shares_to_weight(2), 1);
+        assert_eq!(shares_to_weight(262_144), 10_000);
+        assert_eq!(shares_to_weight(1024), 39); // runc's mapping for the default
+        // Out-of-range inputs are clamped, never panic / overflow.
+        assert_eq!(shares_to_weight(0), 1);
+        assert_eq!(shares_to_weight(u64::MAX), 10_000);
+    }
+}
+
 /// A per-container cgroup v2 (memory + cpu limits). Dropping it removes the
 /// cgroup directory.
 pub struct ContainerCgroup {
@@ -94,10 +117,12 @@ impl ContainerCgroup {
         memory_max: Option<u64>,
         cpu_quota: Option<i64>,
         cpu_period: Option<u64>,
+        cpu_shares: Option<u64>,
     ) -> Option<Self> {
         let want_memory = memory_max.is_some_and(|m| m > 0);
         let want_cpu = cpu_quota.is_some_and(|q| q > 0);
-        if (!want_memory && !want_cpu) || !ensure_cgroup2_ready() {
+        let want_weight = cpu_shares.is_some_and(|s| s > 0);
+        if (!want_memory && !want_cpu && !want_weight) || !ensure_cgroup2_ready() {
             return None;
         }
         let seq = CGROUP_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -128,10 +153,18 @@ impl ContainerCgroup {
                 warn!(error = %error, value, "cgroup: failed to set cpu.max");
             }
         }
+        if want_weight {
+            let weight = shares_to_weight(cpu_shares.unwrap_or(1024));
+            if let Err(error) = write_cgroup_file(&format!("{path}/cpu.weight"), &weight.to_string())
+            {
+                warn!(error = %error, weight, "cgroup: failed to set cpu.weight");
+            }
+        }
         debug!(
             path,
             ?memory_max,
             ?cpu_quota,
+            ?cpu_shares,
             "cgroup: created container cgroup"
         );
         Some(Self { path })

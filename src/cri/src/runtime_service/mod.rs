@@ -1005,6 +1005,14 @@ impl RuntimeService for BoxRuntimeService {
                     ));
                 }
             }
+            // CPU shares → guest cgroup v2 cpu.weight (relative CPU under
+            // contention, the kubelet's CPU *request*).
+            if resources.cpu_shares > 0 {
+                env.push((
+                    "A3S_SEC_CPU_SHARES".to_string(),
+                    resources.cpu_shares.to_string(),
+                ));
+            }
         }
         let working_dir = if config.working_dir.is_empty() {
             image_config
