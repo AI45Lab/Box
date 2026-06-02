@@ -75,6 +75,10 @@ All notable changes to A3S Box will be documented in this file.
   shutdown already reaps VMs, so this is a no-op then.
 
 ### Fixed
+- `save`/`load` now round-trip the image tag: `save` stamps the image reference
+  into the OCI `index.json` `org.opencontainers.image.ref.name` annotation, so
+  `load` restores the tag (e.g. `rt:9`) instead of importing the image untagged
+  (by digest only). `load` already read the annotation; `save` never wrote it.
 - Image references with a purely numeric tag and no registry (`redis:7`,
   `node:18`, `postgres:16`, `ubuntu:24`) were mis-parsed: the numeric tag was
   treated as a registry port and dropped, so the reference resolved to the
