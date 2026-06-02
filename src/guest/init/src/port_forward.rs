@@ -147,8 +147,17 @@ fn serve_control(control: std::fs::File) -> io::Result<()> {
 
         let frame = match read_frame(&mut reader)? {
             Some(frame) => frame,
-            None => return Ok(()),
+            None => {
+                debug!("pf: serve_control read EOF, connection closing");
+                return Ok(());
+            }
         };
+        debug!(
+            kind = frame.kind,
+            stream_id = frame.stream_id,
+            payload_len = frame.payload.len(),
+            "pf: serve_control received frame"
+        );
 
         match frame.kind {
             FRAME_OPEN => {
@@ -162,6 +171,13 @@ fn serve_control(control: std::fs::File) -> io::Result<()> {
                     Ok(stream) => {
                         let _ = stream.set_nodelay(true);
                         let read_stream = stream.try_clone()?;
+                        debug!(
+                            stream_id = frame.stream_id,
+                            guest_port,
+                            peer = ?stream.peer_addr().ok(),
+                            local = ?stream.local_addr().ok(),
+                            "pf: connected guest target, spawned reader"
+                        );
                         streams.lock().unwrap().insert(frame.stream_id, stream);
                         spawn_guest_reader(
                             frame.stream_id,
@@ -187,10 +203,22 @@ fn serve_control(control: std::fs::File) -> io::Result<()> {
                 {
                     let mut guard = streams.lock().unwrap();
                     if let Some(stream) = guard.get_mut(&frame.stream_id) {
-                        if stream.write_all(&frame.payload).is_err() {
-                            remove = true;
+                        match stream
+                            .write_all(&frame.payload)
+                            .and_then(|_| stream.flush())
+                        {
+                            Ok(()) => debug!(
+                                stream_id = frame.stream_id,
+                                len = frame.payload.len(),
+                                "pf: wrote client data to guest target"
+                            ),
+                            Err(err) => {
+                                warn!(stream_id = frame.stream_id, error = %err, "pf: write to guest target failed");
+                                remove = true;
+                            }
                         }
                     } else {
+                        warn!(stream_id = frame.stream_id, "pf: DATA for unknown stream");
                         continue;
                     }
                 }
@@ -237,19 +265,29 @@ fn spawn_guest_reader(
 ) {
     thread::spawn(move || {
         let mut buf = [0u8; 16 * 1024];
+        debug!(stream_id, "pf: guest reader thread started");
         loop {
             match stream.read(&mut buf) {
-                Ok(0) => break,
+                Ok(0) => {
+                    debug!(stream_id, "pf: guest target read EOF");
+                    break;
+                }
                 Ok(n) => {
+                    debug!(stream_id, n, "pf: read from guest target -> FRAME_DATA");
                     if write_frame(&writer, FRAME_DATA, stream_id, &buf[..n]).is_err() {
+                        warn!(stream_id, "pf: relay FRAME_DATA to host failed");
                         break;
                     }
                 }
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
+                Err(err) => {
+                    warn!(stream_id, error = %err, "pf: guest target read error");
+                    break;
+                }
             }
         }
 
+        debug!(stream_id, "pf: guest reader thread exiting");
         close_stream(stream_id, &streams);
         let _ = write_frame(&writer, FRAME_CLOSE, stream_id, &[]);
     });

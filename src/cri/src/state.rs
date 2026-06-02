@@ -113,6 +113,7 @@ mod tests {
             network_ip: String::new(),
             additional_ips: vec![],
             dns: crate::sandbox::SandboxDns::default(),
+            container_ports: vec![],
         }
     }
 

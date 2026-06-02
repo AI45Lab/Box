@@ -17,11 +17,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixStream};
 use tokio::sync::{broadcast, RwLock};
 
-const PORT_FORWARD_STREAM_ID: u32 = 1;
-const PORT_FORWARD_FRAME_OPEN: u8 = 1;
-const PORT_FORWARD_FRAME_OPEN_ACK: u8 = 2;
-const PORT_FORWARD_FRAME_DATA: u8 = 3;
-const PORT_FORWARD_FRAME_CLOSE: u8 = 4;
+pub(crate) const PORT_FORWARD_STREAM_ID: u32 = 1;
+pub(crate) const PORT_FORWARD_FRAME_OPEN: u8 = 1;
+pub(crate) const PORT_FORWARD_FRAME_OPEN_ACK: u8 = 2;
+pub(crate) const PORT_FORWARD_FRAME_DATA: u8 = 3;
+pub(crate) const PORT_FORWARD_FRAME_CLOSE: u8 = 4;
 const PORT_FORWARD_UNAVAILABLE_MESSAGE: &str =
     "PortForward is not available for this sandbox: no guest port-forward control channel is configured.";
 const PORT_FORWARD_CONNECT_FAILED_MESSAGE: &str =
@@ -332,6 +332,9 @@ async fn handle_connection(
         SessionKind::Exec => handle_exec_stream(&mut stream, &session).await,
         SessionKind::Attach if upgrade_spdy => crate::spdy::serve_attach(stream, &session).await,
         SessionKind::Attach => handle_attach_stream(&mut stream, &session).await,
+        SessionKind::PortForward if upgrade_spdy => {
+            crate::spdy::serve_port_forward(stream, &session).await
+        }
         SessionKind::PortForward => handle_port_forward_stream(&mut stream, &session).await,
     }
 }
@@ -823,13 +826,13 @@ async fn write_pty_frame(
     Ok(())
 }
 
-struct PortForwardFrame {
-    kind: u8,
-    stream_id: u32,
-    payload: Vec<u8>,
+pub(crate) struct PortForwardFrame {
+    pub(crate) kind: u8,
+    pub(crate) stream_id: u32,
+    pub(crate) payload: Vec<u8>,
 }
 
-async fn write_port_forward_frame<W>(
+pub(crate) async fn write_port_forward_frame<W>(
     stream: &mut W,
     frame_type: u8,
     stream_id: u32,
@@ -849,7 +852,7 @@ where
     stream.flush().await
 }
 
-async fn read_port_forward_frame<R>(
+pub(crate) async fn read_port_forward_frame<R>(
     stream: &mut R,
 ) -> Result<Option<PortForwardFrame>, std::io::Error>
 where

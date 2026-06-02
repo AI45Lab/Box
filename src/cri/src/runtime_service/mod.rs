@@ -188,7 +188,10 @@ fn parse_localhost_seccomp_deny(localhost_ref: &str) -> Result<Vec<String>, Stri
         .map_err(|e| format!("read seccomp profile {localhost_ref}: {e}"))?;
     let profile: OciSeccompProfile =
         serde_json::from_str(&raw).map_err(|e| format!("parse seccomp profile: {e}"))?;
-    if !matches!(profile.default_action.as_str(), "SCMP_ACT_ALLOW" | "SCMP_ACT_LOG") {
+    if !matches!(
+        profile.default_action.as_str(),
+        "SCMP_ACT_ALLOW" | "SCMP_ACT_LOG"
+    ) {
         return Err(format!(
             "unsupported seccomp defaultAction {} (only allow-default profiles are supported)",
             profile.default_action
@@ -200,7 +203,10 @@ fn parse_localhost_seccomp_deny(localhost_ref: &str) -> Result<Vec<String>, Stri
         .filter(|s| {
             matches!(
                 s.action.as_str(),
-                "SCMP_ACT_ERRNO" | "SCMP_ACT_KILL" | "SCMP_ACT_KILL_THREAD" | "SCMP_ACT_KILL_PROCESS"
+                "SCMP_ACT_ERRNO"
+                    | "SCMP_ACT_KILL"
+                    | "SCMP_ACT_KILL_THREAD"
+                    | "SCMP_ACT_KILL_PROCESS"
             )
         })
         .flat_map(|s| s.names)
@@ -573,6 +579,12 @@ impl RuntimeService for BoxRuntimeService {
                     options: dns.options.clone(),
                 })
                 .unwrap_or_default(),
+            container_ports: config
+                .port_mappings
+                .iter()
+                .map(|mapping| mapping.container_port)
+                .filter(|port| *port > 0)
+                .collect(),
         };
 
         self.store.add_sandbox(sandbox).await;
@@ -1009,10 +1021,7 @@ impl RuntimeService for BoxRuntimeService {
                         // guest, which compiles them into a BPF filter.
                         match parse_localhost_seccomp_deny(&profile.localhost_ref) {
                             Ok(deny) => {
-                                env.push((
-                                    "A3S_SEC_SECCOMP_LOCALHOST".to_string(),
-                                    deny.join(","),
-                                ));
+                                env.push(("A3S_SEC_SECCOMP_LOCALHOST".to_string(), deny.join(",")));
                             }
                             Err(e) => {
                                 // Fall back to RuntimeDefault rather than running
@@ -2218,12 +2227,7 @@ impl RuntimeService for BoxRuntimeService {
             "CRI PortForward"
         );
 
-        if req.port.is_empty() {
-            return Err(Status::invalid_argument(
-                "PortForward must request at least one port",
-            ));
-        }
-        if req.port.len() != 1 {
+        if req.port.len() > 1 {
             return Err(Status::unimplemented(
                 "PortForward currently supports exactly one port per streaming session",
             ));
@@ -2237,6 +2241,26 @@ impl RuntimeService for BoxRuntimeService {
             .await
             .ok_or_else(|| Status::not_found(format!("Sandbox not found: {}", sandbox_id)))?;
         ensure_sandbox_ready(&sandbox, "PortForward")?;
+
+        // critest passes the target port in the RPC; `crictl port-forward` sends
+        // an empty list and carries the port only in the SPDY stream header
+        // (which we cannot read without SPDY/3 dictionary decompression). In the
+        // empty case, fall back to the sandbox's single declared container port.
+        let ports = if req.port.is_empty() {
+            sandbox.container_ports.clone()
+        } else {
+            req.port
+        };
+        if ports.is_empty() {
+            return Err(Status::invalid_argument(
+                "PortForward requested no port and the sandbox declares none",
+            ));
+        }
+        if ports.len() != 1 {
+            return Err(Status::unimplemented(
+                "PortForward currently supports exactly one port per streaming session",
+            ));
+        }
 
         let vm_managers = self.vm_managers.read().await;
         let vm = vm_managers.get(sandbox_id).ok_or_else(|| {
@@ -2260,7 +2284,7 @@ impl RuntimeService for BoxRuntimeService {
             stdin_once: false,
             stdout: false,
             stderr: false,
-            ports: req.port,
+            ports,
             attach_stream: None,
             attach_stdin: None,
             exec_socket_path: String::new(),

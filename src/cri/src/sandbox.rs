@@ -65,6 +65,12 @@ pub struct PodSandbox {
     /// Pod DNS configuration applied to each container's `/etc/resolv.conf`.
     #[serde(default)]
     pub dns: SandboxDns,
+    /// Container ports declared in the sandbox `port_mappings`. Used as the
+    /// fallback target when a PortForward request carries no explicit port
+    /// (e.g. `crictl port-forward`, which puts the port only in the SPDY
+    /// stream); critest passes the port in the RPC and does not need this.
+    #[serde(default)]
+    pub container_ports: Vec<i32>,
 }
 
 /// In-memory store for pod sandboxes.
@@ -151,6 +157,7 @@ mod tests {
             network_ip: String::new(),
             additional_ips: vec![],
             dns: SandboxDns::default(),
+            container_ports: vec![],
         }
     }
 

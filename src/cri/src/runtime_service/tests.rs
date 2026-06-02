@@ -801,6 +801,7 @@ fn test_sandbox(id: &str) -> PodSandbox {
         network_ip: String::new(),
         additional_ips: vec![],
         dns: crate::sandbox::SandboxDns::default(),
+        container_ports: vec![],
     }
 }
 
@@ -1832,11 +1833,7 @@ fn test_parse_localhost_seccomp_deny_allow_default() {
 fn test_parse_localhost_seccomp_deny_rejects_deny_by_default() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("deny-default.json");
-    std::fs::write(
-        &path,
-        r#"{"defaultAction":"SCMP_ACT_ERRNO","syscalls":[]}"#,
-    )
-    .unwrap();
+    std::fs::write(&path, r#"{"defaultAction":"SCMP_ACT_ERRNO","syscalls":[]}"#).unwrap();
     // Deny-by-default profiles need a full allow-list; not supported -> Err so
     // the caller falls back to RuntimeDefault rather than running unconfined.
     assert!(super::parse_localhost_seccomp_deny(path.to_str().unwrap()).is_err());
@@ -4046,8 +4043,13 @@ async fn test_port_forward_sandbox_not_found() {
 }
 
 #[tokio::test]
-async fn test_port_forward_rejects_empty_ports() {
+async fn test_port_forward_empty_ports_rejected_when_sandbox_declares_none() {
+    // critest passes the port in the RPC; `crictl port-forward` sends none and
+    // we fall back to the sandbox's declared ports. A ready sandbox that
+    // declares no ports therefore has nothing to forward to.
     let svc = make_test_service();
+    svc.store.sandboxes.add(test_sandbox("sb-1")).await;
+
     let result = svc
         .port_forward(Request::new(PortForwardRequest {
             pod_sandbox_id: "sb-1".to_string(),
@@ -4058,7 +4060,7 @@ async fn test_port_forward_rejects_empty_ports() {
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
-    assert!(err.message().contains("at least one port"));
+    assert!(err.message().contains("declares none"));
 }
 
 #[tokio::test]
