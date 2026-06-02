@@ -45,7 +45,12 @@ pub(super) fn handle_copy(
 
     // Copy each source
     for src in src_patterns {
-        let src_path = context_dir.join(src);
+        // Resolve the source relative to the context (or, for COPY --from, the
+        // source stage's rootfs). A leading "/" must NOT be treated as a host
+        // absolute path: `Path::join` discards the base for an absolute arg, so
+        // `rootfs.join("/run.sh")` would wrongly become "/run.sh". COPY --from
+        // sources are conventionally absolute, so strip the leading slash.
+        let src_path = context_dir.join(src.trim_start_matches('/'));
         if !src_path.exists() {
             return Err(BoxError::BuildError(format!(
                 "COPY source not found: {} (in context {})",
@@ -465,7 +470,9 @@ pub(super) fn handle_add(
             continue;
         }
 
-        let src_path = context_dir.join(src);
+        // See handle_copy: strip a leading slash so an absolute src resolves
+        // within the context rather than discarding the base in `Path::join`.
+        let src_path = context_dir.join(src.trim_start_matches('/'));
         if !src_path.exists() {
             return Err(BoxError::BuildError(format!(
                 "ADD source not found: {} (in context {})",

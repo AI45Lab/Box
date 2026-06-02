@@ -194,7 +194,9 @@ pub(crate) fn hash_context_sources(context_dir: &Path, src_patterns: &[String]) 
 
     let mut files: Vec<(PathBuf, PathBuf)> = Vec::new();
     for src in src_patterns {
-        let src_path = context_dir.join(src);
+        // Match handle_copy/handle_add: a leading slash is context-relative, not
+        // a host absolute path (which `Path::join` would otherwise jump to).
+        let src_path = context_dir.join(src.trim_start_matches('/'));
         if !src_path.exists() {
             return None;
         }

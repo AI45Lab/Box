@@ -70,6 +70,11 @@ All notable changes to A3S Box will be documented in this file.
   shutdown already reaps VMs, so this is a no-op then.
 
 ### Fixed
+- Multi-stage `COPY --from=<stage> /abs/path` (and any absolute COPY/ADD source)
+  was broken: the absolute source was resolved against the host root instead of
+  the source stage's rootfs (`Path::join` discards the base for an absolute
+  argument), failing with "source not found". Absolute sources are now resolved
+  relative to the context/stage, so multi-stage builds work.
 - Multi-layer image corruption in `a3s-box build`: layer digest and size were
   computed before the gzip stream was flushed to disk (the tar builder owning
   the encoder was dropped only at function end), so every layer recorded the

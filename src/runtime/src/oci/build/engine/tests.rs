@@ -146,6 +146,56 @@ LABEL org.opencontainers.image.title="scratch-smoke"
         );
     }
 
+    /// Regression: a multi-stage `COPY --from=<stage> /abs/path` must resolve
+    /// the absolute source inside the source stage's rootfs. Previously
+    /// `context_dir.join("/abs")` discarded the base (Path::join semantics) and
+    /// looked at the host root, so multi-stage copies failed with "source not
+    /// found".
+    #[tokio::test]
+    async fn test_build_multistage_copy_from_absolute_source() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = tmp.path().join("context");
+        let store_dir = tmp.path().join("images");
+        std::fs::create_dir_all(&context).unwrap();
+        std::fs::write(context.join("run.sh"), "built-artifact").unwrap();
+        std::fs::write(
+            context.join("Dockerfile"),
+            r#"FROM scratch AS builder
+COPY run.sh /run.sh
+
+FROM scratch
+COPY --from=builder /run.sh /work/run.sh
+CMD ["/work/run.sh"]
+"#,
+        )
+        .unwrap();
+
+        let store = Arc::new(ImageStore::new(&store_dir, 1024 * 1024 * 100).unwrap());
+        let result = build(
+            BuildConfig {
+                context_dir: context.clone(),
+                dockerfile_path: context.join("Dockerfile"),
+                tag: Some("multistage:latest".to_string()),
+                build_args: HashMap::new(),
+                quiet: true,
+                platforms: vec![],
+                metrics: None,
+            },
+            store.clone(),
+        )
+        .await
+        .expect("multi-stage COPY --from with an absolute source must build");
+
+        // Only the final stage's single layer is in the output image.
+        assert_eq!(result.layer_count, 1);
+        let stored = store.get("multistage:latest").await.unwrap();
+        let image = OciImage::from_path(&stored.path).unwrap();
+        assert_eq!(
+            image.config().cmd,
+            Some(vec!["/work/run.sh".to_string()])
+        );
+    }
+
     #[tokio::test]
     async fn test_add_url_invalid_host_returns_error() {
         // Verify that ADD <url> with an unreachable host returns a BuildError,
