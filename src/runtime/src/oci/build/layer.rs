@@ -176,9 +176,18 @@ pub fn create_layer(
         }
     }
 
-    builder
+    // Finish the tar archive AND the gzip stream so every byte is flushed to
+    // disk before we hash the file. `Builder::finish()` alone only writes the
+    // tar trailer into the still-buffered GzEncoder; the gzip data is not
+    // flushed to the file until the encoder is dropped/finished. Hashing before
+    // that flush would digest an incomplete file (the bug that gave every layer
+    // the same digest of the partial 10-byte gzip header).
+    let encoder = builder
+        .into_inner()
+        .map_err(|e| BoxError::BuildError(format!("Failed to finalize layer tar: {}", e)))?;
+    encoder
         .finish()
-        .map_err(|e| BoxError::BuildError(format!("Failed to finalize layer: {}", e)))?;
+        .map_err(|e| BoxError::BuildError(format!("Failed to finalize layer gzip: {}", e)))?;
 
     // Compute SHA256 digest of the layer file
     let digest = sha256_file(output_path)?;
@@ -216,9 +225,14 @@ pub fn create_layer_from_dir(
 
     add_dir_to_tar(&mut builder, src_dir, src_dir, target_prefix)?;
 
-    builder
+    // Finish the tar AND flush the gzip stream to disk before hashing (see
+    // `create_layer` for why hashing before the gzip flush is incorrect).
+    let encoder = builder
+        .into_inner()
+        .map_err(|e| BoxError::BuildError(format!("Failed to finalize layer tar: {}", e)))?;
+    encoder
         .finish()
-        .map_err(|e| BoxError::BuildError(format!("Failed to finalize layer: {}", e)))?;
+        .map_err(|e| BoxError::BuildError(format!("Failed to finalize layer gzip: {}", e)))?;
 
     let digest = sha256_file(output_path)?;
     let size = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
@@ -423,6 +437,66 @@ mod tests {
 
         let info = create_layer(rootfs.path(), &[], &output_path).unwrap();
         assert!(info.path.exists());
+    }
+
+    /// Regression: the recorded digest/size must reflect the COMPLETE file
+    /// (gzip stream fully flushed), not a partially-written one. Previously the
+    /// digest was computed before the GzEncoder was finished, so every layer
+    /// recorded the same hash of the 10-byte gzip header.
+    #[test]
+    fn test_create_layer_digest_matches_completed_file() {
+        let rootfs = TempDir::new().unwrap();
+        let output_dir = TempDir::new().unwrap();
+        fs::write(rootfs.path().join("a.txt"), "AAAA-content").unwrap();
+
+        let out = output_dir.path().join("layer.tar.gz");
+        let info = create_layer(rootfs.path(), &[PathBuf::from("a.txt")], &out).unwrap();
+
+        // The digest/size recorded must equal the on-disk file, re-read after
+        // the function returned (i.e. the file was complete when hashed).
+        let on_disk = sha256_file(&info.path).unwrap();
+        let on_disk_size = fs::metadata(&info.path).unwrap().len();
+        assert_eq!(
+            info.digest, on_disk,
+            "recorded digest must match completed file"
+        );
+        assert_eq!(
+            info.size, on_disk_size,
+            "recorded size must match completed file"
+        );
+        assert!(
+            info.size > 20,
+            "a real one-file layer is larger than an empty gzip header"
+        );
+    }
+
+    /// Regression: single-file layers with different content must produce
+    /// different digests (else the content-addressed store/cache collides).
+    #[test]
+    fn test_create_layer_distinct_content_distinct_digest() {
+        let rootfs = TempDir::new().unwrap();
+        let out_dir = TempDir::new().unwrap();
+
+        fs::write(rootfs.path().join("a.txt"), "AAAA-content").unwrap();
+        let a = create_layer(
+            rootfs.path(),
+            &[PathBuf::from("a.txt")],
+            &out_dir.path().join("a.tgz"),
+        )
+        .unwrap();
+
+        fs::write(rootfs.path().join("b.txt"), "BBBB-different-longer").unwrap();
+        let b = create_layer(
+            rootfs.path(),
+            &[PathBuf::from("b.txt")],
+            &out_dir.path().join("b.tgz"),
+        )
+        .unwrap();
+
+        assert_ne!(
+            a.digest, b.digest,
+            "distinct layer content must yield distinct digests"
+        );
     }
 
     // --- create_layer_from_dir ---
