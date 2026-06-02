@@ -413,6 +413,10 @@ fn build_command(
                 // inside the rootfs (idempotent) so in-container reads of
                 // /proc/self/* and /sys/class/* work like any container runtime.
                 ensure_container_pseudo_filesystems(rootfs);
+                // Populate the standard /dev device nodes (urandom, null, ...);
+                // many workloads (e.g. Apache httpd seeding its RNG from
+                // /dev/urandom) fail to start without them.
+                ensure_container_dev_nodes(rootfs);
                 // CRI MaskedPaths/ReadonlyPaths arrive as ':'-separated absolute
                 // paths over A3S_SEC_MASKED_PATHS / A3S_SEC_READONLY_PATHS.
                 let masked = parse_sec_path_list(spec.env, "A3S_SEC_MASKED_PATHS=");
@@ -1089,6 +1093,48 @@ fn ensure_container_pseudo_filesystems(rootfs: &str) {
             None::<&str>,
         ) {
             warn!("Failed to mount {fstype} at {target}: {e}");
+        }
+    }
+}
+
+/// Create the standard character device nodes in a container `rootfs`.
+///
+/// A minimal image rootfs has an empty `/dev`, but many workloads need the
+/// usual nodes — e.g. Apache httpd reads `/dev/urandom` to seed its RNG and
+/// aborts with `AH00141` if it is absent. Created with `mknod` while guest-init
+/// still holds `CAP_MKNOD` (before the privilege drop and chroot). Best-effort
+/// and idempotent: an existing node is left as-is.
+#[cfg(target_os = "linux")]
+fn ensure_container_dev_nodes(rootfs: &str) {
+    let dev = format!("{rootfs}/dev");
+    if let Err(e) = std::fs::create_dir_all(&dev) {
+        warn!("Failed to create container /dev {dev}: {e}");
+        return;
+    }
+    // (name, major, minor) — the fixed Linux char-device numbers.
+    for (name, major, minor) in [
+        ("null", 1u32, 3u32),
+        ("zero", 1, 5),
+        ("full", 1, 7),
+        ("random", 1, 8),
+        ("urandom", 1, 9),
+        ("tty", 5, 0),
+    ] {
+        let path = format!("{dev}/{name}");
+        if std::path::Path::new(&path).exists() {
+            continue;
+        }
+        let Ok(cpath) = std::ffi::CString::new(path.as_str()) else {
+            continue;
+        };
+        let mode: libc::mode_t = libc::S_IFCHR | 0o666;
+        // SAFETY: mknod with a valid CString path + fixed device numbers.
+        let ret = unsafe { libc::mknod(cpath.as_ptr(), mode, libc::makedev(major, minor)) };
+        if ret != 0 {
+            warn!(
+                "Failed to mknod {path}: {}",
+                std::io::Error::last_os_error()
+            );
         }
     }
 }

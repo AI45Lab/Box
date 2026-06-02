@@ -60,6 +60,11 @@ All notable changes to A3S Box will be documented in this file.
   shutdown already reaps VMs, so this is a no-op then.
 
 ### Fixed
+- Container `/dev` now contains the standard device nodes (`null`, `zero`,
+  `full`, `random`, `urandom`, `tty`), created in the guest before the container
+  starts. Workloads that need them — e.g. Apache httpd, which reads
+  `/dev/urandom` to seed its RNG and otherwise aborts with `AH00141` — now run.
+  Fixes the multi-container exec/log conformance specs.
 - The container log file is now created eagerly at `StartContainer` (instead of
   lazily when the first output arrives), so a caller that opens the log
   immediately after start — e.g. `ReopenContainerLog`, or before the container
