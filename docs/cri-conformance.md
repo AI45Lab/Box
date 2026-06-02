@@ -64,9 +64,12 @@ critest --runtime-endpoint unix:///tmp/a3s-box.sock \
   `ReadonlyRootfs`, per-container **capabilities** (default set, add/drop),
   HostPID (the pod's shared VM-wide PID namespace). `/proc` + `/sys` are mounted
   inside the container chroot.
-- **Resources:** the container `memory_limit_in_bytes` is enforced inside the
-  guest by a per-container cgroup v2 memory cgroup (`memory.max`); an OOM kill is
-  detected via `memory.events` and reported as the **`OOMKilled`** exit reason.
+- **Resources:** the container `memory_limit_in_bytes` and `cpu_quota`/`cpu_period`
+  are enforced inside the guest by a per-container cgroup v2 (`memory.max` /
+  `cpu.max`). The container joins the cgroup from its pre-exec hook, so workers it
+  forks are bounded too. An OOM kill is detected via `memory.events` and reported
+  as the **`OOMKilled`** exit reason. Real CPU/memory usage is reported through
+  `ContainerStats`/`PodSandboxStats` (from the pod VM's shim process).
 - **Pod sysctls** (safe), **pod `DNSConfig`** → container `/etc/resolv.conf`,
   standard **`/dev` device nodes** (null/zero/full/random/urandom/tty).
 - **Volumes:** read-only and writable mounts (incl. host-path symlink),
