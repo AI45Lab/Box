@@ -111,8 +111,12 @@ critest --runtime-endpoint unix:///tmp/a3s-box.sock \
   masked symlinks are masked by the entry (`O_PATH|O_NOFOLLOW`), never their
   followed target.
 - **ReopenContainerLog is synchronous** (waits for the supervisor to confirm the
-  reopen). The residual flake is guest→host log-transport ordering and would
-  need an exec-stream flush barrier.
+  reopen) and uses an exec-stream **flush barrier**: on reopen the supervisor
+  sends a flush control to the guest, which drains every buffered output chunk
+  to the wire and replies with a flush-ack; the supervisor writes those chunks
+  into the old log file and only then reopens. This closes the guest→host
+  log-transport ordering gap so pre-rotation output cannot land in the new file.
+  (Pty/tty workloads keep the prior best-effort reopen.)
 
 ## Methodology
 

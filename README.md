@@ -168,6 +168,13 @@ Boundaries:
 - macOS `RUN` fails by default; `A3S_BOX_UNSAFE_HOST_RUN=1` enables unsafe host-side experiments only;
 - `--platform` records one target platform; multi-platform image indexes are not implemented.
 
+Builds use a Docker/BuildKit-style **layer cache**: each instruction extends a
+rolling chain key (its text plus, for `COPY`/`ADD`, the content hash of the
+source files), and a layer-producing step whose chain key was seen before is
+reused instead of re-run. A changed instruction or input rebuilds that layer
+and everything after it. The cache lives at `~/.a3s/buildcache` and is size-capped
+(default 2 GiB, override with `A3S_BOX_BUILDCACHE_MAX_BYTES`; oldest blobs evicted first).
+
 ## Filesystems, volumes, and snapshots
 
 ```bash
@@ -351,6 +358,7 @@ matrix, and CRI smoke procedures.
 | `A3S_BOX_ALLOW_REGISTRY_PULL` | Set to `1` to let the host integration runner use live registry pulls when no OCI archive is provided. |
 | `A3S_BOX_HOST_SMOKE_TIMEOUT_SECS` | Boot timeout override for ignored host smoke tests. |
 | `A3S_BOX_UNSAFE_HOST_RUN` | Opt into unsafe macOS host execution for Dockerfile `RUN` experiments. |
+| `A3S_BOX_BUILDCACHE_MAX_BYTES` | Cap on the total size of cached build layers at `~/.a3s/buildcache` (oldest evicted first). Default: 2 GiB. |
 | `RUST_LOG` | Rust tracing log level. |
 
 ## License

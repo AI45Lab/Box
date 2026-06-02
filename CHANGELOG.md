@@ -21,6 +21,16 @@ All notable changes to A3S Box will be documented in this file.
   the guest applies the groups that user belongs to per the image's `/etc/group`
   (runc-style initgroups) and defaults the primary gid to the user's
   `/etc/passwd` group when no `RunAsGroup` is set.
+- Layer-level build cache (Docker/BuildKit-style): `a3s-box build` reuses
+  previously built layers across builds via a rolling chain key over each
+  instruction (and, for `COPY`/`ADD`, the content of the source files), so an
+  unchanged prefix is reused and a changed instruction/input rebuilds from that
+  layer on. Cached at `~/.a3s/buildcache`, size-capped (default 2 GiB,
+  `A3S_BOX_BUILDCACHE_MAX_BYTES`; oldest evicted first), best-effort.
+- CRI `ReopenContainerLog` flush boundary: log rotation now asks the guest to
+  flush and drains every buffered output chunk into the old log file (stopping
+  at a flush-ack marker added to the exec protocol) before reopening, so output
+  produced before the rotation cannot leak into the new file.
 
 ### Security
 - Host network/IPC namespaces are now rejected fail-closed: a pod or container
@@ -60,6 +70,13 @@ All notable changes to A3S Box will be documented in this file.
   shutdown already reaps VMs, so this is a no-op then.
 
 ### Fixed
+- Multi-layer image corruption in `a3s-box build`: layer digest and size were
+  computed before the gzip stream was flushed to disk (the tar builder owning
+  the encoder was dropped only at function end), so every layer recorded the
+  same digest — the hash of the partial 10-byte gzip header — and `size` 10.
+  Manifests referenced one wrong digest for every layer and the content-addressed
+  blob store collapsed all layers into the first; single-layer images happened
+  to round-trip, hiding the bug. The encoder is now finished before hashing.
 - Container `/dev` now contains the standard device nodes (`null`, `zero`,
   `full`, `random`, `urandom`, `tty`), created in the guest before the container
   starts. Workloads that need them — e.g. Apache httpd, which reads
