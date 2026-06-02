@@ -12,6 +12,7 @@ use a3s_box_core::platform::Platform;
 
 use super::cache::{hash_context_sources, BuildCache};
 use super::dockerfile::{Dockerfile, Instruction};
+use super::dockerignore::DockerIgnore;
 use super::layer::{sha256_bytes, sha256_file, LayerInfo};
 use crate::oci::image::OciImageConfig;
 use crate::oci::layers::extract_layer;
@@ -153,8 +154,14 @@ pub async fn build(config: BuildConfig, store: Arc<ImageStore>) -> Result<BuildR
     // Parse Dockerfile
     let dockerfile = Dockerfile::from_file(&config.dockerfile_path)?;
 
+    // Load the context's .dockerignore once; applied to every context COPY/ADD.
+    let dockerignore = DockerIgnore::load(&config.context_dir);
+
     if !config.quiet {
         println!("Building from {}", config.dockerfile_path.display());
+        if !dockerignore.is_empty() {
+            println!("Using .dockerignore");
+        }
     }
 
     // Split instructions into stages by FROM
@@ -335,6 +342,8 @@ pub async fn build(config: BuildConfig, store: Arc<ImageStore>) -> Result<BuildR
                             );
                         }
                         let from_rootfs = resolve_stage_rootfs(from_ref, &completed_stages)?;
+                        // .dockerignore applies to the build context, not to a
+                        // source stage's rootfs.
                         let layer_info = handle_copy(
                             src,
                             dst,
@@ -343,6 +352,7 @@ pub async fn build(config: BuildConfig, store: Arc<ImageStore>) -> Result<BuildR
                             &layers_dir,
                             &state.workdir,
                             state.layers.len() + base_layers.len(),
+                            None,
                         )?;
                         let diff_id = compute_diff_id(&layer_info.path)?;
                         if let Some(c) = &cache {
@@ -377,6 +387,7 @@ pub async fn build(config: BuildConfig, store: Arc<ImageStore>) -> Result<BuildR
                             &layers_dir,
                             &state.workdir,
                             state.layers.len() + base_layers.len(),
+                            Some(&dockerignore),
                         )?;
                         let diff_id = compute_diff_id(&layer_info.path)?;
                         if let Some(c) = &cache {
@@ -431,6 +442,7 @@ pub async fn build(config: BuildConfig, store: Arc<ImageStore>) -> Result<BuildR
                         &layers_dir,
                         &state.workdir,
                         state.layers.len() + base_layers.len(),
+                        Some(&dockerignore),
                     )?;
                     let diff_id = compute_diff_id(&layer_info.path)?;
                     if let Some(c) = &cache {

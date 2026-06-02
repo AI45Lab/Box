@@ -151,6 +151,62 @@ LABEL org.opencontainers.image.title="scratch-smoke"
     /// `context_dir.join("/abs")` discarded the base (Path::join semantics) and
     /// looked at the host root, so multi-stage copies failed with "source not
     /// found".
+    /// `.dockerignore` must keep ignored context paths (secrets, `.git`,
+    /// `node_modules`) out of `COPY .`, with `!` negation re-including.
+    #[tokio::test]
+    async fn test_build_honors_dockerignore() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = tmp.path().join("context");
+        let store_dir = tmp.path().join("images");
+        std::fs::create_dir_all(context.join(".git")).unwrap();
+        std::fs::create_dir_all(context.join("logs")).unwrap();
+        std::fs::write(context.join(".env"), "SECRET").unwrap();
+        std::fs::write(context.join(".git/config"), "g").unwrap();
+        std::fs::write(context.join("keep.txt"), "keep").unwrap();
+        std::fs::write(context.join("logs/a.log"), "x").unwrap();
+        std::fs::write(context.join("logs/important.log"), "y").unwrap();
+        std::fs::write(context.join(".dockerignore"), ".git\n.env\n**/*.log\n!logs/important.log\n")
+            .unwrap();
+        std::fs::write(context.join("Dockerfile"), "FROM scratch\nCOPY . /app\n").unwrap();
+
+        let store = Arc::new(ImageStore::new(&store_dir, 1024 * 1024 * 100).unwrap());
+        build(
+            BuildConfig {
+                context_dir: context.clone(),
+                dockerfile_path: context.join("Dockerfile"),
+                tag: Some("di:latest".to_string()),
+                build_args: HashMap::new(),
+                quiet: true,
+                platforms: vec![],
+                metrics: None,
+            },
+            store.clone(),
+        )
+        .await
+        .unwrap();
+
+        let stored = store.get("di:latest").await.unwrap();
+        // Read the single layer and collect file paths.
+        let image = OciImage::from_path(&stored.path).unwrap();
+        let layer = &image.layer_paths()[0];
+        let file = std::fs::File::open(layer).unwrap();
+        let dec = flate2::read::GzDecoder::new(file);
+        let mut ar = tar::Archive::new(dec);
+        let names: Vec<String> = ar
+            .entries()
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.header().entry_type().is_file())
+            .map(|e| e.path().unwrap().to_string_lossy().to_string())
+            .collect();
+
+        assert!(names.iter().any(|n| n == "app/keep.txt"));
+        assert!(names.iter().any(|n| n == "app/logs/important.log")); // !negation
+        assert!(!names.iter().any(|n| n.contains(".env")), "secret leaked: {names:?}");
+        assert!(!names.iter().any(|n| n.contains(".git")), ".git leaked: {names:?}");
+        assert!(!names.iter().any(|n| n == "app/logs/a.log"), "*.log leaked: {names:?}");
+    }
+
     #[tokio::test]
     async fn test_build_multistage_copy_from_absolute_source() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -219,6 +275,7 @@ CMD ["/work/run.sh"]
                 &layers,
                 "/",
                 0,
+                None,
             )
         })
         .await

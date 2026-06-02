@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 use a3s_box_core::error::{BoxError, Result};
 
 use super::super::dockerfile::Instruction;
+use super::super::dockerignore::DockerIgnore;
 use super::super::layer::{create_layer, create_layer_from_dir, LayerInfo};
 use super::utils::{
-    copy_dir_recursive, expand_args, extract_tar_to_dst, is_tar_archive, resolve_path,
+    copy_dir_filtered, expand_args, extract_tar_to_dst, is_tar_archive, resolve_path,
 };
 use super::BuildState;
 
@@ -15,6 +16,7 @@ use super::BuildState;
 const UNSAFE_HOST_RUN_ENV: &str = "A3S_BOX_UNSAFE_HOST_RUN";
 
 /// Handle COPY: copy files from build context into rootfs, create a layer.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn handle_copy(
     src_patterns: &[String],
     dst: &str,
@@ -23,6 +25,7 @@ pub(super) fn handle_copy(
     layers_dir: &Path,
     workdir: &str,
     layer_index: usize,
+    ignore: Option<&DockerIgnore>,
 ) -> Result<LayerInfo> {
     // Resolve destination path
     let resolved_dst = resolve_path(workdir, dst);
@@ -50,6 +53,7 @@ pub(super) fn handle_copy(
         // absolute path: `Path::join` discards the base for an absolute arg, so
         // `rootfs.join("/run.sh")` would wrongly become "/run.sh". COPY --from
         // sources are conventionally absolute, so strip the leading slash.
+        let rel = PathBuf::from(if src == "." { "" } else { src.trim_start_matches('/') });
         let src_path = context_dir.join(src.trim_start_matches('/'));
         if !src_path.exists() {
             return Err(BoxError::BuildError(format!(
@@ -59,8 +63,18 @@ pub(super) fn handle_copy(
             )));
         }
 
+        // A single source excluded by .dockerignore is not in the build context.
+        if let Some(ign) = ignore {
+            if !rel.as_os_str().is_empty() && src_path.is_file() && ign.is_excluded(&rel) {
+                return Err(BoxError::BuildError(format!(
+                    "COPY source not found: {} (excluded by .dockerignore)",
+                    src
+                )));
+            }
+        }
+
         if src_path.is_dir() {
-            copy_dir_recursive(&src_path, &dst_in_rootfs)?;
+            copy_dir_filtered(&src_path, &dst_in_rootfs, &rel, ignore)?;
         } else {
             // If dst ends with / or is a directory, copy into it
             let target = if dst_in_rootfs.is_dir() {
@@ -415,6 +429,7 @@ pub(super) fn handle_add(
     layers_dir: &Path,
     workdir: &str,
     layer_index: usize,
+    ignore: Option<&DockerIgnore>,
 ) -> Result<LayerInfo> {
     if let Some(chown) = chown {
         return Err(BoxError::BuildError(format!(
@@ -472,6 +487,7 @@ pub(super) fn handle_add(
 
         // See handle_copy: strip a leading slash so an absolute src resolves
         // within the context rather than discarding the base in `Path::join`.
+        let rel = PathBuf::from(if src == "." { "" } else { src.trim_start_matches('/') });
         let src_path = context_dir.join(src.trim_start_matches('/'));
         if !src_path.exists() {
             return Err(BoxError::BuildError(format!(
@@ -481,11 +497,20 @@ pub(super) fn handle_add(
             )));
         }
 
+        if let Some(ign) = ignore {
+            if !rel.as_os_str().is_empty() && src_path.is_file() && ign.is_excluded(&rel) {
+                return Err(BoxError::BuildError(format!(
+                    "ADD source not found: {} (excluded by .dockerignore)",
+                    src
+                )));
+            }
+        }
+
         // Check if it's a tar archive that should be auto-extracted
         if is_tar_archive(src) && !src_path.is_dir() {
             extract_tar_to_dst(&src_path, &dst_in_rootfs)?;
         } else if src_path.is_dir() {
-            copy_dir_recursive(&src_path, &dst_in_rootfs)?;
+            copy_dir_filtered(&src_path, &dst_in_rootfs, &rel, ignore)?;
         } else {
             let target = if dst_in_rootfs.is_dir() {
                 dst_in_rootfs.join(
@@ -946,6 +971,7 @@ mod tests {
             &layers,
             "/",
             0,
+            None,
         )
         .unwrap_err()
         .to_string();

@@ -5,6 +5,7 @@ use std::path::Path;
 
 use a3s_box_core::error::{BoxError, Result};
 
+use super::super::dockerignore::DockerIgnore;
 use super::super::layer::sha256_bytes;
 
 /// Check if a filename looks like a tar archive.
@@ -155,7 +156,16 @@ pub(super) fn compute_diff_id(layer_path: &Path) -> Result<String> {
 }
 
 /// Recursively copy a directory.
-pub(super) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+/// Recursively copy `src` to `dst`, tracking each entry's path relative to the
+/// build context (`rel_base`) and skipping entries excluded by `.dockerignore`.
+/// An excluded directory is pruned (not descended into). When `ignore` is
+/// `None` (e.g. `COPY --from`), nothing is filtered.
+pub(super) fn copy_dir_filtered(
+    src: &Path,
+    dst: &Path,
+    rel_base: &Path,
+    ignore: Option<&DockerIgnore>,
+) -> Result<()> {
     std::fs::create_dir_all(dst).map_err(|e| {
         BoxError::BuildError(format!(
             "Failed to create directory {}: {}",
@@ -170,6 +180,15 @@ pub(super) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
         let entry =
             entry.map_err(|e| BoxError::BuildError(format!("Failed to read entry: {}", e)))?;
         let src_path = entry.path();
+        let entry_rel = rel_base.join(entry.file_name());
+
+        // Skip paths excluded by .dockerignore (prunes the whole subtree).
+        if let Some(ign) = ignore {
+            if ign.is_excluded(&entry_rel) {
+                continue;
+            }
+        }
+
         let dst_path = dst.join(entry.file_name());
 
         // Use the no-follow file type so a symlink is preserved as a symlink
@@ -190,7 +209,7 @@ pub(super) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
             let _ = std::fs::remove_file(&dst_path);
             symlink_to(&target, &dst_path)?;
         } else if file_type.is_dir() {
-            copy_dir_recursive(&src_path, &dst_path)?;
+            copy_dir_filtered(&src_path, &dst_path, &entry_rel, ignore)?;
         } else {
             std::fs::copy(&src_path, &dst_path).map_err(|e| {
                 BoxError::BuildError(format!(

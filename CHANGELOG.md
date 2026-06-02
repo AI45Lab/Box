@@ -21,6 +21,11 @@ All notable changes to A3S Box will be documented in this file.
   the guest applies the groups that user belongs to per the image's `/etc/group`
   (runc-style initgroups) and defaults the primary gid to the user's
   `/etc/passwd` group when no `RunAsGroup` is set.
+- `.dockerignore` support: a context-root `.dockerignore` now excludes matching
+  paths from `COPY`/`ADD` (comments, blank lines, `!` negation with last-match-
+  wins, and `?`/`*`/`**` globs). Previously `COPY . /app` copied everything —
+  `.git`, `node_modules`, `.env` secrets — into the image; those are now kept
+  out, matching Docker. (Applies to the build context, not `COPY --from`.)
 - Layer-level build cache (Docker/BuildKit-style): `a3s-box build` reuses
   previously built layers across builds via a rolling chain key over each
   instruction (and, for `COPY`/`ADD`, the content of the source files), so an
