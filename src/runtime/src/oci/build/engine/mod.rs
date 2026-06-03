@@ -243,8 +243,12 @@ pub async fn build(config: BuildConfig, store: Arc<ImageStore>) -> Result<BuildR
                 // paths are not arg-expanded by this engine, so their raw repr is
                 // faithful; build-arg-driven behavior reaches RUN only via ENV.)
                 let repr = match instruction {
-                    Instruction::Env { key, value } => {
-                        format!("ENV {}={}", key, expand_args(value, &state.build_args))
+                    Instruction::Env { vars } => {
+                        let pairs: Vec<String> = vars
+                            .iter()
+                            .map(|(k, v)| format!("{}={}", k, expand_args(v, &state.build_args)))
+                            .collect();
+                        format!("ENV {}", pairs.join(" "))
                     }
                     Instruction::Arg { name, default } => {
                         let effective = state
@@ -550,21 +554,23 @@ pub async fn build(config: BuildConfig, store: Arc<ImageStore>) -> Result<BuildR
                     });
                 }
 
-                Instruction::Env { key, value } => {
+                Instruction::Env { vars } => {
+                    let display: Vec<String> =
+                        vars.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+                    let display = display.join(" ");
                     if !config.quiet {
-                        println!(
-                            "Step {}/{}: ENV {}={}",
-                            step, total_instructions, key, value
-                        );
+                        println!("Step {}/{}: ENV {}", step, total_instructions, display);
                     }
-                    let expanded_value = expand_args(value, &state.build_args);
-                    if let Some(existing) = state.env.iter_mut().find(|(k, _)| k == key) {
-                        existing.1 = expanded_value;
-                    } else {
-                        state.env.push((key.clone(), expanded_value));
+                    for (key, value) in vars {
+                        let expanded_value = expand_args(value, &state.build_args);
+                        if let Some(existing) = state.env.iter_mut().find(|(k, _)| k == key) {
+                            existing.1 = expanded_value;
+                        } else {
+                            state.env.push((key.clone(), expanded_value));
+                        }
                     }
                     state.history.push(HistoryEntry {
-                        created_by: format!("ENV {}={}", key, value),
+                        created_by: format!("ENV {}", display),
                         empty_layer: true,
                     });
                 }

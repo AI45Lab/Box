@@ -30,8 +30,9 @@ pub enum Instruction {
     },
     /// `WORKDIR <path>`
     Workdir { path: String },
-    /// `ENV <key>=<value>` or `ENV <key> <value>`
-    Env { key: String, value: String },
+    /// `ENV <key>=<value> [<key>=<value> ...]` or legacy `ENV <key> <value>`.
+    /// Carries one or more key/value pairs (Docker allows several per line).
+    Env { vars: Vec<(String, String)> },
     /// `ENTRYPOINT ["exec", "form"]` or `ENTRYPOINT command`
     Entrypoint { exec: Vec<String> },
     /// `CMD ["exec", "form"]` or `CMD command`

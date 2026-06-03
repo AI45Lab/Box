@@ -88,6 +88,11 @@ All notable changes to A3S Box will be documented in this file.
   shutdown already reaps VMs, so this is a no-op then.
 
 ### Fixed
+- Multi-variable `ENV KEY1=V1 KEY2=V2` (several pairs on one line) was parsed
+  as a single variable swallowing the rest (`KEY1="V1 KEY2=V2"`), so only the
+  first key got set and downstream `$KEY2` expanded empty. ENV now parses all
+  pairs (quote-aware, so `KEY="a b" K2=c` stays two vars). Single and legacy
+  `ENV KEY VALUE` forms are unchanged.
 - Image `USER` (named or numeric) and `run --user` are now applied to the
   container MAIN process, by the guest init right before exec (setgroups +
   setgid + setuid, after PID 1 finishes its root-only setup), reusing the same

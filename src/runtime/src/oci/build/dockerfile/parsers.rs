@@ -99,24 +99,79 @@ pub(super) fn parse_env(rest: &str, line_num: usize) -> Result<Instruction> {
     }
 
     // Two forms:
-    // ENV KEY=VALUE  (or KEY="VALUE")
-    // ENV KEY VALUE
-    if let Some(eq_pos) = rest.find('=') {
-        // Check it's not inside a value after a space
-        let space_pos = rest.find(char::is_whitespace);
-        if space_pos.is_none_or(|sp| eq_pos < sp) {
-            let key = rest[..eq_pos].to_string();
-            let value = unquote(&rest[eq_pos + 1..]);
-            return Ok(Instruction::Env { key, value });
+    //   ENV KEY=VALUE [KEY2=VALUE2 ...]   (one or more pairs, quote-aware)
+    //   ENV KEY VALUE                     (legacy; VALUE is the rest of the line)
+    // The new form is used when the first `=` precedes the first whitespace.
+    let first_eq = rest.find('=');
+    let first_space = rest.find(char::is_whitespace);
+    let is_kv_form = match (first_eq, first_space) {
+        (Some(eq), Some(sp)) => eq < sp,
+        (Some(_), None) => true,
+        _ => false,
+    };
+
+    if is_kv_form {
+        let mut vars = Vec::new();
+        for token in tokenize_quoted(rest) {
+            match token.split_once('=') {
+                Some((key, value)) if !key.is_empty() => {
+                    vars.push((key.to_string(), unquote(value)))
+                }
+                _ => {
+                    return Err(BoxError::BuildError(format!(
+                        "Line {}: invalid ENV token '{}' (expected KEY=VALUE)",
+                        line_num, token
+                    )))
+                }
+            }
         }
+        return Ok(Instruction::Env { vars });
     }
 
-    // Legacy form: ENV KEY VALUE
+    // Legacy form: ENV KEY VALUE — a single variable whose value is the rest.
     let (key, value) = split_first_word(rest);
     Ok(Instruction::Env {
-        key: key.to_string(),
-        value: value.to_string(),
+        vars: vec![(key.to_string(), value.to_string())],
     })
+}
+
+/// Split a string on unquoted whitespace, honoring single/double quotes so that
+/// `K="a b" K2=c` yields `["K=\"a b\"", "K2=c"]`. Quotes are preserved in the
+/// tokens (callers `unquote` the value side).
+fn tokenize_quoted(s: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut has_content = false;
+    for c in s.chars() {
+        match quote {
+            Some(q) => {
+                current.push(c);
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => {
+                if c == '"' || c == '\'' {
+                    quote = Some(c);
+                    current.push(c);
+                    has_content = true;
+                } else if c.is_whitespace() {
+                    if has_content {
+                        tokens.push(std::mem::take(&mut current));
+                        has_content = false;
+                    }
+                } else {
+                    current.push(c);
+                    has_content = true;
+                }
+            }
+        }
+    }
+    if has_content {
+        tokens.push(current);
+    }
+    tokens
 }
 
 pub(super) fn parse_entrypoint(rest: &str, line_num: usize) -> Result<Instruction> {

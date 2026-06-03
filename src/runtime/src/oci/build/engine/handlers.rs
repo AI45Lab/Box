@@ -573,12 +573,14 @@ pub(super) fn execute_onbuild_trigger(
     // Only handle metadata instructions in ONBUILD triggers for now
     // (RUN/COPY would need full execution context)
     match &instruction {
-        Instruction::Env { key, value } => {
-            let expanded = expand_args(value, &state.build_args);
-            if let Some(existing) = state.env.iter_mut().find(|(k, _)| k == key) {
-                existing.1 = expanded;
-            } else {
-                state.env.push((key.clone(), expanded));
+        Instruction::Env { vars } => {
+            for (key, value) in vars {
+                let expanded = expand_args(value, &state.build_args);
+                if let Some(existing) = state.env.iter_mut().find(|(k, _)| k == key) {
+                    existing.1 = expanded;
+                } else {
+                    state.env.push((key.clone(), expanded));
+                }
             }
         }
         Instruction::Label { key, value } => {
@@ -631,7 +633,10 @@ pub(super) fn instruction_to_string(instr: &Instruction) -> String {
             }
         }
         Instruction::Workdir { path } => format!("WORKDIR {}", path),
-        Instruction::Env { key, value } => format!("ENV {}={}", key, value),
+        Instruction::Env { vars } => {
+            let pairs: Vec<String> = vars.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+            format!("ENV {}", pairs.join(" "))
+        }
         Instruction::Entrypoint { exec } => format!("ENTRYPOINT {:?}", exec),
         Instruction::Cmd { exec } => format!("CMD {:?}", exec),
         Instruction::Expose { port } => format!("EXPOSE {}", port),
@@ -798,8 +803,7 @@ mod tests {
     #[test]
     fn test_instruction_to_string_env() {
         let instr = Instruction::Env {
-            key: "PATH".to_string(),
-            value: "/usr/local/bin:/usr/bin".to_string(),
+            vars: vec![("PATH".to_string(), "/usr/local/bin:/usr/bin".to_string())],
         };
         assert_eq!(
             instruction_to_string(&instr),

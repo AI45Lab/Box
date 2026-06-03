@@ -194,8 +194,7 @@ mod tests {
         assert_eq!(
             result,
             Instruction::Env {
-                key: "PATH".to_string(),
-                value: "/usr/local/bin:/usr/bin".to_string(),
+                vars: vec![("PATH".to_string(), "/usr/local/bin:/usr/bin".to_string())],
             }
         );
     }
@@ -206,8 +205,7 @@ mod tests {
         assert_eq!(
             result,
             Instruction::Env {
-                key: "MSG".to_string(),
-                value: "hello world".to_string(),
+                vars: vec![("MSG".to_string(), "hello world".to_string())],
             }
         );
     }
@@ -218,8 +216,38 @@ mod tests {
         assert_eq!(
             result,
             Instruction::Env {
-                key: "MY_VAR".to_string(),
-                value: "my_value".to_string(),
+                vars: vec![("MY_VAR".to_string(), "my_value".to_string())],
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_env_multi_var() {
+        // The form that was broken: several KEY=VALUE pairs on one line.
+        let result = parsers::parse_env("GREETING=hello APPDIR=/srv DEBUG=1", 1).unwrap();
+        assert_eq!(
+            result,
+            Instruction::Env {
+                vars: vec![
+                    ("GREETING".to_string(), "hello".to_string()),
+                    ("APPDIR".to_string(), "/srv".to_string()),
+                    ("DEBUG".to_string(), "1".to_string()),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_env_multi_var_with_quoted_spaces() {
+        // A quoted value with spaces must stay one variable, not split the line.
+        let result = parsers::parse_env(r#"NAME="John Doe" CITY=NYC"#, 1).unwrap();
+        assert_eq!(
+            result,
+            Instruction::Env {
+                vars: vec![
+                    ("NAME".to_string(), "John Doe".to_string()),
+                    ("CITY".to_string(), "NYC".to_string()),
+                ],
             }
         );
     }
