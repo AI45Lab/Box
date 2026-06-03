@@ -94,6 +94,15 @@ All notable changes to A3S Box will be documented in this file.
 
 ### Fixed
 - Docker build/runtime parity (found via a 51-case real-Linux probe):
+  - Build-time variable expansion now matches Docker: a later `ENV` value and
+    `WORKDIR` expand earlier `ENV`/`ARG` (e.g. `ENV APPDIR=/srv/app` then
+    `WORKDIR $APPDIR`), instead of keeping the literal `$APPDIR`. An undeclared
+    `--build-arg` (no matching `ARG`) is no longer substituted, and a global
+    pre-FROM `ARG` is now in scope for every stage's `FROM` and body (so
+    `FROM alpine:$BASETAG` in a later stage resolves).
+  - `COPY`/`ADD` expand wildcard sources (`COPY *.conf /etc/`) against the
+    build context instead of failing "source not found"; a glob matching
+    nothing errors like Docker. Remote `ADD` URLs are never globbed.
   - `LABEL a=1 b=2 c=3` and `EXPOSE 80 443 8080/udp` on one line now parse every
     item (previously LABEL merged into one key and EXPOSE kept only the first
     port); bare EXPOSE ports normalize to `<port>/tcp`.
