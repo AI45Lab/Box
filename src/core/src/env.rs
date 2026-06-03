@@ -7,12 +7,31 @@ pub fn parse_env_vars(vars: &[String]) -> Result<Vec<(String, String)>, String> 
     vars.iter().map(|var| parse_env_var(var)).collect()
 }
 
-/// Parse a single `KEY=VALUE` string.
+/// Parse a single `KEY=VALUE` string. A bare key (no `=`) is rejected; use
+/// [`parse_runtime_env_var`] for the `docker run -e KEY` host-passthrough form.
 pub fn parse_env_var(var: &str) -> Result<(String, String), String> {
     let (key, value) = var
         .split_once('=')
         .ok_or_else(|| format!("Invalid environment variable (expected KEY=VALUE): {var}"))?;
     Ok((key.to_string(), value.to_string()))
+}
+
+/// Parse a runtime `-e`/`--env` value, matching `docker run -e`.
+///
+/// `KEY=VALUE` sets the value explicitly; a bare `KEY` (no `=`) copies the
+/// value from the host environment (empty string if unset) — Docker's
+/// host-environment passthrough. Unlike [`parse_env_var`] this never errors, so
+/// it must only back the runtime `--env` path (not `--label`/`--log-opt`).
+pub fn parse_runtime_env_var(var: &str) -> (String, String) {
+    match var.split_once('=') {
+        Some((key, value)) => (key.to_string(), value.to_string()),
+        None => (var.to_string(), std::env::var(var).unwrap_or_default()),
+    }
+}
+
+/// Parse runtime `-e`/`--env` values (see [`parse_runtime_env_var`]).
+pub fn parse_runtime_env_vars(vars: &[String]) -> Vec<(String, String)> {
+    vars.iter().map(|var| parse_runtime_env_var(var)).collect()
 }
 
 /// Load environment variables from a Docker-style env file.
@@ -26,20 +45,23 @@ pub fn parse_env_file(path: impl AsRef<Path>) -> Result<Vec<(String, String)>, S
 /// Parse Docker-style env file content.
 ///
 /// Empty lines and `#` comments are skipped. A key without `=` gets an empty
-/// value, matching Docker env-file behavior.
+/// value. The value after the first `=` is kept VERBATIM (leading/trailing
+/// whitespace preserved), matching Docker — only the key is trimmed, and a
+/// trailing CR from Windows line endings is stripped.
 pub fn parse_env_file_content(content: &str) -> Vec<(String, String)> {
     content
         .lines()
         .filter_map(|line| {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
+            // Decide blank/comment on a leading-trimmed view without mutating
+            // the value's whitespace.
+            if line.trim_start().is_empty() || line.trim_start().starts_with('#') {
                 return None;
             }
-            let (key, value) = trimmed
-                .split_once('=')
-                .map(|(key, value)| (key.trim(), value.trim()))
-                .unwrap_or((trimmed, ""));
-            Some((key.to_string(), value.to_string()))
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            match line.split_once('=') {
+                Some((key, value)) => Some((key.trim().to_string(), value.to_string())),
+                None => Some((line.trim().to_string(), String::new())),
+            }
         })
         .collect()
 }
@@ -82,6 +104,40 @@ mod tests {
     fn test_parse_env_vars_rejects_missing_equals() {
         let err = parse_env_var("FOO").unwrap_err();
         assert!(err.contains("KEY=VALUE"));
+    }
+
+    #[test]
+    fn test_parse_runtime_env_var_explicit_and_host_passthrough() {
+        // KEY=VALUE explicit
+        assert_eq!(
+            parse_runtime_env_var("FOO=bar"),
+            ("FOO".to_string(), "bar".to_string())
+        );
+        // Bare KEY copies from the host env (docker run -e KEY).
+        std::env::set_var("A3S_TEST_HOSTPASS", "host_value_123");
+        assert_eq!(
+            parse_runtime_env_var("A3S_TEST_HOSTPASS"),
+            (
+                "A3S_TEST_HOSTPASS".to_string(),
+                "host_value_123".to_string()
+            )
+        );
+        // Bare KEY unset on host => empty value, never an error.
+        assert_eq!(
+            parse_runtime_env_var("A3S_TEST_DEFINITELY_UNSET_XYZ"),
+            ("A3S_TEST_DEFINITELY_UNSET_XYZ".to_string(), String::new())
+        );
+    }
+
+    #[test]
+    fn test_parse_env_file_preserves_value_whitespace() {
+        // Docker keeps the value verbatim after the first '='; only the key is trimmed.
+        let parsed = parse_env_file_content("PADDED=  spaced value  \nKEY=v\n");
+        assert_eq!(
+            parsed[0],
+            ("PADDED".to_string(), "  spaced value  ".to_string())
+        );
+        assert_eq!(parsed[1], ("KEY".to_string(), "v".to_string()));
     }
 
     #[test]

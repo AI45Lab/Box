@@ -331,7 +331,12 @@ pub async fn build(config: BuildConfig, store: Arc<ImageStore>) -> Result<BuildR
                     });
                 }
 
-                Instruction::Copy { src, dst, from, chown } => {
+                Instruction::Copy {
+                    src,
+                    dst,
+                    from,
+                    chown,
+                } => {
                     let created_by = if let Some(from_ref) = from {
                         format!("COPY --from={} {} {}", from_ref, src.join(" "), dst)
                     } else if let Some(owner) = chown {
@@ -600,27 +605,36 @@ pub async fn build(config: BuildConfig, store: Arc<ImageStore>) -> Result<BuildR
                     });
                 }
 
-                Instruction::Expose { port } => {
+                Instruction::Expose { ports } => {
+                    let joined = ports.join(" ");
                     if !config.quiet {
-                        println!("Step {}/{}: EXPOSE {}", step, total_instructions, port);
+                        println!("Step {}/{}: EXPOSE {}", step, total_instructions, joined);
                     }
-                    state.exposed_ports.push(port.clone());
+                    for port in ports {
+                        if !state.exposed_ports.contains(port) {
+                            state.exposed_ports.push(port.clone());
+                        }
+                    }
                     state.history.push(HistoryEntry {
-                        created_by: format!("EXPOSE {}", port),
+                        created_by: format!("EXPOSE {}", joined),
                         empty_layer: true,
                     });
                 }
 
-                Instruction::Label { key, value } => {
+                Instruction::Label { pairs } => {
+                    let joined = pairs
+                        .iter()
+                        .map(|(k, v)| format!("{}={}", k, v))
+                        .collect::<Vec<_>>()
+                        .join(" ");
                     if !config.quiet {
-                        println!(
-                            "Step {}/{}: LABEL {}={}",
-                            step, total_instructions, key, value
-                        );
+                        println!("Step {}/{}: LABEL {}", step, total_instructions, joined);
                     }
-                    state.labels.insert(key.clone(), value.clone());
+                    for (key, value) in pairs {
+                        state.labels.insert(key.clone(), value.clone());
+                    }
                     state.history.push(HistoryEntry {
-                        created_by: format!("LABEL {}={}", key, value),
+                        created_by: format!("LABEL {}", joined),
                         empty_layer: true,
                     });
                 }

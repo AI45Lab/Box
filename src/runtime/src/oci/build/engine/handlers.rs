@@ -7,12 +7,10 @@ use a3s_box_core::error::{BoxError, Result};
 use super::super::dockerfile::Instruction;
 use super::super::dockerignore::DockerIgnore;
 use super::super::layer::{
-    create_layer, create_layer_from_dir_with_chown,
-    create_layer_with_chown, LayerInfo,
+    create_layer, create_layer_from_dir_with_chown, create_layer_with_chown, LayerInfo,
 };
 use super::utils::{
-    copy_dir_filtered, expand_args, extract_tar_to_dst, is_tar_archive, resolve_chown,
-    resolve_path,
+    copy_dir_filtered, expand_args, extract_tar_to_dst, is_tar_archive, resolve_chown, resolve_path,
 };
 use super::BuildState;
 
@@ -58,7 +56,11 @@ pub(super) fn handle_copy(
         // absolute path: `Path::join` discards the base for an absolute arg, so
         // `rootfs.join("/run.sh")` would wrongly become "/run.sh". COPY --from
         // sources are conventionally absolute, so strip the leading slash.
-        let rel = PathBuf::from(if src == "." { "" } else { src.trim_start_matches('/') });
+        let rel = PathBuf::from(if src == "." {
+            ""
+        } else {
+            src.trim_start_matches('/')
+        });
         let src_path = context_dir.join(src.trim_start_matches('/'));
         if !src_path.exists() {
             return Err(BoxError::BuildError(format!(
@@ -495,7 +497,11 @@ pub(super) fn handle_add(
 
         // See handle_copy: strip a leading slash so an absolute src resolves
         // within the context rather than discarding the base in `Path::join`.
-        let rel = PathBuf::from(if src == "." { "" } else { src.trim_start_matches('/') });
+        let rel = PathBuf::from(if src == "." {
+            ""
+        } else {
+            src.trim_start_matches('/')
+        });
         let src_path = context_dir.join(src.trim_start_matches('/'));
         if !src_path.exists() {
             return Err(BoxError::BuildError(format!(
@@ -583,14 +589,20 @@ pub(super) fn execute_onbuild_trigger(
                 }
             }
         }
-        Instruction::Label { key, value } => {
-            state.labels.insert(key.clone(), value.clone());
+        Instruction::Label { pairs } => {
+            for (key, value) in pairs {
+                state.labels.insert(key.clone(), value.clone());
+            }
         }
         Instruction::Workdir { path } => {
             state.workdir = resolve_path(&state.workdir, path);
         }
-        Instruction::Expose { port } => {
-            state.exposed_ports.push(port.clone());
+        Instruction::Expose { ports } => {
+            for port in ports {
+                if !state.exposed_ports.contains(port) {
+                    state.exposed_ports.push(port.clone());
+                }
+            }
         }
         Instruction::User { user } => {
             state.user = Some(user.clone());
@@ -615,7 +627,12 @@ pub(super) fn execute_onbuild_trigger(
 pub(super) fn instruction_to_string(instr: &Instruction) -> String {
     match instr {
         Instruction::Run { command } => format!("RUN {}", command),
-        Instruction::Copy { src, dst, from, chown } => {
+        Instruction::Copy {
+            src,
+            dst,
+            from,
+            chown,
+        } => {
             let mut prefix = String::from("COPY");
             if let Some(f) = from {
                 prefix.push_str(&format!(" --from={}", f));
@@ -639,8 +656,15 @@ pub(super) fn instruction_to_string(instr: &Instruction) -> String {
         }
         Instruction::Entrypoint { exec } => format!("ENTRYPOINT {:?}", exec),
         Instruction::Cmd { exec } => format!("CMD {:?}", exec),
-        Instruction::Expose { port } => format!("EXPOSE {}", port),
-        Instruction::Label { key, value } => format!("LABEL {}={}", key, value),
+        Instruction::Expose { ports } => format!("EXPOSE {}", ports.join(" ")),
+        Instruction::Label { pairs } => format!(
+            "LABEL {}",
+            pairs
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
         Instruction::User { user } => format!("USER {}", user),
         Instruction::Arg { name, default } => {
             if let Some(d) = default {
@@ -844,7 +868,7 @@ mod tests {
     #[test]
     fn test_instruction_to_string_expose() {
         let instr = Instruction::Expose {
-            port: "8080/tcp".to_string(),
+            ports: vec!["8080/tcp".to_string()],
         };
         assert_eq!(instruction_to_string(&instr), "EXPOSE 8080/tcp");
     }
@@ -852,8 +876,7 @@ mod tests {
     #[test]
     fn test_instruction_to_string_label() {
         let instr = Instruction::Label {
-            key: "version".to_string(),
-            value: "1.0.0".to_string(),
+            pairs: vec![("version".to_string(), "1.0.0".to_string())],
         };
         assert_eq!(instruction_to_string(&instr), "LABEL version=1.0.0");
     }
@@ -993,7 +1016,11 @@ mod tests {
             0,
             None,
         );
-        assert!(result.is_ok(), "ADD --chown with numeric uid:gid should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "ADD --chown with numeric uid:gid should succeed: {:?}",
+            result.err()
+        );
         // Checking that the layer was created is sufficient for unit coverage.
         assert!(result.unwrap().path.exists());
     }

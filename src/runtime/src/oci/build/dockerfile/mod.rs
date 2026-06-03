@@ -37,10 +37,10 @@ pub enum Instruction {
     Entrypoint { exec: Vec<String> },
     /// `CMD ["exec", "form"]` or `CMD command`
     Cmd { exec: Vec<String> },
-    /// `EXPOSE <port>[/<proto>]`
-    Expose { port: String },
-    /// `LABEL <key>=<value> ...`
-    Label { key: String, value: String },
+    /// `EXPOSE <port>[/<proto>] ...` — one or more ports on a single line.
+    Expose { ports: Vec<String> },
+    /// `LABEL <key>=<value> [<key>=<value> ...]` — one or more pairs per line.
+    Label { pairs: Vec<(String, String)> },
     /// `USER <user>[:<group>]`
     User { user: String },
     /// `ARG <name>[=<default>]`
@@ -177,10 +177,24 @@ pub(super) fn parse_instruction(line: &str, line_num: usize) -> Result<Instructi
         "HEALTHCHECK" => parsers::parse_healthcheck(rest, line_num),
         "ONBUILD" => parsers::parse_onbuild(rest, line_num),
         "VOLUME" => parsers::parse_volume(rest, line_num),
-        "MAINTAINER" => Err(BoxError::BuildError(format!(
-            "Line {}: MAINTAINER is deprecated and not supported; use LABEL maintainer=<value>",
-            line_num
-        ))),
+        // MAINTAINER is deprecated but still valid in Docker: it builds and
+        // records the author. Accept it (don't fail the build), storing it as a
+        // `maintainer` label — the modern equivalent Docker itself recommends.
+        "MAINTAINER" => {
+            if rest.trim().is_empty() {
+                return Err(BoxError::BuildError(format!(
+                    "Line {}: MAINTAINER requires a value",
+                    line_num
+                )));
+            }
+            eprintln!(
+                "Warning: MAINTAINER is deprecated (line {}); recording as label maintainer=...",
+                line_num
+            );
+            Ok(Instruction::Label {
+                pairs: vec![("maintainer".to_string(), rest.trim().to_string())],
+            })
+        }
         _ => Err(BoxError::BuildError(format!(
             "Line {}: Unknown instruction '{}'",
             line_num, keyword

@@ -231,7 +231,10 @@ pub(crate) fn parse_env_file(
 pub(crate) fn build_env_map(
     common: &CommonBoxArgs,
 ) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
-    let mut env = parse_env_vars(&common.env)?;
+    // Runtime `--env` honors `docker run -e KEY` host-env passthrough (bare key).
+    let mut env: HashMap<String, String> = a3s_box_core::env::parse_runtime_env_vars(&common.env)
+        .into_iter()
+        .collect();
     for env_file in &common.env_file {
         for (key, value) in parse_env_file(env_file)? {
             env.entry(key).or_insert(value);

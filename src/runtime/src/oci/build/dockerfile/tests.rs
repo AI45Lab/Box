@@ -318,10 +318,11 @@ mod tests {
     #[test]
     fn test_parse_expose() {
         let result = parsers::parse_expose("8080", 1).unwrap();
+        // Bare ports are normalized to <port>/tcp, matching Docker.
         assert_eq!(
             result,
             Instruction::Expose {
-                port: "8080".to_string(),
+                ports: vec!["8080/tcp".to_string()],
             }
         );
     }
@@ -332,7 +333,22 @@ mod tests {
         assert_eq!(
             result,
             Instruction::Expose {
-                port: "8080/tcp".to_string(),
+                ports: vec!["8080/tcp".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_expose_multiple_ports() {
+        let result = parsers::parse_expose("80 443 8080/udp", 1).unwrap();
+        assert_eq!(
+            result,
+            Instruction::Expose {
+                ports: vec![
+                    "80/tcp".to_string(),
+                    "443/tcp".to_string(),
+                    "8080/udp".to_string(),
+                ],
             }
         );
     }
@@ -345,8 +361,7 @@ mod tests {
         assert_eq!(
             result,
             Instruction::Label {
-                key: "version".to_string(),
-                value: "1.0.0".to_string(),
+                pairs: vec![("version".to_string(), "1.0.0".to_string())],
             }
         );
     }
@@ -357,8 +372,22 @@ mod tests {
         assert_eq!(
             result,
             Instruction::Label {
-                key: "description".to_string(),
-                value: "My App".to_string(),
+                pairs: vec![("description".to_string(), "My App".to_string())],
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_label_multiple_pairs() {
+        let result = parsers::parse_label("a=1 b=2 c=3", 1).unwrap();
+        assert_eq!(
+            result,
+            Instruction::Label {
+                pairs: vec![
+                    ("a".to_string(), "1".to_string()),
+                    ("b".to_string(), "2".to_string()),
+                    ("c".to_string(), "3".to_string()),
+                ],
             }
         );
     }
@@ -578,11 +607,15 @@ CMD ["app.py"]
     }
 
     #[test]
-    fn test_parse_maintainer_is_rejected() {
-        let err = Dockerfile::parse("FROM alpine\nMAINTAINER ops@example.com")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("MAINTAINER is deprecated and not supported"));
+    fn test_parse_maintainer_accepted_as_label() {
+        // MAINTAINER is deprecated but still valid in Docker: the build succeeds
+        // and the value is recorded as a `maintainer` label.
+        let df = Dockerfile::parse("FROM alpine\nMAINTAINER ops@example.com").unwrap();
+        assert!(df.instructions.iter().any(|i| matches!(
+            i,
+            Instruction::Label { pairs }
+                if pairs == &vec![("maintainer".to_string(), "ops@example.com".to_string())]
+        )));
     }
 
     // --- parse_shell ---
@@ -710,6 +743,23 @@ CMD ["app.py"]
                 start_period: Some(30),
             }
         );
+    }
+
+    #[test]
+    fn test_parse_healthcheck_compound_go_duration() {
+        // Docker accepts Go-style compound durations like 1m30s (=90s).
+        let result =
+            parsers::parse_healthcheck("--interval=1m30s --timeout=2s --retries=3 CMD true", 1)
+                .unwrap();
+        if let Instruction::HealthCheck {
+            interval, timeout, ..
+        } = result
+        {
+            assert_eq!(interval, Some(90));
+            assert_eq!(timeout, Some(2));
+        } else {
+            panic!("expected HealthCheck");
+        }
     }
 
     #[test]

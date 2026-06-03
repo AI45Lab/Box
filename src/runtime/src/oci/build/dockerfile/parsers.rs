@@ -75,7 +75,12 @@ pub(super) fn parse_copy(rest: &str, line_num: usize) -> Result<Instruction> {
         .map(|s| s.to_string())
         .collect();
 
-    Ok(Instruction::Copy { src, dst, from, chown })
+    Ok(Instruction::Copy {
+        src,
+        dst,
+        from,
+        chown,
+    })
 }
 
 pub(super) fn parse_workdir(rest: &str, line_num: usize) -> Result<Instruction> {
@@ -217,9 +222,19 @@ pub(super) fn parse_expose(rest: &str, line_num: usize) -> Result<Instruction> {
             line_num
         )));
     }
-    Ok(Instruction::Expose {
-        port: rest.split_whitespace().next().unwrap_or(rest).to_string(),
-    })
+    // EXPOSE may list several ports on one line; Docker normalizes a bare port
+    // to `<port>/tcp` in the image config's ExposedPorts.
+    let ports = rest
+        .split_whitespace()
+        .map(|p| {
+            if p.contains('/') {
+                p.to_string()
+            } else {
+                format!("{}/tcp", p)
+            }
+        })
+        .collect();
+    Ok(Instruction::Expose { ports })
 }
 
 pub(super) fn parse_label(rest: &str, line_num: usize) -> Result<Instruction> {
@@ -230,19 +245,40 @@ pub(super) fn parse_label(rest: &str, line_num: usize) -> Result<Instruction> {
         )));
     }
 
-    // LABEL key=value
-    if let Some(eq_pos) = rest.find('=') {
-        let key = rest[..eq_pos].trim().to_string();
-        let value = unquote(rest[eq_pos + 1..].trim());
-        Ok(Instruction::Label { key, value })
-    } else {
-        // LABEL key value (legacy)
-        let (key, value) = split_first_word(rest);
-        Ok(Instruction::Label {
-            key: key.to_string(),
-            value: unquote(value),
-        })
+    // Two forms (same as ENV):
+    //   LABEL key=value [key2=value2 ...]   (one or more pairs, quote-aware)
+    //   LABEL key value                     (legacy; value is the rest of the line)
+    let first_eq = rest.find('=');
+    let first_space = rest.find(char::is_whitespace);
+    let is_kv_form = match (first_eq, first_space) {
+        (Some(eq), Some(sp)) => eq < sp,
+        (Some(_), None) => true,
+        _ => false,
+    };
+
+    if is_kv_form {
+        let mut pairs = Vec::new();
+        for token in tokenize_quoted(rest) {
+            match token.split_once('=') {
+                Some((key, value)) if !key.is_empty() => {
+                    pairs.push((key.to_string(), unquote(value)))
+                }
+                _ => {
+                    return Err(BoxError::BuildError(format!(
+                        "Line {}: invalid LABEL token '{}' (expected key=value)",
+                        line_num, token
+                    )))
+                }
+            }
+        }
+        return Ok(Instruction::Label { pairs });
     }
+
+    // Legacy form: LABEL key value — a single label whose value is the rest.
+    let (key, value) = split_first_word(rest);
+    Ok(Instruction::Label {
+        pairs: vec![(key.to_string(), unquote(value))],
+    })
 }
 
 pub(super) fn parse_user(rest: &str, line_num: usize) -> Result<Instruction> {
