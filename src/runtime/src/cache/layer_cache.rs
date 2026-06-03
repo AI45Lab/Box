@@ -239,6 +239,30 @@ impl LayerCache {
 }
 
 /// Recursively copy a directory and its contents.
+/// Copy `src`'s uid/gid onto `dst` (no symlink follow), best-effort, root only.
+///
+/// `std::fs::copy`/`create_dir_all` do not carry ownership, so a rootfs copied
+/// from extracted layers would collapse to root and lose `COPY --chown` (and
+/// base-image) ownership. Only root can chown to arbitrary ids, so this is a
+/// no-op otherwise.
+#[cfg(unix)]
+fn preserve_owner(meta: &std::fs::Metadata, dst: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    if unsafe { libc::geteuid() } != 0 {
+        return;
+    }
+    if let Ok(c_path) = std::ffi::CString::new(dst.as_os_str().as_bytes()) {
+        // lchown so a symlink's own ownership is set, not its target's.
+        unsafe {
+            libc::lchown(c_path.as_ptr(), meta.uid(), meta.gid());
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn preserve_owner(_meta: &std::fs::Metadata, _dst: &Path) {}
+
 pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     std::fs::create_dir_all(dst).map_err(|e| {
         BoxError::CacheError(format!(
@@ -247,6 +271,10 @@ pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
             e
         ))
     })?;
+    // Mirror the source directory's ownership onto the destination (root only).
+    if let Ok(src_meta) = std::fs::symlink_metadata(src) {
+        preserve_owner(&src_meta, dst);
+    }
 
     for entry in std::fs::read_dir(src).map_err(|e| {
         BoxError::CacheError(format!("Failed to read directory {}: {}", src.display(), e))
@@ -283,6 +311,7 @@ pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
                         e
                     ))
                 })?;
+                preserve_owner(&meta, &dst_path);
             }
             #[cfg(not(unix))]
             {
@@ -302,6 +331,7 @@ pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
                     e
                 ))
             })?;
+            preserve_owner(&meta, &dst_path);
         }
     }
 

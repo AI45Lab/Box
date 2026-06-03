@@ -64,7 +64,17 @@ pub fn extract_layer(layer_path: &Path, target_dir: &Path) -> Result<()> {
     archive.set_preserve_mtime(true);
     archive.set_overwrite(true);
     #[cfg(unix)]
-    archive.set_unpack_xattrs(true);
+    {
+        archive.set_unpack_xattrs(true);
+        // Restore the uid/gid stamped in the layer tar headers so `COPY --chown`
+        // ownership (and non-root ownership baked into base-image layers) is
+        // preserved in the rootfs instead of collapsing to root. tar performs a
+        // chown for this, which only succeeds as root — gate on euid 0 so a
+        // non-privileged extraction does not fail with EPERM.
+        if unsafe { libc::geteuid() } == 0 {
+            archive.set_preserve_ownerships(true);
+        }
+    }
 
     let entries = archive
         .entries()
