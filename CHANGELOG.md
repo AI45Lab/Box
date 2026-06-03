@@ -88,6 +88,11 @@ All notable changes to A3S Box will be documented in this file.
   shutdown already reaps VMs, so this is a no-op then.
 
 ### Fixed
+- Image `USER <name>` directives (e.g. `USER appuser`) are now applied to the
+  container main process: the named user is resolved to a numeric uid:gid via
+  the image rootfs `/etc/passwd`/`/etc/group` before boot. Previously the shim
+  could only set a numeric uid and silently skipped named users, so an image
+  that declared a non-root USER still ran as root (a correctness + security gap).
 - `save`/`load` now round-trip the image tag: `save` stamps the image reference
   into the OCI `index.json` `org.opencontainers.image.ref.name` annotation, so
   `load` restores the tag (e.g. `rt:9`) instead of importing the image untagged

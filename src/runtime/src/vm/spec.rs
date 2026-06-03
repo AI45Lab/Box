@@ -92,7 +92,13 @@ impl VmManager {
         // BOX_EXEC_* env vars to the container entrypoint).
         let guest_init_exec = Self::guest_init_exec_path(&layout.rootfs_path);
         let workdir = Self::effective_workdir(&self.config, layout.oci_config.as_ref());
-        let user = Self::effective_user(&self.config, layout.oci_config.as_ref());
+        // Resolve the effective user (CLI --user override, else image USER) to a
+        // numeric uid[:gid] using the image rootfs /etc/passwd|/etc/group — the
+        // shim's libkrun set_uid needs numeric ids, so a named USER like
+        // `appuser` must be resolved here or it would be silently dropped and the
+        // container would run as root.
+        let user = Self::effective_user(&self.config, layout.oci_config.as_ref())
+            .map(|u| Self::resolve_user_ids(&u, &layout.rootfs_path));
 
         // Build entrypoint
         let mut entrypoint = if let Some(guest_init_exec) = guest_init_exec {
@@ -418,6 +424,64 @@ impl VmManager {
             })
     }
 
+    /// Resolve a `user[:group]` spec to numeric `uid[:gid]`, looking up names in
+    /// the image rootfs `/etc/passwd` and `/etc/group`. Already-numeric ids pass
+    /// through. An unresolvable name is returned unchanged (the shim then logs
+    /// and skips it, preserving prior behaviour rather than failing the boot).
+    fn resolve_user_ids(spec: &str, rootfs: &std::path::Path) -> String {
+        let (user_part, group_part) = match spec.split_once(':') {
+            Some((u, g)) => (u, Some(g)),
+            None => (spec, None),
+        };
+
+        // Resolve the user to a uid, and remember its primary gid from passwd.
+        let (uid, passwd_gid) = if user_part.parse::<u32>().is_ok() {
+            (user_part.to_string(), None)
+        } else {
+            match Self::passwd_lookup(rootfs, user_part) {
+                Some((uid, gid)) => (uid.to_string(), Some(gid)),
+                None => return spec.to_string(), // unresolvable name: leave as-is
+            }
+        };
+
+        let gid = match group_part {
+            None => passwd_gid.map(|g| g.to_string()),
+            Some(g) if g.parse::<u32>().is_ok() => Some(g.to_string()),
+            Some(g) => Self::group_lookup(rootfs, g).map(|gid| gid.to_string()),
+        };
+
+        match gid {
+            Some(gid) => format!("{uid}:{gid}"),
+            None => uid,
+        }
+    }
+
+    /// Look up `name` in `<rootfs>/etc/passwd`, returning `(uid, primary_gid)`.
+    fn passwd_lookup(rootfs: &std::path::Path, name: &str) -> Option<(u32, u32)> {
+        let passwd = std::fs::read_to_string(rootfs.join("etc/passwd")).ok()?;
+        for line in passwd.lines() {
+            let f: Vec<&str> = line.splitn(5, ':').collect();
+            if f.len() >= 4 && f[0] == name {
+                let uid = f[2].parse::<u32>().ok()?;
+                let gid = f[3].parse::<u32>().unwrap_or(uid);
+                return Some((uid, gid));
+            }
+        }
+        None
+    }
+
+    /// Look up `name` in `<rootfs>/etc/group`, returning its gid.
+    fn group_lookup(rootfs: &std::path::Path, name: &str) -> Option<u32> {
+        let group = std::fs::read_to_string(rootfs.join("etc/group")).ok()?;
+        for line in group.lines() {
+            let f: Vec<&str> = line.splitn(4, ':').collect();
+            if f.len() >= 3 && f[0] == name {
+                return f[2].parse::<u32>().ok();
+            }
+        }
+        None
+    }
+
     /// Parse a volume mount string into a FsMount.
     ///
     /// Supported formats:
@@ -595,6 +659,35 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_resolve_user_ids_name_and_numeric() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("etc")).unwrap();
+        fs::write(
+            dir.path().join("etc/passwd"),
+            "root:x:0:0:root:/root:/bin/sh\nappuser:x:1500:1200:App:/home/app:/bin/sh\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("etc/group"),
+            "root:x:0:\nstaff:x:50:\n",
+        )
+        .unwrap();
+
+        // Named user -> uid:primary_gid from passwd.
+        assert_eq!(VmManager::resolve_user_ids("appuser", dir.path()), "1500:1200");
+        // Named user with named group -> both resolved.
+        assert_eq!(
+            VmManager::resolve_user_ids("appuser:staff", dir.path()),
+            "1500:50"
+        );
+        // Already numeric passes through.
+        assert_eq!(VmManager::resolve_user_ids("1000:1000", dir.path()), "1000:1000");
+        assert_eq!(VmManager::resolve_user_ids("0", dir.path()), "0");
+        // Unresolvable name is left unchanged (shim then skips it).
+        assert_eq!(VmManager::resolve_user_ids("ghost", dir.path()), "ghost");
+    }
 
     fn test_oci_config(workdir: Option<&str>, user: Option<&str>) -> OciImageConfig {
         OciImageConfig {
