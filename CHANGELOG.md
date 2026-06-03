@@ -166,6 +166,14 @@ All notable changes to A3S Box will be documented in this file.
     image pull/remove by tag, without tag, and by digest; image status across
     all reference kinds; non-empty uid/username; and the listImage image and
     repoTag counts.
+- `stop` now stops containers gracefully and honors the image `STOPSIGNAL`. The
+  CLI signalled the shim directly, but libkrun renames the shim and a host
+  signal kills the VM abruptly, so the container never ran its stop handler —
+  a `STOPSIGNAL SIGINT` image, or even a plain SIGTERM trap, was ignored. The
+  stop signal is now delivered inside the guest over the exec channel (a
+  `signal-main` control to the container's main process); the container runs its
+  own shutdown and exits, then guest init exits and the VM halts cleanly. A
+  container that ignores the signal is still force-killed at the stop timeout.
 
 ## [2.0.6] — 2026-06-01
 
