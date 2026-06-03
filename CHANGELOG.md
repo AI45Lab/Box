@@ -21,6 +21,8 @@ All notable changes to A3S Box will be documented in this file.
   the guest applies the groups that user belongs to per the image's `/etc/group`
   (runc-style initgroups) and defaults the primary gid to the user's
   `/etc/passwd` group when no `RunAsGroup` is set.
+- `images --filter` supports `reference=<glob>` and `label=<key>[=<value>]`
+  (repeatable; all must match), matching common `docker images --filter` usage.
 - `build --target <stage>` builds only up to the named (or indexed) stage of a
   multi-stage build and emits that stage's image; later stages are not executed.
 - `build --no-cache` disables the layer build cache so every layer is rebuilt.
