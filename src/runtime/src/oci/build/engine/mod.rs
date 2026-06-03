@@ -4,6 +4,7 @@
 //! executes each instruction, creates layers, and assembles the final OCI image.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -30,7 +31,7 @@ use handlers::{
     apply_base_config, execute_onbuild_trigger, handle_add, handle_copy, handle_run,
     instruction_to_string,
 };
-use stages::{resolve_stage_rootfs, split_into_stages};
+use stages::{global_arg_decls, resolve_stage_rootfs, split_into_stages};
 use utils::{compute_diff_id, expand_args, format_size, resolve_path};
 
 /// Configuration for a build operation.
@@ -93,8 +94,13 @@ pub(super) struct BuildState {
     pub(super) diff_ids: Vec<String>,
     /// History entries
     pub(super) history: Vec<HistoryEntry>,
-    /// Build arguments
+    /// Build arguments (all `--build-arg` values plus ARG defaults). A value is
+    /// only usable in variable expansion if its name is also in `declared_args`.
     pub(super) build_args: HashMap<String, String>,
+    /// Names declared via an `ARG` instruction in scope for this stage (plus any
+    /// global pre-FROM ARGs). Docker only substitutes `$NAME` for declared names;
+    /// an undeclared `--build-arg` is ignored for expansion.
+    pub(super) declared_args: HashSet<String>,
     /// Shell override (default: ["/bin/sh", "-c"])
     pub(super) shell: Vec<String>,
     /// Stop signal
@@ -130,11 +136,44 @@ impl BuildState {
             diff_ids: Vec::new(),
             history: Vec::new(),
             build_args,
+            declared_args: HashSet::new(),
             shell: vec!["/bin/sh".to_string(), "-c".to_string()],
             stop_signal: None,
             health_check: None,
             onbuild: Vec::new(),
             volumes: Vec::new(),
+        }
+    }
+
+    /// Build args whose names were declared via `ARG` (gates `$NAME` expansion,
+    /// so an undeclared `--build-arg` is not substituted — matching Docker).
+    fn declared_build_args(&self) -> HashMap<String, String> {
+        self.build_args
+            .iter()
+            .filter(|(name, _)| self.declared_args.contains(*name))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect()
+    }
+
+    /// Variables in scope for `$NAME`/`${NAME}` expansion in ENV/WORKDIR/FROM:
+    /// declared ARG values overlaid with already-set ENV (ENV wins), matching
+    /// Docker. An undeclared/unset name is left untouched by `expand_args`.
+    fn expansion_vars(&self) -> HashMap<String, String> {
+        let mut vars = self.declared_build_args();
+        for (key, value) in &self.env {
+            vars.insert(key.clone(), value.clone());
+        }
+        vars
+    }
+
+    /// Seed a global (pre-FROM) ARG into this stage: declare its name and apply
+    /// its default unless a `--build-arg` already overrides it.
+    fn seed_global_arg(&mut self, name: &str, default: Option<&str>) {
+        self.declared_args.insert(name.to_string());
+        if !self.build_args.contains_key(name) {
+            if let Some(val) = default {
+                self.build_args.insert(name.to_string(), val.to_string());
+            }
         }
     }
 }
@@ -171,6 +210,10 @@ pub async fn build(config: BuildConfig, store: Arc<ImageStore>) -> Result<BuildR
 
     // Split instructions into stages by FROM
     let stages = split_into_stages(&dockerfile.instructions);
+    // Global (pre-FROM) ARG declarations: in scope for every stage. Stage 0 also
+    // processes them inline (they are prepended to it), so they are only seeded
+    // into later stages to avoid double-counting.
+    let global_args = global_arg_decls(&dockerfile.instructions);
     let total_stages = stages.len();
 
     // Resolve --target to the stage that produces the output image (by alias or
@@ -214,6 +257,14 @@ pub async fn build(config: BuildConfig, store: Arc<ImageStore>) -> Result<BuildR
         })?;
 
         let mut state = BuildState::new(config.build_args.clone());
+        // Seed later stages with the global pre-FROM ARGs (stage 0 gets them
+        // inline). Without this, a later `FROM image:$GLOBAL_ARG` would not
+        // resolve and the global ARG would be unavailable to the stage body.
+        if stage_idx > 0 {
+            for (name, default) in &global_args {
+                state.seed_global_arg(name, default.as_deref());
+            }
+        }
         let mut base_layers: Vec<LayerInfo> = Vec::new();
         let mut base_diff_ids: Vec<String> = Vec::new();
 
@@ -246,7 +297,9 @@ pub async fn build(config: BuildConfig, store: Arc<ImageStore>) -> Result<BuildR
                     Instruction::Env { vars } => {
                         let pairs: Vec<String> = vars
                             .iter()
-                            .map(|(k, v)| format!("{}={}", k, expand_args(v, &state.build_args)))
+                            .map(|(k, v)| {
+                                format!("{}={}", k, expand_args(v, &state.expansion_vars()))
+                            })
                             .collect();
                         format!("ENV {}", pairs.join(" "))
                     }
@@ -291,9 +344,14 @@ pub async fn build(config: BuildConfig, store: Arc<ImageStore>) -> Result<BuildR
                             println!("Step {}/{}: FROM {}", step, total_instructions, image);
                         }
                     }
-                    let (layers, diff_ids, base_config) =
-                        handle_from(image, &rootfs_dir, &layers_dir, &store, &state.build_args)
-                            .await?;
+                    let (layers, diff_ids, base_config) = handle_from(
+                        image,
+                        &rootfs_dir,
+                        &layers_dir,
+                        &store,
+                        &state.declared_build_args(),
+                    )
+                    .await?;
                     base_layers = layers;
                     base_diff_ids = diff_ids;
 
@@ -550,7 +608,9 @@ pub async fn build(config: BuildConfig, store: Arc<ImageStore>) -> Result<BuildR
                     if !config.quiet {
                         println!("Step {}/{}: WORKDIR {}", step, total_instructions, path);
                     }
-                    state.workdir = resolve_path(&state.workdir, path);
+                    // Expand prior ENV/ARG in the WORKDIR path (Docker does too).
+                    let expanded_path = expand_args(path, &state.expansion_vars());
+                    state.workdir = resolve_path(&state.workdir, &expanded_path);
                     let full = rootfs_dir.join(state.workdir.trim_start_matches('/'));
                     let _ = std::fs::create_dir_all(&full);
                     state.history.push(HistoryEntry {
@@ -567,7 +627,9 @@ pub async fn build(config: BuildConfig, store: Arc<ImageStore>) -> Result<BuildR
                         println!("Step {}/{}: ENV {}", step, total_instructions, display);
                     }
                     for (key, value) in vars {
-                        let expanded_value = expand_args(value, &state.build_args);
+                        // Expand prior ENV (and declared ARGs) in the value, left
+                        // to right, so `ENV A=/x B=$A/y` resolves B against A.
+                        let expanded_value = expand_args(value, &state.expansion_vars());
                         if let Some(existing) = state.env.iter_mut().find(|(k, _)| k == key) {
                             existing.1 = expanded_value;
                         } else {
@@ -654,6 +716,7 @@ pub async fn build(config: BuildConfig, store: Arc<ImageStore>) -> Result<BuildR
                     if !config.quiet {
                         println!("Step {}/{}: ARG {}", step, total_instructions, name);
                     }
+                    state.declared_args.insert(name.clone());
                     if !state.build_args.contains_key(name) {
                         if let Some(val) = default {
                             state.build_args.insert(name.clone(), val.clone());

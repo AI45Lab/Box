@@ -17,6 +17,99 @@ use super::BuildState;
 #[cfg(target_os = "macos")]
 const UNSAFE_HOST_RUN_ENV: &str = "A3S_BOX_UNSAFE_HOST_RUN";
 
+/// Whether a COPY/ADD source contains shell glob metacharacters.
+fn has_glob_meta(s: &str) -> bool {
+    s.contains('*') || s.contains('?') || s.contains('[')
+}
+
+/// Match a single path-segment glob (`*` = any run, `?` = one char) against a
+/// name. Used for COPY/ADD wildcard expansion (the final segment of the source).
+fn glob_segment_match(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    // Classic two-pointer wildcard match with `*` backtracking.
+    let (mut pi, mut ni) = (0usize, 0usize);
+    let (mut star, mut mark) = (None, 0usize);
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            mark = ni;
+            pi += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            mark += 1;
+            ni = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// Expand a COPY/ADD source pattern against `base_dir` into concrete relative
+/// paths. Globs are honored in the final path segment (the common Docker case,
+/// e.g. `*.conf` or `src/*.txt`). Returns the matches sorted; empty if none.
+fn expand_glob_sources(base_dir: &Path, pattern: &str) -> Vec<String> {
+    let p = pattern.trim_start_matches('/');
+    let (dir_part, name_pat) = match p.rsplit_once('/') {
+        Some((d, n)) => (d, n),
+        None => ("", p),
+    };
+    let search_dir = if dir_part.is_empty() {
+        base_dir.to_path_buf()
+    } else {
+        base_dir.join(dir_part)
+    };
+    let mut matches = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&search_dir) {
+        for entry in entries.flatten() {
+            let fname = entry.file_name();
+            let fname = fname.to_string_lossy();
+            if glob_segment_match(name_pat, &fname) {
+                matches.push(if dir_part.is_empty() {
+                    fname.into_owned()
+                } else {
+                    format!("{}/{}", dir_part, fname)
+                });
+            }
+        }
+    }
+    matches.sort();
+    matches
+}
+
+/// Resolve COPY/ADD source patterns, expanding any globs against `base_dir`.
+/// A non-glob source is passed through verbatim; a glob with no matches errors
+/// like Docker ("no source files were specified").
+fn resolve_source_patterns(base_dir: &Path, src_patterns: &[String]) -> Result<Vec<String>> {
+    let mut resolved = Vec::new();
+    for src in src_patterns {
+        if src.starts_with("http://") || src.starts_with("https://") {
+            // Remote ADD sources are never globbed (and may contain `?` query
+            // strings); pass them through untouched.
+            resolved.push(src.clone());
+        } else if has_glob_meta(src) {
+            let matches = expand_glob_sources(base_dir, src);
+            if matches.is_empty() {
+                return Err(BoxError::BuildError(format!(
+                    "COPY/ADD source not found: no matches for pattern '{}'",
+                    src
+                )));
+            }
+            resolved.extend(matches);
+        } else {
+            resolved.push(src.clone());
+        }
+    }
+    Ok(resolved)
+}
+
 /// Handle COPY: copy files from build context into rootfs, create a layer.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn handle_copy(
@@ -30,6 +123,9 @@ pub(super) fn handle_copy(
     layer_index: usize,
     ignore: Option<&DockerIgnore>,
 ) -> Result<LayerInfo> {
+    // Expand any glob source patterns against the context (Docker semantics).
+    let src_patterns = &resolve_source_patterns(context_dir, src_patterns)?;
+
     // Resolve destination path
     let resolved_dst = resolve_path(workdir, dst);
     let dst_in_rootfs = rootfs_dir.join(resolved_dst.trim_start_matches('/'));
@@ -448,6 +544,10 @@ pub(super) fn handle_add(
         None
     };
 
+    // Expand any glob source patterns against the context (Docker semantics);
+    // remote URL sources pass through untouched.
+    let src_patterns = &resolve_source_patterns(context_dir, src_patterns)?;
+
     let resolved_dst = resolve_path(workdir, dst);
     let dst_in_rootfs = rootfs_dir.join(resolved_dst.trim_start_matches('/'));
 
@@ -760,10 +860,38 @@ fn download_url(url: &str) -> std::result::Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::super::super::dockerfile::Instruction;
-    use super::{execute_onbuild_trigger, handle_add, instruction_to_string};
+    use super::{
+        execute_onbuild_trigger, expand_glob_sources, glob_segment_match, handle_add,
+        instruction_to_string,
+    };
     use crate::oci::build::engine::{BuildConfig, BuildState};
     use std::collections::HashMap;
     use std::path::PathBuf;
+
+    #[test]
+    fn test_glob_segment_match() {
+        assert!(glob_segment_match("*.conf", "alpha.conf"));
+        assert!(glob_segment_match("*.conf", ".conf"));
+        assert!(!glob_segment_match("*.conf", "skip.txt"));
+        assert!(glob_segment_match("a?c", "abc"));
+        assert!(!glob_segment_match("a?c", "ac"));
+        assert!(glob_segment_match("*", "anything"));
+        assert!(glob_segment_match("pre*post", "pre_middle_post"));
+        assert!(!glob_segment_match("pre*post", "pre_middle"));
+    }
+
+    #[test]
+    fn test_expand_glob_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("alpha.conf"), "1").unwrap();
+        std::fs::write(dir.path().join("beta.conf"), "2").unwrap();
+        std::fs::write(dir.path().join("skip.txt"), "x").unwrap();
+        let mut got = expand_glob_sources(dir.path(), "*.conf");
+        got.sort();
+        assert_eq!(got, vec!["alpha.conf".to_string(), "beta.conf".to_string()]);
+        // Non-matching glob yields no entries.
+        assert!(expand_glob_sources(dir.path(), "*.md").is_empty());
+    }
 
     #[test]
     fn test_instruction_to_string_run() {

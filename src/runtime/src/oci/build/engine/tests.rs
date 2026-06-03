@@ -231,8 +231,11 @@ LABEL org.opencontainers.image.title="scratch-smoke"
         std::fs::write(context.join("keep.txt"), "keep").unwrap();
         std::fs::write(context.join("logs/a.log"), "x").unwrap();
         std::fs::write(context.join("logs/important.log"), "y").unwrap();
-        std::fs::write(context.join(".dockerignore"), ".git\n.env\n**/*.log\n!logs/important.log\n")
-            .unwrap();
+        std::fs::write(
+            context.join(".dockerignore"),
+            ".git\n.env\n**/*.log\n!logs/important.log\n",
+        )
+        .unwrap();
         std::fs::write(context.join("Dockerfile"), "FROM scratch\nCOPY . /app\n").unwrap();
 
         let store = Arc::new(ImageStore::new(&store_dir, 1024 * 1024 * 100).unwrap());
@@ -270,9 +273,18 @@ LABEL org.opencontainers.image.title="scratch-smoke"
 
         assert!(names.iter().any(|n| n == "app/keep.txt"));
         assert!(names.iter().any(|n| n == "app/logs/important.log")); // !negation
-        assert!(!names.iter().any(|n| n.contains(".env")), "secret leaked: {names:?}");
-        assert!(!names.iter().any(|n| n.contains(".git")), ".git leaked: {names:?}");
-        assert!(!names.iter().any(|n| n == "app/logs/a.log"), "*.log leaked: {names:?}");
+        assert!(
+            !names.iter().any(|n| n.contains(".env")),
+            "secret leaked: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains(".git")),
+            ".git leaked: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "app/logs/a.log"),
+            "*.log leaked: {names:?}"
+        );
     }
 
     #[tokio::test]
@@ -316,10 +328,7 @@ CMD ["/work/run.sh"]
         assert_eq!(result.layer_count, 1);
         let stored = store.get("multistage:latest").await.unwrap();
         let image = OciImage::from_path(&stored.path).unwrap();
-        assert_eq!(
-            image.config().cmd,
-            Some(vec!["/work/run.sh".to_string()])
-        );
+        assert_eq!(image.config().cmd, Some(vec!["/work/run.sh".to_string()]));
     }
 
     #[tokio::test]
