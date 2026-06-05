@@ -39,6 +39,15 @@ pub fn json_log_path(log_dir: &Path) -> PathBuf {
     log_dir.join("container.json")
 }
 
+/// True for console lines that are VM/runtime boot internals, not container
+/// output. Currently libkrun's C-init preamble (`init.krun: ...`), emitted to
+/// the console before `/sbin/init` (guest-init) takes over. guest-init's own
+/// tracing is routed to `/dev/kmsg` and never reaches the console, so this is
+/// the only remaining non-container source on it.
+fn is_runtime_console_noise(line: &str) -> bool {
+    line.starts_with("init.krun:")
+}
+
 /// Tail console.log and write Docker-compatible JSON lines to container.json.
 fn run_json_file_processor(console_log: &Path, log_dir: &Path, max_size: u64, max_file: u32) {
     // Wait for console.log to appear
@@ -70,6 +79,14 @@ fn run_json_file_processor(console_log: &Path, log_dir: &Path, max_size: u64, ma
                 continue;
             }
         };
+
+        // Drop libkrun's C-init boot preamble (`init.krun: ...`) printed to the
+        // console before /sbin/init starts. It is runtime internals, not
+        // container output — Docker `logs` must show only the latter. (guest-init's
+        // own tracing already goes to /dev/kmsg, not the console.)
+        if is_runtime_console_noise(&line) {
+            continue;
+        }
 
         let entry = LogEntry {
             log: format!("{}\n", line),
@@ -128,6 +145,9 @@ fn run_syslog_processor(console_log: &Path, address: &str, _facility: &str, tag:
                         continue;
                     }
                 };
+                if is_runtime_console_noise(&line) {
+                    continue;
+                }
                 // RFC 3164 format: <priority>tag: message
                 // facility=daemon(3), severity=info(6) → priority = 3*8+6 = 30
                 let msg = format!("<30>{}: {}", tag, line);
@@ -148,6 +168,9 @@ fn run_syslog_processor(console_log: &Path, address: &str, _facility: &str, tag:
                         continue;
                     }
                 };
+                if is_runtime_console_noise(&line) {
+                    continue;
+                }
                 let msg = format!("<30>{}: {}\n", tag, line);
                 if stream.write_all(msg.as_bytes()).is_err() {
                     // Connection lost — try to reconnect once
@@ -264,6 +287,16 @@ mod tests {
     use super::*;
     use std::io::Read;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_is_runtime_console_noise() {
+        assert!(is_runtime_console_noise("init.krun: mount_filesystems ok"));
+        assert!(is_runtime_console_noise("init.krun: execvp(/sbin/init) starting"));
+        // Real container output must pass through, even if it mentions krun.
+        assert!(!is_runtime_console_noise("L1"));
+        assert!(!is_runtime_console_noise("starting app (init.krun: ignored)"));
+        assert!(!is_runtime_console_noise(""));
+    }
 
     #[test]
     fn test_rotating_writer_basic() {

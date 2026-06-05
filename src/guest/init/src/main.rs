@@ -164,13 +164,83 @@ fn is_tee_environment() -> bool {
     a3s_box_core::tee::is_tee_available()
 }
 
+/// Raw fd of `/dev/kmsg`, opened ONCE before any chroot/pivot and kept open for
+/// the process lifetime. An open file description survives `pivot_root`/`chroot`
+/// (it is independent of the path), so reusing this fd avoids the gap where the
+/// new root has no `/dev/kmsg` yet — which would otherwise leak a few lines back
+/// to the console mid-boot.
+static KMSG_FD: std::sync::OnceLock<Option<std::os::unix::io::RawFd>> = std::sync::OnceLock::new();
+
+/// Writer for guest-init's OWN tracing. Routes it to the kernel log
+/// (`/dev/kmsg`) instead of the VM console so it never pollutes container logs:
+/// the container inherits the console for its stdout/stderr, and Docker-style
+/// `logs` must show only that, not runtime internals (init/exec/pty chatter).
+/// A `<7>` (debug) priority prefix keeps these lines below the guest kernel's
+/// console loglevel (4), so they never echo back to the console. Falls back to
+/// stdout when `/dev/kmsg` is unavailable (e.g. non-Linux), preserving the old
+/// behavior rather than dropping logs.
+enum InitLogWriter {
+    Kmsg(std::os::unix::io::RawFd),
+    Stdout(std::io::Stdout),
+}
+
+impl std::io::Write for InitLogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            InitLogWriter::Kmsg(fd) => {
+                // /dev/kmsg treats each write() as one record: prefix the
+                // priority and flatten embedded newlines so a formatted event
+                // stays a single kernel-log record.
+                let mut record = Vec::with_capacity(buf.len() + 13);
+                record.extend_from_slice(b"<7>a3s-init: ");
+                record.extend(buf.iter().map(|&b| if b == b'\n' { b' ' } else { b }));
+                // SAFETY: *fd is a valid, process-lifetime fd to /dev/kmsg; a
+                // failed write is intentionally ignored (logging must never panic).
+                unsafe {
+                    libc::write(*fd, record.as_ptr() as *const libc::c_void, record.len());
+                }
+                Ok(buf.len())
+            }
+            InitLogWriter::Stdout(out) => out.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            InitLogWriter::Kmsg(_) => Ok(()),
+            InitLogWriter::Stdout(out) => out.flush(),
+        }
+    }
+}
+
+fn make_init_log_writer() -> InitLogWriter {
+    match KMSG_FD.get().copied().flatten() {
+        Some(fd) => InitLogWriter::Kmsg(fd),
+        None => InitLogWriter::Stdout(std::io::stdout()),
+    }
+}
+
 fn main() {
-    // Initialize logging
+    // Open /dev/kmsg once (before any chroot) and keep it open for the whole
+    // process via into_raw_fd, so guest-init's logs reach the kernel log
+    // reliably across the pivot. Container logs stay clean (see InitLogWriter).
+    use std::os::unix::io::IntoRawFd;
+    let kmsg_fd = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/kmsg")
+        .ok()
+        .map(|file| file.into_raw_fd());
+    let _ = KMSG_FD.set(kmsg_fd);
+
+    // Initialize logging. guest-init's own logs go to the kernel log, NOT the
+    // console, to keep container logs clean.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        .with_ansi(false)
+        .with_writer(make_init_log_writer)
         .init();
 
     info!("a3s-box guest init starting (PID {})", process::id());
