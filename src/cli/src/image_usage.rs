@@ -120,6 +120,23 @@ pub fn resolve_stored_image(
     Ok(None)
 }
 
+/// All images matching `query` (exact, then alias, then digest — first mode
+/// with any match wins). Used by `rmi --force`, where an ambiguous digest
+/// should remove every reference sharing it rather than erroring.
+pub fn all_matching_images(images: &[StoredImage], query: &str) -> Vec<StoredImage> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Vec::new();
+    }
+    for mode in [MatchMode::Exact, MatchMode::Alias, MatchMode::Digest] {
+        let matches = matching_images(images, query, mode);
+        if !matches.is_empty() {
+            return matches;
+        }
+    }
+    Vec::new()
+}
+
 pub fn resolve_required_stored_image(
     images: &[StoredImage],
     query: &str,
@@ -179,17 +196,33 @@ fn ambiguous_reference_error(query: &str, matches: &[StoredImage]) -> String {
 }
 
 fn is_digest_reference(reference: &str) -> bool {
-    reference.starts_with("sha256:")
+    if reference.starts_with("sha256:") {
+        return true;
+    }
+    // A bare lowercase-hex string is a Docker image id (short id = 12 hex,
+    // full = 64). Tags/repos that happen to be all-hex are still matched first
+    // by Exact/Alias, so this only catches genuine id queries.
+    let len = reference.len();
+    (12..=64).contains(&len)
+        && reference
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 fn digest_matches(stored_digest: &str, query: &str) -> bool {
     if stored_digest == query {
         return true;
     }
-    let Some(query_hex) = query.strip_prefix("sha256:") else {
+    // Accept both `sha256:<hex>` and a bare `<hex>` query, prefix-matching the
+    // stored digest's hex (so `rmi 5b10f432ef3d` resolves the image).
+    let query_hex = query.strip_prefix("sha256:").unwrap_or(query);
+    if query_hex.is_empty() {
         return false;
-    };
-    !query_hex.is_empty() && stored_digest.starts_with(query)
+    }
+    let stored_hex = stored_digest
+        .strip_prefix("sha256:")
+        .unwrap_or(stored_digest);
+    stored_hex.starts_with(query_hex)
 }
 
 pub fn normalize_reference(reference: &str) -> String {
@@ -396,6 +429,21 @@ mod tests {
         assert!(digest_matches("sha256:abcdef123456", "sha256:abcdef123456"));
         assert!(digest_matches("sha256:abcdef123456", "sha256:abcdef"));
         assert!(!digest_matches("sha256:abcdef123456", "sha256:"));
-        assert!(!digest_matches("sha256:abcdef123456", "abcdef"));
+        // A bare hex query prefix-matches the stored digest's hex (Docker short id).
+        assert!(digest_matches("sha256:abcdef123456", "abcdef"));
+        assert!(!digest_matches("sha256:abcdef123456", "ffffff"));
+    }
+
+    #[test]
+    fn test_is_digest_reference_bare_hex_short_id() {
+        assert!(is_digest_reference("sha256:abc"));
+        // 12-hex Docker short id.
+        assert!(is_digest_reference("5b10f432ef3d"));
+        // Normal tags/repos are not treated as digests.
+        assert!(!is_digest_reference("alpine"));
+        assert!(!is_digest_reference("v1"));
+        assert!(!is_digest_reference("latest"));
+        // Uppercase hex is not a valid image id.
+        assert!(!is_digest_reference("5B10F432EF3D"));
     }
 }

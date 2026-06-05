@@ -209,7 +209,7 @@ fn apply_changes(
 }
 
 /// Parse a CMD/ENTRYPOINT value as a JSON array (exec form) or a shell string.
-fn parse_exec_or_shell(rest: &str) -> serde_json::Value {
+pub(crate) fn parse_exec_or_shell(rest: &str) -> serde_json::Value {
     let t = rest.trim();
     if t.starts_with('[') {
         if let Ok(v) = serde_json::from_str::<Vec<String>>(t) {
@@ -220,7 +220,7 @@ fn parse_exec_or_shell(rest: &str) -> serde_json::Value {
     serde_json::json!(["/bin/sh", "-c", t])
 }
 
-fn parse_key_value(rest: &str) -> Result<(String, String), String> {
+pub(crate) fn parse_key_value(rest: &str) -> Result<(String, String), String> {
     if let Some((k, v)) = rest.split_once('=') {
         Ok((k.trim().to_string(), v.trim().to_string()))
     } else if let Some((k, v)) = rest.split_once(char::is_whitespace) {

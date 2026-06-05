@@ -75,7 +75,9 @@ fn build_image_inspect_json(
         "LayerCount": oci.layer_paths().len(),
     });
 
-    Ok(serde_json::to_string_pretty(&output)?)
+    // Docker's inspect family always returns a top-level JSON array (even for a
+    // single image), so tooling can do `inspect X | jq '.[0].Config'`.
+    Ok(serde_json::to_string_pretty(&serde_json::json!([output]))?)
 }
 
 #[cfg(test)]
