@@ -281,6 +281,23 @@ impl ComposeProject {
         }
     }
 
+    /// Dependencies this service must wait to run to completion (exit 0) before
+    /// starting — `depends_on: { dep: { condition: service_completed_successfully } }`.
+    pub fn completed_wait_deps(&self, service_name: &str) -> Vec<String> {
+        let Some(svc) = self.config.services.get(service_name) else {
+            return vec![];
+        };
+
+        match &svc.depends_on {
+            a3s_box_core::compose::DependsOn::Map(map) => map
+                .iter()
+                .filter(|(_, cond)| cond.condition == "service_completed_successfully")
+                .map(|(name, _)| name.clone())
+                .collect(),
+            _ => vec![],
+        }
+    }
+
     /// Get the health check config for a service, if defined.
     pub fn healthcheck(&self, service_name: &str) -> Option<HealthCheckSpec> {
         let svc = self.config.services.get(service_name)?;
@@ -419,10 +436,10 @@ fn validate_depends_on_conditions(
 
     for (dep_name, condition) in map {
         match condition.condition.as_str() {
-            "service_started" | "service_healthy" => {}
+            "service_started" | "service_healthy" | "service_completed_successfully" => {}
             other => {
                 return Err(BoxError::ConfigError(format!(
-                    "Service '{}' depends on '{}' with unsupported condition '{}' (supported: service_started, service_healthy)",
+                    "Service '{}' depends on '{}' with unsupported condition '{}' (supported: service_started, service_healthy, service_completed_successfully)",
                     service_name, dep_name, other
                 )));
             }
@@ -1057,6 +1074,25 @@ services:
     }
 
     #[test]
+    fn test_service_completed_successfully_condition_accepted() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx
+    depends_on:
+      init:
+        condition: service_completed_successfully
+  init:
+    image: busybox
+"#;
+        let config = ComposeConfig::from_yaml_str(yaml).unwrap();
+        let project = ComposeProject::new("myapp", config).unwrap();
+        assert_eq!(project.completed_wait_deps("web"), vec!["init".to_string()]);
+        // `init` itself has no completion wait.
+        assert!(project.completed_wait_deps("init").is_empty());
+    }
+
+    #[test]
     fn test_unsupported_depends_on_condition_rejected() {
         let yaml = r#"
 services:
@@ -1064,7 +1100,7 @@ services:
     image: nginx
     depends_on:
       db:
-        condition: service_completed_successfully
+        condition: service_bogus_condition
   db:
     image: postgres
 "#;

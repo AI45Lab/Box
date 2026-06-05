@@ -28,6 +28,38 @@ pub fn is_process_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
+/// Whether `pid` has exited, treating a zombie (an exited-but-unreaped child)
+/// as exited. Unlike [`is_process_alive`], whose `kill(pid, 0)` succeeds for a
+/// zombie, this inspects `/proc/<pid>/stat` on Linux so a detached box's shim —
+/// which becomes a zombie under its parent the moment the VM halts — is detected
+/// as completed rather than appearing to run forever.
+#[cfg(target_os = "linux")]
+pub fn is_process_exited(pid: u32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // Format: "<pid> (<comm>) <state> ...". comm may contain spaces/parens,
+        // so scan past the final ')'. Z (zombie) or X (dead) => exited.
+        Ok(stat) => match stat.rfind(')') {
+            Some(idx) => matches!(
+                stat[idx + 1..].trim_start().chars().next(),
+                Some('Z') | Some('X')
+            ),
+            None => false,
+        },
+        // No /proc entry => the process is gone.
+        Err(_) => true,
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+pub fn is_process_exited(pid: u32) -> bool {
+    !is_process_alive(pid)
+}
+
+#[cfg(not(unix))]
+pub fn is_process_exited(pid: u32) -> bool {
+    !is_process_alive(pid)
+}
+
 #[cfg(windows)]
 pub fn is_process_alive(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::STILL_ACTIVE;
@@ -190,6 +222,14 @@ mod tests {
     #[test]
     fn test_is_process_alive_nonexistent() {
         assert!(!is_process_alive(99999));
+    }
+
+    #[test]
+    fn test_is_process_exited_current_and_missing() {
+        // The running test process has not exited.
+        assert!(!is_process_exited(std::process::id()));
+        // A PID with no process is treated as exited.
+        assert!(is_process_exited(0x7fff_fffe));
     }
 
     #[cfg(unix)]
