@@ -497,13 +497,13 @@ mod tests {
     }
 
     #[test]
-    fn test_config_from_record_rejects_invalid_user() {
+    fn test_config_from_record_accepts_named_user() {
+        // Named users are forwarded as-is and resolved in the guest.
         let mut record = sample_record();
         record.user = Some("node".to_string());
 
-        let err = config_from_record(&record).unwrap_err();
-
-        assert!(err.contains("Named user"));
+        let config = config_from_record(&record).unwrap();
+        assert_eq!(config.user.as_deref(), Some("node"));
     }
 
     #[test]

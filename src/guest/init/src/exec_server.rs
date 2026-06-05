@@ -438,13 +438,14 @@ fn build_command(
     };
     let timeout = Duration::from_nanos(timeout_ns);
     let workdir = spec.working_dir.unwrap_or("/");
-    // Resolve a named user (CRI RunAsUserName) against the container's
-    // /etc/passwd before numeric parsing; falls through to spec.user when the
-    // value is already numeric/root or cannot be resolved.
+    // Resolve a named user (CRI RunAsUserName, or `exec -u <name>`) against the
+    // container's /etc/passwd before numeric parsing; falls through to spec.user
+    // when the value is already numeric/root or cannot be resolved. For an exec
+    // (no rootfs override) the container root is the current `/`.
+    let resolve_rootfs = spec.rootfs.unwrap_or("/");
     let resolved_user = spec
         .user
-        .zip(spec.rootfs)
-        .and_then(|(user, rootfs)| crate::user::resolve_named_user(user, rootfs));
+        .and_then(|user| crate::user::resolve_named_user(user, resolve_rootfs));
     let mut process_user = match parse_process_user(resolved_user.as_deref().or(spec.user)) {
         Ok(process_user) => process_user,
         Err(error) => {
@@ -458,9 +459,9 @@ fn build_command(
     // When a user is set without an explicit group (RunAsUser, no RunAsGroup),
     // default the primary gid to the user's /etc/passwd group — matching how a
     // normal login derives the primary group — instead of inheriting root's.
-    if let (Some(process_user), Some(rootfs)) = (process_user.as_mut(), spec.rootfs) {
+    if let Some(process_user) = process_user.as_mut() {
         if process_user.gid.is_none() {
-            process_user.gid = crate::user::primary_gid_for_uid(rootfs, process_user.uid);
+            process_user.gid = crate::user::primary_gid_for_uid(resolve_rootfs, process_user.uid);
         }
     }
 

@@ -51,7 +51,7 @@ pub struct CommonBoxArgs {
     #[arg(long)]
     pub hostname: Option<String>,
 
-    /// Run as a specific user (supported: root, UID, UID:GID)
+    /// Run as a specific user (root, UID, UID:GID, name, or name:group)
     #[arg(short = 'u', long)]
     pub user: Option<String>,
 
@@ -413,12 +413,18 @@ fn normalize_user_part(part: &str, label: &str, original: &str) -> Result<String
             "Invalid --user '{original}' ({label} component is empty)"
         ));
     }
+    if part.contains('\0') {
+        return Err(format!(
+            "Invalid --user '{original}' ({label} contains a NUL byte)"
+        ));
+    }
     if part == "root" {
         return Ok("0".to_string());
     }
-    part.parse::<u32>().map(|_| part.to_string()).map_err(|_| {
-        format!("Named {label} '{part}' is not supported yet; use root or a numeric UID[:GID]")
-    })
+    // Numeric stays numeric; a named user/group is forwarded as-is and resolved
+    // in the guest against the container's /etc/passwd and /etc/group, like
+    // Docker's `--user name`.
+    Ok(part.to_string())
 }
 
 /// Validate an in-guest working directory override.
@@ -890,13 +896,22 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_runtime_options_rejects_named_user() {
+    fn test_validate_runtime_options_accepts_named_user() {
+        // A named user is forwarded as-is and resolved in the guest against the
+        // container's /etc/passwd (like Docker's --user name).
         let mut args = default_common_args();
         args.user = Some("node".to_string());
-
-        let err = validate_runtime_options(&args).unwrap_err();
-
-        assert!(err.contains("Named user"));
+        validate_runtime_options(&args).unwrap();
+        assert_eq!(
+            normalize_user_option(Some("nobody")).unwrap().as_deref(),
+            Some("nobody")
+        );
+        assert_eq!(
+            normalize_user_option(Some("node:staff"))
+                .unwrap()
+                .as_deref(),
+            Some("node:staff")
+        );
     }
 
     #[test]
