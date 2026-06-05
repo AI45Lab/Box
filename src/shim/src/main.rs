@@ -455,7 +455,10 @@ unsafe fn configure_and_start_vm(spec: &InstanceSpec) -> Result<()> {
 
         let mount_path: std::path::PathBuf = if host_path.is_file() {
             // Create a temporary directory to hold the file
-            let temp_dir = std::env::temp_dir().join(format!("a3s-fs-mount-{}", spec.box_id));
+            // Per-mount temp dir (keyed by tag) so two file mounts sharing a
+            // basename (e.g. two app.conf to different targets) don't collide.
+            let temp_dir =
+                std::env::temp_dir().join(format!("a3s-fs-mount-{}-{}", spec.box_id, mount.tag));
             let file_name = host_path.file_name().unwrap();
             let temp_file_path = temp_dir.join(file_name);
 

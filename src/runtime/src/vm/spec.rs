@@ -161,9 +161,19 @@ impl VmManager {
                     } else {
                         ""
                     };
+                    // Mark single-file bind mounts so the guest binds the file onto
+                    // guest_path instead of mounting the virtio-fs share over its
+                    // parent directory (which would clobber e.g. /etc). The host is
+                    // authoritative here (it can stat the path); the guest must not
+                    // re-guess from the guest path's shape.
+                    let file_flag = if std::path::Path::new(parts[0]).is_file() {
+                        ":file"
+                    } else {
+                        ""
+                    };
                     env.push((
                         format!("BOX_VOL_{}", i),
-                        format!("vol{}:{}{}", i, guest_path, mode),
+                        format!("vol{}:{}{}{}", i, guest_path, mode, file_flag),
                     ));
                 }
             }
