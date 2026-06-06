@@ -242,6 +242,36 @@ fn open_console(console_log: &Path, stop: &AtomicBool) -> Option<std::fs::File> 
 }
 
 /// Tail console.log and write one Docker-style JSON record per container line.
+/// The stderr companion to `console.log` (libkrun's 3-fd console sends guest
+/// stderr here, stdout to `console.log`).
+pub fn stderr_console_path(console_log: &Path) -> PathBuf {
+    console_log.with_file_name("console.err.log")
+}
+
+/// Tail one console file, emitting each container line via `emit(line, stream)`.
+/// `filter_noise` drops libkrun's `init.krun:` preamble (only on the stdout
+/// console). Blocks until `stop` is set and the file is drained.
+fn run_tagged_tail(
+    file: &Path,
+    stream: &str,
+    filter_noise: bool,
+    stop: &AtomicBool,
+    emit: &(dyn Fn(&str, &str) + Sync),
+) {
+    let f = match open_console(file, stop) {
+        Some(f) => f,
+        None => return,
+    };
+    let mut reader = BufReader::new(f);
+    let mut buf = String::new();
+    while let Some(line) = tail_next_line(&mut reader, &mut buf, stop) {
+        if filter_noise && is_runtime_console_noise(&line) {
+            continue;
+        }
+        emit(&line, stream);
+    }
+}
+
 fn run_json_file_processor(
     console_log: &Path,
     log_dir: &Path,
@@ -249,34 +279,38 @@ fn run_json_file_processor(
     max_file: u32,
     stop: &AtomicBool,
 ) {
-    let file = match open_console(console_log, stop) {
-        Some(f) => f,
-        None => return,
-    };
-    let mut reader = BufReader::new(file);
     let json_path = json_log_path(log_dir);
-    let mut writer = match RotatingWriter::new(&json_path, max_size, max_file) {
+    let writer = std::sync::Mutex::new(match RotatingWriter::new(&json_path, max_size, max_file) {
         Ok(w) => w,
         Err(_) => return,
-    };
+    });
+    let err_log = stderr_console_path(console_log);
 
-    let mut buf = String::new();
-    while let Some(line) = tail_next_line(&mut reader, &mut buf, stop) {
-        if is_runtime_console_noise(&line) {
-            continue;
-        }
+    // Write one tagged JSON record per line; shared by the stdout and stderr
+    // tail threads (the Mutex serializes their interleave into container.json).
+    let emit = |line: &str, stream: &str| {
         let entry = LogEntry {
             log: format!("{line}\n"),
-            stream: "stdout".to_string(),
+            stream: stream.to_string(),
             time: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
         };
         if let Ok(json) = serde_json::to_string(&entry) {
-            let _ = writer.write_line(&json);
+            if let Ok(mut w) = writer.lock() {
+                let _ = w.write_line(&json);
+            }
         }
-    }
+    };
+    let emit: &(dyn Fn(&str, &str) + Sync) = &emit;
+
+    std::thread::scope(|s| {
+        s.spawn(|| run_tagged_tail(console_log, "stdout", true, stop, emit));
+        // libkrun's `init.krun:` preamble can land on EITHER stream, so filter
+        // the noise on stderr too.
+        s.spawn(|| run_tagged_tail(&err_log, "stderr", true, stop, emit));
+    });
 }
 
-/// Forward console.log lines to a syslog endpoint via UDP or TCP.
+/// Forward both console streams (stdout + stderr) to a syslog endpoint.
 fn run_syslog_processor(
     console_log: &Path,
     address: &str,
@@ -286,10 +320,6 @@ fn run_syslog_processor(
 ) {
     use std::net::UdpSocket;
 
-    let file = match open_console(console_log, stop) {
-        Some(f) => f,
-        None => return,
-    };
     let (proto, addr) = if let Some(rest) = address.strip_prefix("udp://") {
         ("udp", rest)
     } else if let Some(rest) = address.strip_prefix("tcp://") {
@@ -297,9 +327,7 @@ fn run_syslog_processor(
     } else {
         ("udp", address)
     };
-
-    let mut reader = BufReader::new(file);
-    let mut buf = String::new();
+    let err_log = stderr_console_path(console_log);
 
     match proto {
         "udp" => {
@@ -307,33 +335,38 @@ fn run_syslog_processor(
                 Ok(s) => s,
                 Err(_) => return,
             };
-            while let Some(line) = tail_next_line(&mut reader, &mut buf, stop) {
-                if is_runtime_console_noise(&line) {
-                    continue;
-                }
-                // RFC 3164: <priority>tag: message; daemon(3)*8 + info(6) = 30.
+            // RFC 3164: <priority>tag: message; daemon(3)*8 + info(6) = 30.
+            let emit = |line: &str, _stream: &str| {
                 let msg = format!("<30>{tag}: {line}");
                 let _ = socket.send_to(msg.as_bytes(), addr);
-            }
+            };
+            let emit: &(dyn Fn(&str, &str) + Sync) = &emit;
+            std::thread::scope(|s| {
+                s.spawn(|| run_tagged_tail(console_log, "stdout", true, stop, emit));
+                s.spawn(|| run_tagged_tail(&err_log, "stderr", true, stop, emit));
+            });
         }
         "tcp" => {
-            let mut stream = match std::net::TcpStream::connect(addr) {
-                Ok(s) => s,
+            let stream = match std::net::TcpStream::connect(addr) {
+                Ok(s) => std::sync::Mutex::new(s),
                 Err(_) => return,
             };
-            while let Some(line) = tail_next_line(&mut reader, &mut buf, stop) {
-                if is_runtime_console_noise(&line) {
-                    continue;
-                }
+            let emit = |line: &str, _stream: &str| {
                 let msg = format!("<30>{tag}: {line}\n");
-                if stream.write_all(msg.as_bytes()).is_err() {
-                    stream = match std::net::TcpStream::connect(addr) {
-                        Ok(s) => s,
-                        Err(_) => return,
-                    };
-                    let _ = stream.write_all(msg.as_bytes());
+                if let Ok(mut s) = stream.lock() {
+                    if s.write_all(msg.as_bytes()).is_err() {
+                        if let Ok(news) = std::net::TcpStream::connect(addr) {
+                            *s = news;
+                            let _ = s.write_all(msg.as_bytes());
+                        }
+                    }
                 }
-            }
+            };
+            let emit: &(dyn Fn(&str, &str) + Sync) = &emit;
+            std::thread::scope(|sc| {
+                sc.spawn(|| run_tagged_tail(console_log, "stdout", true, stop, emit));
+                sc.spawn(|| run_tagged_tail(&err_log, "stderr", true, stop, emit));
+            });
         }
         _ => {}
     }

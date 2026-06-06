@@ -756,8 +756,37 @@ unsafe fn configure_and_start_vm(spec: &InstanceSpec) -> Result<()> {
                 message: format!("Invalid console output path: {}", console_path.display()),
                 hint: None,
             })?;
-        tracing::debug!(console_path = console_str, "Redirecting console output");
-        ctx.set_console_output(console_str)?;
+        // Split console: guest stdout -> console.log, stderr -> console.err.log
+        // (libkrun's 3-fd virtio-console separates the streams), so the log
+        // processor can tag each line's stream like Docker's json-file driver.
+        // Falls back to the merged single-file console if the err file can't be
+        // opened. BOX_NO_SPLIT_STDERR forces the legacy merged behavior.
+        use std::os::unix::io::AsRawFd;
+        let opened = if std::env::var_os("BOX_NO_SPLIT_STDERR").is_none() {
+            let err_path = console_path.with_file_name("console.err.log");
+            let open = |p: &std::path::Path| {
+                std::fs::OpenOptions::new().create(true).append(true).open(p)
+            };
+            match (open(console_path), open(&err_path)) {
+                (Ok(out_f), Ok(err_f)) => Some((out_f, err_f)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        match opened {
+            Some((out_f, err_f)) => {
+                ctx.add_split_console(-1, out_f.as_raw_fd(), err_f.as_raw_fd())?;
+                // Keep the fds open for the VM's lifetime.
+                std::mem::forget(out_f);
+                std::mem::forget(err_f);
+                tracing::debug!("split console enabled (stdout/stderr separated)");
+            }
+            None => {
+                tracing::debug!(console_path = console_str, "Redirecting console output (merged)");
+                ctx.set_console_output(console_str)?;
+            }
+        }
     }
 
     // Configure TEE if specified (only available on Linux with SEV support)

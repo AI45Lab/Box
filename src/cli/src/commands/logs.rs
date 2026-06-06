@@ -241,11 +241,18 @@ fn print_json_line(
         }
     }
 
-    // The log field already contains the trailing newline
-    if timestamps {
-        print!("{} {}", entry.time, entry.log);
+    // The log field already contains the trailing newline. Route stderr lines to
+    // the terminal's stderr, like Docker `logs`.
+    let line = if timestamps {
+        format!("{} {}", entry.time, entry.log)
     } else {
-        print!("{}", entry.log);
+        entry.log.clone()
+    };
+    if entry.stream == "stderr" {
+        use std::io::Write as _;
+        let _ = std::io::stderr().write_all(line.as_bytes());
+    } else {
+        print!("{line}");
     }
 }
 

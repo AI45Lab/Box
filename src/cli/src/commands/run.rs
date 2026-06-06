@@ -624,8 +624,14 @@ async fn run_foreground(
     );
 
     let console_log = ctx.box_dir.join("logs").join("console.log");
+    let console_err = ctx.box_dir.join("logs").join("console.err.log");
     let log_handle = tokio::spawn(async move {
-        super::tail_file(&console_log).await;
+        // Stream the container's stdout (console.log) and stderr
+        // (console.err.log, split console) to the terminal's stdout/stderr.
+        tokio::join!(
+            super::tail_file(&console_log),
+            super::tail_file_stream(&console_err, true),
+        );
     });
 
     let name = ctx.name.clone();

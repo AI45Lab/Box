@@ -241,6 +241,14 @@ pub(crate) fn resolve_box_rootfs(box_dir: &std::path::Path) -> Option<PathBuf> {
 /// Waits for the file to exist, then continuously reads and prints new data.
 /// Used by `run` (foreground mode) and `attach`.
 pub(crate) async fn tail_file(path: &std::path::Path) {
+    tail_file_stream(path, false).await;
+}
+
+/// Tail a console file to the terminal. `to_stderr` routes it to the terminal's
+/// stderr — used for the container's stderr console (console.err.log) so a
+/// foreground `run`/`attach` shows stdout and stderr like Docker.
+pub(crate) async fn tail_file_stream(path: &std::path::Path, to_stderr: bool) {
+    use std::io::Write as _;
     use tokio::io::AsyncReadExt;
 
     // Wait for file to exist
@@ -264,7 +272,13 @@ pub(crate) async fn tail_file(path: &std::path::Path) {
             }
             Ok(n) => {
                 let text = String::from_utf8_lossy(&buf[..n]);
-                print!("{text}");
+                if to_stderr {
+                    let mut err = std::io::stderr();
+                    let _ = err.write_all(text.as_bytes());
+                    let _ = err.flush();
+                } else {
+                    print!("{text}");
+                }
             }
             Err(_) => break,
         }

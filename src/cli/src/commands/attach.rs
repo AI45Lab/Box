@@ -53,8 +53,12 @@ pub async fn execute(args: AttachArgs) -> Result<(), Box<dyn std::error::Error>>
 
     println!("Attached to box {}. Press Ctrl-C to detach.", record.name);
 
+    let console_err = console_log.with_file_name("console.err.log");
     let log_handle = tokio::spawn(async move {
-        super::tail_file(&console_log).await;
+        tokio::join!(
+            super::tail_file(&console_log),
+            super::tail_file_stream(&console_err, true),
+        );
     });
 
     let _ = tokio::signal::ctrl_c().await;
