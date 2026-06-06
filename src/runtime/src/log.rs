@@ -48,6 +48,35 @@ fn is_runtime_console_noise(line: &str) -> bool {
     line.starts_with("init.krun:")
 }
 
+/// Read the next COMPLETE line from a tailed `console.log`, blocking (with
+/// polling) until one is available, and return it WITHOUT the trailing newline.
+///
+/// This is `tail -f` semantics, which the log processors require: `BufRead`
+/// signals EOF with `Ok(0)` (NOT an error), so a plain `reader.lines()` loop
+/// ENDS at the first EOF and silently drops every line a container logs after an
+/// initial quiet period. Here EOF just means "wait for the file to grow". `buf`
+/// accumulates a partial line (no trailing newline yet) across reads so it is
+/// completed on the next append instead of being split into two records.
+fn tail_next_line(reader: &mut impl BufRead, buf: &mut String) -> String {
+    loop {
+        match reader.read_line(buf) {
+            Ok(0) | Err(_) => {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                continue;
+            }
+            Ok(_) => {}
+        }
+        if !buf.ends_with('\n') {
+            // Partial line at EOF — keep it buffered and wait for the rest.
+            continue;
+        }
+        let line = std::mem::take(buf);
+        return line
+            .trim_end_matches(|c| c == '\n' || c == '\r')
+            .to_string();
+    }
+}
+
 /// Tail console.log and write Docker-compatible JSON lines to container.json.
 fn run_json_file_processor(console_log: &Path, log_dir: &Path, max_size: u64, max_file: u32) {
     // Wait for console.log to appear
@@ -63,22 +92,17 @@ fn run_json_file_processor(console_log: &Path, log_dir: &Path, max_size: u64, ma
         Err(_) => return,
     };
 
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
     let json_path = json_log_path(log_dir);
     let mut writer = match RotatingWriter::new(&json_path, max_size, max_file) {
         Ok(w) => w,
         Err(_) => return,
     };
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => {
-                // EOF — poll for more data
-                std::thread::sleep(std::time::Duration::from_millis(200));
-                continue;
-            }
-        };
+    // Tail console.log (see tail_next_line) and emit one JSON record per line.
+    let mut buf = String::new();
+    loop {
+        let line = tail_next_line(&mut reader, &mut buf);
 
         // Drop libkrun's C-init boot preamble (`init.krun: ...`) printed to the
         // console before /sbin/init starts. It is runtime internals, not
@@ -129,7 +153,8 @@ fn run_syslog_processor(console_log: &Path, address: &str, _facility: &str, tag:
         ("udp", address)
     };
 
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
+    let mut buf = String::new();
 
     match proto {
         "udp" => {
@@ -137,14 +162,8 @@ fn run_syslog_processor(console_log: &Path, address: &str, _facility: &str, tag:
                 Ok(s) => s,
                 Err(_) => return,
             };
-            for line in reader.lines() {
-                let line = match line {
-                    Ok(l) => l,
-                    Err(_) => {
-                        std::thread::sleep(std::time::Duration::from_millis(200));
-                        continue;
-                    }
-                };
+            loop {
+                let line = tail_next_line(&mut reader, &mut buf);
                 if is_runtime_console_noise(&line) {
                     continue;
                 }
@@ -160,14 +179,8 @@ fn run_syslog_processor(console_log: &Path, address: &str, _facility: &str, tag:
                 Ok(s) => s,
                 Err(_) => return,
             };
-            for line in reader.lines() {
-                let line = match line {
-                    Ok(l) => l,
-                    Err(_) => {
-                        std::thread::sleep(std::time::Duration::from_millis(200));
-                        continue;
-                    }
-                };
+            loop {
+                let line = tail_next_line(&mut reader, &mut buf);
                 if is_runtime_console_noise(&line) {
                     continue;
                 }
@@ -287,6 +300,18 @@ mod tests {
     use super::*;
     use std::io::Read;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_tail_next_line_returns_complete_lines() {
+        use std::io::Cursor;
+        // Two complete lines (one CRLF, one LF) are returned newline-stripped.
+        // A third call would block polling for EOF growth (tail -f), so we stop.
+        let mut reader = BufReader::new(Cursor::new(b"alpha\r\nbeta\n".to_vec()));
+        let mut buf = String::new();
+        assert_eq!(tail_next_line(&mut reader, &mut buf), "alpha");
+        assert_eq!(tail_next_line(&mut reader, &mut buf), "beta");
+        assert!(buf.is_empty(), "buffer must be drained after a complete line");
+    }
 
     #[test]
     fn test_is_runtime_console_noise() {
