@@ -40,6 +40,10 @@ pub struct Container {
     pub sandbox_id: String,
     /// Container name.
     pub name: String,
+    /// CRI metadata `attempt` (restart generation). kubelet correlates restarts
+    /// by `(name, attempt)`, so it must round-trip back in status/list responses.
+    #[serde(default)]
+    pub attempt: u32,
     /// Image reference used to create this container.
     pub image_ref: String,
     /// Content digest resolved from the local image store during CreateContainer.
@@ -317,6 +321,7 @@ mod tests {
             id: id.to_string(),
             sandbox_id: sandbox_id.to_string(),
             name: format!("container-{}", id),
+            attempt: 0,
             image_ref: "nginx:latest".to_string(),
             resolved_image_digest: "sha256:test".to_string(),
             resolved_image_path: "/".to_string(),
