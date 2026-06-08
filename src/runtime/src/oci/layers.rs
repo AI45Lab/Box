@@ -1,10 +1,11 @@
 //! OCI layer extraction utilities.
 //!
-//! Handles extraction of OCI image layers (tar.gz format) to filesystem.
+//! Handles extraction of OCI image layers (gzip, zstd, or uncompressed tar).
 
 use a3s_box_core::error::{BoxError, Result};
 use flate2::read::GzDecoder;
 use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use tar::Archive;
 
@@ -41,7 +42,7 @@ pub fn extract_layer(layer_path: &Path, target_dir: &Path) -> Result<()> {
     })?;
 
     // Open layer file
-    let file = File::open(layer_path).map_err(|e| {
+    let mut file = File::open(layer_path).map_err(|e| {
         BoxError::OciImageError(format!(
             "Failed to open layer file {}: {}",
             layer_path.display(),
@@ -49,8 +50,34 @@ pub fn extract_layer(layer_path: &Path, target_dir: &Path) -> Result<()> {
         ))
     })?;
 
-    // Decompress gzip
-    let decoder = GzDecoder::new(file);
+    // Detect the layer's compression from its magic bytes — OCI layers are gzip
+    // (1f 8b), zstd (28 b5 2f fd, e.g. buildkit/nerdctl `--compression zstd`), or
+    // an uncompressed tar. Peek, rewind, then pick the matching decoder; relying
+    // on the media type alone would miss layers stored without one.
+    let mut magic = [0u8; 4];
+    let read = file.read(&mut magic).map_err(|e| {
+        BoxError::OciImageError(format!(
+            "Failed to read layer header {}: {e}",
+            layer_path.display()
+        ))
+    })?;
+    file.seek(SeekFrom::Start(0)).map_err(|e| {
+        BoxError::OciImageError(format!("Failed to rewind layer {}: {e}", layer_path.display()))
+    })?;
+
+    let decoder: Box<dyn Read> = if read >= 2 && magic[0] == 0x1f && magic[1] == 0x8b {
+        Box::new(GzDecoder::new(file))
+    } else if read >= 4 && magic == [0x28, 0xb5, 0x2f, 0xfd] {
+        Box::new(zstd::stream::read::Decoder::new(file).map_err(|e| {
+            BoxError::OciImageError(format!(
+                "Failed to init zstd decoder for {}: {e}",
+                layer_path.display()
+            ))
+        })?)
+    } else {
+        // Uncompressed tar (some registries / `--compression none`).
+        Box::new(file)
+    };
 
     // Extract the tar archive, applying OCI whiteout semantics so files deleted
     // in an upper layer do not reappear from lower layers:
@@ -338,5 +365,51 @@ mod tests {
         }
 
         builder.finish().unwrap();
+    }
+
+    fn write_test_tar<W: std::io::Write>(writer: W, files: &[(&str, &[u8])]) {
+        use tar::Builder;
+        let mut builder = Builder::new(writer);
+        for (name, content) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_uid(0);
+            header.set_gid(0);
+            header.set_cksum();
+            builder.append_data(&mut header, name, *content).unwrap();
+        }
+        builder.finish().unwrap();
+    }
+
+    #[test]
+    fn test_extract_layer_handles_zstd() {
+        let temp_dir = TempDir::new().unwrap();
+        let layer_path = temp_dir.path().join("layer.tar.zst");
+        let target_dir = temp_dir.path().join("extracted");
+        {
+            let file = File::create(&layer_path).unwrap();
+            let encoder = zstd::stream::write::Encoder::new(file, 0)
+                .unwrap()
+                .auto_finish();
+            write_test_tar(encoder, &[("z.txt", b"zstd-content")]);
+        }
+
+        extract_layer(&layer_path, &target_dir).unwrap();
+        assert_eq!(
+            fs::read_to_string(target_dir.join("z.txt")).unwrap(),
+            "zstd-content"
+        );
+    }
+
+    #[test]
+    fn test_extract_layer_handles_uncompressed_tar() {
+        let temp_dir = TempDir::new().unwrap();
+        let layer_path = temp_dir.path().join("layer.tar");
+        let target_dir = temp_dir.path().join("extracted");
+        write_test_tar(File::create(&layer_path).unwrap(), &[("p.txt", b"plain")]);
+
+        extract_layer(&layer_path, &target_dir).unwrap();
+        assert_eq!(fs::read_to_string(target_dir.join("p.txt")).unwrap(), "plain");
     }
 }

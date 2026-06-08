@@ -72,6 +72,7 @@ oci-spec = "0.6"
 oci-distribution = { workspace = true }
 tar = "0.4"
 flate2 = "1.0"
+zstd = "0.13"
 
 # Build support
 tempfile = { workspace = true }
