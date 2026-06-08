@@ -801,6 +801,7 @@ fn test_sandbox(id: &str) -> PodSandbox {
         name: format!("pod-{}", id),
         namespace: "default".to_string(),
         uid: format!("uid-{}", id),
+        attempt: 0,
         state: SandboxState::Ready,
         created_at: 1_000_000_000,
         labels: HashMap::from([("app".to_string(), "test".to_string())]),
@@ -840,6 +841,7 @@ fn test_container(id: &str, sandbox_id: &str) -> Container {
         id: id.to_string(),
         sandbox_id: sandbox_id.to_string(),
         name: format!("container-{}", id),
+        attempt: 0,
         image_ref: "nginx:latest".to_string(),
         resolved_image_digest: "sha256:test".to_string(),
         resolved_image_path: "/".to_string(),
@@ -1445,6 +1447,23 @@ async fn test_list_pod_sandbox_with_entries() {
         .unwrap()
         .into_inner();
     assert_eq!(resp.items.len(), 2);
+}
+
+#[tokio::test]
+async fn test_list_pod_sandbox_round_trips_metadata_attempt() {
+    let svc = make_test_service();
+    let mut sandbox = test_sandbox("sb-attempt");
+    sandbox.attempt = 5;
+    svc.store.sandboxes.add(sandbox).await;
+
+    let resp = svc
+        .list_pod_sandbox(Request::new(ListPodSandboxRequest { filter: None }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.items.len(), 1);
+    // kubelet correlates restarts by (name, uid, attempt) — it must round-trip.
+    assert_eq!(resp.items[0].metadata.as_ref().unwrap().attempt, 5);
 }
 
 #[tokio::test]

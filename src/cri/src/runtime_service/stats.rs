@@ -210,7 +210,7 @@ pub(super) async fn container_stats(container: &Container, usage: VmUsage) -> Co
             id: container.id.clone(),
             metadata: Some(ContainerMetadata {
                 name: container.name.clone(),
-                attempt: 0,
+                attempt: container.attempt,
             }),
             labels: container.labels.clone(),
             annotations: container.annotations.clone(),
@@ -253,7 +253,7 @@ pub(super) async fn pod_sandbox_stats(
                 name: sandbox.name.clone(),
                 uid: sandbox.uid.clone(),
                 namespace: sandbox.namespace.clone(),
-                attempt: 0,
+                attempt: sandbox.attempt,
             }),
             labels: sandbox.labels.clone(),
             annotations: sandbox.annotations.clone(),

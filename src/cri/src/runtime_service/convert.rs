@@ -351,7 +351,7 @@ pub(super) fn container_summary(container: Container) -> crate::cri_api::Contain
         pod_sandbox_id: container.sandbox_id,
         metadata: Some(ContainerMetadata {
             name: container.name,
-            attempt: 0,
+            attempt: container.attempt,
         }),
         image: Some(ImageSpec {
             image: container.image_ref.clone(),
@@ -372,7 +372,7 @@ pub(super) fn sandbox_summary(sandbox: PodSandbox) -> crate::cri_api::PodSandbox
             name: sandbox.name,
             uid: sandbox.uid,
             namespace: sandbox.namespace,
-            attempt: 0,
+            attempt: sandbox.attempt,
         }),
         state: sandbox_state_to_cri(sandbox.state).into(),
         created_at: sandbox.created_at,

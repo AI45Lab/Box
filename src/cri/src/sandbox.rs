@@ -44,6 +44,10 @@ pub struct PodSandbox {
     pub namespace: String,
     /// Pod UID.
     pub uid: String,
+    /// CRI metadata `attempt` (restart generation). kubelet correlates sandboxes
+    /// by `(name, uid, attempt)`, so it must round-trip in status/list responses.
+    #[serde(default)]
+    pub attempt: u32,
     /// Current state.
     pub state: SandboxState,
     /// Creation timestamp in nanoseconds.
@@ -148,6 +152,7 @@ mod tests {
             name: format!("pod-{}", id),
             namespace: "default".to_string(),
             uid: format!("uid-{}", id),
+            attempt: 0,
             state: SandboxState::Ready,
             created_at: 1000000000,
             labels: HashMap::from([("app".to_string(), "test".to_string())]),
