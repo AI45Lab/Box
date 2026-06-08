@@ -119,6 +119,32 @@ fn image_matches_filter(image: &Image, filter: &str) -> bool {
 }
 
 /// A3S Box implementation of the CRI ImageService.
+/// Convert a CRI per-request `AuthConfig` (kubelet fills it from a pod's
+/// `imagePullSecrets`) into a registry credential. Supports the standard
+/// username/password shape and the Docker-config base64 `auth` ("user:pass")
+/// field. Bearer tokens (`identity_token`/`registry_token`) are not modeled by
+/// `RegistryAuth` yet, so a token-only AuthConfig yields `None` and the caller
+/// falls back to the service-default credential.
+fn auth_config_to_registry_auth(auth: &AuthConfig) -> Option<RegistryAuth> {
+    if !auth.username.is_empty() {
+        return Some(RegistryAuth::basic(
+            auth.username.clone(),
+            auth.password.clone(),
+        ));
+    }
+    if !auth.auth.is_empty() {
+        use base64::Engine;
+        if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(auth.auth.trim()) {
+            if let Ok(pair) = String::from_utf8(decoded) {
+                if let Some((user, pass)) = pair.split_once(':') {
+                    return Some(RegistryAuth::basic(user, pass));
+                }
+            }
+        }
+    }
+    None
+}
+
 pub struct BoxImageService {
     image_store: Arc<ImageStore>,
     image_puller: Arc<ImagePuller>,
@@ -233,12 +259,25 @@ impl ImageService for BoxImageService {
             .image
             .ok_or_else(|| Status::invalid_argument("image spec required"))?;
 
-        tracing::info!(image = %image_spec.image, "CRI PullImage");
-
-        self.image_puller
-            .pull(&image_spec.image)
-            .await
-            .map_err(box_error_to_status)?;
+        // Honor kubelet's per-request credentials (imagePullSecrets). When the
+        // request carries usable auth, pull with a one-off puller built from it;
+        // otherwise fall back to the service-default registry credential.
+        match req.auth.as_ref().and_then(auth_config_to_registry_auth) {
+            Some(auth) => {
+                tracing::info!(image = %image_spec.image, "CRI PullImage (request auth)");
+                ImagePuller::new(self.image_store.clone(), auth)
+                    .pull(&image_spec.image)
+                    .await
+                    .map_err(box_error_to_status)?;
+            }
+            None => {
+                tracing::info!(image = %image_spec.image, "CRI PullImage");
+                self.image_puller
+                    .pull(&image_spec.image)
+                    .await
+                    .map_err(box_error_to_status)?;
+            }
+        }
 
         // CRI uses the content-addressable image id (digest) as the canonical
         // image_ref, so callers can dedupe different tags of the same image.
@@ -653,5 +692,38 @@ mod tests {
         let fs = &resp.image_filesystems[0];
         assert!(fs.used_bytes.as_ref().unwrap().value > 0);
         assert!(fs.fs_id.is_some());
+    }
+
+    #[test]
+    fn test_auth_config_to_registry_auth() {
+        // username/password (the common imagePullSecrets shape) -> basic
+        let ra = auth_config_to_registry_auth(&AuthConfig {
+            username: "alice".into(),
+            password: "secret".into(),
+            ..Default::default()
+        });
+        assert!(ra.is_some());
+        let dbg = format!("{ra:?}");
+        assert!(dbg.contains("alice") && dbg.contains("secret"), "got {dbg}");
+
+        // Docker-config base64 "user:pass" auth field -> basic
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode("bob:pw123");
+        let ra = auth_config_to_registry_auth(&AuthConfig {
+            auth: encoded,
+            ..Default::default()
+        });
+        let dbg = format!("{ra:?}");
+        assert!(dbg.contains("bob") && dbg.contains("pw123"), "got {dbg}");
+
+        // Bearer-token-only AuthConfig -> None (no RegistryAuth bearer support yet)
+        assert!(auth_config_to_registry_auth(&AuthConfig {
+            identity_token: "tok".into(),
+            ..Default::default()
+        })
+        .is_none());
+
+        // Empty -> None (caller falls back to the service-default credential)
+        assert!(auth_config_to_registry_auth(&AuthConfig::default()).is_none());
     }
 }
