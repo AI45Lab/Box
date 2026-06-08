@@ -7,6 +7,55 @@
 
 use super::*;
 
+/// Mount points at or under `root`, parsed from `/proc/self/mountinfo` content
+/// (space-separated; field index 4 is the mount point). Returned deepest-first
+/// so a parent unmount does not `EBUSY` on a child. Pure (string in/out) for
+/// testing; managed CRI rootfs paths contain no whitespace, so mountinfo's
+/// octal escaping needs no decoding here.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn submounts_under(mountinfo: &str, root: &str) -> Vec<String> {
+    let root = root.trim_end_matches('/');
+    let with_slash = format!("{root}/");
+    let mut mps: Vec<String> = mountinfo
+        .lines()
+        .filter_map(|line| line.split(' ').nth(4))
+        .filter(|mp| *mp == root || mp.starts_with(&with_slash))
+        .map(|mp| mp.to_string())
+        .collect();
+    mps.sort_by_key(|p| std::cmp::Reverse(p.matches('/').count()));
+    mps.dedup();
+    mps
+}
+
+/// Lazy-unmount every bind/submount at or under `root` before the rootfs is
+/// removed. CRI mounts are bind-mounted into the container rootfs (which is
+/// virtio-fs-shared into the pod VM), so `remove_dir_all` over a live bind would
+/// delete the host source through it. `umount -l` (MNT_DETACH) succeeds even if
+/// the mount is still busy.
+#[cfg(target_os = "linux")]
+fn unmount_submounts_under(root: &std::path::Path) {
+    let mountinfo = match std::fs::read_to_string("/proc/self/mountinfo") {
+        Ok(content) => content,
+        Err(_) => return,
+    };
+    for mp in submounts_under(&mountinfo, &root.to_string_lossy()) {
+        if let Err(error) = std::process::Command::new("umount")
+            .arg("-l")
+            .arg(&mp)
+            .status()
+        {
+            tracing::warn!(
+                mount = %mp,
+                error = %error,
+                "Failed to lazy-unmount CRI bind before rootfs cleanup"
+            );
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn unmount_submounts_under(_root: &std::path::Path) {}
+
 impl BoxRuntimeService {
     pub(super) async fn connect_sandbox_network(
         &self,
@@ -194,6 +243,12 @@ impl BoxRuntimeService {
             return;
         }
 
+        // Lazy-unmount any CRI bind-mounts under the rootfs FIRST; otherwise
+        // remove_dir_all would recurse through a live bind and delete the host
+        // source. Safe no-op when there are none (the copy/test build path).
+        let unmount_path = rootfs_path.clone();
+        let _ = tokio::task::spawn_blocking(move || unmount_submounts_under(&unmount_path)).await;
+
         match tokio::fs::remove_dir_all(&rootfs_path).await {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -211,6 +266,13 @@ impl BoxRuntimeService {
         let path = self
             .container_rootfs_base()
             .join(sanitize_path_component(sandbox_id));
+
+        // Lazy-unmount any CRI bind-mounts under the sandbox's container rootfs
+        // tree before removing it (see cleanup_container_rootfs_path). This also
+        // reclaims binds leaked by a previously crashed CRI on restart.
+        let unmount_path = path.clone();
+        let _ = tokio::task::spawn_blocking(move || unmount_submounts_under(&unmount_path)).await;
+
         match tokio::fs::remove_dir_all(&path).await {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -409,5 +471,40 @@ impl BoxRuntimeService {
         }
 
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::submounts_under;
+
+    #[test]
+    fn test_submounts_under_filters_and_orders_deepest_first() {
+        // /proc/self/mountinfo lines; field index 4 is the mount point.
+        let mountinfo = "\
+24 30 0:22 / /proc rw shared:5 - proc proc rw
+60 30 0:46 / /root/.a3s/images/cri-container-rootfs/sb/ctr/rootfs/data rw - ext4 /dev/sda1 rw
+61 30 0:47 / /root/.a3s/images/cri-container-rootfs/sb/ctr/rootfs/data/deep rw - ext4 /dev/sda1 rw
+62 30 0:48 / /root/.a3s/images/cri-container-rootfs/other/x rw - ext4 /dev/sda1 rw
+";
+        let got =
+            submounts_under(mountinfo, "/root/.a3s/images/cri-container-rootfs/sb/ctr/rootfs");
+        assert_eq!(
+            got,
+            vec![
+                "/root/.a3s/images/cri-container-rootfs/sb/ctr/rootfs/data/deep".to_string(),
+                "/root/.a3s/images/cri-container-rootfs/sb/ctr/rootfs/data".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_submounts_under_includes_root_excludes_prefix_siblings() {
+        let mountinfo = "\
+1 2 0:1 / /root/x rw - ext4 d rw
+1 2 0:1 / /root/xy rw - ext4 d rw
+";
+        // Exact root match included; a sibling sharing the string prefix is not.
+        assert_eq!(submounts_under(mountinfo, "/root/x"), vec!["/root/x".to_string()]);
     }
 }
