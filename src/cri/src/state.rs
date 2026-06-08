@@ -112,6 +112,8 @@ mod tests {
             runtime_handler: "a3s".to_string(),
             network_ip: String::new(),
             additional_ips: vec![],
+            dns: crate::sandbox::SandboxDns::default(),
+            container_ports: vec![],
         }
     }
 
@@ -137,6 +139,7 @@ mod tests {
             started_at: 2_000_000_000,
             finished_at: 0,
             exit_code: 0,
+            oom_killed: false,
             labels: HashMap::new(),
             annotations: HashMap::new(),
             log_path: String::new(),

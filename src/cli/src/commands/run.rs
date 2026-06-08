@@ -188,6 +188,9 @@ async fn setup_and_boot(args: &RunArgs) -> Result<RunContext, Box<dyn std::error
 
     let emitter = EventEmitter::new(256);
     let mut vm = VmManager::new(config, emitter);
+    // The shim runs the log processor for the box's lifetime (so detached boxes
+    // keep logging after this CLI exits).
+    vm.set_log_config(log_config.clone());
     let box_id = vm.box_id().to_string();
     println!(
         "Creating box {} ({})...",
@@ -376,11 +379,10 @@ async fn setup_and_boot(args: &RunArgs) -> Result<RunContext, Box<dyn std::error
         .await;
         return Err(error.into());
     }
-    let _log_handle = a3s_box_runtime::log::spawn_log_processor(
-        box_dir.join("logs").join("console.log"),
-        log_dir,
-        log_config,
-    );
+    // Log processing now runs in the shim for the box's lifetime; see
+    // VmManager::set_log_config above. (log_dir is still created so the shim's
+    // container.json has a home.)
+    let _ = &log_dir;
 
     let health_checker = health_check.as_ref().map(|hc| {
         crate::health::spawn_health_checker(box_id.clone(), exec_socket_path.clone(), hc.clone())
@@ -471,7 +473,11 @@ fn build_box_config(
             vsock_port: args.sidecar_vsock_port,
             env: vec![],
         }),
-        persistent: args.common.persistent,
+        // A box without `--rm` survives its stop like a Docker stopped
+        // container: keep its dir (logs + overlay upper) so `logs`/`start` work
+        // afterwards. `--rm` boxes and CRI pods stay non-persistent (removed on
+        // teardown). `rm` force-removes either way (cleanup_removed_box).
+        persistent: args.common.persistent || !args.rm,
         ..Default::default()
     })
 }
@@ -618,8 +624,14 @@ async fn run_foreground(
     );
 
     let console_log = ctx.box_dir.join("logs").join("console.log");
+    let console_err = ctx.box_dir.join("logs").join("console.err.log");
     let log_handle = tokio::spawn(async move {
-        super::tail_file(&console_log).await;
+        // Stream the container's stdout (console.log) and stderr
+        // (console.err.log, split console) to the terminal's stdout/stderr.
+        tokio::join!(
+            super::tail_file(&console_log),
+            super::tail_file_stream(&console_err, true),
+        );
     });
 
     let name = ctx.name.clone();

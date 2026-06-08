@@ -304,6 +304,27 @@ async fn execute_up(
             println!(" ✓");
         }
 
+        // Wait for dependencies that must run to completion (exit 0) first.
+        let completed_deps = project.completed_wait_deps(svc_name);
+        if !completed_deps.is_empty() {
+            print!(
+                "  [~] Waiting for {} to complete...",
+                completed_deps.join(", ")
+            );
+            if let Err(error) =
+                wait_for_completed(project_name, &completed_deps, up_args.timeout).await
+            {
+                return rollback_compose_up(
+                    &mut state,
+                    &started_services,
+                    &created_networks,
+                    error,
+                )
+                .await;
+            }
+            println!(" ✓");
+        }
+
         let mut box_config = match project.build_box_config(svc_name, Some(&default_net)) {
             Ok(config) => config,
             Err(error) => {
@@ -388,7 +409,14 @@ async fn execute_up(
                 )
                 .await;
             }
-            let endpoint = match net_config.connect(&box_id, &box_name) {
+            // Register the bare service name as a DNS alias so peers can reach
+            // this service as `svc` (Docker Compose behavior), not only as the
+            // `{project}-{svc}` box name.
+            let endpoint = match net_config.connect_with_aliases(
+                &box_id,
+                &box_name,
+                std::slice::from_ref(svc_name),
+            ) {
                 Ok(endpoint) => endpoint,
                 Err(error) => {
                     return rollback_compose_up(
@@ -585,13 +613,9 @@ async fn execute_up(
             );
         }
 
-        // Spawn log processor
-        let log_dir = box_dir.join("logs");
-        let _ = a3s_box_runtime::log::spawn_log_processor(
-            box_dir.join("logs").join("console.log"),
-            log_dir,
-            Default::default(),
-        );
+        // Ensure the log dir exists; the shim runs the log processor (default
+        // json-file driver) for each service box's lifetime.
+        let _ = std::fs::create_dir_all(box_dir.join("logs"));
 
         println!(" ✓");
     }
@@ -653,6 +677,73 @@ async fn wait_for_healthy(
         }
 
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
+/// Wait for dependency services to run to completion (Docker's
+/// `service_completed_successfully`).
+///
+/// A dependency is "completed" once it is no longer active — preferring the
+/// record's terminal status (set by the monitor) and falling back to shim-PID
+/// liveness for the daemonless case. If an exit code was recorded and is
+/// non-zero, the dependency failed and the wait errors.
+async fn wait_for_completed(
+    project_name: &str,
+    service_names: &[String],
+    timeout_secs: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+
+    loop {
+        if std::time::Instant::now() > deadline {
+            return Err(format!(
+                "Timed out waiting for services to complete: {}",
+                service_names.join(", ")
+            )
+            .into());
+        }
+
+        let state = StateFile::load_default()?;
+        let mut all_done = true;
+        for svc_name in service_names {
+            let records = state.find_by_label(LABEL_SERVICE, svc_name);
+            let Some(record) = records
+                .iter()
+                .find(|r| r.labels.get(LABEL_PROJECT).map(String::as_str) == Some(project_name))
+            else {
+                all_done = false;
+                continue;
+            };
+
+            // A detached box's shim becomes a zombie under this process when its
+            // VM halts; is_process_exited is zombie-aware (is_process_alive /
+            // kill(pid,0) is not), so a completed dependency is detected.
+            let exited = !status::is_active(record)
+                || record
+                    .pid
+                    .map(crate::process::is_process_exited)
+                    .unwrap_or(true);
+            if !exited {
+                all_done = false;
+                continue;
+            }
+
+            if let Some(code) = record.exit_code {
+                if code != 0 {
+                    return Err(format!(
+                        "dependency service '{}' did not complete successfully (exit code {})",
+                        svc_name, code
+                    )
+                    .into());
+                }
+            }
+        }
+
+        if all_done {
+            return Ok(());
+        }
+
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
 }
 
@@ -777,7 +868,12 @@ async fn stop_service_process(svc: &ServiceBox) {
         .map(a3s_box_core::vmm::parse_signal_name)
         .unwrap_or(libc::SIGTERM);
     let stop_timeout = svc.stop_timeout.unwrap_or(10);
-    crate::process::graceful_stop(pid, stop_signal, stop_timeout).await;
+    let exec_socket = if svc.exec_socket_path.as_os_str().is_empty() {
+        svc.box_dir.join("sockets").join("exec.sock")
+    } else {
+        svc.exec_socket_path.clone()
+    };
+    crate::process::graceful_stop_via_guest(pid, &exec_socket, stop_signal, stop_timeout).await;
 }
 
 fn cleanup_created_networks(created_networks: &[String]) {

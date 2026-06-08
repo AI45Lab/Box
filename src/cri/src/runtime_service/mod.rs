@@ -61,7 +61,10 @@ use network::{
     disconnect_sandbox_from_network_store, sandbox_network_name,
     sandbox_network_status_from_annotations, SandboxNetworkAllocation,
 };
-use stats::{container_stats, metric_descriptors, pod_sandbox_metrics, pod_sandbox_stats};
+use stats::{
+    container_stats, metric_descriptors, pod_sandbox_metrics, pod_sandbox_stats, read_vm_usage,
+    VmUsage,
+};
 use supervisor::{spawn_container_exit_supervisor, ContainerExitSupervisor, SupervisedWorkload};
 
 type CriResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
@@ -86,6 +89,79 @@ type ContainerEventSender = broadcast::Sender<ContainerEventResponse>;
 const CRI_CONTAINER_ROOTFS_HOST_DIR: &str = "cri-container-rootfs";
 const CRI_CONTAINER_ROOTFS_GUEST_BASE: &str = "/run/a3s/cri/container-rootfs";
 const CONTAINER_EVENT_BUFFER: usize = 1024;
+
+/// Capabilities a non-privileged container keeps by default (matches the
+/// containerd/runc default set). A privileged container keeps the full set.
+const DEFAULT_CAPABILITIES: &[&str] = &[
+    "CHOWN",
+    "DAC_OVERRIDE",
+    "FSETID",
+    "FOWNER",
+    "MKNOD",
+    "NET_RAW",
+    "SETGID",
+    "SETUID",
+    "SETFCAP",
+    "SETPCAP",
+    "NET_BIND_SERVICE",
+    "SYS_CHROOT",
+    "KILL",
+    "AUDIT_WRITE",
+];
+
+/// Compute the capability set a non-privileged container keeps: the default set
+/// unioned with `add_capabilities` and minus `drop_capabilities` (`ALL` is
+/// honored on either side). Returns `None` when the container should keep the
+/// full set (an `add` of `ALL`), in which case no keep-set is emitted.
+fn kept_capabilities(capabilities: Option<&Capability>) -> Option<Vec<String>> {
+    let normalize = |cap: &str| {
+        cap.trim()
+            .strip_prefix("CAP_")
+            .unwrap_or(cap.trim())
+            .to_uppercase()
+    };
+    let mut kept: std::collections::BTreeSet<String> =
+        DEFAULT_CAPABILITIES.iter().map(|c| c.to_string()).collect();
+    if let Some(capabilities) = capabilities {
+        if capabilities
+            .add_capabilities
+            .iter()
+            .any(|c| normalize(c) == "ALL")
+        {
+            return None;
+        }
+        if capabilities
+            .drop_capabilities
+            .iter()
+            .any(|c| normalize(c) == "ALL")
+        {
+            kept.clear();
+        } else {
+            for cap in &capabilities.drop_capabilities {
+                kept.remove(&normalize(cap));
+            }
+        }
+        for cap in &capabilities.add_capabilities {
+            kept.insert(normalize(cap));
+        }
+    }
+    Some(kept.into_iter().collect())
+}
+
+/// Whether an AppArmor profile of the given name is currently loaded on the
+/// host (listed in `/sys/kernel/security/apparmor/profiles`).
+///
+/// Returns `false` when AppArmor is unavailable (file absent/unreadable), which
+/// makes a requested Localhost profile fail closed rather than run unconfined.
+fn apparmor_profile_loaded(name: &str) -> bool {
+    let Ok(content) = std::fs::read_to_string("/sys/kernel/security/apparmor/profiles") else {
+        return false;
+    };
+    // Each line is `<profile-name> (<mode>)`.
+    content
+        .lines()
+        .any(|line| line.split_whitespace().next() == Some(name))
+}
 
 #[derive(serde::Deserialize)]
 struct OciSeccompProfile {
@@ -115,7 +191,10 @@ fn parse_localhost_seccomp_deny(localhost_ref: &str) -> Result<Vec<String>, Stri
         .map_err(|e| format!("read seccomp profile {localhost_ref}: {e}"))?;
     let profile: OciSeccompProfile =
         serde_json::from_str(&raw).map_err(|e| format!("parse seccomp profile: {e}"))?;
-    if !matches!(profile.default_action.as_str(), "SCMP_ACT_ALLOW" | "SCMP_ACT_LOG") {
+    if !matches!(
+        profile.default_action.as_str(),
+        "SCMP_ACT_ALLOW" | "SCMP_ACT_LOG"
+    ) {
         return Err(format!(
             "unsupported seccomp defaultAction {} (only allow-default profiles are supported)",
             profile.default_action
@@ -127,7 +206,10 @@ fn parse_localhost_seccomp_deny(localhost_ref: &str) -> Result<Vec<String>, Stri
         .filter(|s| {
             matches!(
                 s.action.as_str(),
-                "SCMP_ACT_ERRNO" | "SCMP_ACT_KILL" | "SCMP_ACT_KILL_THREAD" | "SCMP_ACT_KILL_PROCESS"
+                "SCMP_ACT_ERRNO"
+                    | "SCMP_ACT_KILL"
+                    | "SCMP_ACT_KILL_THREAD"
+                    | "SCMP_ACT_KILL_PROCESS"
             )
         })
         .flat_map(|s| s.names)
@@ -204,6 +286,23 @@ pub struct BoxRuntimeService {
 }
 
 impl BoxRuntimeService {
+    /// Real CPU + memory usage of a sandbox's microVM, read from the host-side
+    /// shim process (the shim *is* the pod in the microVM-per-pod model).
+    /// Returns zeros if the VM is not booted or its procfs is unreadable.
+    async fn sandbox_vm_usage(&self, sandbox_id: &str) -> VmUsage {
+        let pid = {
+            let vm_managers = self.vm_managers.read().await;
+            match vm_managers.get(sandbox_id) {
+                Some(vm) => vm.pid().await,
+                None => None,
+            }
+        };
+        match pid {
+            Some(pid) => read_vm_usage(pid),
+            None => VmUsage::default(),
+        }
+    }
+
     /// Create a new BoxRuntimeService with JSON-backed persistent state.
     pub fn new(
         image_store: Arc<ImageStore>,
@@ -294,6 +393,12 @@ impl BoxRuntimeService {
                 self.store
                     .update_sandbox_state(&sandbox.id, SandboxState::NotReady)
                     .await;
+                // Crash recovery: a graceful shutdown already destroyed the VMs,
+                // but a crash (SIGKILL/OOM) leaves the shim microVM, its overlay
+                // mount, and the rootfs dirs orphaned. Reap them so they do not
+                // leak across restarts. No-op when nothing is left behind.
+                a3s_box_runtime::vm::reap::reap_orphaned_box(&sandbox.id);
+                self.cleanup_sandbox_rootfs(&sandbox.id).await;
             }
         }
 
@@ -391,6 +496,17 @@ impl RuntimeService for BoxRuntimeService {
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("sandbox metadata required"))?;
 
+        // Reject host-namespace requests fail-closed (microVM cannot share the
+        // host's namespaces) before acquiring any VM or network resources.
+        convert::validate_namespace_options(
+            config
+                .linux
+                .as_ref()
+                .and_then(|linux| linux.security_context.as_ref())
+                .and_then(|sc| sc.namespace_options.as_ref()),
+            "RunPodSandbox",
+        )?;
+
         tracing::info!(
             name = %metadata.name,
             namespace = %metadata.namespace,
@@ -450,6 +566,15 @@ impl RuntimeService for BoxRuntimeService {
             }
         };
 
+        // For a default (TSI) pod that publishes ports but has no
+        // allocated/annotated IP, report the loopback as the pod IP: TSI binds
+        // 0.0.0.0:<hostPort> and forwards to the guest, so the pod's published
+        // ports are genuinely reachable at 127.0.0.1:<port> from the node (which
+        // is what a node-local CRI consumer / conformance GET targets).
+        if network_ip.is_empty() && !config.port_mappings.is_empty() {
+            network_ip = "127.0.0.1".to_string();
+        }
+
         // Store sandbox state
         let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let sandbox = PodSandbox {
@@ -465,6 +590,21 @@ impl RuntimeService for BoxRuntimeService {
             runtime_handler: req.runtime_handler,
             network_ip,
             additional_ips,
+            dns: config
+                .dns_config
+                .as_ref()
+                .map(|dns| crate::sandbox::SandboxDns {
+                    servers: dns.servers.clone(),
+                    searches: dns.searches.clone(),
+                    options: dns.options.clone(),
+                })
+                .unwrap_or_default(),
+            container_ports: config
+                .port_mappings
+                .iter()
+                .map(|mapping| mapping.container_port)
+                .filter(|port| *port > 0)
+                .collect(),
         };
 
         self.store.add_sandbox(sandbox).await;
@@ -802,6 +942,15 @@ impl RuntimeService for BoxRuntimeService {
             .metadata
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("container metadata required"))?;
+        // Reject host-namespace requests fail-closed before allocating anything.
+        convert::validate_namespace_options(
+            config
+                .linux
+                .as_ref()
+                .and_then(|linux| linux.security_context.as_ref())
+                .and_then(|sc| sc.namespace_options.as_ref()),
+            "CreateContainer",
+        )?;
         if !config.devices.is_empty() {
             return Err(Status::unimplemented(
                 "CRI devices are not yet supported for microVM-backed containers",
@@ -827,6 +976,44 @@ impl RuntimeService for BoxRuntimeService {
         // override the runtime's (escalating supplemental groups, unmasking
         // paths, or toggling seccomp). Only runtime-derived values may set them.
         env.retain(|(key, _)| !key.starts_with("A3S_SEC_"));
+        // Carry the container memory limit so guest-init enforces it with a
+        // per-container cgroup v2 `memory.max` and reports OOMKilled when the
+        // kernel OOM-killer reaps the cgroup. The microVM RAM stays larger than
+        // this, so the cgroup limit (not the VM) is what bounds the workload.
+        if let Some(resources) = config
+            .linux
+            .as_ref()
+            .and_then(|linux| linux.resources.as_ref())
+        {
+            if resources.memory_limit_in_bytes > 0 {
+                env.push((
+                    "A3S_SEC_MEM_LIMIT".to_string(),
+                    resources.memory_limit_in_bytes.to_string(),
+                ));
+            }
+            // CPU limit → guest cgroup v2 cpu.max ("<quota_us> <period_us>"). A
+            // quota of 0 / -1 means unlimited, so only plumb a positive quota.
+            if resources.cpu_quota > 0 {
+                env.push((
+                    "A3S_SEC_CPU_QUOTA".to_string(),
+                    resources.cpu_quota.to_string(),
+                ));
+                if resources.cpu_period > 0 {
+                    env.push((
+                        "A3S_SEC_CPU_PERIOD".to_string(),
+                        resources.cpu_period.to_string(),
+                    ));
+                }
+            }
+            // CPU shares → guest cgroup v2 cpu.weight (relative CPU under
+            // contention, the kubelet's CPU *request*).
+            if resources.cpu_shares > 0 {
+                env.push((
+                    "A3S_SEC_CPU_SHARES".to_string(),
+                    resources.cpu_shares.to_string(),
+                ));
+            }
+        }
         let working_dir = if config.working_dir.is_empty() {
             image_config
                 .and_then(|image| image.working_dir.clone())
@@ -892,10 +1079,7 @@ impl RuntimeService for BoxRuntimeService {
                         // guest, which compiles them into a BPF filter.
                         match parse_localhost_seccomp_deny(&profile.localhost_ref) {
                             Ok(deny) => {
-                                env.push((
-                                    "A3S_SEC_SECCOMP_LOCALHOST".to_string(),
-                                    deny.join(","),
-                                ));
+                                env.push(("A3S_SEC_SECCOMP_LOCALHOST".to_string(), deny.join(",")));
                             }
                             Err(e) => {
                                 // Fall back to RuntimeDefault rather than running
@@ -913,17 +1097,64 @@ impl RuntimeService for BoxRuntimeService {
                     ProfileType::Unconfined => {}
                 }
             }
-            // CRI capabilities: drop the requested capabilities in the guest
-            // (effective/permitted/inheritable + bounding sets). "ALL" drops
-            // everything. Added capabilities need no action — the container
-            // already runs as full-capability root in the microVM.
-            if let Some(capabilities) = sc.capabilities.as_ref() {
-                if !capabilities.drop_capabilities.is_empty() {
-                    env.push((
-                        "A3S_SEC_CAP_DROP".to_string(),
-                        capabilities.drop_capabilities.join(","),
-                    ));
+            // CRI capabilities: a privileged container keeps the full set; a
+            // non-privileged one is restricted to the runtime default set,
+            // adjusted by add/drop (A3S_SEC_CAP_KEEP — the guest drops every
+            // capability not listed). This is what stops a non-privileged
+            // container from doing privileged operations (e.g. creating a bridge
+            // with CAP_NET_ADMIN). An `add` of `ALL` keeps the full set.
+            if !sc.privileged {
+                if let Some(kept) = kept_capabilities(sc.capabilities.as_ref()) {
+                    env.push(("A3S_SEC_CAP_KEEP".to_string(), kept.join(",")));
                 }
+            }
+            // no_new_privs: the guest sets PR_SET_NO_NEW_PRIVS before exec so a
+            // setuid/setgid (or file-capability) binary can no longer raise the
+            // process's privileges. Privileged containers opt out.
+            if sc.no_new_privs && !sc.privileged {
+                env.push(("A3S_SEC_NO_NEW_PRIVS".to_string(), "1".to_string()));
+            }
+            // readonly_rootfs: the guest remounts the container root read-only
+            // before exec. This is a deliberate config (not a hardening default),
+            // so it applies to privileged containers too.
+            if sc.readonly_rootfs {
+                env.push(("A3S_SEC_READONLY_ROOTFS".to_string(), "1".to_string()));
+            }
+            // AppArmor: a microVM cannot enforce an in-guest LSM profile, but a
+            // requested Localhost profile must not be silently ignored. Validate
+            // it against the host's loaded profiles and reject when it is not
+            // loaded (the CRI contract: an unloaded profile fails). A loaded
+            // profile is accepted but cannot be enforced in-guest. The modern
+            // `apparmor` SecurityProfile takes precedence over the deprecated
+            // `apparmor_profile` string.
+            #[allow(deprecated)] // clients (incl. critest) still send apparmor_profile
+            let apparmor_localhost = sc
+                .apparmor
+                .as_ref()
+                .filter(|profile| {
+                    profile.profile_type()
+                        == crate::cri_api::security_profile::ProfileType::Localhost
+                })
+                .map(|profile| profile.localhost_ref.clone())
+                .or_else(|| {
+                    sc.apparmor_profile
+                        .strip_prefix("localhost/")
+                        .map(|name| name.to_string())
+                });
+            if let Some(profile) = apparmor_localhost {
+                let profile = profile.trim();
+                if profile.is_empty() || !apparmor_profile_loaded(profile) {
+                    return Err(Status::failed_precondition(format!(
+                        "AppArmor profile 'localhost/{profile}' is not loaded"
+                    )));
+                }
+                tracing::warn!(
+                    container = %metadata.name,
+                    profile = %profile,
+                    "AppArmor localhost profile is loaded on the host but the microVM \
+                     runtime cannot enforce it in-guest; the container runs without \
+                     AppArmor confinement"
+                );
             }
         }
         let user = container_user_from_linux_config(config.linux.as_ref())
@@ -946,7 +1177,25 @@ impl RuntimeService for BoxRuntimeService {
         let (rootfs_path, rootfs_guest_path) = match resolved_image.as_ref() {
             Some(image) => {
                 let paths = self.container_rootfs_paths(sandbox_id, &container_id);
-                if let Err(status) = self.prepare_container_rootfs(image, &paths).await {
+                // Render the pod's DNS config into the container's resolv.conf
+                // (empty -> the builder writes its default).
+                let resolv_conf = self
+                    .store
+                    .sandboxes
+                    .get(sandbox_id)
+                    .await
+                    .map(|sb| {
+                        a3s_box_core::dns::render_resolv_conf(
+                            &sb.dns.servers,
+                            &sb.dns.searches,
+                            &sb.dns.options,
+                        )
+                    })
+                    .unwrap_or_default();
+                if let Err(status) = self
+                    .prepare_container_rootfs(image, &paths, resolv_conf)
+                    .await
+                {
                     let failed_path = paths.host_path.to_string_lossy().to_string();
                     self.cleanup_container_rootfs_path(&failed_path).await;
                     return Err(status);
@@ -1002,6 +1251,7 @@ impl RuntimeService for BoxRuntimeService {
             started_at: 0,
             finished_at: 0,
             exit_code: 0,
+            oom_killed: false,
             labels: config.labels.clone(),
             annotations: config.annotations.clone(),
             log_path,
@@ -1181,6 +1431,16 @@ impl RuntimeService for BoxRuntimeService {
             );
         }
 
+        // Open (create) the container log file now, before StartContainer
+        // returns, so a caller that opens it immediately — e.g. critest's
+        // ReopenContainerLog test, before the container has produced any output
+        // — finds it. The supervisor would otherwise create it lazily in its
+        // task, racing the caller.
+        let log_writer = log_writer::CriLogWriter::open(&container.log_path)
+            .await
+            .ok()
+            .flatten();
+
         spawn_container_exit_supervisor(ContainerExitSupervisor {
             store: self.store.clone(),
             attach_streams: self.attach_streams.clone(),
@@ -1191,6 +1451,7 @@ impl RuntimeService for BoxRuntimeService {
             container_id: container_id.clone(),
             sandbox_id: container.sandbox_id.clone(),
             log_path: container.log_path.clone(),
+            log_writer,
             attach_tx,
             stop_rx,
             log_reopen,
@@ -1260,7 +1521,7 @@ impl RuntimeService for BoxRuntimeService {
                     self.stop_container_vm(&container, req.timeout).await?;
                     let updated = self
                         .store
-                        .mark_container_exited_if_running(container_id, now_ns, 137)
+                        .mark_container_exited_if_running(container_id, now_ns, 137, false)
                         .await;
                     if updated {
                         self.emit_container_event(
@@ -1350,7 +1611,9 @@ impl RuntimeService for BoxRuntimeService {
             ContainerState::Exited => crate::cri_api::ContainerState::ContainerExited,
         };
         let (reason, message) = match container.state {
-            ContainerState::Exited => container_exit_reason(container.exit_code),
+            ContainerState::Exited => {
+                container_exit_reason(container.exit_code, container.oom_killed)
+            }
             ContainerState::Created | ContainerState::Running => ("", String::new()),
         };
         let info = if req.verbose {
@@ -2025,12 +2288,7 @@ impl RuntimeService for BoxRuntimeService {
             "CRI PortForward"
         );
 
-        if req.port.is_empty() {
-            return Err(Status::invalid_argument(
-                "PortForward must request at least one port",
-            ));
-        }
-        if req.port.len() != 1 {
+        if req.port.len() > 1 {
             return Err(Status::unimplemented(
                 "PortForward currently supports exactly one port per streaming session",
             ));
@@ -2044,6 +2302,26 @@ impl RuntimeService for BoxRuntimeService {
             .await
             .ok_or_else(|| Status::not_found(format!("Sandbox not found: {}", sandbox_id)))?;
         ensure_sandbox_ready(&sandbox, "PortForward")?;
+
+        // critest passes the target port in the RPC; `crictl port-forward` sends
+        // an empty list and carries the port only in the SPDY stream header
+        // (which we cannot read without SPDY/3 dictionary decompression). In the
+        // empty case, fall back to the sandbox's single declared container port.
+        let ports = if req.port.is_empty() {
+            sandbox.container_ports.clone()
+        } else {
+            req.port
+        };
+        if ports.is_empty() {
+            return Err(Status::invalid_argument(
+                "PortForward requested no port and the sandbox declares none",
+            ));
+        }
+        if ports.len() != 1 {
+            return Err(Status::unimplemented(
+                "PortForward currently supports exactly one port per streaming session",
+            ));
+        }
 
         let vm_managers = self.vm_managers.read().await;
         let vm = vm_managers.get(sandbox_id).ok_or_else(|| {
@@ -2067,7 +2345,7 @@ impl RuntimeService for BoxRuntimeService {
             stdin_once: false,
             stdout: false,
             stderr: false,
-            ports: req.port,
+            ports,
             attach_stream: None,
             attach_stdin: None,
             exec_socket_path: String::new(),
@@ -2091,8 +2369,20 @@ impl RuntimeService for BoxRuntimeService {
             .await
             .ok_or_else(|| Status::not_found(format!("Container not found: {}", container_id)))?;
 
+        let running = self
+            .store
+            .containers
+            .list(Some(&container.sandbox_id), None)
+            .await
+            .into_iter()
+            .filter(|c| c.state == ContainerState::Running)
+            .count();
+        let usage = self
+            .sandbox_vm_usage(&container.sandbox_id)
+            .await
+            .per_container(running);
         Ok(Response::new(ContainerStatsResponse {
-            stats: Some(container_stats(&container).await),
+            stats: Some(container_stats(&container, usage).await),
         }))
     }
 
@@ -2131,7 +2421,30 @@ impl RuntimeService for BoxRuntimeService {
                 true
             })
             .collect();
-        let stats = join_all(containers.iter().map(container_stats)).await;
+        // Resolve each pod's VM usage once, split across its running containers.
+        let mut usage_by_sandbox: std::collections::HashMap<String, VmUsage> =
+            std::collections::HashMap::new();
+        for container in &containers {
+            if !usage_by_sandbox.contains_key(&container.sandbox_id) {
+                let running = containers
+                    .iter()
+                    .filter(|c| c.sandbox_id == container.sandbox_id)
+                    .count();
+                let usage = self
+                    .sandbox_vm_usage(&container.sandbox_id)
+                    .await
+                    .per_container(running);
+                usage_by_sandbox.insert(container.sandbox_id.clone(), usage);
+            }
+        }
+        let stats = join_all(containers.iter().map(|c| {
+            let usage = usage_by_sandbox
+                .get(&c.sandbox_id)
+                .copied()
+                .unwrap_or_default();
+            container_stats(c, usage)
+        }))
+        .await;
 
         Ok(Response::new(ListContainerStatsResponse { stats }))
     }
@@ -2167,9 +2480,10 @@ impl RuntimeService for BoxRuntimeService {
             .await
             .ok_or_else(|| Status::not_found(format!("Sandbox not found: {}", sandbox_id)))?;
         let containers = self.store.containers.list(Some(&sandbox_id), None).await;
+        let vm_usage = self.sandbox_vm_usage(&sandbox_id).await;
 
         Ok(Response::new(PodSandboxStatsResponse {
-            stats: Some(pod_sandbox_stats(&sandbox, containers).await),
+            stats: Some(pod_sandbox_stats(&sandbox, containers, vm_usage).await),
         }))
     }
 
@@ -2194,7 +2508,8 @@ impl RuntimeService for BoxRuntimeService {
             }
 
             let containers = self.store.containers.list(Some(&sandbox.id), None).await;
-            stats.push(pod_sandbox_stats(&sandbox, containers).await);
+            let vm_usage = self.sandbox_vm_usage(&sandbox.id).await;
+            stats.push(pod_sandbox_stats(&sandbox, containers, vm_usage).await);
         }
 
         Ok(Response::new(ListPodSandboxStatsResponse { stats }))

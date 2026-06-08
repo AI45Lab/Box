@@ -23,6 +23,7 @@ pub async fn execute(args: SystemPruneArgs) -> Result<(), Box<dyn std::error::Er
     if !args.force {
         println!("WARNING: This will remove:");
         println!("  - all created, stopped, and dead boxes");
+        println!("  - all networks not used by at least one box");
         if args.all {
             println!("  - all images not used by active boxes");
         } else {
@@ -35,6 +36,7 @@ pub async fn execute(args: SystemPruneArgs) -> Result<(), Box<dyn std::error::Er
 
     let mut boxes_removed: usize = 0;
     let mut images_removed: usize = 0;
+    let mut networks_removed: usize = 0;
     let mut space_freed: u64 = 0;
 
     // Phase 1: Remove stopped/dead boxes
@@ -83,11 +85,23 @@ pub async fn execute(args: SystemPruneArgs) -> Result<(), Box<dyn std::error::Er
         }
     }
 
+    // Phase 3: Remove unused networks (mirrors `docker system prune`).
+    // Reload state so freshly-removed boxes no longer count as network users.
+    let state = StateFile::load_default()?;
+    if let Ok(network_store) = a3s_box_runtime::NetworkStore::default_path() {
+        let (removed, _errors) = super::network::prune_unused_networks(&network_store, &state);
+        for name in &removed {
+            networks_removed += 1;
+            println!("Removed network: {name}");
+        }
+    }
+
     println!();
     println!(
-        "Removed {} box(es), {} image(s), freed {}",
+        "Removed {} box(es), {} image(s), {} network(s), freed {}",
         boxes_removed,
         images_removed,
+        networks_removed,
         output::format_bytes(space_freed)
     );
 

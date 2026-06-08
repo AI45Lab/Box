@@ -27,37 +27,48 @@ pub async fn execute(args: RmiArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     for query in &args.images {
         let images = store.list().await;
-        let target = match image_usage::resolve_stored_image(&images, query) {
-            Ok(Some(target)) => target,
-            Ok(None) if args.force => continue,
-            Ok(None) => {
-                errors.push(format!("{query}: Image not found"));
-                continue;
+        // `--force` removes every reference matching the query (Docker: a digest
+        // id with multiple tags is untagged-all); without force a single
+        // unambiguous match is required.
+        let targets: Vec<_> = if args.force {
+            let all = image_usage::all_matching_images(&images, query);
+            if all.is_empty() {
+                continue; // force: ignore not-found
             }
-            Err(error) => {
-                errors.push(format!("{query}: {error}"));
-                continue;
+            all
+        } else {
+            match image_usage::resolve_stored_image(&images, query) {
+                Ok(Some(target)) => vec![target],
+                Ok(None) => {
+                    errors.push(format!("{query}: Image not found"));
+                    continue;
+                }
+                Err(error) => {
+                    errors.push(format!("{query}: {error}"));
+                    continue;
+                }
             }
         };
 
-        if image_usage::is_protected_reference(&target.reference, &protected_images) {
-            errors.push(format!(
-                "{}: image is referenced by an existing box; remove the box before removing this image",
-                target.reference
-            ));
-            continue;
-        }
-
-        match store.remove(&target.reference).await {
-            Ok(()) => {
-                println!("Removed: {}", target.reference);
+        for target in targets {
+            if image_usage::is_protected_reference(&target.reference, &protected_images) {
+                errors.push(format!(
+                    "{}: image is referenced by an existing box; remove the box before removing this image",
+                    target.reference
+                ));
+                continue;
             }
-            Err(e) => {
-                if args.force {
-                    // Silently skip not-found errors in force mode
-                    continue;
+
+            match store.remove(&target.reference).await {
+                Ok(()) => {
+                    println!("Removed: {}", target.reference);
                 }
-                errors.push(format!("{}: {e}", target.reference));
+                Err(e) => {
+                    if args.force {
+                        continue; // silently skip not-found in force mode
+                    }
+                    errors.push(format!("{}: {e}", target.reference));
+                }
             }
         }
     }

@@ -238,7 +238,17 @@ fn parse_port_mappings(config: &PodSandboxConfig) -> Result<Vec<String>> {
             )));
         }
 
-        port_map.push(format!("{}:{}", mapping.host_port, mapping.container_port));
+        // A port mapping with only a container port (host_port == 0) publishes
+        // the container port on the same host port (Docker/containerd style), so
+        // the pod's port becomes reachable at the node — TSI binds 0.0.0.0:<port>
+        // and forwards to the guest. Without this the entry is dropped and the
+        // port is never published.
+        let host_port = if mapping.host_port == 0 {
+            mapping.container_port
+        } else {
+            mapping.host_port
+        };
+        port_map.push(format!("{}:{}", host_port, mapping.container_port));
     }
 
     Ok(port_map)
@@ -384,7 +394,8 @@ mod tests {
 
         let box_config = pod_sandbox_config_to_box_config(&config, DEFAULT_AGENT_IMAGE).unwrap();
 
-        assert_eq!(box_config.port_map, vec!["8080:80", "0:8080"]);
+        // host_port == 0 publishes the container port on the same host port.
+        assert_eq!(box_config.port_map, vec!["8080:80", "8080:8080"]);
     }
 
     #[test]

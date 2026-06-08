@@ -22,7 +22,7 @@ resolver = "2"
 h2 = { path = "third_party/h2" }
 
 [workspace.package]
-version = "2.0.6"
+version = "2.0.7"
 edition = "2021"
 authors = ["A3S Lab Team"]
 license = "MIT"

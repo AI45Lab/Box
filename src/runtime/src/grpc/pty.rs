@@ -213,6 +213,7 @@ impl StreamingPty {
                 self.done = true;
                 Ok(Some(ExecEvent::Exit(ExecExit {
                     exit_code: exit.exit_code,
+                    oom_killed: false,
                 })))
             }
             a3s_box_core::pty::FRAME_PTY_ERROR => {

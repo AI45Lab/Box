@@ -208,25 +208,24 @@ async fn copy_file_to_box(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let content =
         std::fs::read(host_path).map_err(|e| format!("Failed to read {host_path}: {e}"))?;
+    let len = content.len();
+    let mode = host_file_mode(host_path);
 
-    use base64::Engine;
-    let encoded = base64::engine::general_purpose::STANDARD.encode(&content);
-
+    // Stream the raw bytes over the exec channel's stdin (not the command line)
+    // so large files do not exceed ARG_MAX, and restore the source file's mode
+    // (Docker `cp` preserves permissions).
+    let dst = shell_escape(box_path);
     let request = ExecRequest {
         cmd: vec![
             "sh".to_string(),
             "-c".to_string(),
-            format!(
-                "echo '{}' | base64 -d > {}",
-                encoded,
-                shell_escape(box_path)
-            ),
+            format!("cat > {dst} && chmod {mode:o} {dst}"),
         ],
         timeout_ns: DEFAULT_EXEC_TIMEOUT_NS,
         env: vec![],
         working_dir: None,
         rootfs: None,
-        stdin: None,
+        stdin: Some(content),
         stdin_streaming: false,
         user: None,
         streaming: false,
@@ -239,11 +238,25 @@ async fn copy_file_to_box(
         return Err(format!("Failed to write {box_path} in box: {stderr}").into());
     }
 
-    println!(
-        "{host_path} → {box_name}:{box_path} ({} bytes)",
-        content.len()
-    );
+    println!("{host_path} → {box_name}:{box_path} ({len} bytes)");
     Ok(())
+}
+
+/// Source file's permission bits (lower 12) for `cp` to restore in the box;
+/// defaults to 0o644 off-Unix or on stat failure.
+fn host_file_mode(host_path: &str) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(host_path)
+            .map(|m| m.permissions().mode() & 0o7777)
+            .unwrap_or(0o644)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = host_path;
+        0o644
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -12,21 +12,110 @@ use crate::container::{Container, ContainerState};
 use crate::cri_api::*;
 use crate::sandbox::{PodSandbox, SandboxState};
 
-fn zero_cpu_usage(now_ns: i64) -> CpuUsage {
+/// Real CPU + memory usage of a pod's microVM, read from the host-side shim
+/// process. In the microVM-per-pod model the shim process *is* the pod: its
+/// `/proc/<pid>/stat` CPU time (vcpu threads are aggregated into the process)
+/// and `/proc/<pid>/status` `VmRSS` (which backs the guest RAM) are the pod's
+/// real resource usage.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct VmUsage {
+    /// Cumulative CPU time in nanoseconds (utime + stime).
+    cpu_core_nanos: u64,
+    /// Resident set size in bytes.
+    memory_bytes: u64,
+}
+
+impl VmUsage {
+    /// Split the pod-VM usage evenly across its running containers so the sum of
+    /// per-container stats equals the pod total (single-container pods — the
+    /// common case — get the full usage; the per-container split is an
+    /// approximation for multi-container pods sharing one VM).
+    pub(super) fn per_container(self, running: usize) -> VmUsage {
+        let n = running.max(1) as u64;
+        VmUsage {
+            cpu_core_nanos: self.cpu_core_nanos / n,
+            memory_bytes: self.memory_bytes / n,
+        }
+    }
+}
+
+/// Read a process's cumulative CPU time + RSS from procfs.
+#[cfg(target_os = "linux")]
+pub(super) fn read_vm_usage(pid: u32) -> VmUsage {
+    // Near-universal on Linux; avoids pulling libc into the CRI crate just for
+    // sysconf(_SC_CLK_TCK).
+    const CLK_TCK: u64 = 100;
+    let mut usage = VmUsage::default();
+
+    if let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                if let Some(kb) = rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|value| value.parse::<u64>().ok())
+                {
+                    usage.memory_bytes = kb.saturating_mul(1024);
+                }
+                break;
+            }
+        }
+    }
+
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // The comm field (2) may contain spaces/parens, so index fields after
+        // the final ')': utime is field 14, stime field 15 (1-based), i.e.
+        // offsets 11 and 12 in the post-')' token list (which starts at field 3).
+        if let Some(rparen) = stat.rfind(')') {
+            let after: Vec<&str> = stat[rparen + 1..].split_whitespace().collect();
+            let utime = after
+                .get(11)
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            let stime = after
+                .get(12)
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            usage.cpu_core_nanos = utime
+                .saturating_add(stime)
+                .saturating_mul(1_000_000_000 / CLK_TCK);
+        }
+    }
+
+    usage
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn read_vm_usage(_pid: u32) -> VmUsage {
+    VmUsage::default()
+}
+
+fn cpu_usage(now_ns: i64, usage: VmUsage) -> CpuUsage {
     CpuUsage {
         timestamp: now_ns,
-        usage_core_nano_seconds: Some(UInt64Value { value: 0 }),
+        // Cumulative CPU time; the kubelet derives the rate from deltas between
+        // samples. usage_nano_cores (instantaneous) needs two samples, so it is
+        // left at 0 and computed by the consumer.
+        usage_core_nano_seconds: Some(UInt64Value {
+            value: usage.cpu_core_nanos,
+        }),
         usage_nano_cores: Some(UInt64Value { value: 0 }),
     }
 }
 
-fn zero_memory_usage(now_ns: i64) -> MemoryUsage {
+fn memory_usage(now_ns: i64, usage: VmUsage) -> MemoryUsage {
     MemoryUsage {
         timestamp: now_ns,
-        working_set_bytes: Some(UInt64Value { value: 0 }),
+        working_set_bytes: Some(UInt64Value {
+            value: usage.memory_bytes,
+        }),
         available_bytes: Some(UInt64Value { value: 0 }),
-        usage_bytes: Some(UInt64Value { value: 0 }),
-        rss_bytes: Some(UInt64Value { value: 0 }),
+        usage_bytes: Some(UInt64Value {
+            value: usage.memory_bytes,
+        }),
+        rss_bytes: Some(UInt64Value {
+            value: usage.memory_bytes,
+        }),
         page_faults: Some(UInt64Value { value: 0 }),
         major_page_faults: Some(UInt64Value { value: 0 }),
     }
@@ -113,7 +202,7 @@ fn writable_layer_usage(
     }
 }
 
-pub(super) async fn container_stats(container: &Container) -> ContainerStats {
+pub(super) async fn container_stats(container: &Container, usage: VmUsage) -> ContainerStats {
     let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
     let rootfs_usage = rootfs_path_usage(&container.rootfs_path).await;
     ContainerStats {
@@ -126,8 +215,8 @@ pub(super) async fn container_stats(container: &Container) -> ContainerStats {
             labels: container.labels.clone(),
             annotations: container.annotations.clone(),
         }),
-        cpu: Some(zero_cpu_usage(now_ns)),
-        memory: Some(zero_memory_usage(now_ns)),
+        cpu: Some(cpu_usage(now_ns, usage)),
+        memory: Some(memory_usage(now_ns, usage)),
         writable_layer: Some(writable_layer_usage(
             &container.rootfs_path,
             rootfs_usage,
@@ -139,6 +228,7 @@ pub(super) async fn container_stats(container: &Container) -> ContainerStats {
 pub(super) async fn pod_sandbox_stats(
     sandbox: &PodSandbox,
     containers: Vec<Container>,
+    vm_usage: VmUsage,
 ) -> PodSandboxStats {
     let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
     let running_containers: Vec<Container> = containers
@@ -146,7 +236,15 @@ pub(super) async fn pod_sandbox_stats(
         .filter(|container| container.state == ContainerState::Running)
         .cloned()
         .collect();
-    let container_stats = join_all(running_containers.iter().map(container_stats)).await;
+    // Pod-level stats report the VM total; per-container stats are split evenly
+    // so their sum equals the pod total.
+    let per_container = vm_usage.per_container(running_containers.len());
+    let container_stats = join_all(
+        running_containers
+            .iter()
+            .map(|c| container_stats(c, per_container)),
+    )
+    .await;
 
     PodSandboxStats {
         attributes: Some(PodSandboxAttributes {
@@ -161,8 +259,8 @@ pub(super) async fn pod_sandbox_stats(
             annotations: sandbox.annotations.clone(),
         }),
         linux: Some(LinuxPodSandboxStats {
-            cpu: Some(zero_cpu_usage(now_ns)),
-            memory: Some(zero_memory_usage(now_ns)),
+            cpu: Some(cpu_usage(now_ns, vm_usage)),
+            memory: Some(memory_usage(now_ns, vm_usage)),
             network: Some(NetworkUsage {
                 timestamp: now_ns,
                 default_interface: None,
@@ -177,8 +275,12 @@ pub(super) async fn pod_sandbox_stats(
                         .count() as u64,
                 }),
             }),
+            // Per-container stats belong inside LinuxPodSandboxStats (field 5),
+            // matching the official CRI v1 layout (the box proto previously put
+            // them on PodSandboxStats=3, colliding with `windows` and breaking
+            // crictl/kubelet decode of pod sandbox stats).
+            containers: container_stats,
         }),
-        containers: container_stats,
     }
 }
 
@@ -217,6 +319,39 @@ pub(super) fn metric_descriptors() -> Vec<MetricDescriptor> {
             unit: "count".to_string(),
         },
     ]
+}
+
+#[cfg(test)]
+mod stats_tests {
+    use super::*;
+
+    #[test]
+    fn test_per_container_split_sums_to_total() {
+        let total = VmUsage {
+            cpu_core_nanos: 900,
+            memory_bytes: 300,
+        };
+        let per = total.per_container(3);
+        assert_eq!(per.cpu_core_nanos, 300);
+        assert_eq!(per.memory_bytes, 100);
+        // 0 or 1 container → the full usage (no divide-by-zero, single-container
+        // pods get the whole VM's usage).
+        assert_eq!(total.per_container(0).memory_bytes, 300);
+        assert_eq!(total.per_container(1).cpu_core_nanos, 900);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_read_vm_usage_reports_real_memory_for_self() {
+        // Reading the test process's own procfs must yield a non-zero RSS (CPU
+        // may legitimately round to 0 immediately after start, so only memory
+        // is asserted).
+        let usage = read_vm_usage(std::process::id());
+        assert!(
+            usage.memory_bytes > 0,
+            "expected a non-zero RSS reading the test process's own /proc"
+        );
+    }
 }
 
 fn pod_sandbox_metric_labels(sandbox: &PodSandbox) -> HashMap<String, String> {

@@ -101,6 +101,7 @@ mod tests {
                 src: vec!["app.py".to_string()],
                 dst: "/workspace/".to_string(),
                 from: None,
+                chown: None,
             }
         );
     }
@@ -114,6 +115,7 @@ mod tests {
                 src: vec!["file1.txt".to_string(), "file2.txt".to_string()],
                 dst: "/dest/".to_string(),
                 from: None,
+                chown: None,
             }
         );
     }
@@ -127,16 +129,43 @@ mod tests {
                 src: vec!["/app/bin".to_string()],
                 dst: "/usr/local/bin/".to_string(),
                 from: Some("builder".to_string()),
+                chown: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_copy_chown() {
+        let result = parsers::parse_copy("--chown=1000:1000 app.py /workspace/", 1).unwrap();
+        assert_eq!(
+            result,
+            Instruction::Copy {
+                src: vec!["app.py".to_string()],
+                dst: "/workspace/".to_string(),
+                from: None,
+                chown: Some("1000:1000".to_string()),
+            }
+        );
+        // Named user only
+        let r2 = parsers::parse_copy("--chown=node app.js /app/", 1).unwrap();
+        assert_eq!(
+            r2,
+            Instruction::Copy {
+                src: vec!["app.js".to_string()],
+                dst: "/app/".to_string(),
+                from: None,
+                chown: Some("node".to_string()),
             }
         );
     }
 
     #[test]
     fn test_parse_copy_rejects_unsupported_flag() {
-        let err = parsers::parse_copy("--chown=1000:1000 app.py /workspace/", 1)
+        // --link is not a supported flag
+        let err = parsers::parse_copy("--link app.py /workspace/", 1)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("COPY flag '--chown=1000:1000' is not supported yet"));
+        assert!(err.contains("COPY flag '--link' is not supported"));
     }
 
     #[test]
@@ -165,8 +194,7 @@ mod tests {
         assert_eq!(
             result,
             Instruction::Env {
-                key: "PATH".to_string(),
-                value: "/usr/local/bin:/usr/bin".to_string(),
+                vars: vec![("PATH".to_string(), "/usr/local/bin:/usr/bin".to_string())],
             }
         );
     }
@@ -177,8 +205,7 @@ mod tests {
         assert_eq!(
             result,
             Instruction::Env {
-                key: "MSG".to_string(),
-                value: "hello world".to_string(),
+                vars: vec![("MSG".to_string(), "hello world".to_string())],
             }
         );
     }
@@ -189,8 +216,38 @@ mod tests {
         assert_eq!(
             result,
             Instruction::Env {
-                key: "MY_VAR".to_string(),
-                value: "my_value".to_string(),
+                vars: vec![("MY_VAR".to_string(), "my_value".to_string())],
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_env_multi_var() {
+        // The form that was broken: several KEY=VALUE pairs on one line.
+        let result = parsers::parse_env("GREETING=hello APPDIR=/srv DEBUG=1", 1).unwrap();
+        assert_eq!(
+            result,
+            Instruction::Env {
+                vars: vec![
+                    ("GREETING".to_string(), "hello".to_string()),
+                    ("APPDIR".to_string(), "/srv".to_string()),
+                    ("DEBUG".to_string(), "1".to_string()),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_env_multi_var_with_quoted_spaces() {
+        // A quoted value with spaces must stay one variable, not split the line.
+        let result = parsers::parse_env(r#"NAME="John Doe" CITY=NYC"#, 1).unwrap();
+        assert_eq!(
+            result,
+            Instruction::Env {
+                vars: vec![
+                    ("NAME".to_string(), "John Doe".to_string()),
+                    ("CITY".to_string(), "NYC".to_string()),
+                ],
             }
         );
     }
@@ -261,10 +318,11 @@ mod tests {
     #[test]
     fn test_parse_expose() {
         let result = parsers::parse_expose("8080", 1).unwrap();
+        // Bare ports are normalized to <port>/tcp, matching Docker.
         assert_eq!(
             result,
             Instruction::Expose {
-                port: "8080".to_string(),
+                ports: vec!["8080/tcp".to_string()],
             }
         );
     }
@@ -275,7 +333,22 @@ mod tests {
         assert_eq!(
             result,
             Instruction::Expose {
-                port: "8080/tcp".to_string(),
+                ports: vec!["8080/tcp".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_expose_multiple_ports() {
+        let result = parsers::parse_expose("80 443 8080/udp", 1).unwrap();
+        assert_eq!(
+            result,
+            Instruction::Expose {
+                ports: vec![
+                    "80/tcp".to_string(),
+                    "443/tcp".to_string(),
+                    "8080/udp".to_string(),
+                ],
             }
         );
     }
@@ -288,8 +361,7 @@ mod tests {
         assert_eq!(
             result,
             Instruction::Label {
-                key: "version".to_string(),
-                value: "1.0.0".to_string(),
+                pairs: vec![("version".to_string(), "1.0.0".to_string())],
             }
         );
     }
@@ -300,8 +372,22 @@ mod tests {
         assert_eq!(
             result,
             Instruction::Label {
-                key: "description".to_string(),
-                value: "My App".to_string(),
+                pairs: vec![("description".to_string(), "My App".to_string())],
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_label_multiple_pairs() {
+        let result = parsers::parse_label("a=1 b=2 c=3", 1).unwrap();
+        assert_eq!(
+            result,
+            Instruction::Label {
+                pairs: vec![
+                    ("a".to_string(), "1".to_string()),
+                    ("b".to_string(), "2".to_string()),
+                    ("c".to_string(), "3".to_string()),
+                ],
             }
         );
     }
@@ -477,11 +563,16 @@ CMD ["app.py"]
     }
 
     #[test]
-    fn test_parse_add_rejects_chown() {
-        let err = parsers::parse_add("--chown=1000:1000 files/ /data/", 1)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("ADD flag '--chown=1000:1000' is not supported yet"));
+    fn test_parse_add_chown() {
+        let result = parsers::parse_add("--chown=1000:1000 files/ /data/", 1).unwrap();
+        assert_eq!(
+            result,
+            Instruction::Add {
+                src: vec!["files/".to_string()],
+                dst: "/data/".to_string(),
+                chown: Some("1000:1000".to_string()),
+            }
+        );
     }
 
     #[test]
@@ -516,11 +607,15 @@ CMD ["app.py"]
     }
 
     #[test]
-    fn test_parse_maintainer_is_rejected() {
-        let err = Dockerfile::parse("FROM alpine\nMAINTAINER ops@example.com")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("MAINTAINER is deprecated and not supported"));
+    fn test_parse_maintainer_accepted_as_label() {
+        // MAINTAINER is deprecated but still valid in Docker: the build succeeds
+        // and the value is recorded as a `maintainer` label.
+        let df = Dockerfile::parse("FROM alpine\nMAINTAINER ops@example.com").unwrap();
+        assert!(df.instructions.iter().any(|i| matches!(
+            i,
+            Instruction::Label { pairs }
+                if pairs == &vec![("maintainer".to_string(), "ops@example.com".to_string())]
+        )));
     }
 
     // --- parse_shell ---
@@ -651,6 +746,23 @@ CMD ["app.py"]
     }
 
     #[test]
+    fn test_parse_healthcheck_compound_go_duration() {
+        // Docker accepts Go-style compound durations like 1m30s (=90s).
+        let result =
+            parsers::parse_healthcheck("--interval=1m30s --timeout=2s --retries=3 CMD true", 1)
+                .unwrap();
+        if let Instruction::HealthCheck {
+            interval, timeout, ..
+        } = result
+        {
+            assert_eq!(interval, Some(90));
+            assert_eq!(timeout, Some(2));
+        } else {
+            panic!("expected HealthCheck");
+        }
+    }
+
+    #[test]
     fn test_parse_healthcheck_json_cmd() {
         let result =
             parsers::parse_healthcheck(r#"CMD ["curl", "-f", "http://localhost/"]"#, 1).unwrap();
@@ -703,6 +815,7 @@ CMD ["app.py"]
                     src: vec![".".to_string()],
                     dst: "/app".to_string(),
                     from: None,
+                    chown: None,
                 }),
             }
         );

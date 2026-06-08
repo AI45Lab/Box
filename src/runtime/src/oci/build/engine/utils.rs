@@ -5,6 +5,7 @@ use std::path::Path;
 
 use a3s_box_core::error::{BoxError, Result};
 
+use super::super::dockerignore::DockerIgnore;
 use super::super::layer::sha256_bytes;
 
 /// Check if a filename looks like a tar archive.
@@ -155,7 +156,16 @@ pub(super) fn compute_diff_id(layer_path: &Path) -> Result<String> {
 }
 
 /// Recursively copy a directory.
-pub(super) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+/// Recursively copy `src` to `dst`, tracking each entry's path relative to the
+/// build context (`rel_base`) and skipping entries excluded by `.dockerignore`.
+/// An excluded directory is pruned (not descended into). When `ignore` is
+/// `None` (e.g. `COPY --from`), nothing is filtered.
+pub(super) fn copy_dir_filtered(
+    src: &Path,
+    dst: &Path,
+    rel_base: &Path,
+    ignore: Option<&DockerIgnore>,
+) -> Result<()> {
     std::fs::create_dir_all(dst).map_err(|e| {
         BoxError::BuildError(format!(
             "Failed to create directory {}: {}",
@@ -170,10 +180,36 @@ pub(super) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
         let entry =
             entry.map_err(|e| BoxError::BuildError(format!("Failed to read entry: {}", e)))?;
         let src_path = entry.path();
+        let entry_rel = rel_base.join(entry.file_name());
+
+        // Skip paths excluded by .dockerignore (prunes the whole subtree).
+        if let Some(ign) = ignore {
+            if ign.is_excluded(&entry_rel) {
+                continue;
+            }
+        }
+
         let dst_path = dst.join(entry.file_name());
 
-        if src_path.is_dir() {
-            copy_dir_recursive(&src_path, &dst_path)?;
+        // Use the no-follow file type so a symlink is preserved as a symlink
+        // (Docker copies symlinks verbatim; following them would duplicate the
+        // target content and lose e.g. shared-library `.so -> .so.1` links).
+        let file_type = entry
+            .file_type()
+            .map_err(|e| BoxError::BuildError(format!("Failed to stat entry: {}", e)))?;
+
+        if file_type.is_symlink() {
+            let target = std::fs::read_link(&src_path).map_err(|e| {
+                BoxError::BuildError(format!(
+                    "Failed to read symlink {}: {}",
+                    src_path.display(),
+                    e
+                ))
+            })?;
+            let _ = std::fs::remove_file(&dst_path);
+            symlink_to(&target, &dst_path)?;
+        } else if file_type.is_dir() {
+            copy_dir_filtered(&src_path, &dst_path, &entry_rel, ignore)?;
         } else {
             std::fs::copy(&src_path, &dst_path).map_err(|e| {
                 BoxError::BuildError(format!(
@@ -188,7 +224,98 @@ pub(super) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Create a symlink at `link` pointing at `target` (best-effort cross-platform).
+fn symlink_to(target: &Path, link: &Path) -> Result<()> {
+    #[cfg(unix)]
+    let result = std::os::unix::fs::symlink(target, link);
+    #[cfg(not(unix))]
+    let result = std::fs::write(link, Vec::new()); // non-unix fallback: placeholder file
+    result.map_err(|e| {
+        BoxError::BuildError(format!(
+            "Failed to create symlink {} -> {}: {}",
+            link.display(),
+            target.display(),
+            e
+        ))
+    })
+}
+
 /// Format a byte size as a human-readable string.
+/// Parse a `--chown` value (`user[:group]`, numeric or named) into a
+/// `(uid, gid)` pair. Named users/groups are resolved from the base image's
+/// `/etc/passwd` and `/etc/group` inside `rootfs_dir`.
+pub(super) fn resolve_chown(spec: &str, rootfs_dir: &Path) -> Result<(u32, u32)> {
+    let (user_part, group_part) = match spec.split_once(':') {
+        Some((u, g)) => (u, Some(g)),
+        None => (spec, None),
+    };
+
+    let uid = resolve_user(user_part, rootfs_dir)?;
+    let gid = match group_part {
+        Some(g) => resolve_group(g, rootfs_dir)?,
+        None => uid_to_gid(uid, rootfs_dir).unwrap_or(uid),
+    };
+    Ok((uid, gid))
+}
+
+fn resolve_user(user: &str, rootfs: &Path) -> Result<u32> {
+    if let Ok(n) = user.parse::<u32>() {
+        return Ok(n);
+    }
+    // Look up in rootfs /etc/passwd: root:x:0:0:...
+    let passwd = std::fs::read_to_string(rootfs.join("etc/passwd")).unwrap_or_default();
+    for line in passwd.lines() {
+        let f: Vec<&str> = line.splitn(4, ':').collect();
+        if f.len() >= 3 && f[0] == user {
+            return f[2].parse::<u32>().map_err(|_| {
+                BoxError::BuildError(format!("Invalid UID for user '{}' in /etc/passwd", user))
+            });
+        }
+    }
+    Err(BoxError::BuildError(format!(
+        "COPY --chown: user '{}' not found in rootfs /etc/passwd",
+        user
+    )))
+}
+
+fn resolve_group(group: &str, rootfs: &Path) -> Result<u32> {
+    if let Ok(n) = group.parse::<u32>() {
+        return Ok(n);
+    }
+    let etc_group = std::fs::read_to_string(rootfs.join("etc/group")).unwrap_or_default();
+    for line in etc_group.lines() {
+        let f: Vec<&str> = line.splitn(4, ':').collect();
+        if f.len() >= 3 && f[0] == group {
+            return f[2].parse::<u32>().map_err(|_| {
+                BoxError::BuildError(format!("Invalid GID for group '{}' in /etc/group", group))
+            });
+        }
+    }
+    Err(BoxError::BuildError(format!(
+        "COPY --chown: group '{}' not found in rootfs /etc/group",
+        group
+    )))
+}
+
+/// Get the primary GID for a UID from /etc/passwd (field 4).
+fn uid_to_gid(uid: u32, rootfs: &Path) -> Option<u32> {
+    let passwd = std::fs::read_to_string(rootfs.join("etc/passwd")).ok()?;
+    for line in passwd.lines() {
+        let f: Vec<&str> = line.splitn(5, ':').collect();
+        if f.len() >= 4 && f[2].parse::<u32>().ok() == Some(uid) {
+            return f[3].parse::<u32>().ok();
+        }
+    }
+    None
+}
+
+/// Placeholder — no longer used; chown is applied in tar headers, not the
+/// host filesystem.
+#[allow(dead_code)]
+pub(super) fn apply_chown_recursive(_dir: &Path, _uid: u32, _gid: u32) -> Result<()> {
+    Ok(())
+}
+
 pub(super) fn format_size(bytes: u64) -> String {
     if bytes >= 1024 * 1024 * 1024 {
         format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))

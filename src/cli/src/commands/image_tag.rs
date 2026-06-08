@@ -13,7 +13,28 @@ pub struct ImageTagArgs {
     pub target: String,
 }
 
+/// Validate a tag target's reference grammar. Docker requires the repository
+/// name (everything before the `:tag`/`@digest`) to be lowercase.
+fn validate_tag_target(target: &str) -> Result<(), String> {
+    let without_digest = target.split('@').next().unwrap_or(target);
+    let last_slash = without_digest.rfind('/');
+    // Strip a trailing `:tag` only when the colon is part of the tag, not a
+    // `registry:port`.
+    let repo = match without_digest.rfind(':') {
+        Some(colon) if last_slash.is_none_or(|slash| colon > slash) => &without_digest[..colon],
+        _ => without_digest,
+    };
+    if repo.bytes().any(|b| b.is_ascii_uppercase()) {
+        return Err(format!(
+            "invalid reference format: repository name must be lowercase: '{target}'"
+        ));
+    }
+    Ok(())
+}
+
 pub async fn execute(args: ImageTagArgs) -> Result<(), Box<dyn std::error::Error>> {
+    validate_tag_target(&args.target)?;
+
     let store = super::open_image_store()?;
     let images = store.list().await;
 
@@ -45,6 +66,15 @@ mod tests {
             last_used: Utc::now(),
             path: PathBuf::from("/tmp/image"),
         }
+    }
+
+    #[test]
+    fn test_validate_tag_target_rejects_uppercase_repo() {
+        assert!(validate_tag_target("BadRepo:Tag").is_err());
+        assert!(validate_tag_target("myrepo:V1").is_ok()); // uppercase tag is fine
+        assert!(validate_tag_target("localhost:5000/myrepo:tag").is_ok());
+        assert!(validate_tag_target("alpine:latest").is_ok());
+        assert!(validate_tag_target("ns/Sub:tag").is_err());
     }
 
     #[test]

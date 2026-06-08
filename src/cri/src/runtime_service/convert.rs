@@ -85,6 +85,45 @@ pub(super) fn container_mount_to_cri(mount: &ContainerMount) -> Mount {
     }
 }
 
+/// Reject CRI namespace options that a microVM-per-pod runtime cannot honor.
+///
+/// Each pod is an isolated microVM with its own kernel and namespaces, so it
+/// cannot share the *host's* network/IPC/user namespace (`NamespaceMode::NODE`
+/// — i.e. HostNetwork / HostIpc): there is no host network or IPC namespace
+/// inside the guest. Rather than silently running such a pod fully isolated
+/// (the wrong semantics, and a fail-open surprise for the workload), reject it
+/// with a clear error, matching the fail-closed handling of unsupported mount
+/// propagation above.
+///
+/// `HostPID` (`pid == NODE`) is NOT rejected: all of a pod's processes already
+/// share the single VM-wide PID namespace (incl. the VM's PID 1), which is the
+/// broadest PID namespace available in the guest — there is no separate host
+/// PID namespace to be denied, so HostPID is legitimately satisfied. `POD`/
+/// `CONTAINER`/`TARGET` are likewise accepted (one shared VM namespace set).
+pub(super) fn validate_namespace_options(
+    options: Option<&NamespaceOption>,
+    context: &str,
+) -> Result<(), Status> {
+    let Some(options) = options else {
+        return Ok(());
+    };
+    let host = crate::cri_api::namespace_option::NamespaceMode::Node as i32;
+    for (mode, kind) in [
+        (options.network, "network (HostNetwork)"),
+        (options.ipc, "IPC (HostIpc)"),
+        (options.user, "user"),
+    ] {
+        if mode == host {
+            return Err(Status::unimplemented(format!(
+                "{context}: host {kind} namespace (NamespaceMode::NODE) is not supported by the \
+                 microVM-per-pod runtime — each pod runs in an isolated VM and cannot share the \
+                 host's namespaces"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_container_mount(mount: &Mount) -> Result<(), Status> {
     if mount.host_path.trim().is_empty() {
         return Err(Status::invalid_argument(
@@ -179,8 +218,13 @@ pub(super) fn resolve_command_and_args(
     (command, args)
 }
 
-pub(super) fn container_exit_reason(exit_code: i32) -> (&'static str, String) {
-    if exit_code == 0 {
+pub(super) fn container_exit_reason(exit_code: i32, oom_killed: bool) -> (&'static str, String) {
+    if oom_killed {
+        (
+            "OOMKilled",
+            format!("Container was killed by the out-of-memory killer (exit code {exit_code})"),
+        )
+    } else if exit_code == 0 {
         ("Completed", "Container exited successfully".to_string())
     } else {
         ("Error", format!("Container exited with code {exit_code}"))
@@ -389,5 +433,84 @@ pub(super) fn container_event_response(
         created_at,
         reason: reason.into(),
         message: message.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cri_api::namespace_option::NamespaceMode;
+    use crate::cri_api::NamespaceOption;
+
+    #[test]
+    fn test_container_exit_reason_oom_killed_overrides_code() {
+        // OOMKilled wins regardless of exit code (the OOM killer SIGKILLs → 137).
+        let (reason, message) = container_exit_reason(137, true);
+        assert_eq!(reason, "OOMKilled");
+        assert!(message.contains("out-of-memory"));
+        // A zero exit code that was still an OOM is reported as OOMKilled.
+        assert_eq!(container_exit_reason(0, true).0, "OOMKilled");
+        // Non-OOM exits keep Completed / Error.
+        assert_eq!(container_exit_reason(0, false).0, "Completed");
+        assert_eq!(container_exit_reason(1, false).0, "Error");
+    }
+
+    fn ns(network: NamespaceMode, pid: NamespaceMode, ipc: NamespaceMode) -> NamespaceOption {
+        NamespaceOption {
+            network: network as i32,
+            pid: pid as i32,
+            ipc: ipc as i32,
+            target_id: String::new(),
+            user: NamespaceMode::Pod as i32,
+        }
+    }
+
+    #[test]
+    fn test_validate_namespace_options_accepts_default_and_none() {
+        assert!(validate_namespace_options(None, "X").is_ok());
+        // POD/CONTAINER (the kubelet default for ordinary pods) are accepted.
+        assert!(validate_namespace_options(
+            Some(&ns(
+                NamespaceMode::Pod,
+                NamespaceMode::Container,
+                NamespaceMode::Pod
+            )),
+            "X"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_validate_namespace_options_accepts_host_pid() {
+        // HostPID is satisfied by the pod's shared VM-wide PID namespace — must
+        // NOT be rejected (regression guard for "runtime should support HostPID").
+        assert!(validate_namespace_options(
+            Some(&ns(
+                NamespaceMode::Pod,
+                NamespaceMode::Node,
+                NamespaceMode::Pod
+            )),
+            "X"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_validate_namespace_options_rejects_host_network_and_ipc() {
+        for opts in [
+            ns(
+                NamespaceMode::Node,
+                NamespaceMode::Container,
+                NamespaceMode::Pod,
+            ), // HostNetwork
+            ns(
+                NamespaceMode::Pod,
+                NamespaceMode::Container,
+                NamespaceMode::Node,
+            ), // HostIpc
+        ] {
+            let err = validate_namespace_options(Some(&opts), "RunPodSandbox").unwrap_err();
+            assert_eq!(err.code(), tonic::Code::Unimplemented);
+        }
     }
 }

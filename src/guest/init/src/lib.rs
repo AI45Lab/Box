@@ -6,6 +6,8 @@
 //! passt-based virtio-net interfaces.
 
 pub mod attest_server;
+#[cfg(target_os = "linux")]
+pub mod cgroup;
 pub mod exec_server;
 pub mod host_config;
 pub mod namespace;

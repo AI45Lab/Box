@@ -83,16 +83,13 @@ impl ImageReference {
                     (name_tag.to_string(), None)
                 }
             } else if let Some(colon_pos) = name_tag.rfind(':') {
-                // Could be registry:port or name:tag — check if after colon is numeric (port)
-                let after_colon = &name_tag[colon_pos + 1..];
-                if after_colon.chars().all(|c| c.is_ascii_digit()) {
-                    // Looks like a port, treat whole thing as name
-                    (name_tag.to_string(), None)
-                } else {
-                    let tag = after_colon;
-                    let name = &name_tag[..colon_pos];
-                    (name.to_string(), Some(tag.to_string()))
-                }
+                // No slash: the colon always introduces a tag. A bare
+                // `registry:port` with no repository is not a valid image
+                // reference, so numeric tags (`redis:7`, `node:18`,
+                // `postgres:16`) must NOT be mistaken for a port.
+                let tag = &name_tag[colon_pos + 1..];
+                let name = &name_tag[..colon_pos];
+                (name.to_string(), Some(tag.to_string()))
             } else {
                 (name_tag.to_string(), None)
             }
@@ -307,6 +304,28 @@ mod tests {
     fn test_display() {
         let r = ImageReference::parse("nginx:1.25").unwrap();
         assert_eq!(format!("{}", r), "docker.io/library/nginx:1.25");
+    }
+
+    /// Regression: a purely numeric tag with no registry (`redis:7`, `node:18`)
+    /// must be parsed as a tag, not mistaken for a registry port.
+    #[test]
+    fn test_numeric_tag_is_not_a_port() {
+        for (input, repo, tag) in [
+            ("redis:7", "library/redis", "7"),
+            ("node:18", "library/node", "18"),
+            ("postgres:16", "library/postgres", "16"),
+            ("mgmt:1", "library/mgmt", "1"),
+        ] {
+            let r = ImageReference::parse(input).unwrap();
+            assert_eq!(r.registry, "docker.io", "registry for {input}");
+            assert_eq!(r.repository, repo, "repository for {input}");
+            assert_eq!(r.tag.as_deref(), Some(tag), "tag for {input}");
+        }
+        // A real registry:port/repo:tag still splits correctly.
+        let r = ImageReference::parse("localhost:5000/app:2").unwrap();
+        assert_eq!(r.registry, "localhost:5000");
+        assert_eq!(r.repository, "app");
+        assert_eq!(r.tag.as_deref(), Some("2"));
     }
 
     #[test]

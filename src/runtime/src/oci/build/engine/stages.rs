@@ -47,6 +47,22 @@ pub(super) fn split_into_stages(instructions: &[Instruction]) -> Vec<BuildStage>
     stages
 }
 
+/// Collect the global (pre-FROM) `ARG` declarations. In Docker a global ARG is
+/// in scope for every stage's `FROM` line and body (via its default when no
+/// `--build-arg` overrides it), so every stage's state is seeded with these.
+/// Returns `(name, default)` pairs in declaration order; stops at the first FROM.
+pub(super) fn global_arg_decls(instructions: &[Instruction]) -> Vec<(String, Option<String>)> {
+    let mut globals = Vec::new();
+    for instr in instructions {
+        match instr {
+            Instruction::From { .. } => break,
+            Instruction::Arg { name, default } => globals.push((name.clone(), default.clone())),
+            _ => {}
+        }
+    }
+    globals
+}
+
 /// Resolve a stage reference (name or index) to its rootfs path.
 pub(super) fn resolve_stage_rootfs<'a>(
     from_ref: &str,
@@ -108,6 +124,7 @@ mod tests {
             src: vec![src.to_string()],
             dst: dst.to_string(),
             from: None,
+            chown: None,
         }
     }
 

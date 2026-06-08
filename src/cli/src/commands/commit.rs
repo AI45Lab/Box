@@ -246,16 +246,17 @@ fn apply_changes(config: &mut serde_json::Value, changes: &[String]) {
     for change in changes {
         let trimmed = change.trim();
         if let Some(rest) = trimmed.strip_prefix("CMD ") {
-            config["config"]["Cmd"] = serde_json::json!(["/bin/sh", "-c", rest]);
+            // Honor exec form (CMD ["a","b"]) vs shell form, like Docker/import.
+            config["config"]["Cmd"] = super::import::parse_exec_or_shell(rest);
         } else if let Some(rest) = trimmed.strip_prefix("ENTRYPOINT ") {
-            config["config"]["Entrypoint"] = serde_json::json!(["/bin/sh", "-c", rest]);
+            config["config"]["Entrypoint"] = super::import::parse_exec_or_shell(rest);
         } else if let Some(rest) = trimmed.strip_prefix("ENV ") {
-            if let Some((k, v)) = rest.split_once('=') {
-                let env = config["config"]["Env"]
-                    .as_array_mut()
-                    .map(|a| a.clone())
+            // Accept both KEY=VALUE and the legacy space-separated KEY VALUE form.
+            if let Ok((k, v)) = super::import::parse_key_value(rest) {
+                let mut env = config["config"]["Env"]
+                    .as_array()
+                    .cloned()
                     .unwrap_or_default();
-                let mut env = env;
                 env.push(serde_json::json!(format!("{k}={v}")));
                 config["config"]["Env"] = serde_json::json!(env);
             }
@@ -272,13 +273,12 @@ fn apply_changes(config: &mut serde_json::Value, changes: &[String]) {
         } else if let Some(rest) = trimmed.strip_prefix("USER ") {
             config["config"]["User"] = serde_json::json!(rest);
         } else if let Some(rest) = trimmed.strip_prefix("LABEL ") {
-            if let Some((k, v)) = rest.split_once('=') {
-                let labels = config["config"]["Labels"]
+            if let Ok((k, v)) = super::import::parse_key_value(rest) {
+                let mut labels = config["config"]["Labels"]
                     .as_object()
                     .cloned()
                     .unwrap_or_default();
-                let mut labels = labels;
-                labels.insert(k.to_string(), serde_json::json!(v));
+                labels.insert(k, serde_json::json!(v));
                 config["config"]["Labels"] = serde_json::json!(labels);
             }
         }

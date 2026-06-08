@@ -29,6 +29,8 @@ pub enum NetworkCommand {
     Connect(ConnectArgs),
     /// Disconnect a box from a network
     Disconnect(DisconnectArgs),
+    /// Remove all unused networks
+    Prune(PruneArgs),
 }
 
 #[derive(Args)]
@@ -98,6 +100,13 @@ pub struct DisconnectArgs {
     pub force: bool,
 }
 
+#[derive(Args)]
+pub struct PruneArgs {
+    /// Skip confirmation prompt
+    #[arg(short, long)]
+    pub force: bool,
+}
+
 /// Dispatch network subcommands.
 pub async fn execute(args: NetworkArgs) -> Result<(), Box<dyn std::error::Error>> {
     match args.command {
@@ -107,6 +116,87 @@ pub async fn execute(args: NetworkArgs) -> Result<(), Box<dyn std::error::Error>
         NetworkCommand::Inspect(a) => execute_inspect(a).await,
         NetworkCommand::Connect(a) => execute_connect(a).await,
         NetworkCommand::Disconnect(a) => execute_disconnect(a).await,
+        NetworkCommand::Prune(a) => execute_prune(a).await,
+    }
+}
+
+/// Networks that mirror Docker's predefined networks and are never pruned.
+fn is_predefined_network(name: &str) -> bool {
+    matches!(name, "bridge" | "host" | "none")
+}
+
+/// Whether a network has no attachments: no live endpoints and no box record
+/// (running or stopped) configured for it. Matches `docker network prune`,
+/// which removes networks not used by at least one container.
+fn network_is_unused(
+    config: &NetworkConfig,
+    in_use_names: &std::collections::HashSet<String>,
+) -> bool {
+    config.endpoints.is_empty() && !in_use_names.contains(&config.name)
+}
+
+/// Remove every unused, non-predefined network from `store`. Returns the names
+/// removed and any per-network errors. Shared by `network prune` and
+/// `system prune` (Docker's `system prune` also reaps unused networks).
+pub(crate) fn prune_unused_networks(
+    store: &NetworkStore,
+    state: &crate::state::StateFile,
+) -> (Vec<String>, Vec<String>) {
+    let in_use: std::collections::HashSet<String> = state
+        .records()
+        .iter()
+        .filter_map(|record| crate::cleanup::record_network_name(record).map(str::to_string))
+        .collect();
+
+    let mut networks = store.list().unwrap_or_default();
+    networks.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let mut removed = Vec::new();
+    let mut errors = Vec::new();
+    for net in &networks {
+        if is_predefined_network(&net.name) || !network_is_unused(net, &in_use) {
+            continue;
+        }
+        match store.remove(&net.name) {
+            Ok(_) => removed.push(net.name.clone()),
+            Err(error) => errors.push(format!("{}: {error}", net.name)),
+        }
+    }
+    (removed, errors)
+}
+
+async fn execute_prune(args: PruneArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if !args.force {
+        println!("WARNING! This will remove all networks not used by at least one box.");
+        print!("Are you sure you want to continue? [y/N] ");
+        use std::io::Write;
+        std::io::stdout().flush()?;
+
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        if !input.trim().eq_ignore_ascii_case("y") {
+            return Ok(());
+        }
+    }
+
+    let store = NetworkStore::default_path()?;
+    let state = crate::state::StateFile::load_default()?;
+    let (removed, errors) = prune_unused_networks(&store, &state);
+
+    if removed.is_empty() {
+        println!("Total reclaimed space: 0 networks");
+    } else {
+        println!("Deleted Networks:");
+        for name in &removed {
+            println!("{name}");
+        }
+        println!("Total reclaimed space: {} network(s)", removed.len());
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("\n").into())
     }
 }
 
@@ -723,6 +813,43 @@ mod tests {
 
         let reloaded = store.get("testnet").unwrap().unwrap();
         assert_eq!(reloaded.endpoints.len(), 2);
+    }
+
+    #[test]
+    fn test_is_predefined_network() {
+        assert!(is_predefined_network("bridge"));
+        assert!(is_predefined_network("host"));
+        assert!(is_predefined_network("none"));
+        assert!(!is_predefined_network("mynet"));
+    }
+
+    #[test]
+    fn test_prune_unused_networks_keeps_attached_and_referenced() {
+        let (_dir, store) = temp_store();
+        // Truly unused: no endpoints and no box record references it.
+        store
+            .create(NetworkConfig::new("orphan", "10.89.0.0/24").unwrap())
+            .unwrap();
+        // Has a live endpoint → kept.
+        let mut with_ep = NetworkConfig::new("withep", "10.90.0.0/24").unwrap();
+        with_ep.connect("box-1", "web").unwrap();
+        store.create(with_ep).unwrap();
+        // Referenced by a stopped box record → kept (Docker keeps these too).
+        store
+            .create(NetworkConfig::new("recnet", "10.91.0.0/24").unwrap())
+            .unwrap();
+
+        let mut record = crate::test_helpers::fixtures::make_record("box-2", "db", "stopped", None);
+        set_record_network(&mut record, "recnet");
+        let (_state_dir, state) = crate::test_helpers::fixtures::setup_state(vec![record]);
+
+        let (removed, errors) = prune_unused_networks(&store, &state);
+
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert_eq!(removed, vec!["orphan".to_string()]);
+        assert!(store.get("orphan").unwrap().is_none());
+        assert!(store.get("withep").unwrap().is_some());
+        assert!(store.get("recnet").unwrap().is_some());
     }
 
     #[test]

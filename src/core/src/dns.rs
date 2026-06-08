@@ -46,6 +46,32 @@ pub fn generate_resolv_conf(custom_dns: &[String]) -> String {
         + "\n"
 }
 
+/// Render `/etc/resolv.conf` content from explicit DNS settings.
+///
+/// Emits one `nameserver` line per server, a single `search` line (when any
+/// search domains are given), and a single `options` line (when any options are
+/// given) — the layout Kubernetes' `DNSConfig` expects. Returns an empty string
+/// when nothing is configured, so callers can fall back to a default.
+pub fn render_resolv_conf(servers: &[String], searches: &[String], options: &[String]) -> String {
+    let mut out = String::new();
+    for server in servers {
+        out.push_str("nameserver ");
+        out.push_str(server);
+        out.push('\n');
+    }
+    if !searches.is_empty() {
+        out.push_str("search ");
+        out.push_str(&searches.join(" "));
+        out.push('\n');
+    }
+    if !options.is_empty() {
+        out.push_str("options ");
+        out.push_str(&options.join(" "));
+        out.push('\n');
+    }
+    out
+}
+
 /// Try to read the host's /etc/resolv.conf.
 ///
 /// Returns None if the file doesn't exist, is unreadable, or contains
@@ -177,6 +203,24 @@ mod tests {
     fn test_custom_dns() {
         let result = generate_resolv_conf(&["1.1.1.1".to_string(), "1.0.0.1".to_string()]);
         assert_eq!(result, "nameserver 1.1.1.1\nnameserver 1.0.0.1\n");
+    }
+
+    #[test]
+    fn test_render_resolv_conf() {
+        let servers = vec!["10.10.10.10".to_string(), "10.10.10.11".to_string()];
+        let searches = vec!["a.com".to_string(), "b.com".to_string()];
+        let options = vec!["ndots:5".to_string(), "timeout:2".to_string()];
+        assert_eq!(
+            render_resolv_conf(&servers, &searches, &options),
+            "nameserver 10.10.10.10\nnameserver 10.10.10.11\nsearch a.com b.com\noptions ndots:5 timeout:2\n"
+        );
+        // Servers only — no search/options lines.
+        assert_eq!(
+            render_resolv_conf(&["1.1.1.1".to_string()], &[], &[]),
+            "nameserver 1.1.1.1\n"
+        );
+        // Nothing configured -> empty (caller falls back to a default).
+        assert_eq!(render_resolv_conf(&[], &[], &[]), "");
     }
 
     #[test]

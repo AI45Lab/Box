@@ -396,6 +396,8 @@ pub async fn serve_exec(mut stream: TcpStream, session: &StreamingSession) -> Re
                         tracing::debug!(exit_code, "spdy exec: guest command exited");
                         break;
                     }
+                    // Flush-acks are only used by the log-rotation path; ignore.
+                    Ok(Some(ExecEvent::FlushAck)) => {}
                     Ok(None) | Err(_) => break,
                 }
             }
@@ -638,6 +640,7 @@ pub async fn serve_attach(
                                 .await;
                         }
                     }
+                    Ok(ExecEvent::FlushAck) => {}
                     Ok(ExecEvent::Exit(_)) => break,
                     Err(RecvError::Lagged(_)) => continue,
                     Err(RecvError::Closed) => break,
@@ -677,5 +680,259 @@ async fn write_pty_frame<W: AsyncWriteExt + Unpin>(
         .write_all(&(payload.len() as u32).to_be_bytes())
         .await?;
     writer.write_all(payload).await?;
+    Ok(())
+}
+
+/// 101 response that upgrades the connection to SPDY for the `portforward.k8s.io`
+/// subprotocol. crictl/kubelet stream raw TCP bytes over a single SPDY data
+/// stream per forwarded port.
+const UPGRADE_RESPONSE_PORTFORWARD: &str = "HTTP/1.1 101 Switching Protocols\r\n\
+Connection: Upgrade\r\n\
+Upgrade: SPDY/3.1\r\n\
+X-Stream-Protocol-Version: portforward.k8s.io\r\n\r\n";
+
+/// Serve a CRI port-forward over SPDY.
+///
+/// The portforward client (crictl/kubelet) opens, per forwarded port, an
+/// **error** stream then a **data** stream (in that fixed order), immediately
+/// half-closes the error stream, and tunnels the raw TCP byte stream over the
+/// data stream. We accept both `SYN_STREAM`s (replying so the client proceeds),
+/// then bridge the data stream to the guest's vsock port-forward control
+/// channel, which dials `127.0.0.1:<port>` inside the sandbox VM.
+pub async fn serve_port_forward(
+    mut stream: TcpStream,
+    session: &StreamingSession,
+) -> Result<(), DynError> {
+    use crate::streaming::{
+        read_port_forward_frame, write_port_forward_frame, PORT_FORWARD_FRAME_CLOSE,
+        PORT_FORWARD_FRAME_DATA, PORT_FORWARD_FRAME_OPEN, PORT_FORWARD_FRAME_OPEN_ACK,
+        PORT_FORWARD_STREAM_ID,
+    };
+    use tokio::net::UnixStream;
+
+    let _ = stream.set_nodelay(true);
+
+    let port = match session.ports.first().and_then(|p| u16::try_from(*p).ok()) {
+        Some(port) => port,
+        None => {
+            stream
+                .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+                .await?;
+            return Ok(());
+        }
+    };
+    if session.port_forward_socket_path.is_empty() {
+        stream
+            .write_all(b"HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\n\r\n")
+            .await?;
+        return Ok(());
+    }
+
+    stream
+        .write_all(UPGRADE_RESPONSE_PORTFORWARD.as_bytes())
+        .await?;
+    tracing::debug!(
+        port,
+        "spdy serve_port_forward: 101 sent, awaiting SPDY frames"
+    );
+
+    let (mut reader, writer) = tokio::io::split(stream);
+    let writer = std::sync::Arc::new(tokio::sync::Mutex::new(writer));
+
+    // Collect the error + data streams (open order: error first, data second),
+    // replying to each so the client proceeds. The error stream is half-closed
+    // by the client straight away (empty DATA+FIN), which we simply ignore here.
+    let mut compressor = HeaderCompressor::new();
+    let mut stream_ids: Vec<u32> = Vec::new();
+    {
+        let mut guard = writer.lock().await;
+        while stream_ids.len() < 2 {
+            match read_frame(&mut reader).await? {
+                Some(Frame::SynStream { stream_id }) => {
+                    guard
+                        .write_all(&syn_reply_frame(&mut compressor, stream_id))
+                        .await?;
+                    tracing::debug!(
+                        stream_id,
+                        idx = stream_ids.len(),
+                        "spdy pf: SYN_STREAM -> SYN_REPLY"
+                    );
+                    stream_ids.push(stream_id);
+                }
+                Some(Frame::Ping { id }) => {
+                    guard.write_all(&ping_frame(id)).await?;
+                }
+                Some(Frame::Data {
+                    stream_id,
+                    fin,
+                    data,
+                }) => {
+                    tracing::debug!(
+                        stream_id,
+                        fin,
+                        len = data.len(),
+                        "spdy pf: DATA during stream collection (ignored)"
+                    );
+                }
+                Some(Frame::Ignored) => {}
+                None => {
+                    tracing::debug!("spdy pf: connection closed during stream collection");
+                    return Ok(());
+                }
+            }
+        }
+    }
+    let data_id = stream_ids[1];
+    tracing::debug!(
+        error_id = stream_ids[0],
+        data_id,
+        port,
+        "spdy pf: streams collected"
+    );
+
+    // Connect to the guest control channel and open the target guest port.
+    let mut control = match UnixStream::connect(&session.port_forward_socket_path).await {
+        Ok(control) => control,
+        Err(error) => {
+            tracing::warn!(error = %error, "spdy pf: guest control connect failed");
+            return Ok(());
+        }
+    };
+    write_port_forward_frame(
+        &mut control,
+        PORT_FORWARD_FRAME_OPEN,
+        PORT_FORWARD_STREAM_ID,
+        &port.to_be_bytes(),
+    )
+    .await?;
+    let ack = read_port_forward_frame(&mut control).await?;
+    let open_ok = ack.as_ref().is_some_and(|frame| {
+        frame.kind == PORT_FORWARD_FRAME_OPEN_ACK
+            && frame.stream_id == PORT_FORWARD_STREAM_ID
+            && frame.payload.first().copied().unwrap_or(1) == 0
+    });
+    if !open_ok {
+        tracing::warn!(got_ack = ack.is_some(), port, "spdy pf: guest OPEN failed");
+        return Ok(());
+    }
+    tracing::debug!(port, "spdy pf: guest OPEN_ACK ok");
+
+    let (mut control_read, mut control_write) = tokio::io::split(control);
+
+    // Client data stream -> guest TCP.
+    let client_to_guest = {
+        let writer = writer.clone();
+        async move {
+            loop {
+                match read_frame(&mut reader).await {
+                    Ok(Some(Frame::Data {
+                        stream_id,
+                        fin,
+                        data,
+                    })) if stream_id == data_id => {
+                        tracing::debug!(len = data.len(), fin, "spdy pf: client DATA -> guest");
+                        if !data.is_empty()
+                            && write_port_forward_frame(
+                                &mut control_write,
+                                PORT_FORWARD_FRAME_DATA,
+                                PORT_FORWARD_STREAM_ID,
+                                &data,
+                            )
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        if fin {
+                            let _ = write_port_forward_frame(
+                                &mut control_write,
+                                PORT_FORWARD_FRAME_CLOSE,
+                                PORT_FORWARD_STREAM_ID,
+                                &[],
+                            )
+                            .await;
+                            break;
+                        }
+                    }
+                    Ok(Some(Frame::Data { stream_id, fin, .. })) => {
+                        tracing::debug!(
+                            stream_id,
+                            fin,
+                            "spdy pf: client DATA on non-data stream (ignored)"
+                        );
+                    }
+                    Ok(Some(Frame::Ping { id })) => {
+                        let _ = writer.lock().await.write_all(&ping_frame(id)).await;
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => {
+                        let _ = write_port_forward_frame(
+                            &mut control_write,
+                            PORT_FORWARD_FRAME_CLOSE,
+                            PORT_FORWARD_STREAM_ID,
+                            &[],
+                        )
+                        .await;
+                        break;
+                    }
+                }
+            }
+        }
+    };
+
+    // Guest TCP -> client data stream.
+    let guest_to_client = {
+        let writer = writer.clone();
+        async move {
+            loop {
+                match read_port_forward_frame(&mut control_read).await {
+                    Ok(Some(frame)) if frame.stream_id == PORT_FORWARD_STREAM_ID => {
+                        match frame.kind {
+                            PORT_FORWARD_FRAME_DATA => {
+                                tracing::debug!(
+                                    len = frame.payload.len(),
+                                    "spdy pf: guest DATA -> client"
+                                );
+                                if writer
+                                    .lock()
+                                    .await
+                                    .write_all(&data_frame(data_id, false, &frame.payload))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            PORT_FORWARD_FRAME_CLOSE => {
+                                tracing::debug!("spdy pf: guest CLOSE -> client FIN");
+                                let _ = writer
+                                    .lock()
+                                    .await
+                                    .write_all(&data_frame(data_id, true, &[]))
+                                    .await;
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => break,
+                }
+            }
+        }
+    };
+
+    tokio::pin!(client_to_guest);
+    tokio::pin!(guest_to_client);
+    tokio::select! {
+        _ = &mut guest_to_client => {
+            tracing::debug!("spdy pf: guest_to_client finished");
+        }
+        _ = &mut client_to_guest => {
+            tracing::debug!("spdy pf: client_to_guest finished, draining response");
+            let _ = guest_to_client.await;
+        }
+    }
+    tracing::debug!(port, "spdy serve_port_forward: done");
     Ok(())
 }

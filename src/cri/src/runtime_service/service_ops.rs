@@ -79,7 +79,7 @@ impl BoxRuntimeService {
             return Ok(None);
         }
 
-        let Some(stored) = self.image_store.get(image_ref).await else {
+        let Some(stored) = self.image_store.resolve(image_ref).await else {
             return Err(Status::not_found(format!(
                 "Image not found locally: {image_ref}; pull it before CreateContainer"
             )));
@@ -136,6 +136,7 @@ impl BoxRuntimeService {
         &self,
         image: &ResolvedContainerImage,
         paths: &ContainerRootfsPaths,
+        resolv_conf: String,
     ) -> Result<(), Status> {
         let image_path = PathBuf::from(&image.path);
         let rootfs_path = paths.host_path.clone();
@@ -143,6 +144,7 @@ impl BoxRuntimeService {
         tokio::task::spawn_blocking(move || {
             OciRootfsBuilder::new(&rootfs_path)
                 .with_image(&image_path)
+                .with_resolv_conf(resolv_conf)
                 .build()
         })
         .await

@@ -5,25 +5,127 @@ use std::path::{Path, PathBuf};
 use a3s_box_core::error::{BoxError, Result};
 
 use super::super::dockerfile::Instruction;
-use super::super::layer::{create_layer, create_layer_from_dir, LayerInfo};
+use super::super::dockerignore::DockerIgnore;
+use super::super::layer::{
+    create_layer, create_layer_from_dir_with_chown, create_layer_with_chown, LayerInfo,
+};
 use super::utils::{
-    copy_dir_recursive, expand_args, extract_tar_to_dst, is_tar_archive, resolve_path,
+    copy_dir_filtered, expand_args, extract_tar_to_dst, is_tar_archive, resolve_chown, resolve_path,
 };
 use super::BuildState;
 
 #[cfg(target_os = "macos")]
 const UNSAFE_HOST_RUN_ENV: &str = "A3S_BOX_UNSAFE_HOST_RUN";
 
+/// Whether a COPY/ADD source contains shell glob metacharacters.
+fn has_glob_meta(s: &str) -> bool {
+    s.contains('*') || s.contains('?') || s.contains('[')
+}
+
+/// Match a single path-segment glob (`*` = any run, `?` = one char) against a
+/// name. Used for COPY/ADD wildcard expansion (the final segment of the source).
+fn glob_segment_match(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    // Classic two-pointer wildcard match with `*` backtracking.
+    let (mut pi, mut ni) = (0usize, 0usize);
+    let (mut star, mut mark) = (None, 0usize);
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            mark = ni;
+            pi += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            mark += 1;
+            ni = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// Expand a COPY/ADD source pattern against `base_dir` into concrete relative
+/// paths. Globs are honored in the final path segment (the common Docker case,
+/// e.g. `*.conf` or `src/*.txt`). Returns the matches sorted; empty if none.
+fn expand_glob_sources(base_dir: &Path, pattern: &str) -> Vec<String> {
+    let p = pattern.trim_start_matches('/');
+    let (dir_part, name_pat) = match p.rsplit_once('/') {
+        Some((d, n)) => (d, n),
+        None => ("", p),
+    };
+    let search_dir = if dir_part.is_empty() {
+        base_dir.to_path_buf()
+    } else {
+        base_dir.join(dir_part)
+    };
+    let mut matches = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&search_dir) {
+        for entry in entries.flatten() {
+            let fname = entry.file_name();
+            let fname = fname.to_string_lossy();
+            if glob_segment_match(name_pat, &fname) {
+                matches.push(if dir_part.is_empty() {
+                    fname.into_owned()
+                } else {
+                    format!("{}/{}", dir_part, fname)
+                });
+            }
+        }
+    }
+    matches.sort();
+    matches
+}
+
+/// Resolve COPY/ADD source patterns, expanding any globs against `base_dir`.
+/// A non-glob source is passed through verbatim; a glob with no matches errors
+/// like Docker ("no source files were specified").
+fn resolve_source_patterns(base_dir: &Path, src_patterns: &[String]) -> Result<Vec<String>> {
+    let mut resolved = Vec::new();
+    for src in src_patterns {
+        if src.starts_with("http://") || src.starts_with("https://") {
+            // Remote ADD sources are never globbed (and may contain `?` query
+            // strings); pass them through untouched.
+            resolved.push(src.clone());
+        } else if has_glob_meta(src) {
+            let matches = expand_glob_sources(base_dir, src);
+            if matches.is_empty() {
+                return Err(BoxError::BuildError(format!(
+                    "COPY/ADD source not found: no matches for pattern '{}'",
+                    src
+                )));
+            }
+            resolved.extend(matches);
+        } else {
+            resolved.push(src.clone());
+        }
+    }
+    Ok(resolved)
+}
+
 /// Handle COPY: copy files from build context into rootfs, create a layer.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn handle_copy(
     src_patterns: &[String],
     dst: &str,
+    chown: Option<&str>,
     context_dir: &Path,
     rootfs_dir: &Path,
     layers_dir: &Path,
     workdir: &str,
     layer_index: usize,
+    ignore: Option<&DockerIgnore>,
 ) -> Result<LayerInfo> {
+    // Expand any glob source patterns against the context (Docker semantics).
+    let src_patterns = &resolve_source_patterns(context_dir, src_patterns)?;
+
     // Resolve destination path
     let resolved_dst = resolve_path(workdir, dst);
     let dst_in_rootfs = rootfs_dir.join(resolved_dst.trim_start_matches('/'));
@@ -45,7 +147,17 @@ pub(super) fn handle_copy(
 
     // Copy each source
     for src in src_patterns {
-        let src_path = context_dir.join(src);
+        // Resolve the source relative to the context (or, for COPY --from, the
+        // source stage's rootfs). A leading "/" must NOT be treated as a host
+        // absolute path: `Path::join` discards the base for an absolute arg, so
+        // `rootfs.join("/run.sh")` would wrongly become "/run.sh". COPY --from
+        // sources are conventionally absolute, so strip the leading slash.
+        let rel = PathBuf::from(if src == "." {
+            ""
+        } else {
+            src.trim_start_matches('/')
+        });
+        let src_path = context_dir.join(src.trim_start_matches('/'));
         if !src_path.exists() {
             return Err(BoxError::BuildError(format!(
                 "COPY source not found: {} (in context {})",
@@ -54,8 +166,18 @@ pub(super) fn handle_copy(
             )));
         }
 
+        // A single source excluded by .dockerignore is not in the build context.
+        if let Some(ign) = ignore {
+            if !rel.as_os_str().is_empty() && src_path.is_file() && ign.is_excluded(&rel) {
+                return Err(BoxError::BuildError(format!(
+                    "COPY source not found: {} (excluded by .dockerignore)",
+                    src
+                )));
+            }
+        }
+
         if src_path.is_dir() {
-            copy_dir_recursive(&src_path, &dst_in_rootfs)?;
+            copy_dir_filtered(&src_path, &dst_in_rootfs, &rel, ignore)?;
         } else {
             // If dst ends with / or is a directory, copy into it
             let target = if dst_in_rootfs.is_dir() {
@@ -78,22 +200,26 @@ pub(super) fn handle_copy(
         }
     }
 
-    // Create a layer from the copied files
-    // We use create_layer_from_dir approach: snapshot the destination
-    let layer_path = layers_dir.join(format!("layer_{}.tar.gz", layer_index));
+    // Resolve --chown uid/gid (header-level, no host filesystem ownership change
+    // required — Docker BuildKit sets tar headers rather than calling chown).
+    let chown_ids = if let Some(spec) = chown {
+        Some(resolve_chown(spec, rootfs_dir)?)
+    } else {
+        None
+    };
 
-    // For COPY, create a layer containing just the destination files
+    // Create a layer from the copied files
+    let layer_path = layers_dir.join(format!("layer_{}.tar.gz", layer_index));
     let target_prefix = Path::new(resolved_dst.trim_start_matches('/'));
     if dst_in_rootfs.is_dir() {
-        create_layer_from_dir(&dst_in_rootfs, target_prefix, &layer_path)
+        create_layer_from_dir_with_chown(&dst_in_rootfs, target_prefix, &layer_path, chown_ids)
     } else if dst_in_rootfs.parent().is_some() {
-        // Single file copy: create layer with just that file
         let changed = vec![PathBuf::from(
             dst_in_rootfs
                 .strip_prefix(rootfs_dir)
                 .unwrap_or(target_prefix),
         )];
-        create_layer(rootfs_dir, &changed, &layer_path)
+        create_layer_with_chown(rootfs_dir, &changed, &layer_path, chown_ids)
     } else {
         Err(BoxError::BuildError("Invalid COPY destination".to_string()))
     }
@@ -410,13 +536,17 @@ pub(super) fn handle_add(
     layers_dir: &Path,
     workdir: &str,
     layer_index: usize,
+    ignore: Option<&DockerIgnore>,
 ) -> Result<LayerInfo> {
-    if let Some(chown) = chown {
-        return Err(BoxError::BuildError(format!(
-            "ADD --chown={} is not supported yet",
-            chown
-        )));
-    }
+    let chown_ids = if let Some(spec) = chown {
+        Some(resolve_chown(spec, rootfs_dir)?)
+    } else {
+        None
+    };
+
+    // Expand any glob source patterns against the context (Docker semantics);
+    // remote URL sources pass through untouched.
+    let src_patterns = &resolve_source_patterns(context_dir, src_patterns)?;
 
     let resolved_dst = resolve_path(workdir, dst);
     let dst_in_rootfs = rootfs_dir.join(resolved_dst.trim_start_matches('/'));
@@ -465,7 +595,14 @@ pub(super) fn handle_add(
             continue;
         }
 
-        let src_path = context_dir.join(src);
+        // See handle_copy: strip a leading slash so an absolute src resolves
+        // within the context rather than discarding the base in `Path::join`.
+        let rel = PathBuf::from(if src == "." {
+            ""
+        } else {
+            src.trim_start_matches('/')
+        });
+        let src_path = context_dir.join(src.trim_start_matches('/'));
         if !src_path.exists() {
             return Err(BoxError::BuildError(format!(
                 "ADD source not found: {} (in context {})",
@@ -474,11 +611,20 @@ pub(super) fn handle_add(
             )));
         }
 
+        if let Some(ign) = ignore {
+            if !rel.as_os_str().is_empty() && src_path.is_file() && ign.is_excluded(&rel) {
+                return Err(BoxError::BuildError(format!(
+                    "ADD source not found: {} (excluded by .dockerignore)",
+                    src
+                )));
+            }
+        }
+
         // Check if it's a tar archive that should be auto-extracted
         if is_tar_archive(src) && !src_path.is_dir() {
             extract_tar_to_dst(&src_path, &dst_in_rootfs)?;
         } else if src_path.is_dir() {
-            copy_dir_recursive(&src_path, &dst_in_rootfs)?;
+            copy_dir_filtered(&src_path, &dst_in_rootfs, &rel, ignore)?;
         } else {
             let target = if dst_in_rootfs.is_dir() {
                 dst_in_rootfs.join(
@@ -500,18 +646,18 @@ pub(super) fn handle_add(
         }
     }
 
-    // Create a layer from the destination
+    // Create a layer from the destination, stamping --chown into tar headers.
     let layer_path = layers_dir.join(format!("layer_{}.tar.gz", layer_index));
     let target_prefix = Path::new(resolved_dst.trim_start_matches('/'));
     if dst_in_rootfs.is_dir() {
-        create_layer_from_dir(&dst_in_rootfs, target_prefix, &layer_path)
+        create_layer_from_dir_with_chown(&dst_in_rootfs, target_prefix, &layer_path, chown_ids)
     } else if dst_in_rootfs.parent().is_some() {
         let changed = vec![PathBuf::from(
             dst_in_rootfs
                 .strip_prefix(rootfs_dir)
                 .unwrap_or(target_prefix),
         )];
-        create_layer(rootfs_dir, &changed, &layer_path)
+        create_layer_with_chown(rootfs_dir, &changed, &layer_path, chown_ids)
     } else {
         Err(BoxError::BuildError("Invalid ADD destination".to_string()))
     }
@@ -533,22 +679,30 @@ pub(super) fn execute_onbuild_trigger(
     // Only handle metadata instructions in ONBUILD triggers for now
     // (RUN/COPY would need full execution context)
     match &instruction {
-        Instruction::Env { key, value } => {
-            let expanded = expand_args(value, &state.build_args);
-            if let Some(existing) = state.env.iter_mut().find(|(k, _)| k == key) {
-                existing.1 = expanded;
-            } else {
-                state.env.push((key.clone(), expanded));
+        Instruction::Env { vars } => {
+            for (key, value) in vars {
+                let expanded = expand_args(value, &state.build_args);
+                if let Some(existing) = state.env.iter_mut().find(|(k, _)| k == key) {
+                    existing.1 = expanded;
+                } else {
+                    state.env.push((key.clone(), expanded));
+                }
             }
         }
-        Instruction::Label { key, value } => {
-            state.labels.insert(key.clone(), value.clone());
+        Instruction::Label { pairs } => {
+            for (key, value) in pairs {
+                state.labels.insert(key.clone(), value.clone());
+            }
         }
         Instruction::Workdir { path } => {
             state.workdir = resolve_path(&state.workdir, path);
         }
-        Instruction::Expose { port } => {
-            state.exposed_ports.push(port.clone());
+        Instruction::Expose { ports } => {
+            for port in ports {
+                if !state.exposed_ports.contains(port) {
+                    state.exposed_ports.push(port.clone());
+                }
+            }
         }
         Instruction::User { user } => {
             state.user = Some(user.clone());
@@ -573,12 +727,20 @@ pub(super) fn execute_onbuild_trigger(
 pub(super) fn instruction_to_string(instr: &Instruction) -> String {
     match instr {
         Instruction::Run { command } => format!("RUN {}", command),
-        Instruction::Copy { src, dst, from } => {
+        Instruction::Copy {
+            src,
+            dst,
+            from,
+            chown,
+        } => {
+            let mut prefix = String::from("COPY");
             if let Some(f) = from {
-                format!("COPY --from={} {} {}", f, src.join(" "), dst)
-            } else {
-                format!("COPY {} {}", src.join(" "), dst)
+                prefix.push_str(&format!(" --from={}", f));
             }
+            if let Some(c) = chown {
+                prefix.push_str(&format!(" --chown={}", c));
+            }
+            format!("{} {} {}", prefix, src.join(" "), dst)
         }
         Instruction::Add { src, dst, chown } => {
             if let Some(c) = chown {
@@ -588,11 +750,21 @@ pub(super) fn instruction_to_string(instr: &Instruction) -> String {
             }
         }
         Instruction::Workdir { path } => format!("WORKDIR {}", path),
-        Instruction::Env { key, value } => format!("ENV {}={}", key, value),
+        Instruction::Env { vars } => {
+            let pairs: Vec<String> = vars.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+            format!("ENV {}", pairs.join(" "))
+        }
         Instruction::Entrypoint { exec } => format!("ENTRYPOINT {:?}", exec),
         Instruction::Cmd { exec } => format!("CMD {:?}", exec),
-        Instruction::Expose { port } => format!("EXPOSE {}", port),
-        Instruction::Label { key, value } => format!("LABEL {}={}", key, value),
+        Instruction::Expose { ports } => format!("EXPOSE {}", ports.join(" ")),
+        Instruction::Label { pairs } => format!(
+            "LABEL {}",
+            pairs
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
         Instruction::User { user } => format!("USER {}", user),
         Instruction::Arg { name, default } => {
             if let Some(d) = default {
@@ -688,10 +860,38 @@ fn download_url(url: &str) -> std::result::Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::super::super::dockerfile::Instruction;
-    use super::{execute_onbuild_trigger, handle_add, instruction_to_string};
+    use super::{
+        execute_onbuild_trigger, expand_glob_sources, glob_segment_match, handle_add,
+        instruction_to_string,
+    };
     use crate::oci::build::engine::{BuildConfig, BuildState};
     use std::collections::HashMap;
     use std::path::PathBuf;
+
+    #[test]
+    fn test_glob_segment_match() {
+        assert!(glob_segment_match("*.conf", "alpha.conf"));
+        assert!(glob_segment_match("*.conf", ".conf"));
+        assert!(!glob_segment_match("*.conf", "skip.txt"));
+        assert!(glob_segment_match("a?c", "abc"));
+        assert!(!glob_segment_match("a?c", "ac"));
+        assert!(glob_segment_match("*", "anything"));
+        assert!(glob_segment_match("pre*post", "pre_middle_post"));
+        assert!(!glob_segment_match("pre*post", "pre_middle"));
+    }
+
+    #[test]
+    fn test_expand_glob_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("alpha.conf"), "1").unwrap();
+        std::fs::write(dir.path().join("beta.conf"), "2").unwrap();
+        std::fs::write(dir.path().join("skip.txt"), "x").unwrap();
+        let mut got = expand_glob_sources(dir.path(), "*.conf");
+        got.sort();
+        assert_eq!(got, vec!["alpha.conf".to_string(), "beta.conf".to_string()]);
+        // Non-matching glob yields no entries.
+        assert!(expand_glob_sources(dir.path(), "*.md").is_empty());
+    }
 
     #[test]
     fn test_instruction_to_string_run() {
@@ -707,6 +907,7 @@ mod tests {
             src: vec!["file1.txt".to_string(), "file2.txt".to_string()],
             dst: "/app/".to_string(),
             from: None,
+            chown: None,
         };
         assert_eq!(
             instruction_to_string(&instr),
@@ -720,6 +921,7 @@ mod tests {
             src: vec!["app".to_string()],
             dst: "/usr/local/bin/".to_string(),
             from: Some("builder".to_string()),
+            chown: None,
         };
         assert_eq!(
             instruction_to_string(&instr),
@@ -753,8 +955,7 @@ mod tests {
     #[test]
     fn test_instruction_to_string_env() {
         let instr = Instruction::Env {
-            key: "PATH".to_string(),
-            value: "/usr/local/bin:/usr/bin".to_string(),
+            vars: vec![("PATH".to_string(), "/usr/local/bin:/usr/bin".to_string())],
         };
         assert_eq!(
             instruction_to_string(&instr),
@@ -795,7 +996,7 @@ mod tests {
     #[test]
     fn test_instruction_to_string_expose() {
         let instr = Instruction::Expose {
-            port: "8080/tcp".to_string(),
+            ports: vec!["8080/tcp".to_string()],
         };
         assert_eq!(instruction_to_string(&instr), "EXPOSE 8080/tcp");
     }
@@ -803,8 +1004,7 @@ mod tests {
     #[test]
     fn test_instruction_to_string_label() {
         let instr = Instruction::Label {
-            key: "version".to_string(),
-            value: "1.0.0".to_string(),
+            pairs: vec![("version".to_string(), "1.0.0".to_string())],
         };
         assert_eq!(instruction_to_string(&instr), "LABEL version=1.0.0");
     }
@@ -923,14 +1123,17 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_add_rejects_chown() {
+    fn test_handle_add_chown_numeric_uid_gid() {
         let tmp = tempfile::TempDir::new().unwrap();
         let rootfs = tmp.path().join("rootfs");
         let layers = tmp.path().join("layers");
         std::fs::create_dir_all(&rootfs).unwrap();
         std::fs::create_dir_all(&layers).unwrap();
+        // Write the file so ADD can find it
+        std::fs::write(tmp.path().join("file.txt"), "data").unwrap();
 
-        let err = handle_add(
+        // Numeric uid:gid — resolves without /etc/passwd, should succeed.
+        let result = handle_add(
             &["file.txt".to_string()],
             "/tmp/file.txt",
             Some("1000:1000"),
@@ -939,11 +1142,15 @@ mod tests {
             &layers,
             "/",
             0,
-        )
-        .unwrap_err()
-        .to_string();
-
-        assert!(err.contains("ADD --chown=1000:1000 is not supported yet"));
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "ADD --chown with numeric uid:gid should succeed: {:?}",
+            result.err()
+        );
+        // Checking that the layer was created is sufficient for unit coverage.
+        assert!(result.unwrap().path.exists());
     }
 
     #[test]
@@ -956,6 +1163,8 @@ mod tests {
             build_args: HashMap::new(),
             quiet: true,
             platforms: vec![],
+            target: None,
+            no_cache: false,
             metrics: None,
         };
         let tmp = tempfile::TempDir::new().unwrap();

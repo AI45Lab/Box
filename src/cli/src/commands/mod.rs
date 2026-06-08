@@ -20,6 +20,7 @@ mod image_inspect;
 mod image_prune;
 mod image_tag;
 mod images;
+mod import;
 mod info;
 mod inject_secret;
 mod inspect;
@@ -164,6 +165,8 @@ pub enum Command {
     Save(save::SaveArgs),
     /// Load an image from a tar archive
     Load(load::LoadArgs),
+    /// Import a rootfs tarball as a single-layer image
+    Import(import::ImportArgs),
     /// Copy files between host and a running box
     Cp(cp::CpArgs),
     /// Manage networks
@@ -238,6 +241,14 @@ pub(crate) fn resolve_box_rootfs(box_dir: &std::path::Path) -> Option<PathBuf> {
 /// Waits for the file to exist, then continuously reads and prints new data.
 /// Used by `run` (foreground mode) and `attach`.
 pub(crate) async fn tail_file(path: &std::path::Path) {
+    tail_file_stream(path, false).await;
+}
+
+/// Tail a console file to the terminal. `to_stderr` routes it to the terminal's
+/// stderr — used for the container's stderr console (console.err.log) so a
+/// foreground `run`/`attach` shows stdout and stderr like Docker.
+pub(crate) async fn tail_file_stream(path: &std::path::Path, to_stderr: bool) {
+    use std::io::Write as _;
     use tokio::io::AsyncReadExt;
 
     // Wait for file to exist
@@ -261,7 +272,13 @@ pub(crate) async fn tail_file(path: &std::path::Path) {
             }
             Ok(n) => {
                 let text = String::from_utf8_lossy(&buf[..n]);
-                print!("{text}");
+                if to_stderr {
+                    let mut err = std::io::stderr();
+                    let _ = err.write_all(text.as_bytes());
+                    let _ = err.flush();
+                } else {
+                    print!("{text}");
+                }
             }
             Err(_) => break,
         }
@@ -315,6 +332,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Tag(args) => image_tag::execute(args).await,
         Command::Save(args) => save::execute(args).await,
         Command::Load(args) => load::execute(args).await,
+        Command::Import(args) => import::execute(args).await,
         Command::Cp(args) => cp::execute(args).await,
         Command::Network(args) => network::execute(args).await,
         Command::Volume(args) => volume::execute(args).await,

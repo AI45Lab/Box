@@ -144,14 +144,20 @@ async fn execute_rm(args: RmArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let store = VolumeStore::default_path()?;
 
+    let mut errors = Vec::new();
     for name in &args.names {
         match store.remove(name, args.force) {
             Ok(_) => println!("{name}"),
-            Err(e) => eprintln!("Error removing volume '{name}': {e}"),
+            Err(e) => errors.push(format!("Error removing volume '{name}': {e}")),
         }
     }
 
-    Ok(())
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        // A failed removal (e.g. volume in use) must be a non-zero exit, like Docker.
+        Err(errors.join("\n").into())
+    }
 }
 
 async fn execute_inspect(args: InspectArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -161,8 +167,18 @@ async fn execute_inspect(args: InspectArgs) -> Result<(), Box<dyn std::error::Er
         .get(&args.name)?
         .ok_or_else(|| format!("volume '{}' not found", args.name))?;
 
-    let json = serde_json::to_string_pretty(&config)?;
-    println!("{json}");
+    // Match `docker volume inspect`: a top-level JSON array of PascalCase objects
+    // (Mountpoint, Scope, etc.), not the raw snake_case VolumeConfig.
+    let output = serde_json::json!([{
+        "Name": config.name,
+        "Driver": config.driver,
+        "Mountpoint": config.mount_point,
+        "Scope": "local",
+        "Labels": config.labels,
+        "Options": serde_json::Map::new(),
+        "CreatedAt": config.created_at,
+    }]);
+    println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(())
 }
 

@@ -91,6 +91,11 @@ impl VmManager {
         // Determine whether guest init is installed (it becomes PID 1 and passes
         // BOX_EXEC_* env vars to the container entrypoint).
         let guest_init_exec = Self::guest_init_exec_path(&layout.rootfs_path);
+        // When guest init is PID 1 it applies the container user to the main
+        // process itself (via BOX_EXEC_USER below); the shim must then NOT call
+        // libkrun set_uid (which would drop PID 1 and break init). Only the
+        // legacy no-guest-init path falls back to the shim's set_uid.
+        let has_guest_init = guest_init_exec.is_some();
         let workdir = Self::effective_workdir(&self.config, layout.oci_config.as_ref());
         let user = Self::effective_user(&self.config, layout.oci_config.as_ref());
 
@@ -131,6 +136,15 @@ impl VmManager {
             // the container entrypoint agree even when no OCI WORKDIR is set.
             env.push(("BOX_EXEC_WORKDIR".to_string(), workdir.clone()));
 
+            // Pass the container user (image USER / --user) to guest init, which
+            // applies it (setgroups+setgid+setuid) to the MAIN process right
+            // before exec — after PID 1 has done its root-only setup. This must
+            // NOT go through the shim's libkrun set_uid, which would drop guest
+            // PID 1 to the user and break init (mount/chroot need root).
+            if let Some(user) = &user {
+                env.push(("BOX_EXEC_USER".to_string(), user.clone()));
+            }
+
             // Pass container environment variables with BOX_EXEC_ENV_ prefix
             for (key, value) in container_env {
                 env.push((format!("BOX_EXEC_ENV_{}", key), value));
@@ -147,9 +161,19 @@ impl VmManager {
                     } else {
                         ""
                     };
+                    // Mark single-file bind mounts so the guest binds the file onto
+                    // guest_path instead of mounting the virtio-fs share over its
+                    // parent directory (which would clobber e.g. /etc). The host is
+                    // authoritative here (it can stat the path); the guest must not
+                    // re-guess from the guest path's shape.
+                    let file_flag = if std::path::Path::new(parts[0]).is_file() {
+                        ":file"
+                    } else {
+                        ""
+                    };
                     env.push((
                         format!("BOX_VOL_{}", i),
-                        format!("vol{}:{}{}", i, guest_path, mode),
+                        format!("vol{}:{}{}{}", i, guest_path, mode, file_flag),
                     ));
                 }
             }
@@ -303,9 +327,12 @@ impl VmManager {
             workdir,
             tee_config: layout.tee_instance_config.clone(),
             port_map: self.config.port_map.clone(),
-            user,
+            // Guest init applies the user to the main process (BOX_EXEC_USER);
+            // only the legacy no-guest-init path uses the shim's set_uid.
+            user: if has_guest_init { None } else { user },
             network: None, // Network config is set by CLI when --network is specified
             resource_limits: self.config.resource_limits.clone(),
+            log_config: self.log_config.clone(),
         })
     }
 
@@ -389,17 +416,26 @@ impl VmManager {
         config: &a3s_box_core::config::BoxConfig,
         oci_config: Option<&OciImageConfig>,
     ) -> String {
-        config
+        let image_workdir = oci_config
+            .and_then(|oci| oci.working_dir.clone())
+            .filter(|workdir| !workdir.is_empty());
+
+        match config
             .workdir
             .as_ref()
             .filter(|workdir| !workdir.is_empty())
-            .cloned()
-            .or_else(|| {
-                oci_config
-                    .and_then(|oci| oci.working_dir.clone())
-                    .filter(|workdir| !workdir.is_empty())
-            })
-            .unwrap_or_else(|| GUEST_WORKDIR.to_string())
+        {
+            // Absolute override is used as-is.
+            Some(workdir) if workdir.starts_with('/') => workdir.clone(),
+            // Relative override resolves against the image WORKDIR (Docker's
+            // `-w sub` => <image WORKDIR>/sub), falling back to `/` as the base.
+            Some(workdir) => {
+                let base = image_workdir.unwrap_or_else(|| "/".to_string());
+                let base = base.trim_end_matches('/');
+                format!("{}/{}", base, workdir.trim_start_matches('/'))
+            }
+            None => image_workdir.unwrap_or_else(|| GUEST_WORKDIR.to_string()),
+        }
     }
 
     fn effective_user(
@@ -875,12 +911,45 @@ mod tests {
         let spec = vm.build_instance_spec(&layout).unwrap();
 
         assert_eq!(spec.workdir, "/override");
-        assert_eq!(spec.user.as_deref(), Some("1000:1000"));
+        // With guest init present, the user is applied by the guest (via
+        // BOX_EXEC_USER), not the shim's set_uid — so spec.user is None.
+        assert_eq!(spec.user, None);
+        assert!(spec
+            .entrypoint
+            .env
+            .iter()
+            .any(|(key, value)| key == "BOX_EXEC_USER" && value == "1000:1000"));
         assert!(spec
             .entrypoint
             .env
             .iter()
             .any(|(key, value)| key == "BOX_EXEC_WORKDIR" && value == "/override"));
+    }
+
+    #[test]
+    fn test_relative_workdir_resolves_against_image_workdir() {
+        // Docker `-w sub` resolves against the image WORKDIR.
+        let oci = test_oci_config(Some("/srv/app"), None);
+        let cfg = BoxConfig {
+            workdir: Some("sub".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            VmManager::effective_workdir(&cfg, Some(&oci)),
+            "/srv/app/sub"
+        );
+        // Absolute override is used verbatim.
+        let cfg_abs = BoxConfig {
+            workdir: Some("/abs".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(VmManager::effective_workdir(&cfg_abs, Some(&oci)), "/abs");
+        // Relative with no image WORKDIR resolves against `/`.
+        let cfg_rel = BoxConfig {
+            workdir: Some("work".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(VmManager::effective_workdir(&cfg_rel, None), "/work");
     }
 
     #[test]
@@ -896,7 +965,12 @@ mod tests {
         let spec = vm.build_instance_spec(&layout).unwrap();
 
         assert_eq!(spec.workdir, "/oci");
-        assert_eq!(spec.user.as_deref(), Some("2000:2000"));
+        assert_eq!(spec.user, None);
+        assert!(spec
+            .entrypoint
+            .env
+            .iter()
+            .any(|(key, value)| key == "BOX_EXEC_USER" && value == "2000:2000"));
         assert!(spec
             .entrypoint
             .env

@@ -52,7 +52,7 @@ pub(super) fn parse_copy(rest: &str, line_num: usize) -> Result<Instruction> {
         )));
     }
 
-    let (from, remaining) = parse_copy_flags(rest, line_num)?;
+    let (from, chown, remaining) = parse_copy_flags(rest, line_num)?;
     if remaining.starts_with('[') {
         return Err(BoxError::BuildError(format!(
             "Line {}: COPY JSON array form is not supported yet",
@@ -69,14 +69,18 @@ pub(super) fn parse_copy(rest: &str, line_num: usize) -> Result<Instruction> {
         )));
     }
 
-    // parts.len() >= 2 guaranteed by the check above
     let dst = parts[parts.len() - 1].to_string();
     let src: Vec<String> = parts[..parts.len() - 1]
         .iter()
         .map(|s| s.to_string())
         .collect();
 
-    Ok(Instruction::Copy { src, dst, from })
+    Ok(Instruction::Copy {
+        src,
+        dst,
+        from,
+        chown,
+    })
 }
 
 pub(super) fn parse_workdir(rest: &str, line_num: usize) -> Result<Instruction> {
@@ -100,24 +104,79 @@ pub(super) fn parse_env(rest: &str, line_num: usize) -> Result<Instruction> {
     }
 
     // Two forms:
-    // ENV KEY=VALUE  (or KEY="VALUE")
-    // ENV KEY VALUE
-    if let Some(eq_pos) = rest.find('=') {
-        // Check it's not inside a value after a space
-        let space_pos = rest.find(char::is_whitespace);
-        if space_pos.is_none_or(|sp| eq_pos < sp) {
-            let key = rest[..eq_pos].to_string();
-            let value = unquote(&rest[eq_pos + 1..]);
-            return Ok(Instruction::Env { key, value });
+    //   ENV KEY=VALUE [KEY2=VALUE2 ...]   (one or more pairs, quote-aware)
+    //   ENV KEY VALUE                     (legacy; VALUE is the rest of the line)
+    // The new form is used when the first `=` precedes the first whitespace.
+    let first_eq = rest.find('=');
+    let first_space = rest.find(char::is_whitespace);
+    let is_kv_form = match (first_eq, first_space) {
+        (Some(eq), Some(sp)) => eq < sp,
+        (Some(_), None) => true,
+        _ => false,
+    };
+
+    if is_kv_form {
+        let mut vars = Vec::new();
+        for token in tokenize_quoted(rest) {
+            match token.split_once('=') {
+                Some((key, value)) if !key.is_empty() => {
+                    vars.push((key.to_string(), unquote(value)))
+                }
+                _ => {
+                    return Err(BoxError::BuildError(format!(
+                        "Line {}: invalid ENV token '{}' (expected KEY=VALUE)",
+                        line_num, token
+                    )))
+                }
+            }
         }
+        return Ok(Instruction::Env { vars });
     }
 
-    // Legacy form: ENV KEY VALUE
+    // Legacy form: ENV KEY VALUE — a single variable whose value is the rest.
     let (key, value) = split_first_word(rest);
     Ok(Instruction::Env {
-        key: key.to_string(),
-        value: value.to_string(),
+        vars: vec![(key.to_string(), value.to_string())],
     })
+}
+
+/// Split a string on unquoted whitespace, honoring single/double quotes so that
+/// `K="a b" K2=c` yields `["K=\"a b\"", "K2=c"]`. Quotes are preserved in the
+/// tokens (callers `unquote` the value side).
+fn tokenize_quoted(s: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut has_content = false;
+    for c in s.chars() {
+        match quote {
+            Some(q) => {
+                current.push(c);
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => {
+                if c == '"' || c == '\'' {
+                    quote = Some(c);
+                    current.push(c);
+                    has_content = true;
+                } else if c.is_whitespace() {
+                    if has_content {
+                        tokens.push(std::mem::take(&mut current));
+                        has_content = false;
+                    }
+                } else {
+                    current.push(c);
+                    has_content = true;
+                }
+            }
+        }
+    }
+    if has_content {
+        tokens.push(current);
+    }
+    tokens
 }
 
 pub(super) fn parse_entrypoint(rest: &str, line_num: usize) -> Result<Instruction> {
@@ -163,9 +222,19 @@ pub(super) fn parse_expose(rest: &str, line_num: usize) -> Result<Instruction> {
             line_num
         )));
     }
-    Ok(Instruction::Expose {
-        port: rest.split_whitespace().next().unwrap_or(rest).to_string(),
-    })
+    // EXPOSE may list several ports on one line; Docker normalizes a bare port
+    // to `<port>/tcp` in the image config's ExposedPorts.
+    let ports = rest
+        .split_whitespace()
+        .map(|p| {
+            if p.contains('/') {
+                p.to_string()
+            } else {
+                format!("{}/tcp", p)
+            }
+        })
+        .collect();
+    Ok(Instruction::Expose { ports })
 }
 
 pub(super) fn parse_label(rest: &str, line_num: usize) -> Result<Instruction> {
@@ -176,19 +245,40 @@ pub(super) fn parse_label(rest: &str, line_num: usize) -> Result<Instruction> {
         )));
     }
 
-    // LABEL key=value
-    if let Some(eq_pos) = rest.find('=') {
-        let key = rest[..eq_pos].trim().to_string();
-        let value = unquote(rest[eq_pos + 1..].trim());
-        Ok(Instruction::Label { key, value })
-    } else {
-        // LABEL key value (legacy)
-        let (key, value) = split_first_word(rest);
-        Ok(Instruction::Label {
-            key: key.to_string(),
-            value: unquote(value),
-        })
+    // Two forms (same as ENV):
+    //   LABEL key=value [key2=value2 ...]   (one or more pairs, quote-aware)
+    //   LABEL key value                     (legacy; value is the rest of the line)
+    let first_eq = rest.find('=');
+    let first_space = rest.find(char::is_whitespace);
+    let is_kv_form = match (first_eq, first_space) {
+        (Some(eq), Some(sp)) => eq < sp,
+        (Some(_), None) => true,
+        _ => false,
+    };
+
+    if is_kv_form {
+        let mut pairs = Vec::new();
+        for token in tokenize_quoted(rest) {
+            match token.split_once('=') {
+                Some((key, value)) if !key.is_empty() => {
+                    pairs.push((key.to_string(), unquote(value)))
+                }
+                _ => {
+                    return Err(BoxError::BuildError(format!(
+                        "Line {}: invalid LABEL token '{}' (expected key=value)",
+                        line_num, token
+                    )))
+                }
+            }
+        }
+        return Ok(Instruction::Label { pairs });
     }
+
+    // Legacy form: LABEL key value — a single label whose value is the rest.
+    let (key, value) = split_first_word(rest);
+    Ok(Instruction::Label {
+        pairs: vec![(key.to_string(), unquote(value))],
+    })
 }
 
 pub(super) fn parse_user(rest: &str, line_num: usize) -> Result<Instruction> {
@@ -231,7 +321,7 @@ pub(super) fn parse_add(rest: &str, line_num: usize) -> Result<Instruction> {
         )));
     }
 
-    let remaining = reject_add_flags(rest, line_num)?;
+    let (chown_from_flag, remaining) = parse_add_flags(rest, line_num)?;
     if remaining.starts_with('[') {
         return Err(BoxError::BuildError(format!(
             "Line {}: ADD JSON array form is not supported yet",
@@ -258,7 +348,7 @@ pub(super) fn parse_add(rest: &str, line_num: usize) -> Result<Instruction> {
     Ok(Instruction::Add {
         src,
         dst,
-        chown: None,
+        chown: chown_from_flag,
     })
 }
 
@@ -457,14 +547,16 @@ pub(super) fn parse_volume(rest: &str, line_num: usize) -> Result<Instruction> {
     Ok(Instruction::Volume { paths })
 }
 
-fn parse_copy_flags(rest: &str, line_num: usize) -> Result<(Option<String>, &str)> {
+/// Returns `(from, chown, remaining_args)`.
+fn parse_copy_flags(rest: &str, line_num: usize) -> Result<(Option<String>, Option<String>, &str)> {
     let mut from = None;
+    let mut chown = None;
     let mut remaining = rest;
 
     loop {
         let trimmed = remaining.trim_start();
         if !trimmed.starts_with("--") {
-            return Ok((from, trimmed));
+            return Ok((from, chown, trimmed));
         }
 
         let (flag, after) = split_first_word(trimmed);
@@ -484,25 +576,37 @@ fn parse_copy_flags(rest: &str, line_num: usize) -> Result<(Option<String>, &str
             remaining = after;
             continue;
         }
+        if let Some(owner) = flag.strip_prefix("--chown=") {
+            chown = Some(owner.to_string());
+            remaining = after;
+            continue;
+        }
 
         return Err(BoxError::BuildError(format!(
-            "Line {}: COPY flag '{}' is not supported yet (supported: --from=<stage>)",
+            "Line {}: COPY flag '{}' is not supported (supported: --from=<stage>, --chown=user[:group])",
             line_num, flag
         )));
     }
 }
 
-fn reject_add_flags(rest: &str, line_num: usize) -> Result<&str> {
-    let trimmed = rest.trim_start();
-    if let Some(flag) = trimmed
-        .split_whitespace()
-        .next()
-        .filter(|s| s.starts_with("--"))
-    {
+/// Returns `(chown, remaining_args)`.
+fn parse_add_flags(rest: &str, line_num: usize) -> Result<(Option<String>, &str)> {
+    let mut chown = None;
+    let mut remaining = rest;
+    loop {
+        let trimmed = remaining.trim_start();
+        if !trimmed.starts_with("--") {
+            return Ok((chown, trimmed));
+        }
+        let (flag, after) = split_first_word(trimmed);
+        if let Some(owner) = flag.strip_prefix("--chown=") {
+            chown = Some(owner.to_string());
+            remaining = after;
+            continue;
+        }
         return Err(BoxError::BuildError(format!(
-            "Line {}: ADD flag '{}' is not supported yet",
+            "Line {}: ADD flag '{}' is not supported (supported: --chown=user[:group])",
             line_num, flag
         )));
     }
-    Ok(trimmed)
 }

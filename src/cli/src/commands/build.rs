@@ -36,6 +36,14 @@ pub struct BuildArgs {
     /// Multi-platform image indexes are not supported yet.
     #[arg(long)]
     pub platform: Option<String>,
+
+    /// Build only up to the named (or indexed) stage in a multi-stage build.
+    #[arg(long)]
+    pub target: Option<String>,
+
+    /// Do not use the layer build cache; rebuild every layer.
+    #[arg(long = "no-cache")]
+    pub no_cache: bool,
 }
 
 pub async fn execute(args: BuildArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -68,6 +76,8 @@ pub async fn execute(args: BuildArgs) -> Result<(), Box<dyn std::error::Error>> 
         build_args,
         quiet: args.quiet,
         platforms,
+        target: args.target.clone(),
+        no_cache: args.no_cache,
         metrics: None,
     };
 

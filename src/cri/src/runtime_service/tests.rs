@@ -11,6 +11,39 @@ use tokio::time::{sleep, Duration};
 
 use crate::streaming::StreamingServer;
 
+#[test]
+fn test_kept_capabilities() {
+    let cap = |add: &[&str], drop: &[&str]| Capability {
+        add_capabilities: add.iter().map(|s| s.to_string()).collect(),
+        drop_capabilities: drop.iter().map(|s| s.to_string()).collect(),
+        ..Default::default()
+    };
+    let has = |v: &[String], c: &str| v.iter().any(|x| x == c);
+
+    // No capabilities field -> the runtime default set (no NET_ADMIN/SYS_ADMIN).
+    let kept = kept_capabilities(None).unwrap();
+    assert!(has(&kept, "CHOWN") && has(&kept, "NET_BIND_SERVICE"));
+    assert!(!has(&kept, "NET_ADMIN") && !has(&kept, "SYS_ADMIN"));
+
+    // add NET_ADMIN -> present; drop CHOWN -> removed.
+    let kept = kept_capabilities(Some(&cap(&["CAP_NET_ADMIN"], &["CHOWN"]))).unwrap();
+    assert!(has(&kept, "NET_ADMIN") && !has(&kept, "CHOWN"));
+
+    // drop ALL (no add) -> empty.
+    assert!(kept_capabilities(Some(&cap(&[], &["ALL"])))
+        .unwrap()
+        .is_empty());
+
+    // drop ALL + add NET_ADMIN -> only NET_ADMIN.
+    assert_eq!(
+        kept_capabilities(Some(&cap(&["NET_ADMIN"], &["ALL"]))).unwrap(),
+        vec!["NET_ADMIN".to_string()]
+    );
+
+    // add ALL -> None (keep the full set, no restriction emitted).
+    assert!(kept_capabilities(Some(&cap(&["ALL"], &[]))).is_none());
+}
+
 /// Create a BoxRuntimeService for testing.
 /// Uses NoopStateStore (no disk I/O) and a dummy StreamingHandle.
 fn make_test_service() -> BoxRuntimeService {
@@ -458,7 +491,10 @@ where
 
                     sleep(exit_delay).await;
 
-                    let exit = a3s_box_core::exec::ExecExit { exit_code };
+                    let exit = a3s_box_core::exec::ExecExit {
+                        exit_code,
+                        oom_killed: false,
+                    };
                     writer
                         .write_control(&serde_json::to_vec(&exit).unwrap())
                         .await
@@ -543,7 +579,10 @@ async fn spawn_multi_exec_stream_server(
 
                         sleep(exit_delay).await;
 
-                        let exit = a3s_box_core::exec::ExecExit { exit_code };
+                        let exit = a3s_box_core::exec::ExecExit {
+                            exit_code,
+                            oom_killed: false,
+                        };
                         writer
                             .write_control(&serde_json::to_vec(&exit).unwrap())
                             .await
@@ -648,7 +687,10 @@ async fn spawn_cancelable_exec_stream_server() -> Option<TestExecServer> {
                     assert_eq!(cancel.frame_type, a3s_transport::FrameType::Control);
                     assert_eq!(cancel.payload, b"cancel");
 
-                    let exit = a3s_box_core::exec::ExecExit { exit_code: 137 };
+                    let exit = a3s_box_core::exec::ExecExit {
+                        exit_code: 137,
+                        oom_killed: false,
+                    };
                     writer
                         .write_control(&serde_json::to_vec(&exit).unwrap())
                         .await
@@ -767,6 +809,8 @@ fn test_sandbox(id: &str) -> PodSandbox {
         runtime_handler: "a3s".to_string(),
         network_ip: String::new(),
         additional_ips: vec![],
+        dns: crate::sandbox::SandboxDns::default(),
+        container_ports: vec![],
     }
 }
 
@@ -813,6 +857,7 @@ fn test_container(id: &str, sandbox_id: &str) -> Container {
         started_at: 0,
         finished_at: 0,
         exit_code: 0,
+        oom_killed: false,
         labels: HashMap::from([("app".to_string(), "test".to_string())]),
         annotations: HashMap::new(),
         log_path: String::new(),
@@ -1647,6 +1692,13 @@ async fn test_create_container_success() {
                 "/usr/local/bin:/usr/bin:/bin".to_string()
             ),
             ("ENV".to_string(), "prod".to_string()),
+            // Non-privileged container: restricted to the default capability set.
+            (
+                "A3S_SEC_CAP_KEEP".to_string(),
+                "AUDIT_WRITE,CHOWN,DAC_OVERRIDE,FOWNER,FSETID,KILL,MKNOD,\
+                 NET_BIND_SERVICE,NET_RAW,SETFCAP,SETGID,SETPCAP,SETUID,SYS_CHROOT"
+                    .to_string()
+            ),
         ]
     );
     assert_eq!(c.working_dir, "/app");
@@ -1791,11 +1843,7 @@ fn test_parse_localhost_seccomp_deny_allow_default() {
 fn test_parse_localhost_seccomp_deny_rejects_deny_by_default() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("deny-default.json");
-    std::fs::write(
-        &path,
-        r#"{"defaultAction":"SCMP_ACT_ERRNO","syscalls":[]}"#,
-    )
-    .unwrap();
+    std::fs::write(&path, r#"{"defaultAction":"SCMP_ACT_ERRNO","syscalls":[]}"#).unwrap();
     // Deny-by-default profiles need a full allow-list; not supported -> Err so
     // the caller falls back to RuntimeDefault rather than running unconfined.
     assert!(super::parse_localhost_seccomp_deny(path.to_str().unwrap()).is_err());
@@ -3332,7 +3380,7 @@ async fn test_stop_pod_sandbox_uses_workload_stop_controls_for_running_container
         sleep(Duration::from_millis(25)).await;
         let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         store
-            .mark_container_exited_if_running("c-1", now_ns, 143)
+            .mark_container_exited_if_running("c-1", now_ns, 143, false)
             .await;
     });
 
@@ -3341,7 +3389,7 @@ async fn test_stop_pod_sandbox_uses_workload_stop_controls_for_running_container
         second_stop_rx.await.unwrap();
         let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         store
-            .mark_container_exited_if_running("c-2", now_ns, 144)
+            .mark_container_exited_if_running("c-2", now_ns, 144, false)
             .await;
     });
 
@@ -4005,8 +4053,13 @@ async fn test_port_forward_sandbox_not_found() {
 }
 
 #[tokio::test]
-async fn test_port_forward_rejects_empty_ports() {
+async fn test_port_forward_empty_ports_rejected_when_sandbox_declares_none() {
+    // critest passes the port in the RPC; `crictl port-forward` sends none and
+    // we fall back to the sandbox's declared ports. A ready sandbox that
+    // declares no ports therefore has nothing to forward to.
     let svc = make_test_service();
+    svc.store.sandboxes.add(test_sandbox("sb-1")).await;
+
     let result = svc
         .port_forward(Request::new(PortForwardRequest {
             pod_sandbox_id: "sb-1".to_string(),
@@ -4017,7 +4070,7 @@ async fn test_port_forward_rejects_empty_ports() {
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
-    assert!(err.message().contains("at least one port"));
+    assert!(err.message().contains("declares none"));
 }
 
 #[tokio::test]

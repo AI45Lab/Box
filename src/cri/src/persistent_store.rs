@@ -129,10 +129,11 @@ impl PersistentCriStore {
         id: &str,
         finished_at: i64,
         exit_code: i32,
+        oom_killed: bool,
     ) -> bool {
         let updated = self
             .containers
-            .mark_exited_if_running(id, finished_at, exit_code)
+            .mark_exited_if_running(id, finished_at, exit_code, oom_killed)
             .await;
         if updated {
             if let Err(e) = self.persist().await {
@@ -187,6 +188,8 @@ mod tests {
             runtime_handler: "a3s".to_string(),
             network_ip: String::new(),
             additional_ips: vec![],
+            dns: crate::sandbox::SandboxDns::default(),
+            container_ports: vec![],
         }
     }
 
@@ -212,6 +215,7 @@ mod tests {
             started_at: 2_000_000_000,
             finished_at: 0,
             exit_code: 0,
+            oom_killed: false,
             labels: HashMap::new(),
             annotations: HashMap::new(),
             log_path: String::new(),
@@ -340,7 +344,7 @@ mod tests {
         store.add_sandbox(sample_sandbox("sb1")).await;
         store.add_container(sample_container("c1", "sb1")).await;
         store
-            .mark_container_exited_if_running("c1", 3_000_000_000, 17)
+            .mark_container_exited_if_running("c1", 3_000_000_000, 17, false)
             .await;
 
         let store2 = PersistentCriStore::new(Arc::new(JsonStateStore::new(&path)));
@@ -364,7 +368,7 @@ mod tests {
 
         assert!(
             !store
-                .mark_container_exited_if_running("c1", 4_000_000_000, 17)
+                .mark_container_exited_if_running("c1", 4_000_000_000, 17, false)
                 .await
         );
 

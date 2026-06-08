@@ -241,11 +241,18 @@ fn print_json_line(
         }
     }
 
-    // The log field already contains the trailing newline
-    if timestamps {
-        print!("{} {}", entry.time, entry.log);
+    // The log field already contains the trailing newline. Route stderr lines to
+    // the terminal's stderr, like Docker `logs`.
+    let line = if timestamps {
+        format!("{} {}", entry.time, entry.log)
     } else {
-        print!("{}", entry.log);
+        entry.log.clone()
+    };
+    if entry.stream == "stderr" {
+        use std::io::Write as _;
+        let _ = std::io::stderr().write_all(line.as_bytes());
+    } else {
+        print!("{line}");
     }
 }
 
@@ -275,49 +282,15 @@ fn parse_time_filter(s: &str) -> Result<DateTime<Utc>, String> {
     Ok(Utc::now() - duration)
 }
 
-/// Parse a human-readable duration string into a chrono::Duration.
-///
-/// Supports: "30s", "5m", "1h", "2d", "1h30m"
+/// Parse a relative duration (e.g. `30s`, `5m`, `1h`, `2d`, `1h30m`) into a
+/// `chrono::Duration` for `--since`/`--until`. A zero duration is rejected here
+/// because a relative time offset of 0 is not meaningful for log filtering.
 fn parse_duration(s: &str) -> Result<chrono::Duration, String> {
-    let mut total_secs: i64 = 0;
-    let mut num_buf = String::new();
-
-    for ch in s.chars() {
-        if ch.is_ascii_digit() {
-            num_buf.push(ch);
-        } else {
-            let n: i64 = num_buf.parse().map_err(|_| {
-                format!("Invalid duration: {s:?} (expected format like '1h', '30m', '2d')")
-            })?;
-            num_buf.clear();
-
-            match ch {
-                's' => total_secs += n,
-                'm' => total_secs += n * 60,
-                'h' => total_secs += n * 3600,
-                'd' => total_secs += n * 86400,
-                _ => {
-                    return Err(format!(
-                        "Unknown duration unit '{ch}' in {s:?} (expected s/m/h/d)"
-                    ))
-                }
-            }
-        }
-    }
-
-    if !num_buf.is_empty() {
-        // Bare number without unit — treat as seconds
-        let n: i64 = num_buf
-            .parse()
-            .map_err(|_| format!("Invalid duration: {s:?}"))?;
-        total_secs += n;
-    }
-
-    if total_secs == 0 {
+    let secs = crate::output::parse_duration_secs(s)?;
+    if secs == 0 {
         return Err(format!("Invalid duration: {s:?} (resolved to 0)"));
     }
-
-    Ok(chrono::Duration::seconds(total_secs))
+    Ok(chrono::Duration::seconds(secs as i64))
 }
 
 /// Check if a log line falls within the [since, until] time range.

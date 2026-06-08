@@ -151,6 +151,11 @@ pub struct InstanceSpec {
     /// Resource limits (PID limits, CPU pinning, ulimits, cgroup controls).
     #[serde(default)]
     pub resource_limits: ResourceLimits,
+
+    /// Logging driver config. The shim runs the log processor for the box's
+    /// lifetime (so detached `run -d` logs aren't truncated when the CLI exits).
+    #[serde(default)]
+    pub log_config: crate::log::LogConfig,
 }
 
 impl Default for InstanceSpec {
@@ -177,6 +182,7 @@ impl Default for InstanceSpec {
             user: None,
             network: None,
             resource_limits: ResourceLimits::default(),
+            log_config: crate::log::LogConfig::default(),
         }
     }
 }
@@ -239,6 +245,26 @@ pub trait VmHandler: Send + Sync {
     /// Check if the VM process is still alive.
     fn is_running(&self) -> bool;
 
+    /// Whether the VM process has exited, treating a zombie (an exited child not
+    /// yet reaped by its parent) as exited.
+    ///
+    /// Distinct from `!is_running()`: shim handlers implement `is_running` with
+    /// `kill(pid, 0)`, which still succeeds for a zombie, so a freshly-exited
+    /// shim looks alive until its parent reaps it. Boot-readiness waits use this
+    /// so a short-lived container's exit does not stall the wait for the full
+    /// timeout. On Linux it inspects `/proc/<pid>` process state; elsewhere it
+    /// falls back to `!is_running()`.
+    fn has_exited(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            linux_process_exited(self.pid())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            !self.is_running()
+        }
+    }
+
     /// Return the OS process ID of the VM.
     fn pid(&self) -> u32;
 
@@ -260,6 +286,28 @@ pub trait VmHandler: Send + Sync {
     }
 }
 
+/// Whether `pid` has exited, treating a zombie/dead process as exited.
+///
+/// Reads `/proc/<pid>/stat` and inspects the process state field. The `comm`
+/// field can contain spaces and parentheses (e.g. libkrun renames the shim to
+/// `(libkrun VM)`), so the state is located after the final `)`. A `Z` (zombie)
+/// or `X` (dead) state, or a missing `/proc` entry, means the process exited.
+#[cfg(target_os = "linux")]
+pub(crate) fn linux_process_exited(pid: u32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => match stat.rfind(')') {
+            Some(idx) => {
+                let state = stat[idx + 1..].trim_start().chars().next();
+                matches!(state, Some('Z') | Some('X'))
+            }
+            // Malformed stat — be conservative and treat as still running.
+            None => false,
+        },
+        // No /proc entry → the process is gone.
+        Err(_) => true,
+    }
+}
+
 // ── VMM provider ─────────────────────────────────────────────────────────────
 
 /// Trait for VMM backend implementations.
@@ -276,6 +324,20 @@ pub trait VmmProvider: Send + Sync {
 mod tests {
     use super::*;
     use crate::config::ResourceLimits;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_linux_process_exited_current_process_is_alive() {
+        // The test process itself is running (state R/S), not exited.
+        assert!(!linux_process_exited(std::process::id()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_linux_process_exited_missing_pid_is_exited() {
+        // A PID with no /proc entry is treated as exited.
+        assert!(linux_process_exited(0x7fff_fffe));
+    }
 
     #[test]
     fn test_parse_signal_name_term() {
@@ -357,6 +419,7 @@ mod tests {
             user: Some("1000:1000".to_string()),
             network: None,
             resource_limits: ResourceLimits::default(),
+            log_config: crate::log::LogConfig::default(),
         };
 
         let json = serde_json::to_string(&spec).unwrap();

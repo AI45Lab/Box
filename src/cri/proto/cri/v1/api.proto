@@ -842,12 +842,12 @@ message LinuxPodSandboxStats {
     MemoryUsage memory = 2;
     NetworkUsage network = 3;
     ProcessUsage process = 4;
+    repeated ContainerStats containers = 5;
 }
 
 message PodSandboxStats {
     PodSandboxAttributes attributes = 1;
     LinuxPodSandboxStats linux = 2;
-    repeated ContainerStats containers = 3;
 }
 
 message PodSandboxStatsRequest {

@@ -85,6 +85,10 @@ pub struct Container {
     pub finished_at: i64,
     /// Exit code (0 if not exited).
     pub exit_code: i32,
+    /// Whether the container was killed by the out-of-memory killer (its
+    /// memory cgroup exceeded `memory.max`). Drives the `OOMKilled` exit reason.
+    #[serde(default)]
+    pub oom_killed: bool,
     /// Container labels.
     pub labels: HashMap<String, String>,
     /// Container annotations.
@@ -262,7 +266,13 @@ impl ContainerStore {
     }
 
     /// Mark a container exited only if it is still running.
-    pub async fn mark_exited_if_running(&self, id: &str, finished_at: i64, exit_code: i32) -> bool {
+    pub async fn mark_exited_if_running(
+        &self,
+        id: &str,
+        finished_at: i64,
+        exit_code: i32,
+        oom_killed: bool,
+    ) -> bool {
         let mut store = self.containers.write().await;
         if let Some(c) = store.get_mut(id) {
             if c.state != ContainerState::Running {
@@ -272,6 +282,7 @@ impl ContainerStore {
             c.state = ContainerState::Exited;
             c.finished_at = finished_at;
             c.exit_code = exit_code;
+            c.oom_killed = oom_killed;
             true
         } else {
             false
@@ -323,6 +334,7 @@ mod tests {
             started_at: 0,
             finished_at: 0,
             exit_code: 0,
+            oom_killed: false,
             labels: HashMap::from([("app".to_string(), "test".to_string())]),
             annotations: HashMap::new(),
             log_path: format!("/var/log/pods/{}.log", id),
@@ -441,7 +453,11 @@ mod tests {
         store.add(test_container("c1", "sb1")).await;
         store.mark_started("c1", 2000000000).await;
 
-        assert!(store.mark_exited_if_running("c1", 3000000000, 42).await);
+        assert!(
+            store
+                .mark_exited_if_running("c1", 3000000000, 42, false)
+                .await
+        );
         let c = store.get("c1").await.unwrap();
         assert_eq!(c.state, ContainerState::Exited);
         assert_eq!(c.finished_at, 3000000000);
@@ -453,7 +469,11 @@ mod tests {
         let store = ContainerStore::new();
         store.add(test_container("c1", "sb1")).await;
 
-        assert!(!store.mark_exited_if_running("c1", 3000000000, 42).await);
+        assert!(
+            !store
+                .mark_exited_if_running("c1", 3000000000, 42, false)
+                .await
+        );
         let c = store.get("c1").await.unwrap();
         assert_eq!(c.state, ContainerState::Created);
         assert_eq!(c.finished_at, 0);
@@ -467,7 +487,11 @@ mod tests {
         store.mark_started("c1", 2000000000).await;
         store.mark_exited("c1", 3000000000, 7).await;
 
-        assert!(!store.mark_exited_if_running("c1", 4000000000, 42).await);
+        assert!(
+            !store
+                .mark_exited_if_running("c1", 4000000000, 42, false)
+                .await
+        );
         let c = store.get("c1").await.unwrap();
         assert_eq!(c.state, ContainerState::Exited);
         assert_eq!(c.finished_at, 3000000000);

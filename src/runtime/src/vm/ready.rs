@@ -63,9 +63,10 @@ impl VmManager {
                 break;
             }
 
-            // Check if VM is still running
+            // Check if VM is still running (has_exited treats a zombie shim as
+            // exited; is_running's kill(pid,0) would not).
             if let Some(ref handler) = *self.handler.read().await {
-                if !handler.is_running() {
+                if handler.has_exited() {
                     tracing::warn!("VM exited before exec socket appeared");
                     return Ok(());
                 }
@@ -76,6 +77,21 @@ impl VmManager {
 
         // Phase 2: Connect and verify with Heartbeat health check
         while start.elapsed().as_millis() < MAX_WAIT_MS as u128 {
+            // Stop waiting if the VM has already exited: the exec socket can
+            // appear during guest init and then vanish when a fast-exiting
+            // container shuts the VM down. The shim becomes a zombie the moment
+            // the VM halts, so use has_exited (zombie-aware) rather than
+            // is_running — without this, a container that exits before its first
+            // heartbeat stalls the whole boot for MAX_WAIT_MS (~10s), which hit
+            // every short-lived `run` that lost the heartbeat race and every
+            // monitor restart of a fast-exiting container.
+            if let Some(ref handler) = *self.handler.read().await {
+                if handler.has_exited() {
+                    tracing::debug!("VM exited before exec server became ready");
+                    return Ok(());
+                }
+            }
+
             match ExecClient::connect(exec_socket_path).await {
                 Ok(client) => match client.heartbeat().await {
                     Ok(true) => {

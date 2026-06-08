@@ -51,7 +51,7 @@ pub struct CommonBoxArgs {
     #[arg(long)]
     pub hostname: Option<String>,
 
-    /// Run as a specific user (supported: root, UID, UID:GID)
+    /// Run as a specific user (root, UID, UID:GID, name, or name:group)
     #[arg(short = 'u', long)]
     pub user: Option<String>,
 
@@ -79,20 +79,20 @@ pub struct CommonBoxArgs {
     #[arg(long)]
     pub health_cmd: Option<String>,
 
-    /// Health check interval in seconds (default: 30)
-    #[arg(long, default_value = "30")]
+    /// Health check interval, e.g. `30s`, `1m30s` (bare number = seconds; default: 30s)
+    #[arg(long, default_value = "30", value_parser = crate::output::parse_duration_secs)]
     pub health_interval: u64,
 
-    /// Health check timeout in seconds (default: 5)
-    #[arg(long, default_value = "5")]
+    /// Health check timeout, e.g. `5s`, `1m` (bare number = seconds; default: 5s)
+    #[arg(long, default_value = "5", value_parser = crate::output::parse_duration_secs)]
     pub health_timeout: u64,
 
     /// Health check retries before unhealthy (default: 3)
     #[arg(long, default_value = "3")]
     pub health_retries: u32,
 
-    /// Health check start period in seconds (default: 0)
-    #[arg(long, default_value = "0")]
+    /// Health check start period, e.g. `10s`, `1m` (bare number = seconds; default: 0s)
+    #[arg(long, default_value = "0", value_parser = crate::output::parse_duration_secs)]
     pub health_start_period: u64,
 
     /// Limit PIDs inside the box (--pids-limit)
@@ -231,7 +231,10 @@ pub(crate) fn parse_env_file(
 pub(crate) fn build_env_map(
     common: &CommonBoxArgs,
 ) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
-    let mut env = parse_env_vars(&common.env)?;
+    // Runtime `--env` honors `docker run -e KEY` host-env passthrough (bare key).
+    let mut env: HashMap<String, String> = a3s_box_core::env::parse_runtime_env_vars(&common.env)
+        .into_iter()
+        .collect();
     for env_file in &common.env_file {
         for (key, value) in parse_env_file(env_file)? {
             env.entry(key).or_insert(value);
@@ -327,7 +330,32 @@ pub(crate) fn effective_stop_signal(
 
 /// Validate and normalize published port mappings to the runtime format.
 pub(crate) fn normalize_port_maps(entries: &[String]) -> Result<Vec<String>, String> {
-    a3s_box_core::normalize_port_maps(entries)
+    a3s_box_core::normalize_port_maps(entries)?
+        .into_iter()
+        .map(resolve_auto_host_port)
+        .collect()
+}
+
+/// Resolve an auto-assign host port (host part `0`, e.g. `-p 0:80`) to a
+/// concrete free ephemeral port by briefly claiming one with a TcpListener, so
+/// the shim/passt actually forward it and `port` prints the real number
+/// (matching Docker). A non-zero host port is returned unchanged.
+fn resolve_auto_host_port(entry: String) -> Result<String, String> {
+    let Some((host, guest)) = entry.split_once(':') else {
+        return Ok(entry);
+    };
+    if host != "0" {
+        return Ok(entry);
+    }
+    let listener = std::net::TcpListener::bind("0.0.0.0:0")
+        .map_err(|e| format!("failed to allocate a host port for '{entry}': {e}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| format!("failed to read allocated host port: {e}"))?
+        .port();
+    // Release it so the box can bind the port (small TOCTOU window, as Docker has).
+    drop(listener);
+    Ok(format!("{port}:{guest}"))
 }
 
 /// Reject runtime options that a3s-box cannot enforce yet.
@@ -410,12 +438,18 @@ fn normalize_user_part(part: &str, label: &str, original: &str) -> Result<String
             "Invalid --user '{original}' ({label} component is empty)"
         ));
     }
+    if part.contains('\0') {
+        return Err(format!(
+            "Invalid --user '{original}' ({label} contains a NUL byte)"
+        ));
+    }
     if part == "root" {
         return Ok("0".to_string());
     }
-    part.parse::<u32>().map(|_| part.to_string()).map_err(|_| {
-        format!("Named {label} '{part}' is not supported yet; use root or a numeric UID[:GID]")
-    })
+    // Numeric stays numeric; a named user/group is forwarded as-is and resolved
+    // in the guest against the container's /etc/passwd and /etc/group, like
+    // Docker's `--user name`.
+    Ok(part.to_string())
 }
 
 /// Validate an in-guest working directory override.
@@ -429,11 +463,8 @@ pub(crate) fn validate_workdir_option(workdir: Option<&str>) -> Result<(), Strin
     if workdir.contains('\0') {
         return Err("--workdir must not contain NUL bytes".to_string());
     }
-    if !workdir.starts_with('/') {
-        return Err(format!(
-            "Invalid --workdir '{workdir}' (expected an absolute in-box path)"
-        ));
-    }
+    // A relative --workdir is allowed: like Docker, it resolves against the
+    // image WORKDIR at runtime (see VmManager::effective_workdir).
     Ok(())
 }
 
@@ -503,6 +534,21 @@ pub(crate) fn build_resource_limits(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_resolve_auto_host_port() {
+        // A non-zero host port is unchanged.
+        assert_eq!(
+            resolve_auto_host_port("8080:80".to_string()).unwrap(),
+            "8080:80"
+        );
+        // `0:80` resolves to a concrete non-zero host port, keeping the guest port.
+        let resolved = resolve_auto_host_port("0:80".to_string()).unwrap();
+        let (host, guest) = resolved.split_once(':').unwrap();
+        assert_eq!(guest, "80");
+        assert_ne!(host, "0");
+        assert!(host.parse::<u16>().unwrap() > 0);
+    }
 
     // --- parse_env_vars tests ---
 
@@ -890,23 +936,32 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_runtime_options_rejects_named_user() {
+    fn test_validate_runtime_options_accepts_named_user() {
+        // A named user is forwarded as-is and resolved in the guest against the
+        // container's /etc/passwd (like Docker's --user name).
         let mut args = default_common_args();
         args.user = Some("node".to_string());
-
-        let err = validate_runtime_options(&args).unwrap_err();
-
-        assert!(err.contains("Named user"));
+        validate_runtime_options(&args).unwrap();
+        assert_eq!(
+            normalize_user_option(Some("nobody")).unwrap().as_deref(),
+            Some("nobody")
+        );
+        assert_eq!(
+            normalize_user_option(Some("node:staff"))
+                .unwrap()
+                .as_deref(),
+            Some("node:staff")
+        );
     }
 
     #[test]
-    fn test_validate_runtime_options_rejects_relative_workdir() {
+    fn test_validate_runtime_options_accepts_relative_workdir() {
+        // A relative --workdir is accepted (resolved against the image WORKDIR
+        // at runtime, like Docker's `-w sub`).
         let mut args = default_common_args();
         args.workdir = Some("app".to_string());
 
-        let err = validate_runtime_options(&args).unwrap_err();
-
-        assert!(err.contains("absolute"));
+        validate_runtime_options(&args).unwrap();
     }
 
     #[test]

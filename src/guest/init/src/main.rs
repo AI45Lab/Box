@@ -28,6 +28,9 @@ struct ExecConfig {
     env: Vec<(String, String)>,
     /// Working directory
     workdir: String,
+    /// Container user (`uid`, `uid:gid`, `root`, or a name resolved via the
+    /// image `/etc/passwd`). Applied to the main process before exec.
+    user: Option<String>,
 }
 
 impl ExecConfig {
@@ -56,6 +59,11 @@ impl ExecConfig {
 
         let workdir = std::env::var("BOX_EXEC_WORKDIR").unwrap_or_else(|_| "/".to_string());
 
+        // Optional container user (image USER directive or CLI --user).
+        let user = std::env::var("BOX_EXEC_USER")
+            .ok()
+            .filter(|u| !u.is_empty());
+
         // Collect BOX_EXEC_ENV_* variables
         let env: Vec<(String, String)> = std::env::vars()
             .filter_map(|(key, value)| {
@@ -69,6 +77,7 @@ impl ExecConfig {
             args,
             env,
             workdir,
+            user,
         }
     }
 }
@@ -155,13 +164,83 @@ fn is_tee_environment() -> bool {
     a3s_box_core::tee::is_tee_available()
 }
 
+/// Raw fd of `/dev/kmsg`, opened ONCE before any chroot/pivot and kept open for
+/// the process lifetime. An open file description survives `pivot_root`/`chroot`
+/// (it is independent of the path), so reusing this fd avoids the gap where the
+/// new root has no `/dev/kmsg` yet — which would otherwise leak a few lines back
+/// to the console mid-boot.
+static KMSG_FD: std::sync::OnceLock<Option<std::os::unix::io::RawFd>> = std::sync::OnceLock::new();
+
+/// Writer for guest-init's OWN tracing. Routes it to the kernel log
+/// (`/dev/kmsg`) instead of the VM console so it never pollutes container logs:
+/// the container inherits the console for its stdout/stderr, and Docker-style
+/// `logs` must show only that, not runtime internals (init/exec/pty chatter).
+/// A `<7>` (debug) priority prefix keeps these lines below the guest kernel's
+/// console loglevel (4), so they never echo back to the console. Falls back to
+/// stdout when `/dev/kmsg` is unavailable (e.g. non-Linux), preserving the old
+/// behavior rather than dropping logs.
+enum InitLogWriter {
+    Kmsg(std::os::unix::io::RawFd),
+    Stdout(std::io::Stdout),
+}
+
+impl std::io::Write for InitLogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            InitLogWriter::Kmsg(fd) => {
+                // /dev/kmsg treats each write() as one record: prefix the
+                // priority and flatten embedded newlines so a formatted event
+                // stays a single kernel-log record.
+                let mut record = Vec::with_capacity(buf.len() + 13);
+                record.extend_from_slice(b"<7>a3s-init: ");
+                record.extend(buf.iter().map(|&b| if b == b'\n' { b' ' } else { b }));
+                // SAFETY: *fd is a valid, process-lifetime fd to /dev/kmsg; a
+                // failed write is intentionally ignored (logging must never panic).
+                unsafe {
+                    libc::write(*fd, record.as_ptr() as *const libc::c_void, record.len());
+                }
+                Ok(buf.len())
+            }
+            InitLogWriter::Stdout(out) => out.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            InitLogWriter::Kmsg(_) => Ok(()),
+            InitLogWriter::Stdout(out) => out.flush(),
+        }
+    }
+}
+
+fn make_init_log_writer() -> InitLogWriter {
+    match KMSG_FD.get().copied().flatten() {
+        Some(fd) => InitLogWriter::Kmsg(fd),
+        None => InitLogWriter::Stdout(std::io::stdout()),
+    }
+}
+
 fn main() {
-    // Initialize logging
+    // Open /dev/kmsg once (before any chroot) and keep it open for the whole
+    // process via into_raw_fd, so guest-init's logs reach the kernel log
+    // reliably across the pivot. Container logs stay clean (see InitLogWriter).
+    use std::os::unix::io::IntoRawFd;
+    let kmsg_fd = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/kmsg")
+        .ok()
+        .map(|file| file.into_raw_fd());
+    let _ = KMSG_FD.set(kmsg_fd);
+
+    // Initialize logging. guest-init's own logs go to the kernel log, NOT the
+    // console, to keep container logs clean.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        .with_ansi(false)
+        .with_writer(make_init_log_writer)
         .init();
 
     info!("a3s-box guest init starting (PID {})", process::id());
@@ -242,6 +321,20 @@ fn run_init() -> Result<(), Box<dyn std::error::Error>> {
     // Step 7: Launch container entrypoint
     info!("Launching container entrypoint");
 
+    // Ensure the working directory exists — Docker creates a missing WORKDIR /
+    // `-w` path before chdir. Best-effort: a pre-existing dir is fine, and a
+    // read-only rootfs (where creation fails) matches Docker's inability to
+    // create it there.
+    if !exec_config.workdir.is_empty() && exec_config.workdir != "/" {
+        if let Err(e) = std::fs::create_dir_all(&exec_config.workdir) {
+            warn!(
+                workdir = %exec_config.workdir,
+                error = %e,
+                "Could not pre-create working directory (continuing)"
+            );
+        }
+    }
+
     // Convert args to &str for spawn_isolated
     let args_refs: Vec<&str> = exec_config.args.iter().map(|s| s.as_str()).collect();
     let env_refs: Vec<(&str, &str)> = exec_config
@@ -256,10 +349,16 @@ fn run_init() -> Result<(), Box<dyn std::error::Error>> {
         &args_refs,
         &env_refs,
         &exec_config.workdir,
+        exec_config.user.as_deref(),
     )?;
     let container_pid = nix::unistd::Pid::from_raw(container_pid_raw as i32);
 
     info!("Container process started with PID {}", container_pid);
+
+    // Make the main container PID available to the exec server so a host
+    // graceful-stop request (signal-main control frame) can deliver the
+    // STOPSIGNAL to it. Must be set before the exec server thread starts.
+    exec_server::set_container_pid(container_pid_raw as i32);
 
     expose_container_env_to_exec(&exec_config);
 
@@ -663,69 +762,85 @@ fn mount_user_volumes() -> Result<(), Box<dyn std::error::Error>> {
 
                 let tag = parts[0];
                 let guest_path = parts[1];
-                let read_only = parts.get(2).map(|&m| m == "ro").unwrap_or(false);
-
-                // Check if guest_path is a file (has an extension) or a directory
-                // virtio-fs can only mount directories, so if guest_path is a file,
-                // we need to mount at the parent directory instead
-                let mount_path: &str;
-                let file_name: Option<&str>;
-
-                if guest_path
-                    .rsplit('/')
-                    .next()
-                    .map(|s| s.contains('.'))
-                    .unwrap_or(false)
-                {
-                    // guest_path looks like a file (has extension)
-                    // Extract parent directory and file name
-                    if let Some(last_slash) = guest_path.rfind('/') {
-                        mount_path = &guest_path[..last_slash];
-                        file_name = Some(&guest_path[last_slash + 1..]);
-                    } else {
-                        // No slash, just a filename - mount at current directory
-                        mount_path = ".";
-                        file_name = Some(guest_path);
-                    }
-                    info!(
-                        tag = tag,
-                        guest_path = guest_path,
-                        mount_path = mount_path,
-                        file_name = file_name.unwrap_or(""),
-                        read_only = read_only,
-                        "Mounting user volume (file mount detected, will mount parent directory)"
-                    );
-                } else {
-                    // guest_path is a directory
-                    mount_path = guest_path;
-                    file_name = None;
-                    info!(
-                        tag = tag,
-                        guest_path = guest_path,
-                        read_only = read_only,
-                        "Mounting user volume"
-                    );
-                }
-
-                // Ensure mount point exists (parent directory for file mounts)
-                std::fs::create_dir_all(mount_path)?;
+                // Flags after the guest path may appear in any order: "ro", "file".
+                // The host decides "file" (it can stat the source); the guest obeys.
+                let read_only = parts[2..].iter().any(|&m| m == "ro");
+                let is_file = parts[2..].iter().any(|&m| m == "file");
 
                 let flags = if read_only {
                     MsFlags::MS_RDONLY
                 } else {
                     MsFlags::empty()
                 };
-                mount(Some(tag), mount_path, Some("virtiofs"), flags, None::<&str>)?;
 
-                // For file mounts, verify the file exists in the mounted directory
-                if let Some(name) = file_name {
-                    let mounted_file = format!("{}/{}", mount_path, name);
-                    if !std::path::Path::new(&mounted_file).exists() {
-                        warn!(
-                            "Expected file {} after mount but it does not exist",
-                            mounted_file
-                        );
+                if is_file {
+                    // Single-file bind mount. The shim shares a temp DIRECTORY
+                    // containing the file (virtio-fs cannot share a bare file), so
+                    // mount that share at a private location and bind just the file
+                    // onto guest_path. This preserves the target's parent directory
+                    // (e.g. /etc) instead of clobbering it with the share.
+                    let file_name = guest_path.rsplit('/').next().unwrap_or(guest_path);
+                    let private_mp = format!("/run/.a3s-filemounts/{}", index);
+                    std::fs::create_dir_all(&private_mp)?;
+                    mount(
+                        Some(tag),
+                        private_mp.as_str(),
+                        Some("virtiofs"),
+                        MsFlags::empty(),
+                        None::<&str>,
+                    )?;
+
+                    let src = format!("{}/{}", private_mp, file_name);
+                    if !std::path::Path::new(&src).exists() {
+                        warn!("File mount source {} missing in share {}", src, tag);
                     }
+
+                    // Ensure the target parent and an (empty) target file exist so
+                    // the bind has somewhere to land.
+                    if let Some(last_slash) = guest_path.rfind('/') {
+                        let parent = &guest_path[..last_slash];
+                        if !parent.is_empty() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                    }
+                    if !std::path::Path::new(guest_path).exists() {
+                        std::fs::File::create(guest_path)?;
+                    }
+
+                    // Bind the file, then remount read-only if requested (a bind
+                    // mount needs a separate MS_REMOUNT pass to apply MS_RDONLY).
+                    mount(
+                        Some(src.as_str()),
+                        guest_path,
+                        None::<&str>,
+                        MsFlags::MS_BIND,
+                        None::<&str>,
+                    )?;
+                    if read_only {
+                        mount(
+                            None::<&str>,
+                            guest_path,
+                            None::<&str>,
+                            MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY,
+                            None::<&str>,
+                        )?;
+                    }
+                    info!(
+                        tag = tag,
+                        guest_path = guest_path,
+                        read_only = read_only,
+                        "Mounted file volume (bind; parent directory preserved)"
+                    );
+                } else {
+                    // Directory mount: mount the virtio-fs share directly at guest_path.
+                    std::fs::create_dir_all(guest_path)?;
+                    mount(Some(tag), guest_path, Some("virtiofs"), flags, None::<&str>)?;
+                    info!(
+                        tag = tag,
+                        guest_path = guest_path,
+                        read_only = read_only,
+                        "Mounted user volume"
+                    );
                 }
 
                 index += 1;
@@ -811,14 +926,41 @@ fn remount_rootfs_readonly() -> Result<(), Box<dyn std::error::Error>> {
     use nix::mount::{mount, MsFlags};
 
     info!("Remounting rootfs as read-only (--read-only)");
-    mount(
+
+    // A direct `MS_REMOUNT|MS_RDONLY` of the virtio-fs root often fails with
+    // EBUSY. Fall back to the bind-remount trick (bind / onto itself, then
+    // remount that bind read-only), which succeeds where a direct remount
+    // cannot. If both fail, log and continue WRITABLE — a non-enforced
+    // --read-only is far less harmful than killing the container outright.
+    let direct = mount(
         None::<&str>,
         "/",
         None::<&str>,
         MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY,
         None::<&str>,
-    )?;
-    info!("Rootfs remounted read-only");
+    );
+    if direct.is_ok() {
+        info!("Rootfs remounted read-only");
+        return Ok(());
+    }
+
+    let bind = mount(Some("/"), "/", None::<&str>, MsFlags::MS_BIND, None::<&str>).and_then(|_| {
+        mount(
+            None::<&str>,
+            "/",
+            None::<&str>,
+            MsFlags::MS_REMOUNT | MsFlags::MS_BIND | MsFlags::MS_RDONLY,
+            None::<&str>,
+        )
+    });
+    match bind {
+        Ok(()) => info!("Rootfs remounted read-only (via bind)"),
+        Err(error) => warn!(
+            %error,
+            direct_error = ?direct.err(),
+            "Could not remount rootfs read-only; container runs writable"
+        ),
+    }
     Ok(())
 }
 

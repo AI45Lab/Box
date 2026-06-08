@@ -6,6 +6,7 @@
 
 use std::io::Read;
 use std::io::Write;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -18,10 +19,53 @@ use tracing::{info, warn};
 
 use crate::user::{parse_process_user, ProcessUser};
 
+/// PID of the main container process (the entrypoint spawned by guest init).
+/// Set by `main` after spawn so the exec server can deliver a graceful stop
+/// signal to it on a host shutdown request. -1 until known.
+static CONTAINER_PID: AtomicI32 = AtomicI32::new(-1);
+
+/// Record the main container PID for graceful-shutdown signal delivery.
+pub fn set_container_pid(pid: i32) {
+    CONTAINER_PID.store(pid, Ordering::SeqCst);
+}
+
+/// Host→guest control to gracefully stop the container: deliver the given signal
+/// number to the main container process. `signal-main:<N>` (e.g. `signal-main:15`
+/// for SIGTERM, `signal-main:2` for the image STOPSIGNAL=SIGINT). The container
+/// then runs its own shutdown; when it exits, guest init exits and the VM stops.
+/// Must match the host's prefix in `runtime/src/grpc/exec.rs`.
+#[cfg(target_os = "linux")]
+const EXEC_CONTROL_SIGNAL_MAIN: &[u8] = b"signal-main:";
+#[cfg(target_os = "linux")]
+const EXEC_SIGNAL_MAIN_ACK: &[u8] = b"signal-main-ack";
+
+/// Deliver `sig` to the main container process (best-effort).
+#[cfg(target_os = "linux")]
+fn signal_main_process(sig: i32) {
+    let pid = CONTAINER_PID.load(Ordering::SeqCst);
+    if pid > 0 {
+        info!(
+            pid,
+            sig, "Delivering graceful stop signal to container main process"
+        );
+        unsafe {
+            libc::kill(pid, sig);
+        }
+    } else {
+        warn!(sig, "Graceful stop requested but container PID is unknown");
+    }
+}
+
 /// Maximum payload bytes per streamed exec chunk.
 const STREAM_CHUNK_BYTES: usize = 16 * 1024;
 const EXEC_CONTROL_CANCEL: &[u8] = b"cancel";
 const EXEC_CONTROL_STDIN_CLOSE: &[u8] = b"stdin-close";
+/// Host→guest control: flush all buffered output, then reply with a flush-ack.
+const EXEC_CONTROL_FLUSH: &[u8] = b"flush";
+/// Guest→host marker (in a Control frame) acknowledging a flush: every output
+/// chunk buffered when the flush was received has been sent ahead of it. Must
+/// match the host's `EXEC_FLUSH_ACK` in `runtime/src/grpc/exec.rs`.
+const EXEC_FLUSH_ACK: &[u8] = b"flush-ack";
 
 /// Run the exec server, listening on vsock port 4089.
 ///
@@ -115,6 +159,18 @@ fn handle_connection(fd: std::os::fd::OwnedFd) -> Result<(), Box<dyn std::error:
         // Heartbeat: respond with Heartbeat frame (health check)
         if frame_type == FrameType::Heartbeat as u8 {
             write_frame(&mut stream, FrameType::Heartbeat as u8, &payload)?;
+            std::mem::forget(fd);
+            return Ok(());
+        }
+        // Graceful-stop control: deliver a signal to the container main process.
+        if frame_type == FrameType::Control as u8 && payload.starts_with(EXEC_CONTROL_SIGNAL_MAIN) {
+            let sig = std::str::from_utf8(&payload[EXEC_CONTROL_SIGNAL_MAIN.len()..])
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+                .filter(|n| *n > 0 && *n < 64)
+                .unwrap_or(libc::SIGTERM);
+            signal_main_process(sig);
+            write_frame(&mut stream, FrameType::Control as u8, EXEC_SIGNAL_MAIN_ACK)?;
             std::mem::forget(fd);
             return Ok(());
         }
@@ -221,6 +277,8 @@ enum ExecInputEvent {
     Stdin(Vec<u8>),
     StdinClose,
     Cancel,
+    /// Flush buffered output and emit a flush-ack (log-rotation boundary).
+    Flush,
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -243,6 +301,13 @@ fn spawn_exec_input_monitor(
                     && payload == EXEC_CONTROL_STDIN_CLOSE =>
             {
                 if tx.send(ExecInputEvent::StdinClose).is_err() {
+                    break;
+                }
+            }
+            Ok(Some((frame_type, payload)))
+                if frame_type == FrameType::Control as u8 && payload == EXEC_CONTROL_FLUSH =>
+            {
+                if tx.send(ExecInputEvent::Flush).is_err() {
                     break;
                 }
             }
@@ -278,7 +343,7 @@ fn write_exec_stream_response(
 ) -> Result<(), Box<dyn std::error::Error>> {
     write_exec_stream_chunks(w, StreamType::Stdout, &output.stdout)?;
     write_exec_stream_chunks(w, StreamType::Stderr, &output.stderr)?;
-    write_exec_exit(w, output.exit_code)
+    write_exec_exit(w, output.exit_code, false)
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -313,10 +378,25 @@ fn write_exec_stream_chunk(
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn write_exec_exit(w: &mut impl Write, exit_code: i32) -> Result<(), Box<dyn std::error::Error>> {
-    let exit = ExecExit { exit_code };
+fn write_exec_exit(
+    w: &mut impl Write,
+    exit_code: i32,
+    oom_killed: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let exit = ExecExit {
+        exit_code,
+        oom_killed,
+    };
     let payload = serde_json::to_vec(&exit)?;
     write_frame(w, FrameType::Control as u8, &payload)?;
+    Ok(())
+}
+
+/// Emit a flush-ack Control frame, marking that all output buffered when the
+/// flush was received has now been sent.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn write_exec_flush_ack(w: &mut impl Write) -> Result<(), Box<dyn std::error::Error>> {
+    write_frame(w, FrameType::Control as u8, EXEC_FLUSH_ACK)?;
     Ok(())
 }
 
@@ -341,6 +421,7 @@ struct ExecCommandSpec<'a> {
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn build_command(
     spec: ExecCommandSpec<'_>,
+    cgroup_procs: Option<&str>,
 ) -> Result<(std::process::Command, Duration), ExecOutput> {
     if spec.cmd.is_empty() {
         return Err(ExecOutput {
@@ -357,14 +438,15 @@ fn build_command(
     };
     let timeout = Duration::from_nanos(timeout_ns);
     let workdir = spec.working_dir.unwrap_or("/");
-    // Resolve a named user (CRI RunAsUserName) against the container's
-    // /etc/passwd before numeric parsing; falls through to spec.user when the
-    // value is already numeric/root or cannot be resolved.
+    // Resolve a named user (CRI RunAsUserName, or `exec -u <name>`) against the
+    // container's /etc/passwd before numeric parsing; falls through to spec.user
+    // when the value is already numeric/root or cannot be resolved. For an exec
+    // (no rootfs override) the container root is the current `/`.
+    let resolve_rootfs = spec.rootfs.unwrap_or("/");
     let resolved_user = spec
         .user
-        .zip(spec.rootfs)
-        .and_then(|(user, rootfs)| crate::user::resolve_named_user(user, rootfs));
-    let process_user = match parse_process_user(resolved_user.as_deref().or(spec.user)) {
+        .and_then(|user| crate::user::resolve_named_user(user, resolve_rootfs));
+    let mut process_user = match parse_process_user(resolved_user.as_deref().or(spec.user)) {
         Ok(process_user) => process_user,
         Err(error) => {
             return Err(ExecOutput {
@@ -374,6 +456,14 @@ fn build_command(
             });
         }
     };
+    // When a user is set without an explicit group (RunAsUser, no RunAsGroup),
+    // default the primary gid to the user's /etc/passwd group — matching how a
+    // normal login derives the primary group — instead of inheriting root's.
+    if let Some(process_user) = process_user.as_mut() {
+        if process_user.gid.is_none() {
+            process_user.gid = crate::user::primary_gid_for_uid(resolve_rootfs, process_user.uid);
+        }
+    }
 
     if let Some(rootfs) = spec.rootfs {
         if rootfs.is_empty()
@@ -405,12 +495,26 @@ fn build_command(
                 // inside the rootfs (idempotent) so in-container reads of
                 // /proc/self/* and /sys/class/* work like any container runtime.
                 ensure_container_pseudo_filesystems(rootfs);
+                // Populate the standard /dev device nodes (urandom, null, ...);
+                // many workloads (e.g. Apache httpd seeding its RNG from
+                // /dev/urandom) fail to start without them.
+                ensure_container_dev_nodes(rootfs);
                 // CRI MaskedPaths/ReadonlyPaths arrive as ':'-separated absolute
                 // paths over A3S_SEC_MASKED_PATHS / A3S_SEC_READONLY_PATHS.
                 let masked = parse_sec_path_list(spec.env, "A3S_SEC_MASKED_PATHS=");
                 let readonly = parse_sec_path_list(spec.env, "A3S_SEC_READONLY_PATHS=");
                 if !masked.is_empty() || !readonly.is_empty() {
                     apply_container_path_restrictions(rootfs, &masked, &readonly);
+                }
+                // CRI readonly_rootfs: remount the container root read-only
+                // AFTER the pseudo-filesystems and path restrictions are set up,
+                // so /proc, /sys, and any inner mounts stay writable.
+                if spec
+                    .env
+                    .iter()
+                    .any(|entry| entry == "A3S_SEC_READONLY_ROOTFS=1")
+                {
+                    remount_rootfs_readonly(rootfs);
                 }
             }
             Ok(_) => {
@@ -456,7 +560,7 @@ fn build_command(
 
     // CRI SupplementalGroups arrive as A3S_SEC_SUPPLEMENTAL_GROUPS=gid,gid,...
     // and are applied (setgroups) before dropping to the target uid/gid.
-    let supplemental_groups: Vec<u32> = spec
+    let mut supplemental_groups: Vec<u32> = spec
         .env
         .iter()
         .find_map(|entry| entry.strip_prefix("A3S_SEC_SUPPLEMENTAL_GROUPS="))
@@ -466,6 +570,20 @@ fn build_command(
                 .collect()
         })
         .unwrap_or_default();
+    // runc-style initgroups: when running as a specific user, add the groups
+    // that user belongs to per the image's /etc/group (resolved here, pre-fork).
+    // CRI-supplied groups take precedence; image groups are appended + deduped.
+    if let (Some(process_user), Some(rootfs)) = (process_user, spec.rootfs) {
+        let image_groups = crate::user::resolve_image_groups(
+            rootfs,
+            process_user.uid,
+            process_user.gid,
+            spec.user.unwrap_or("root"),
+        );
+        supplemental_groups.extend(image_groups);
+        let mut seen = std::collections::HashSet::new();
+        supplemental_groups.retain(|gid| seen.insert(*gid));
+    }
     // CRI seccomp: A3S_SEC_SECCOMP=default applies the default BPF filter
     // (RuntimeDefault) in the child; unconfined/unset leave the process
     // unfiltered.
@@ -501,6 +619,26 @@ fn build_command(
                 .collect()
         })
         .unwrap_or_default();
+    // CRI capability keep-set: A3S_SEC_CAP_KEEP=NAME,NAME,... restricts a
+    // non-privileged container to exactly these capabilities (the runtime
+    // default adjusted by add/drop), dropping all others. Present-but-empty
+    // means drop everything; absent means leave the full set (privileged).
+    let cap_keep: Option<Vec<String>> = spec
+        .env
+        .iter()
+        .find_map(|entry| entry.strip_prefix("A3S_SEC_CAP_KEEP="))
+        .map(|csv| {
+            csv.split(',')
+                .map(|name| name.trim().to_string())
+                .filter(|name| !name.is_empty())
+                .collect()
+        });
+    // CRI no_new_privs: A3S_SEC_NO_NEW_PRIVS=1 sets PR_SET_NO_NEW_PRIVS in the
+    // child before exec, so a setuid/file-capability binary cannot raise privs.
+    let no_new_privs = spec
+        .env
+        .iter()
+        .any(|entry| entry == "A3S_SEC_NO_NEW_PRIVS=1");
     configure_child_process(
         &mut command,
         spec.rootfs,
@@ -509,7 +647,10 @@ fn build_command(
         supplemental_groups,
         apply_seccomp,
         cap_drop,
+        cap_keep,
         seccomp_localhost,
+        no_new_privs,
+        cgroup_procs,
     );
     if spec.rootfs.is_none() {
         if let Some(dir) = spec.working_dir {
@@ -557,16 +698,19 @@ fn execute_command(
     stdin_data: Option<&[u8]>,
     user: Option<&str>,
 ) -> ExecOutput {
-    let (mut command, timeout) = match build_command(ExecCommandSpec {
-        cmd,
-        timeout_ns,
-        env,
-        working_dir,
-        rootfs,
-        stdin_data,
-        stdin_streaming: false,
-        user,
-    }) {
+    let (mut command, timeout) = match build_command(
+        ExecCommandSpec {
+            cmd,
+            timeout_ns,
+            env,
+            working_dir,
+            rootfs,
+            stdin_data,
+            stdin_streaming: false,
+            user,
+        },
+        None,
+    ) {
         Ok(command) => command,
         Err(output) => return output,
     };
@@ -615,6 +759,15 @@ fn execute_command(
                     };
                 }
                 std::thread::sleep(poll_interval);
+            }
+            Err(ref e) if e.raw_os_error() == Some(libc::ECHILD) => {
+                // Child already reaped (timing race in microVM PID 1 context).
+                let (stdout, stderr) = read_child_output(&mut child);
+                return ExecOutput {
+                    stdout: truncate_output(stdout),
+                    stderr: truncate_output(stderr),
+                    exit_code: 0,
+                };
             }
             Err(e) => {
                 return ExecOutput {
@@ -694,7 +847,7 @@ fn wait_streaming_child(
     let poll_interval = Duration::from_millis(20);
 
     loop {
-        if drain_exec_input_events(child, input_rx) {
+        if process_streaming_input(child, input_rx, receiver, writer)? {
             warn!("Streaming exec command received stop request, killing");
             kill_child_process_group(child);
             return Ok((137, Some(StreamingStopReason::Cancelled)));
@@ -707,7 +860,7 @@ fn wait_streaming_child(
             Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {}
         }
 
-        if drain_exec_input_events(child, input_rx) {
+        if process_streaming_input(child, input_rx, receiver, writer)? {
             warn!("Streaming exec command received stop request, killing");
             kill_child_process_group(child);
             return Ok((137, Some(StreamingStopReason::Cancelled)));
@@ -725,6 +878,15 @@ fn wait_streaming_child(
                     return Ok((137, Some(StreamingStopReason::Timeout)));
                 }
             }
+            Err(ref e) if e.raw_os_error() == Some(libc::ECHILD) => {
+                // The child exited and was reaped before this try_wait — a
+                // timing race where the output pipes closed (confirming the
+                // child finished) but the zombie was collected first (can happen
+                // inside microVMs where PID 1's housekeeping overlaps). Treat
+                // as a clean exit (code 0); the caller observes the output.
+                drain_stream_reader_events(receiver, writer)?;
+                return Ok((0, None));
+            }
             Err(e) => {
                 write_exec_stream_chunk(
                     writer,
@@ -738,12 +900,21 @@ fn wait_streaming_child(
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Default)]
+struct InputDrainOutcome {
+    /// A cancel/stop was requested.
+    cancel: bool,
+    /// A flush was requested (drain buffered output, then emit a flush-ack).
+    flush: bool,
+}
+
 fn drain_exec_input_events(
     child: &mut std::process::Child,
     input_rx: Option<&mpsc::Receiver<ExecInputEvent>>,
-) -> bool {
+) -> InputDrainOutcome {
+    let mut outcome = InputDrainOutcome::default();
     let Some(input_rx) = input_rx else {
-        return false;
+        return outcome;
     };
 
     loop {
@@ -752,10 +923,34 @@ fn drain_exec_input_events(
             Ok(ExecInputEvent::StdinClose) => {
                 let _ = child.stdin.take();
             }
-            Ok(ExecInputEvent::Cancel) => return true,
-            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => return false,
+            Ok(ExecInputEvent::Flush) => outcome.flush = true,
+            Ok(ExecInputEvent::Cancel) => {
+                outcome.cancel = true;
+                return outcome;
+            }
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => return outcome,
         }
     }
+}
+
+/// Process pending input events: apply stdin/close, and on a flush request
+/// drain all buffered output to the writer before emitting a flush-ack.
+/// Returns `true` if a cancel/stop was requested.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn process_streaming_input(
+    child: &mut std::process::Child,
+    input_rx: Option<&mpsc::Receiver<ExecInputEvent>>,
+    receiver: &mpsc::Receiver<StreamReaderEvent>,
+    writer: &mut impl Write,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let outcome = drain_exec_input_events(child, input_rx);
+    if outcome.flush {
+        // Everything the reader threads have queued is written first, so the
+        // ack marks a definitive boundary for log rotation.
+        drain_stream_reader_events(receiver, writer)?;
+        write_exec_flush_ack(writer)?;
+    }
+    Ok(outcome.cancel)
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -787,7 +982,24 @@ fn execute_command_streaming(
     input_rx: Option<mpsc::Receiver<ExecInputEvent>>,
     writer: &mut impl Write,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (mut command, timeout) = match build_command(spec) {
+    // Per-container cgroup v2 (memory.max / cpu.max) for resource limits + OOM
+    // accounting. Created BEFORE build_command so its cgroup.procs path can be
+    // handed to the pre-exec hook: the container joins the cgroup itself (before
+    // exec), so every worker it forks is bounded too — a parent-side join after
+    // spawn races with workers the container forks immediately.
+    #[cfg(target_os = "linux")]
+    let container_cgroup = crate::cgroup::ContainerCgroup::create(
+        parse_sec_mem_limit(spec.env),
+        parse_sec_int(spec.env, "A3S_SEC_CPU_QUOTA="),
+        parse_sec_int(spec.env, "A3S_SEC_CPU_PERIOD=").map(|value| value as u64),
+        parse_sec_int(spec.env, "A3S_SEC_CPU_SHARES=").map(|value| value as u64),
+    );
+    #[cfg(target_os = "linux")]
+    let cgroup_procs = container_cgroup.as_ref().map(|cgroup| cgroup.procs_path());
+    #[cfg(not(target_os = "linux"))]
+    let cgroup_procs: Option<String> = None;
+
+    let (mut command, timeout) = match build_command(spec, cgroup_procs.as_deref()) {
         Ok(command) => command,
         Err(output) => {
             write_exec_stream_response(writer, &output)?;
@@ -864,7 +1076,15 @@ fn execute_command_streaming(
         None => {}
     }
 
-    write_exec_exit(writer, exit_code)
+    // A non-zero cgroup `oom_kill` count means the kernel OOM-killer reaped the
+    // container for exceeding its memory limit — report it as OOMKilled.
+    #[cfg(target_os = "linux")]
+    let oom_killed = container_cgroup
+        .as_ref()
+        .is_some_and(|cgroup| cgroup.oom_kills() > 0);
+    #[cfg(not(target_os = "linux"))]
+    let oom_killed = false;
+    write_exec_exit(writer, exit_code, oom_killed)
 }
 
 #[cfg(unix)]
@@ -877,13 +1097,20 @@ fn configure_child_process(
     supplemental_groups: Vec<u32>,
     apply_seccomp: bool,
     cap_drop: Vec<String>,
+    cap_keep: Option<Vec<String>>,
     seccomp_localhost: Vec<String>,
+    no_new_privs: bool,
+    cgroup_procs: Option<&str>,
 ) {
     use std::ffi::CString;
     use std::os::unix::process::CommandExt;
 
     let rootfs = rootfs
         .map(|rootfs| CString::new(rootfs.as_bytes()).expect("rootfs path was pre-validated"));
+    // The per-container cgroup's `cgroup.procs` path; the child writes its own
+    // PID here (before chroot) so it — and everything it forks — is bounded by
+    // the cgroup's memory.max / cpu.max from birth. Built pre-fork (allocates).
+    let cgroup_procs = cgroup_procs.and_then(|path| CString::new(path.as_bytes()).ok());
     // workdir (for chdir) is only used when chrooting into a rootfs, where
     // build_command has already rejected an embedded NUL. Build the CString only
     // in that case so a workdir containing a NUL with no rootfs set cannot panic
@@ -913,11 +1140,41 @@ fn configure_child_process(
     {
         let _ = apply_seccomp;
         let _ = &cap_drop;
+        let _ = &cap_keep;
         let _ = &seccomp_localhost;
+        let _ = no_new_privs;
     }
 
     unsafe {
         command.pre_exec(move || {
+            // Join the per-container cgroup FIRST, before chroot (afterwards the
+            // guest /sys/fs/cgroup is unreachable). Best-effort and entirely
+            // async-signal-safe: open + getpid + a stack-only itoa + write +
+            // close, no allocation. A failure here leaves the container
+            // unbounded rather than failing its launch.
+            if let Some(procs) = cgroup_procs.as_ref() {
+                let fd = libc::open(procs.as_ptr(), libc::O_WRONLY);
+                if fd >= 0 {
+                    let mut buf = [0u8; 20];
+                    let mut i = buf.len();
+                    let mut n = libc::getpid() as u64;
+                    if n == 0 {
+                        i -= 1;
+                        buf[i] = b'0';
+                    }
+                    while n > 0 {
+                        i -= 1;
+                        buf[i] = b'0' + (n % 10) as u8;
+                        n /= 10;
+                    }
+                    let _ = libc::write(
+                        fd,
+                        buf[i..].as_ptr() as *const libc::c_void,
+                        (buf.len() - i) as libc::size_t,
+                    );
+                    let _ = libc::close(fd);
+                }
+            }
             if libc::setpgid(0, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -942,14 +1199,29 @@ fn configure_child_process(
                     return Err(std::io::Error::last_os_error());
                 }
             }
+            // Apply capabilities BEFORE the uid/gid switch, while the process is
+            // still root and holds CAP_SETPCAP: capset / PR_CAPBSET_DROP require
+            // it, and a setuid to a non-root user clears the effective set and
+            // would make a later capset fail (breaking RunAsUser containers). A
+            // keep-set (the CRI default for a non-privileged container) reduces
+            // to exactly those caps; the legacy drop-list path remains for
+            // explicit-drop-only callers. The default keep-set retains
+            // CAP_SETUID/CAP_SETGID so the subsequent user.apply still works.
+            #[cfg(target_os = "linux")]
+            if let Some(cap_keep) = &cap_keep {
+                crate::namespace::restrict_capabilities_to_keep(cap_keep)?;
+            } else if !cap_drop.is_empty() {
+                crate::namespace::drop_capabilities(&cap_drop)?;
+            }
             if let Some(user) = user {
                 user.apply()?;
             }
-            // Drop capabilities after the uid/gid switch (capset/prctl only —
-            // async-signal-safe) so a privileged container actually loses them.
+            // Set no_new_privs before installing seccomp: a single prctl
+            // (async-signal-safe) that prevents any later execve from gaining
+            // privileges via setuid/setgid bits or file capabilities.
             #[cfg(target_os = "linux")]
-            if !cap_drop.is_empty() {
-                crate::namespace::drop_capabilities(&cap_drop)?;
+            if no_new_privs {
+                crate::namespace::set_no_new_privs()?;
             }
             // Install the seccomp filter last — after chroot and the privilege
             // drop — so it is active across execve. Only the prebuilt filter is
@@ -972,7 +1244,10 @@ fn configure_child_process(
     _supplemental_groups: Vec<u32>,
     _apply_seccomp: bool,
     _cap_drop: Vec<String>,
+    _cap_keep: Option<Vec<String>>,
     _seccomp_localhost: Vec<String>,
+    _no_new_privs: bool,
+    _cgroup_procs: Option<&str>,
 ) {
 }
 
@@ -1018,6 +1293,67 @@ fn ensure_container_pseudo_filesystems(rootfs: &str) {
     }
 }
 
+/// Create the standard character device nodes in a container `rootfs`.
+///
+/// A minimal image rootfs has an empty `/dev`, but many workloads need the
+/// usual nodes — e.g. Apache httpd reads `/dev/urandom` to seed its RNG and
+/// aborts with `AH00141` if it is absent. Created with `mknod` while guest-init
+/// still holds `CAP_MKNOD` (before the privilege drop and chroot). Best-effort
+/// and idempotent: an existing node is left as-is.
+#[cfg(target_os = "linux")]
+fn ensure_container_dev_nodes(rootfs: &str) {
+    let dev = format!("{rootfs}/dev");
+    if let Err(e) = std::fs::create_dir_all(&dev) {
+        warn!("Failed to create container /dev {dev}: {e}");
+        return;
+    }
+    // (name, major, minor) — the fixed Linux char-device numbers.
+    for (name, major, minor) in [
+        ("null", 1u32, 3u32),
+        ("zero", 1, 5),
+        ("full", 1, 7),
+        ("random", 1, 8),
+        ("urandom", 1, 9),
+        ("tty", 5, 0),
+    ] {
+        let path = format!("{dev}/{name}");
+        if std::path::Path::new(&path).exists() {
+            continue;
+        }
+        let Ok(cpath) = std::ffi::CString::new(path.as_str()) else {
+            continue;
+        };
+        let mode: libc::mode_t = libc::S_IFCHR | 0o666;
+        // SAFETY: mknod with a valid CString path + fixed device numbers.
+        let ret = unsafe { libc::mknod(cpath.as_ptr(), mode, libc::makedev(major, minor)) };
+        if ret != 0 {
+            warn!(
+                "Failed to mknod {path}: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
+/// Parse the container memory limit (bytes) from `A3S_SEC_MEM_LIMIT=<n>`.
+/// Returns `None` when unset, zero, or unparseable (no cgroup enforcement).
+#[cfg(target_os = "linux")]
+fn parse_sec_mem_limit(env: &[String]) -> Option<u64> {
+    env.iter()
+        .find_map(|entry| entry.strip_prefix("A3S_SEC_MEM_LIMIT="))
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|limit| *limit > 0)
+}
+
+/// Parse a signed integer from an `A3S_SEC_*=<n>` env entry (the CPU
+/// `cpu_quota`/`cpu_period` cgroup limits). `None` when unset/unparseable.
+#[cfg(target_os = "linux")]
+fn parse_sec_int(env: &[String], prefix: &str) -> Option<i64> {
+    env.iter()
+        .find_map(|entry| entry.strip_prefix(prefix))
+        .and_then(|value| value.trim().parse::<i64>().ok())
+}
+
 /// Parse a `':'`-separated absolute-path list from an `A3S_SEC_*` env entry.
 #[cfg(target_os = "linux")]
 fn parse_sec_path_list<'a>(env: &'a [String], prefix: &str) -> Vec<&'a str> {
@@ -1053,7 +1389,12 @@ fn apply_container_path_restrictions(rootfs: &str, masked: &[&str], readonly: &[
     // differs from its parent directory's. This makes re-application on every
     // exec idempotent (build_command runs per-exec) instead of stacking mounts.
     let is_mountpoint = |target: &str| -> bool {
-        let Ok(dev) = std::fs::metadata(target).map(|m| m.dev()) else {
+        // lstat, not stat: a masked symlink (e.g. busybox's /bin/ls) must be
+        // compared as the link entry itself. Following it would resolve to a
+        // different filesystem (the guest-root busybox), making st_dev differ
+        // from the parent and wrongly reporting "already a mount" — which would
+        // skip masking the symlink on the very first exec.
+        let Ok(dev) = std::fs::symlink_metadata(target).map(|m| m.dev()) else {
             return false;
         };
         std::path::Path::new(target)
@@ -1072,7 +1413,9 @@ fn apply_container_path_restrictions(rootfs: &str, masked: &[&str], readonly: &[
         if is_mountpoint(&target) {
             continue; // already masked
         }
-        match std::fs::metadata(&target) {
+        // lstat (no symlink follow): a masked symlink must be treated as a file
+        // so we mask the entry itself, not whatever it points at.
+        match std::fs::symlink_metadata(&target) {
             Ok(meta) if meta.is_dir() => {
                 if let Err(e) = mount(
                     Some("tmpfs"),
@@ -1085,14 +1428,34 @@ fn apply_container_path_restrictions(rootfs: &str, masked: &[&str], readonly: &[
                 }
             }
             Ok(_) => {
-                if let Err(e) = mount(
-                    Some("/dev/null"),
+                // Bind /dev/null over the entry WITHOUT following it: open with
+                // O_PATH|O_NOFOLLOW and mount onto /proc/self/fd/N so a symlinked
+                // target (e.g. busybox's /bin/ls -> /bin/busybox) masks the
+                // symlink itself — exec'ing it then yields EACCES — instead of
+                // resolving the link against the guest root and masking the wrong
+                // file. (Same technique container runtimes use against symlink
+                // attacks.)
+                use std::os::fd::AsRawFd;
+                match nix::fcntl::open(
                     target.as_str(),
-                    None::<&str>,
-                    MsFlags::MS_BIND,
-                    None::<&str>,
+                    nix::fcntl::OFlag::O_PATH
+                        | nix::fcntl::OFlag::O_NOFOLLOW
+                        | nix::fcntl::OFlag::O_CLOEXEC,
+                    nix::sys::stat::Mode::empty(),
                 ) {
-                    warn!("Failed to mask file {target}: {e}");
+                    Ok(entry_fd) => {
+                        let fd_path = format!("/proc/self/fd/{}", entry_fd.as_raw_fd());
+                        if let Err(e) = mount(
+                            Some("/dev/null"),
+                            fd_path.as_str(),
+                            None::<&str>,
+                            MsFlags::MS_BIND,
+                            None::<&str>,
+                        ) {
+                            warn!("Failed to mask file {target}: {e}");
+                        }
+                    }
+                    Err(e) => warn!("Failed to open masked file {target}: {e}"),
                 }
             }
             Err(_) => {} // path absent in this rootfs; nothing to mask
@@ -1137,6 +1500,46 @@ fn apply_container_path_restrictions(rootfs: &str, masked: &[&str], readonly: &[
         ) {
             warn!("Failed to remount {target} read-only: {e}");
         }
+    }
+}
+
+/// Remount a container `rootfs` read-only (CRI `readonly_rootfs`).
+///
+/// Recursively bind-mounts the rootfs onto itself, then remounts the top
+/// `MS_RDONLY`, so writes to the container root fail while pseudo-filesystems
+/// and volumes mounted inside it (separate mounts) stay writable. Idempotent: a
+/// rootfs that is already read-only is left untouched, so re-exec into the
+/// container does not stack mounts.
+#[cfg(target_os = "linux")]
+fn remount_rootfs_readonly(rootfs: &str) {
+    use nix::mount::{mount, MsFlags};
+
+    if nix::sys::statvfs::statvfs(rootfs)
+        .map(|s| s.flags().contains(nix::sys::statvfs::FsFlags::ST_RDONLY))
+        .unwrap_or(false)
+    {
+        return; // already read-only
+    }
+    // A fresh bind is read-write regardless of the source, so bind (recursively,
+    // to carry the inner pseudo-filesystems) then remount the top read-only.
+    if let Err(e) = mount(
+        Some(rootfs),
+        rootfs,
+        None::<&str>,
+        MsFlags::MS_BIND | MsFlags::MS_REC,
+        None::<&str>,
+    ) {
+        warn!("Failed to bind rootfs {rootfs} for read-only: {e}");
+        return;
+    }
+    if let Err(e) = mount(
+        None::<&str>,
+        rootfs,
+        None::<&str>,
+        MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY,
+        None::<&str>,
+    ) {
+        warn!("Failed to remount rootfs {rootfs} read-only: {e}");
     }
 }
 
@@ -1278,16 +1681,19 @@ mod tests {
 
     #[test]
     fn test_build_command_rejects_named_user() {
-        let output = build_command(ExecCommandSpec {
-            cmd: &["id".to_string()],
-            timeout_ns: 0,
-            env: &[],
-            working_dir: None,
-            rootfs: None,
-            stdin_data: None,
-            stdin_streaming: false,
-            user: Some("node"),
-        })
+        let output = build_command(
+            ExecCommandSpec {
+                cmd: &["id".to_string()],
+                timeout_ns: 0,
+                env: &[],
+                working_dir: None,
+                rootfs: None,
+                stdin_data: None,
+                stdin_streaming: false,
+                user: Some("node"),
+            },
+            None,
+        )
         .unwrap_err();
 
         assert_eq!(output.exit_code, 1);
@@ -1296,16 +1702,19 @@ mod tests {
 
     #[test]
     fn test_build_command_keeps_original_program_with_numeric_user() {
-        let (command, _) = build_command(ExecCommandSpec {
-            cmd: &["echo".to_string(), "hello".to_string()],
-            timeout_ns: 0,
-            env: &[],
-            working_dir: None,
-            rootfs: None,
-            stdin_data: None,
-            stdin_streaming: false,
-            user: Some("1000:1000"),
-        })
+        let (command, _) = build_command(
+            ExecCommandSpec {
+                cmd: &["echo".to_string(), "hello".to_string()],
+                timeout_ns: 0,
+                env: &[],
+                working_dir: None,
+                rootfs: None,
+                stdin_data: None,
+                stdin_streaming: false,
+                user: Some("1000:1000"),
+            },
+            None,
+        )
         .unwrap();
 
         assert_eq!(command.get_program(), "echo");
@@ -1606,6 +2015,67 @@ mod tests {
         }
 
         assert_eq!(stdout, b"hello live stdin");
+        assert_eq!(exit_code, Some(0));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_execute_command_streaming_flush_emits_ack() {
+        let (input_tx, input_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            execute_command_streaming(
+                ExecCommandSpec {
+                    cmd: &["cat".to_string()],
+                    timeout_ns: 5_000_000_000,
+                    env: &[],
+                    working_dir: None,
+                    rootfs: None,
+                    stdin_data: None,
+                    stdin_streaming: true,
+                    user: None,
+                },
+                Some(input_rx),
+                &mut buf,
+            )
+            .unwrap();
+            buf
+        });
+
+        input_tx
+            .send(ExecInputEvent::Stdin(b"echoed".to_vec()))
+            .unwrap();
+        input_tx.send(ExecInputEvent::Flush).unwrap();
+        input_tx.send(ExecInputEvent::StdinClose).unwrap();
+
+        let mut cursor = std::io::Cursor::new(handle.join().unwrap());
+        let mut stdout = Vec::new();
+        let mut flush_acks = 0;
+        let mut exit_code = None;
+
+        while let Some((ft, payload)) = read_frame(&mut cursor).unwrap() {
+            match ft {
+                ft if ft == FrameType::Data as u8 => {
+                    let chunk: ExecChunk = serde_json::from_slice(&payload).unwrap();
+                    if chunk.stream == StreamType::Stdout {
+                        stdout.extend_from_slice(&chunk.data);
+                    }
+                }
+                ft if ft == FrameType::Control as u8 && payload == EXEC_FLUSH_ACK => {
+                    flush_acks += 1;
+                }
+                ft if ft == FrameType::Control as u8 => {
+                    let exit: ExecExit = serde_json::from_slice(&payload).unwrap();
+                    exit_code = Some(exit.exit_code);
+                }
+                other => panic!("unexpected frame type: {other}"),
+            }
+        }
+
+        // A flush-ack was emitted in response to the Flush event, the echoed
+        // output was delivered, and the command still exited cleanly.
+        assert!(flush_acks >= 1, "expected at least one flush-ack frame");
+        assert_eq!(stdout, b"echoed");
         assert_eq!(exit_code, Some(0));
     }
 

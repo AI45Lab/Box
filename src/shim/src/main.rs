@@ -455,7 +455,10 @@ unsafe fn configure_and_start_vm(spec: &InstanceSpec) -> Result<()> {
 
         let mount_path: std::path::PathBuf = if host_path.is_file() {
             // Create a temporary directory to hold the file
-            let temp_dir = std::env::temp_dir().join(format!("a3s-fs-mount-{}", spec.box_id));
+            // Per-mount temp dir (keyed by tag) so two file mounts sharing a
+            // basename (e.g. two app.conf to different targets) don't collide.
+            let temp_dir =
+                std::env::temp_dir().join(format!("a3s-fs-mount-{}-{}", spec.box_id, mount.tag));
             let file_name = host_path.file_name().unwrap();
             let temp_file_path = temp_dir.join(file_name);
 
@@ -753,8 +756,37 @@ unsafe fn configure_and_start_vm(spec: &InstanceSpec) -> Result<()> {
                 message: format!("Invalid console output path: {}", console_path.display()),
                 hint: None,
             })?;
-        tracing::debug!(console_path = console_str, "Redirecting console output");
-        ctx.set_console_output(console_str)?;
+        // Split console: guest stdout -> console.log, stderr -> console.err.log
+        // (libkrun's 3-fd virtio-console separates the streams), so the log
+        // processor can tag each line's stream like Docker's json-file driver.
+        // Falls back to the merged single-file console if the err file can't be
+        // opened. BOX_NO_SPLIT_STDERR forces the legacy merged behavior.
+        use std::os::unix::io::AsRawFd;
+        let opened = if std::env::var_os("BOX_NO_SPLIT_STDERR").is_none() {
+            let err_path = console_path.with_file_name("console.err.log");
+            let open = |p: &std::path::Path| {
+                std::fs::OpenOptions::new().create(true).append(true).open(p)
+            };
+            match (open(console_path), open(&err_path)) {
+                (Ok(out_f), Ok(err_f)) => Some((out_f, err_f)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        match opened {
+            Some((out_f, err_f)) => {
+                ctx.add_split_console(-1, out_f.as_raw_fd(), err_f.as_raw_fd())?;
+                // Keep the fds open for the VM's lifetime.
+                std::mem::forget(out_f);
+                std::mem::forget(err_f);
+                tracing::debug!("split console enabled (stdout/stderr separated)");
+            }
+            None => {
+                tracing::debug!(console_path = console_str, "Redirecting console output (merged)");
+                ctx.set_console_output(console_str)?;
+            }
+        }
     }
 
     // Configure TEE if specified (only available on Linux with SEV support)
@@ -798,9 +830,36 @@ unsafe fn configure_and_start_vm(spec: &InstanceSpec) -> Result<()> {
     #[cfg(target_os = "linux")]
     apply_cgroup_limits(spec);
 
-    // Start VM (process takeover - never returns on success)
+    // Spawn the log processor on a dedicated thread for the box's lifetime. The
+    // shim owns console.log and lives exactly as long as the VM, so this is the
+    // daemonless home for log processing — a detached `run -d` box keeps logging
+    // after the launching CLI exits (the processor used to die with that CLI).
+    let log_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let log_thread = spec.console_output.as_ref().map(|console| {
+        let console = console.clone();
+        let log_dir = console
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let config = spec.log_config.clone();
+        let stop = log_stop.clone();
+        std::thread::spawn(move || {
+            a3s_box_core::log::run_log_processor(&console, &log_dir, &config, &stop);
+        })
+    });
+
+    // Start VM. start_enter RETURNS with the guest exit status once the guest
+    // exits (status >= 0) or on a start failure (status < 0).
     tracing::info!(box_id = %spec.box_id, "Starting VM (process takeover)");
     let status = ctx.start_enter();
+
+    // Guest has exited and console.log is fully flushed: signal the processor to
+    // drain the remainder and stop, then join so the final lines reach
+    // container.json before this process exits (no teardown race).
+    log_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    if let Some(handle) = log_thread {
+        let _ = handle.join();
+    }
 
     // If we reach here, either:
     // 1. VM failed to start (negative status)

@@ -67,10 +67,16 @@ async fn stop_one(
     // Resolve timeout: CLI -t > BoxRecord.stop_timeout > 10s
     let effective_timeout = timeout.or(record.stop_timeout).unwrap_or(10);
 
-    // Send stop signal, then SIGKILL after timeout
+    // Exec socket used to deliver the stop signal inside the guest.
+    let exec_socket = crate::socket_paths::exec(record);
+
+    // Deliver the stop signal to the container (honouring its STOPSIGNAL), then
+    // wait for the VM to exit; SIGKILL the shim after the timeout.
     lifecycle::resume_paused_for_termination(record, pid, "stop")
         .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
-    let stop_outcome = Some(process::graceful_stop(pid, stop_signal, effective_timeout).await);
+    let stop_outcome = Some(
+        process::graceful_stop_via_guest(pid, &exec_socket, stop_signal, effective_timeout).await,
+    );
 
     if auto_remove {
         cleanup::cleanup_removed_box(&record_snapshot);

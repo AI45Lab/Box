@@ -97,6 +97,25 @@ impl ImageStore {
         }
     }
 
+    /// Resolve an image reference to a stored image.
+    ///
+    /// CRI callers may address an image by an exact stored reference, by its
+    /// image id (a bare `sha256:...` or a `name@sha256:...` digest pin), or by
+    /// an unnormalized name (e.g. a tagless name that defaults to `:latest`).
+    pub async fn resolve(&self, image: &str) -> Option<StoredImage> {
+        if let Some(found) = self.get(image).await {
+            return Some(found);
+        }
+        let digest_part = image.rsplit_once('@').map_or(image, |(_, digest)| digest);
+        if let Some(found) = self.get_by_digest(digest_part).await {
+            return Some(found);
+        }
+        match super::ImageReference::parse(image) {
+            Ok(parsed) => self.get(&parsed.full_reference()).await,
+            Err(_) => None,
+        }
+    }
+
     /// Store an image from a source directory.
     ///
     /// Copies the OCI image layout from `source_dir` into the store
@@ -131,6 +150,26 @@ impl ImageStore {
         };
 
         let mut index = self.index.write().await;
+
+        // Docker parity: if this reference already points at a DIFFERENT digest
+        // and that old digest is about to lose its last reference, keep the
+        // displaced image as a dangling entry (keyed by its digest) instead of
+        // dropping it. This makes a rebuilt/re-tagged image show up as
+        // `<none>` in `images`, be removable by `image prune`, and prevents
+        // silently orphaning its on-disk layout.
+        if let Some(old) = index.get(reference).cloned() {
+            if old.digest != digest {
+                let still_referenced = index
+                    .iter()
+                    .any(|(key, img)| key.as_str() != reference && img.digest == old.digest);
+                if !still_referenced && !index.contains_key(&old.digest) {
+                    let mut dangling = old.clone();
+                    dangling.reference = old.digest.clone();
+                    index.insert(old.digest.clone(), dangling);
+                }
+            }
+        }
+
         index.insert(reference.to_string(), stored.clone());
         drop(index);
 
@@ -139,33 +178,57 @@ impl ImageStore {
         Ok(stored)
     }
 
-    /// Remove an image by reference.
-    pub async fn remove(&self, reference: &str) -> Result<()> {
+    /// Remove an image by reference or by image ID (digest).
+    ///
+    /// The CRI `RemoveImage` may identify an image either by a repo
+    /// reference/tag or by its image ID (`sha256:<digest>`, as returned in
+    /// `ImageStatus`). When `image` does not match a stored reference key,
+    /// fall back to removing every reference that points at the matching
+    /// digest.
+    pub async fn remove(&self, image: &str) -> Result<()> {
         let mut index = self.index.write().await;
-        if let Some(image) = index.remove(reference) {
-            // Check if any other reference points to the same digest
-            let digest_still_used = index.values().any(|img| img.digest == image.digest);
-            drop(index);
 
-            if !digest_still_used && image.path.exists() {
-                std::fs::remove_dir_all(&image.path).map_err(|e| {
+        // Resolve the reference keys to remove: the exact reference if it is
+        // a known key, otherwise every key sharing the requested digest.
+        let keys: Vec<String> = if index.contains_key(image) {
+            vec![image.to_string()]
+        } else {
+            index
+                .values()
+                .filter(|img| img.digest == image)
+                .map(|img| img.reference.clone())
+                .collect()
+        };
+
+        if keys.is_empty() {
+            drop(index);
+            return Err(BoxError::OciImageError(format!(
+                "Image not found: {}",
+                image
+            )));
+        }
+
+        let removed: Vec<StoredImage> = keys.iter().filter_map(|k| index.remove(k)).collect();
+
+        // Delete each image's on-disk layout once no remaining reference
+        // points at the same digest. References sharing a digest share the
+        // same directory, so the `path.exists()` guard makes this idempotent.
+        for img in removed {
+            let digest_still_used = index.values().any(|other| other.digest == img.digest);
+            if !digest_still_used && img.path.exists() {
+                std::fs::remove_dir_all(&img.path).map_err(|e| {
                     BoxError::OciImageError(format!(
                         "Failed to remove image directory {}: {}",
-                        image.path.display(),
+                        img.path.display(),
                         e
                     ))
                 })?;
             }
-
-            self.save_index_inner().await?;
-            Ok(())
-        } else {
-            drop(index);
-            Err(BoxError::OciImageError(format!(
-                "Image not found: {}",
-                reference
-            )))
         }
+
+        drop(index);
+        self.save_index_inner().await?;
+        Ok(())
     }
 
     /// List all stored images.
@@ -418,6 +481,143 @@ mod tests {
 
         store.remove("nginx:latest").await.unwrap();
         assert!(store.get("nginx:latest").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_retag_keeps_displaced_image_as_dangling() {
+        // Docker parity: re-pointing a tag at a new digest leaves the old image
+        // as a dangling entry (keyed by its digest), not silently dropped.
+        let tmp = TempDir::new().unwrap();
+        let store_dir = tmp.path().join("store");
+        let source_dir = tmp.path().join("source");
+        create_test_oci_layout(&source_dir);
+
+        let store = ImageStore::new(&store_dir, 10 * 1024 * 1024).unwrap();
+        store
+            .put("app:latest", "sha256:old", &source_dir)
+            .await
+            .unwrap();
+        store
+            .put("app:latest", "sha256:new", &source_dir)
+            .await
+            .unwrap();
+
+        // The tag now resolves to the new digest...
+        assert_eq!(store.get("app:latest").await.unwrap().digest, "sha256:new");
+        // ...and the displaced image survives as a digest-keyed dangling entry.
+        let dangling = store.get("sha256:old").await.unwrap();
+        assert_eq!(dangling.digest, "sha256:old");
+        assert_eq!(store.list().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_reput_same_digest_does_not_create_dangling() {
+        // Re-putting the same reference at the SAME digest (e.g. pulling latest
+        // when content is unchanged) must not spawn a spurious dangling entry.
+        let tmp = TempDir::new().unwrap();
+        let store_dir = tmp.path().join("store");
+        let source_dir = tmp.path().join("source");
+        create_test_oci_layout(&source_dir);
+
+        let store = ImageStore::new(&store_dir, 10 * 1024 * 1024).unwrap();
+        store
+            .put("app:latest", "sha256:same", &source_dir)
+            .await
+            .unwrap();
+        store
+            .put("app:latest", "sha256:same", &source_dir)
+            .await
+            .unwrap();
+
+        assert_eq!(store.list().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_remove_by_digest() {
+        // CRI RemoveImage identifies the image by its ID (sha256 digest),
+        // not its tag. Removing by digest must drop the reference + layout.
+        let tmp = TempDir::new().unwrap();
+        let store_dir = tmp.path().join("store");
+        let source_dir = tmp.path().join("source");
+        create_test_oci_layout(&source_dir);
+
+        let store = ImageStore::new(&store_dir, 10 * 1024 * 1024).unwrap();
+        let stored = store
+            .put("gcr.io/test/img:test", "sha256:deadbeef", &source_dir)
+            .await
+            .unwrap();
+        let path = stored.path.clone();
+
+        store.remove("sha256:deadbeef").await.unwrap();
+        assert!(store.get("gcr.io/test/img:test").await.is_none());
+        assert!(store.get_by_digest("sha256:deadbeef").await.is_none());
+        assert!(!path.exists(), "on-disk layout should be deleted");
+    }
+
+    #[tokio::test]
+    async fn test_remove_by_digest_removes_all_tags() {
+        // Two tags sharing one digest: removing by digest drops both and
+        // deletes the shared layout exactly once.
+        let tmp = TempDir::new().unwrap();
+        let store_dir = tmp.path().join("store");
+        let source_dir = tmp.path().join("source");
+        create_test_oci_layout(&source_dir);
+
+        let store = ImageStore::new(&store_dir, 10 * 1024 * 1024).unwrap();
+        store
+            .put("img:v1", "sha256:shared", &source_dir)
+            .await
+            .unwrap();
+        let stored = store
+            .put("img:latest", "sha256:shared", &source_dir)
+            .await
+            .unwrap();
+        let path = stored.path.clone();
+
+        store.remove("sha256:shared").await.unwrap();
+        assert!(store.get("img:v1").await.is_none());
+        assert!(store.get("img:latest").await.is_none());
+        assert!(!path.exists(), "shared layout should be deleted");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_by_name_digest_and_normalized() {
+        let tmp = TempDir::new().unwrap();
+        let store_dir = tmp.path().join("store");
+        let source_dir = tmp.path().join("source");
+        create_test_oci_layout(&source_dir);
+
+        let store = ImageStore::new(&store_dir, 10 * 1024 * 1024).unwrap();
+        store
+            .put(
+                "gcr.io/x/test-image-predefined-group:latest",
+                "sha256:grp",
+                &source_dir,
+            )
+            .await
+            .unwrap();
+
+        // Exact reference.
+        assert!(store
+            .resolve("gcr.io/x/test-image-predefined-group:latest")
+            .await
+            .is_some());
+        // Unnormalized name (no tag -> :latest) — the CreateContainer case.
+        assert_eq!(
+            store
+                .resolve("gcr.io/x/test-image-predefined-group")
+                .await
+                .map(|i| i.digest),
+            Some("sha256:grp".to_string())
+        );
+        // Image id (bare digest) and a name@digest pin.
+        assert!(store.resolve("sha256:grp").await.is_some());
+        assert!(store
+            .resolve("gcr.io/x/test-image-predefined-group@sha256:grp")
+            .await
+            .is_some());
+        // Unknown.
+        assert!(store.resolve("nope:latest").await.is_none());
     }
 
     #[tokio::test]

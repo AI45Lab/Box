@@ -19,6 +19,20 @@ pub enum SandboxState {
     Removed,
 }
 
+/// Pod DNS configuration captured from the sandbox's CRI `DNSConfig`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SandboxDns {
+    /// DNS server addresses (`nameserver` lines).
+    #[serde(default)]
+    pub servers: Vec<String>,
+    /// DNS search domains (`search` line).
+    #[serde(default)]
+    pub searches: Vec<String>,
+    /// Resolver options (`options` line).
+    #[serde(default)]
+    pub options: Vec<String>,
+}
+
 /// Represents a pod sandbox backed by a Box microVM.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PodSandbox {
@@ -48,6 +62,15 @@ pub struct PodSandbox {
     /// Additional Pod IPs, for dual-stack or multi-address integrations.
     #[serde(default)]
     pub additional_ips: Vec<String>,
+    /// Pod DNS configuration applied to each container's `/etc/resolv.conf`.
+    #[serde(default)]
+    pub dns: SandboxDns,
+    /// Container ports declared in the sandbox `port_mappings`. Used as the
+    /// fallback target when a PortForward request carries no explicit port
+    /// (e.g. `crictl port-forward`, which puts the port only in the SPDY
+    /// stream); critest passes the port in the RPC and does not need this.
+    #[serde(default)]
+    pub container_ports: Vec<i32>,
 }
 
 /// In-memory store for pod sandboxes.
@@ -133,6 +156,8 @@ mod tests {
             runtime_handler: "a3s".to_string(),
             network_ip: String::new(),
             additional_ips: vec![],
+            dns: SandboxDns::default(),
+            container_ports: vec![],
         }
     }
 

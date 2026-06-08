@@ -3,6 +3,7 @@
 mod layout;
 mod network;
 mod ready;
+pub mod reap;
 mod spec;
 
 use std::path::{Path, PathBuf};
@@ -137,6 +138,11 @@ pub struct VmManager {
 
     /// Optional progress callback for image pulls: `(current, total, digest, size_bytes)`.
     pub(crate) pull_progress_fn: Option<PullProgressFn>,
+
+    /// Logging driver config, threaded into the InstanceSpec so the shim runs
+    /// the log processor for the box's lifetime (set by the CLI via
+    /// [`VmManager::set_log_config`]).
+    pub(crate) log_config: a3s_box_core::log::LogConfig,
 }
 
 impl VmManager {
@@ -168,6 +174,7 @@ impl VmManager {
             prom: None,
             shim_exit_code: None,
             pull_progress_fn: None,
+            log_config: a3s_box_core::log::LogConfig::default(),
         }
     }
 
@@ -198,6 +205,7 @@ impl VmManager {
             prom: None,
             shim_exit_code: None,
             pull_progress_fn: None,
+            log_config: a3s_box_core::log::LogConfig::default(),
         }
     }
 
@@ -322,6 +330,7 @@ impl VmManager {
             prom: None,
             shim_exit_code: None,
             pull_progress_fn: None,
+            log_config: a3s_box_core::log::LogConfig::default(),
         }
     }
 
@@ -426,6 +435,12 @@ impl VmManager {
     /// Attach Prometheus metrics to this VM manager.
     pub fn set_metrics(&mut self, metrics: crate::prom::RuntimeMetrics) {
         self.prom = Some(metrics);
+    }
+
+    /// Set the logging driver config. Threaded into the InstanceSpec so the shim
+    /// runs the log processor for the box's lifetime.
+    pub fn set_log_config(&mut self, log_config: a3s_box_core::log::LogConfig) {
+        self.log_config = log_config;
     }
 
     /// Get the attached Prometheus metrics (if any).
@@ -811,6 +826,27 @@ impl VmManager {
                 error = %e,
                 "Failed to cleanup VM socket directory"
             );
+        }
+
+        // Remove the box working directory itself (overlay upper/work, logs,
+        // leftover metadata) for non-persistent boxes. Without this, ephemeral
+        // CRI pods leak their `boxes/<id>` directory on every destroy; the
+        // accumulation slows later RunPodSandbox calls until they time out
+        // (observed: pod #21 after churning 20). Persistent boxes keep their
+        // dir intentionally.
+        if !self.config.persistent {
+            match std::fs::remove_dir_all(&box_dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!(
+                        box_id = %self.box_id,
+                        path = %box_dir.display(),
+                        error = %e,
+                        "Failed to remove box directory on destroy"
+                    );
+                }
+            }
         }
 
         // Record Prometheus metrics

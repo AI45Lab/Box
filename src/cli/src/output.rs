@@ -111,6 +111,75 @@ pub fn parse_size_bytes(s: &str) -> Result<u64, String> {
     Ok(num * multiplier)
 }
 
+/// Parse a Docker/Go-style duration string into whole seconds.
+///
+/// Accepts a bare integer (seconds, kept for backward compatibility) or a
+/// duration with unit suffixes — `ns`, `us`/`µs`, `ms`, `s`, `m`, `h`, `d` —
+/// including compounds like `1m30s` or `2h45m`. Sub-second components are
+/// rounded to the nearest second. Used for Docker-compatible
+/// `--health-interval`/`--health-timeout`/`--health-start-period` and for
+/// `logs --since`/`--until` (via `logs::parse_duration`).
+pub fn parse_duration_secs(s: &str) -> Result<u64, String> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Err("empty duration value".to_string());
+    }
+    // Bare integer → seconds (backward compatible with the old plain-int form).
+    if let Ok(n) = t.parse::<u64>() {
+        return Ok(n);
+    }
+    if t.starts_with('-') {
+        return Err(format!("negative duration not allowed: {s}"));
+    }
+
+    let mut total_secs = 0f64;
+    let mut num = String::new();
+    let mut saw_unit = false;
+    let mut chars = t.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c.is_ascii_digit() || c == '.' {
+            num.push(c);
+            chars.next();
+            continue;
+        }
+        let mut unit = String::new();
+        while let Some(&u) = chars.peek() {
+            if u.is_ascii_alphabetic() || u == 'µ' {
+                unit.push(u);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        if num.is_empty() || unit.is_empty() {
+            return Err(format!("invalid duration: {s}"));
+        }
+        let value: f64 = num
+            .parse()
+            .map_err(|_| format!("invalid duration number in: {s}"))?;
+        let unit_secs = match unit.as_str() {
+            "ns" => 1e-9,
+            "us" | "µs" => 1e-6,
+            "ms" => 1e-3,
+            "s" => 1.0,
+            "m" => 60.0,
+            "h" => 3600.0,
+            "d" => 86400.0,
+            other => return Err(format!("unknown duration unit '{other}' in: {s}")),
+        };
+        total_secs += value * unit_secs;
+        num.clear();
+        saw_unit = true;
+    }
+    if !num.is_empty() {
+        return Err(format!("duration missing unit in: {s}"));
+    }
+    if !saw_unit {
+        return Err(format!("invalid duration: {s}"));
+    }
+    Ok(total_secs.round() as u64)
+}
+
 /// Parse a memory string like "512m", "2g" into megabytes.
 pub fn parse_memory(s: &str) -> Result<u32, String> {
     let s = s.trim().to_lowercase();
@@ -141,6 +210,39 @@ pub fn parse_memory(s: &str) -> Result<u32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- parse_duration_secs tests ---
+
+    #[test]
+    fn test_parse_duration_bare_integer_is_seconds() {
+        assert_eq!(parse_duration_secs("30").unwrap(), 30);
+        assert_eq!(parse_duration_secs("0").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_parse_duration_units() {
+        assert_eq!(parse_duration_secs("30s").unwrap(), 30);
+        assert_eq!(parse_duration_secs("1m").unwrap(), 60);
+        assert_eq!(parse_duration_secs("2h").unwrap(), 7200);
+        assert_eq!(parse_duration_secs("500ms").unwrap(), 1); // rounds to nearest second
+        assert_eq!(parse_duration_secs("400ms").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_parse_duration_compound() {
+        assert_eq!(parse_duration_secs("1m30s").unwrap(), 90);
+        assert_eq!(parse_duration_secs("2h45m").unwrap(), 2 * 3600 + 45 * 60);
+        assert_eq!(parse_duration_secs("1.5h").unwrap(), 5400);
+    }
+
+    #[test]
+    fn test_parse_duration_rejects_garbage() {
+        assert!(parse_duration_secs("").is_err());
+        assert!(parse_duration_secs("abc").is_err());
+        assert!(parse_duration_secs("10x").is_err());
+        assert!(parse_duration_secs("-5s").is_err());
+        assert!(parse_duration_secs("30 s").is_err());
+    }
 
     // --- format_bytes tests ---
 

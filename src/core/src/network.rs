@@ -81,6 +81,11 @@ pub struct NetworkEndpoint {
     /// Box name (for DNS resolution).
     pub box_name: String,
 
+    /// Additional DNS names that also resolve to this endpoint's IP (e.g. the
+    /// bare Compose service name alongside the `{project}-{service}` box name).
+    #[serde(default)]
+    pub aliases: Vec<String>,
+
     /// Assigned IPv4 address.
     pub ip_address: Ipv4Addr,
 
@@ -432,6 +437,17 @@ impl NetworkConfig {
 
     /// Allocate an IP and register a new endpoint for a box.
     pub fn connect(&mut self, box_id: &str, box_name: &str) -> Result<NetworkEndpoint, String> {
+        self.connect_with_aliases(box_id, box_name, &[])
+    }
+
+    /// Connect a box, also registering extra DNS aliases that resolve to its IP
+    /// (e.g. the bare Compose service name in addition to the box name).
+    pub fn connect_with_aliases(
+        &mut self,
+        box_id: &str,
+        box_name: &str,
+        aliases: &[String],
+    ) -> Result<NetworkEndpoint, String> {
         if self.endpoints.contains_key(box_id) {
             return Err(format!(
                 "box '{}' is already connected to network '{}'",
@@ -447,6 +463,11 @@ impl NetworkConfig {
         let endpoint = NetworkEndpoint {
             box_id: box_id.to_string(),
             box_name: box_name.to_string(),
+            aliases: aliases
+                .iter()
+                .filter(|a| !a.is_empty() && *a != box_name)
+                .cloned()
+                .collect(),
             ip_address: ip,
             mac_address: mac,
         };
@@ -487,7 +508,13 @@ impl NetworkConfig {
         self.endpoints
             .values()
             .filter(|ep| ep.box_id != exclude_box_id)
-            .map(|ep| (ep.ip_address.to_string(), ep.box_name.clone()))
+            .flat_map(|ep| {
+                let ip = ep.ip_address.to_string();
+                // The box name plus any aliases (e.g. the bare service name) all
+                // resolve to this peer's IP.
+                std::iter::once((ip.clone(), ep.box_name.clone()))
+                    .chain(ep.aliases.iter().map(move |a| (ip.clone(), a.clone())))
+            })
             .collect()
     }
 
@@ -784,6 +811,35 @@ mod tests {
     }
 
     #[test]
+    fn test_connect_with_aliases_resolvable_as_peer() {
+        let mut net = NetworkConfig::new("mynet", "10.88.0.0/24").unwrap();
+        // Compose-style: box name is "proj-db", bare service name "db" is an alias.
+        let ep = net
+            .connect_with_aliases("box-db", "proj-db", &["db".to_string()])
+            .unwrap();
+        assert_eq!(ep.aliases, vec!["db".to_string()]);
+        net.connect("box-web", "proj-web").unwrap();
+
+        let peers = net.peer_endpoints("box-web");
+        let db_ip = ep.ip_address.to_string();
+        // Both the box name AND the bare alias resolve to db's IP.
+        assert!(peers
+            .iter()
+            .any(|(ip, name)| ip == &db_ip && name == "proj-db"));
+        assert!(peers.iter().any(|(ip, name)| ip == &db_ip && name == "db"));
+    }
+
+    #[test]
+    fn test_connect_alias_skips_empty_and_self_duplicate() {
+        let mut net = NetworkConfig::new("mynet", "10.88.0.0/24").unwrap();
+        // An alias equal to the box name or empty is dropped.
+        let ep = net
+            .connect_with_aliases("b", "web", &["".to_string(), "web".to_string()])
+            .unwrap();
+        assert!(ep.aliases.is_empty());
+    }
+
+    #[test]
     fn test_peer_endpoints_empty_when_alone() {
         let mut net = NetworkConfig::new("mynet", "10.88.0.0/24").unwrap();
         net.connect("box-1", "web").unwrap();
@@ -821,6 +877,7 @@ mod tests {
         let ep = NetworkEndpoint {
             box_id: "abc123".to_string(),
             box_name: "web".to_string(),
+            aliases: vec!["app".to_string()],
             ip_address: Ipv4Addr::new(10, 88, 0, 2),
             mac_address: "02:42:0a:58:00:02".to_string(),
         };
@@ -828,6 +885,11 @@ mod tests {
         let json = serde_json::to_string(&ep).unwrap();
         let parsed: NetworkEndpoint = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, ep);
+
+        // Backward compat: older stored endpoints without `aliases` deserialize.
+        let legacy = r#"{"box_id":"x","box_name":"web","ip_address":"10.88.0.3","mac_address":"02:42:0a:58:00:03"}"#;
+        let parsed_legacy: NetworkEndpoint = serde_json::from_str(legacy).unwrap();
+        assert!(parsed_legacy.aliases.is_empty());
     }
 
     // --- NetworkPolicy tests ---

@@ -337,7 +337,7 @@ impl CoreSmoke {
                     &mut slave,
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
-                    &winsize,
+                    &winsize as *const _ as *mut _,
                 )
             };
             if rc != 0 {
