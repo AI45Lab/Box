@@ -47,9 +47,20 @@ fn parse_registry_mirrors() -> std::collections::HashMap<String, String> {
 impl ImagePuller {
     /// Create a new image puller.
     pub fn new(store: Arc<ImageStore>, auth: RegistryAuth) -> Self {
+        Self::with_platform(store, auth, None)
+    }
+
+    /// Create an image puller that resolves multi-arch images to an explicit
+    /// platform (e.g. "linux/arm64") instead of the host architecture. `None`
+    /// keeps the host-architecture default.
+    pub fn with_platform(
+        store: Arc<ImageStore>,
+        auth: RegistryAuth,
+        platform: Option<String>,
+    ) -> Self {
         Self {
             store,
-            puller: RegistryPuller::with_auth(auth),
+            puller: RegistryPuller::with_auth_and_platform(auth, platform),
             metrics: None,
             mirrors: parse_registry_mirrors(),
         }
