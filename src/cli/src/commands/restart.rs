@@ -64,7 +64,13 @@ async fn restart_one(
         let effective_timeout = record.stop_timeout.unwrap_or(timeout);
         lifecycle::resume_paused_for_termination(record, pid, "restart")
             .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
-        process::graceful_stop(pid, stop_signal, effective_timeout).await;
+        // Deliver the stop signal inside the guest so the container honours its
+        // STOPSIGNAL and runs its own shutdown (then the VM halts cleanly), as
+        // `stop` does. Signalling the host shim never reaches the container and
+        // kills the VM abruptly; graceful_stop_via_guest falls back to that only
+        // when no guest exec server is reachable.
+        process::graceful_stop_via_guest(pid, &exec_socket_path, stop_signal, effective_timeout)
+            .await;
 
         // Update state to stopped
         let record = resolve::resolve_mut(state, &box_id)?;
