@@ -50,12 +50,13 @@ impl ResourceUpdate {
 
     /// Build shell commands to apply Tier 2 cgroup changes inside the guest.
     ///
-    /// Returns a list of shell commands that write to cgroup v2 control files.
-    /// The guest init process runs as PID 1 in the root cgroup, so we write
-    /// to `/sys/fs/cgroup/` (the root cgroup or the box's cgroup slice).
+    /// Returns one `sh` command per cgroup v2 control file. The resize exec runs
+    /// in the guest ROOT cgroup, so each command resolves the per-container
+    /// cgroup slice (`box-<pid>-<seq>`, joined by the container at spawn) at
+    /// runtime and writes there — a bare `/sys/fs/cgroup/<file>` write would hit
+    /// the root cgroup and silently leave the container's limits unchanged.
     pub fn build_cgroup_commands(&self) -> Vec<String> {
         let mut cmds = Vec::new();
-        let cg = "/sys/fs/cgroup";
 
         // cpu.max: "$QUOTA $PERIOD" (or "max $PERIOD" for unlimited)
         if self.limits.cpu_quota.is_some() || self.limits.cpu_period.is_some() {
@@ -71,7 +72,7 @@ impl ResourceUpdate {
                 })
                 .unwrap_or_else(|| "max".to_string());
             let period = self.limits.cpu_period.unwrap_or(100_000);
-            cmds.push(format!("echo '{quota} {period}' > {cg}/cpu.max"));
+            cmds.push(cgroup_write_cmd("cpu.max", &format!("{quota} {period}")));
         }
 
         // cpu.weight: 1-10000 (maps from Docker's cpu-shares 2-262144)
@@ -83,12 +84,12 @@ impl ResourceUpdate {
             } else {
                 1 + ((shares.saturating_sub(2)) * 9999 / 262142).min(10000)
             };
-            cmds.push(format!("echo '{weight}' > {cg}/cpu.weight"));
+            cmds.push(cgroup_write_cmd("cpu.weight", &weight.to_string()));
         }
 
         // memory.low (soft limit / reservation)
         if let Some(reservation) = self.limits.memory_reservation {
-            cmds.push(format!("echo '{reservation}' > {cg}/memory.low"));
+            cmds.push(cgroup_write_cmd("memory.low", &reservation.to_string()));
         }
 
         // memory.swap.max
@@ -98,21 +99,35 @@ impl ResourceUpdate {
             } else {
                 swap.to_string()
             };
-            cmds.push(format!("echo '{val}' > {cg}/memory.swap.max"));
+            cmds.push(cgroup_write_cmd("memory.swap.max", &val));
         }
 
         // pids.max
         if let Some(pids) = self.limits.pids_limit {
-            cmds.push(format!("echo '{pids}' > {cg}/pids.max"));
+            cmds.push(cgroup_write_cmd("pids.max", &pids.to_string()));
         }
 
         // cpuset.cpus
         if let Some(ref cpuset) = self.limits.cpuset_cpus {
-            cmds.push(format!("echo '{cpuset}' > {cg}/cpuset.cpus"));
+            cmds.push(cgroup_write_cmd("cpuset.cpus", cpuset));
         }
 
         cmds
     }
+}
+
+/// Build a `sh` command that writes `value` to cgroup v2 control file `file` in
+/// the container's per-container cgroup slice.
+///
+/// The resize exec runs in the guest root cgroup and this exec channel carries
+/// no container id, so the command resolves the slice at runtime: when there is
+/// exactly one `box-*` slice (every CLI box and single-container pod) it writes
+/// there; otherwise it falls back to the root cgroup — a harmless no-op — rather
+/// than mis-targeting a sibling container in a multi-container pod.
+fn cgroup_write_cmd(file: &str, value: &str) -> String {
+    format!(
+        "d=\"\"; n=0; for x in /sys/fs/cgroup/box-*/; do [ -d \"$x\" ] && {{ d=\"$x\"; n=$((n+1)); }}; done; [ \"$n\" = 1 ] || d=\"/sys/fs/cgroup/\"; echo '{value}' > \"${{d}}{file}\""
+    )
 }
 
 /// Validate a resource update request.
@@ -330,6 +345,23 @@ mod tests {
         };
         let cmds = update.build_cgroup_commands();
         assert_eq!(cmds.len(), 3);
+    }
+
+    #[test]
+    fn test_cgroup_commands_target_per_container_slice() {
+        let update = ResourceUpdate {
+            limits: ResourceLimits {
+                pids_limit: Some(50),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let cmds = update.build_cgroup_commands();
+        assert_eq!(cmds.len(), 1);
+        // Must resolve the per-container `box-*` slice, not write a bare root path.
+        assert!(cmds[0].contains("/sys/fs/cgroup/box-*"), "got {}", cmds[0]);
+        assert!(cmds[0].contains("pids.max"));
+        assert!(cmds[0].contains("'50'"));
     }
 
     #[test]
