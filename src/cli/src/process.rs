@@ -209,6 +209,26 @@ pub async fn graceful_stop_via_guest(
     graceful_stop(pid, signal, timeout).await
 }
 
+/// Deliver `signal` to the container's main process inside the guest over the
+/// exec socket, without waiting for exit or tearing down the VM — the `kill`
+/// primitive (e.g. `kill -USR1`). Returns true if delivered.
+///
+/// Signalling the shim host-side never reaches the container: libkrun renames
+/// the shim and a host signal kills the VM abruptly. The caller falls back to a
+/// host signal only when no guest exec server is reachable (older box).
+#[cfg(unix)]
+pub async fn deliver_signal_via_guest(exec_socket: &std::path::Path, signal: i32) -> bool {
+    match a3s_box_runtime::ExecClient::connect(exec_socket).await {
+        Ok(client) => client.signal_main(signal).await.unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+#[cfg(windows)]
+pub async fn deliver_signal_via_guest(_exec_socket: &std::path::Path, _signal: i32) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

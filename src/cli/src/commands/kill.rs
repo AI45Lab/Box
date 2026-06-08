@@ -78,7 +78,7 @@ pub async fn execute(args: KillArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut errors: Vec<String> = Vec::new();
 
     for query in &args.boxes {
-        if let Err(e) = kill_one(&mut state, query, signal) {
+        if let Err(e) = kill_one(&mut state, query, signal).await {
             errors.push(format!("{query}: {e}"));
         }
     }
@@ -90,7 +90,7 @@ pub async fn execute(args: KillArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn kill_one(
+async fn kill_one(
     state: &mut StateFile,
     query: &str,
     signal: i32,
@@ -112,12 +112,19 @@ fn kill_one(
 
     #[cfg(unix)]
     {
-        process::send_signal(pid, signal).map_err(|err| {
-            format!(
-                "Failed to send signal {signal} to box {} (PID {pid}): {err}",
-                record.name
-            )
-        })?;
+        // Deliver the signal to the container's main process inside the guest;
+        // signalling the host shim never reaches the container and would kill the
+        // VM abruptly. Fall back to a host signal only when no guest exec server
+        // is reachable (older box / socket gone).
+        let exec_socket = crate::socket_paths::exec(&record);
+        if !process::deliver_signal_via_guest(&exec_socket, signal).await {
+            process::send_signal(pid, signal).map_err(|err| {
+                format!(
+                    "Failed to send signal {signal} to box {} (PID {pid}): {err}",
+                    record.name
+                )
+            })?;
+        }
     }
     #[cfg(windows)]
     {
