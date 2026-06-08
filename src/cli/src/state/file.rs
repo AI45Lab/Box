@@ -182,6 +182,21 @@ impl StateFile {
 
             let has_live_pid = record.pid.is_some_and(is_process_alive);
             if !has_live_pid {
+                // guest-init writes the container exit code into the overlay
+                // rootfs (`/.a3s_exit_code`) on exit; it surfaces on the host at
+                // <box_dir>/upper/.a3s_exit_code. Capture it here so a detached
+                // box's `wait`/`inspect` report the real code — libkrun's
+                // start_enter takeover means we can't waitpid the VM, so liveness
+                // polling alone would otherwise always yield exit 0.
+                if record.exit_code.is_none() {
+                    if let Ok(contents) = std::fs::read_to_string(
+                        record.box_dir.join("upper").join(".a3s_exit_code"),
+                    ) {
+                        if let Ok(code) = contents.trim().parse::<i32>() {
+                            record.exit_code = Some(code);
+                        }
+                    }
+                }
                 record.status = "dead".to_string();
                 record.pid = None;
                 record.health_status = "none".to_string();

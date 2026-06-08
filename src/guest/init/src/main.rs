@@ -994,10 +994,12 @@ fn wait_for_children(container_pid: nix::unistd::Pid) -> Result<(), Box<dyn std:
         match waitpid(container_pid, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::Exited(pid, status)) => {
                 info!("Container process {} exited with status {}", pid, status);
+                persist_exit_code(status);
                 process::exit(status);
             }
             Ok(WaitStatus::Signaled(pid, signal, _)) => {
                 error!("Container process {} killed by signal {:?}", pid, signal);
+                persist_exit_code(128 + signal as i32);
                 process::exit(128 + signal as i32);
             }
             Ok(WaitStatus::StillAlive) => {
@@ -1017,6 +1019,20 @@ fn wait_for_children(container_pid: nix::unistd::Pid) -> Result<(), Box<dyn std:
     }
 
     Ok(())
+}
+
+/// Persist the container's exit code to the overlay rootfs so the host can read
+/// it after the VM halts. libkrun's `start_enter` takes over and `exit()`s the
+/// shim process, so the host cannot `waitpid` the VM for a detached `run -d`; the
+/// CLI state reconcile instead reads `<box_dir>/upper/.a3s_exit_code`, which is
+/// this file surfaced through the overlay upperdir. Best-effort, with `sync_all`
+/// so the write reaches the host before PID 1 exits and the VM halts.
+fn persist_exit_code(code: i32) {
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::File::create("/.a3s_exit_code") {
+        let _ = write!(file, "{code}");
+        let _ = file.sync_all();
+    }
 }
 
 /// Perform graceful shutdown: forward SIGTERM to children, wait, then force-kill.

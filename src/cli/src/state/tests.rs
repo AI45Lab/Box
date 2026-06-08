@@ -426,6 +426,37 @@ fn test_reconcile_marks_dead_pid() {
 }
 
 #[test]
+fn test_reconcile_reads_exit_code_from_upper() {
+    let tmp = TempDir::new().unwrap();
+    let path = test_state_path(&tmp);
+
+    // guest-init persists the container exit code into the overlay upperdir
+    // (<box_dir>/upper/.a3s_exit_code) since libkrun's start_enter takeover
+    // prevents the host from waitpid-ing a detached VM.
+    let box_dir = tmp.path().join("boxes").join("exitcode-id");
+    std::fs::create_dir_all(box_dir.join("upper")).unwrap();
+    std::fs::write(box_dir.join("upper").join(".a3s_exit_code"), "42").unwrap();
+
+    {
+        let mut sf = StateFile::load(&path).unwrap();
+        let mut record = sample_record("exitcode-id", "exitcode_box", "created");
+        record.status = "running".to_string();
+        record.pid = Some(4294967); // dead pid -> reconcile marks it dead
+        record.box_dir = box_dir.clone();
+        sf.records.push(record);
+        sf.save().unwrap();
+    }
+
+    // Reconcile on reload marks it dead AND captures the persisted exit code.
+    {
+        let sf = StateFile::load(&path).unwrap();
+        let record = sf.find_by_id("exitcode-id").unwrap();
+        assert_eq!(record.status, "dead");
+        assert_eq!(record.exit_code, Some(42));
+    }
+}
+
+#[test]
 fn test_reconcile_running_without_pid() {
     let tmp = TempDir::new().unwrap();
     let path = test_state_path(&tmp);
