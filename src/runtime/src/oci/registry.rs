@@ -245,6 +245,29 @@ impl RegistryPuller {
         }
     }
 
+    /// Like [`with_auth`](Self::with_auth) but resolves multi-arch image indexes
+    /// to an explicit `--platform` (e.g. "linux/arm64") instead of the host
+    /// architecture. `None` keeps the host-architecture default.
+    pub fn with_auth_and_platform(auth: RegistryAuth, platform: Option<String>) -> Self {
+        let Some(platform) = platform else {
+            return Self::with_auth(auth);
+        };
+        let arch = resolve_target_arch(Some(&platform));
+        let config = ClientConfig {
+            protocol: registry_protocol_from_env(),
+            platform_resolver: Some(Box::new(platform_resolver_for(arch))),
+            ..Default::default()
+        };
+        let client = Client::new(config);
+
+        Self {
+            client,
+            auth,
+            signature_policy: SignaturePolicy::default(),
+            progress_fn: None,
+        }
+    }
+
     /// Set the signature verification policy.
     pub fn with_signature_policy(mut self, policy: SignaturePolicy) -> Self {
         self.signature_policy = policy;
@@ -619,22 +642,47 @@ impl RegistryPusher {
 ///
 /// Container images run inside a Linux microVM regardless of the host OS,
 /// so we always look for `os: "linux"` with the host's CPU architecture.
-fn linux_platform_resolver(manifests: &[ImageIndexEntry]) -> Option<String> {
-    let arch = match std::env::consts::ARCH {
-        "x86_64" => "amd64",
-        "aarch64" => "arm64",
-        other => other,
+/// Resolve the target architecture (OCI/Docker naming) from an optional
+/// `--platform` string ("linux/amd64", "linux/arm64/v8", or a bare "arm64"),
+/// defaulting to the host architecture.
+fn resolve_target_arch(platform: Option<&str>) -> String {
+    let raw = match platform {
+        // Docker/OCI platform is os/arch[/variant]; accept a bare arch too.
+        Some(p) => p
+            .split('/')
+            .nth(1)
+            .or_else(|| p.split('/').next())
+            .unwrap_or(p)
+            .to_string(),
+        None => std::env::consts::ARCH.to_string(),
     };
+    match raw.as_str() {
+        "x86_64" => "amd64".to_string(),
+        "aarch64" => "arm64".to_string(),
+        other => other.to_string(),
+    }
+}
 
-    manifests
-        .iter()
-        .find(|entry| {
-            entry
-                .platform
-                .as_ref()
-                .is_some_and(|p| p.os == "linux" && p.architecture == arch)
-        })
-        .map(|entry| entry.digest.clone())
+/// Build a resolver selecting the `linux` manifest for `arch` from a multi-arch
+/// image index. Container images run inside a Linux microVM, so the os is
+/// always "linux".
+fn platform_resolver_for(arch: String) -> impl Fn(&[ImageIndexEntry]) -> Option<String> {
+    move |manifests: &[ImageIndexEntry]| {
+        manifests
+            .iter()
+            .find(|entry| {
+                entry
+                    .platform
+                    .as_ref()
+                    .is_some_and(|p| p.os == "linux" && p.architecture == arch)
+            })
+            .map(|entry| entry.digest.clone())
+    }
+}
+
+/// Platform resolver selecting the linux manifest matching the host architecture.
+fn linux_platform_resolver(manifests: &[ImageIndexEntry]) -> Option<String> {
+    platform_resolver_for(resolve_target_arch(None))(manifests)
 }
 
 #[cfg(test)]
@@ -652,6 +700,19 @@ mod tests {
         let auth = RegistryAuth::anonymous();
         assert!(auth.username.is_none());
         assert!(auth.password.is_none());
+    }
+
+    #[test]
+    fn test_resolve_target_arch() {
+        // os/arch[/variant] and bare arch, normalized to OCI/Docker names.
+        assert_eq!(resolve_target_arch(Some("linux/arm64")), "arm64");
+        assert_eq!(resolve_target_arch(Some("linux/amd64")), "amd64");
+        assert_eq!(resolve_target_arch(Some("linux/arm64/v8")), "arm64");
+        assert_eq!(resolve_target_arch(Some("arm64")), "arm64");
+        assert_eq!(resolve_target_arch(Some("linux/x86_64")), "amd64");
+        assert_eq!(resolve_target_arch(Some("aarch64")), "arm64");
+        // No platform -> host arch (non-empty, normalized for common hosts).
+        assert!(!resolve_target_arch(None).is_empty());
     }
 
     #[tokio::test]
