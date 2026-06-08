@@ -7,7 +7,8 @@ use a3s_box_core::error::{BoxError, Result};
 use super::super::dockerfile::Instruction;
 use super::super::dockerignore::DockerIgnore;
 use super::super::layer::{
-    create_layer, create_layer_from_dir_with_chown, create_layer_with_chown, LayerInfo,
+    create_layer_from_dir_with_chown, create_layer_with_chown, create_layer_with_deletions,
+    LayerInfo,
 };
 use super::utils::{
     copy_dir_filtered, expand_args, extract_tar_to_dst, is_tar_archive, resolve_chown, resolve_path,
@@ -219,7 +220,7 @@ pub(super) fn handle_copy(
                 .strip_prefix(rootfs_dir)
                 .unwrap_or(target_prefix),
         )];
-        create_layer_with_chown(rootfs_dir, &changed, &layer_path, chown_ids)
+        create_layer_with_chown(rootfs_dir, &changed, &[], &layer_path, chown_ids)
     } else {
         Err(BoxError::BuildError("Invalid COPY destination".to_string()))
     }
@@ -323,13 +324,15 @@ pub(super) fn handle_run(
         // Capture diff
         let after = DirSnapshot::capture(rootfs_dir)?;
         let changed = before.diff(&after);
+        let deleted = before.deletions(&after);
 
-        if changed.is_empty() {
+        if changed.is_empty() && deleted.is_empty() {
             return Ok(None);
         }
 
         let layer_path = layers_dir.join(format!("layer_{}.tar.gz", layer_index));
-        let layer_info = create_layer(rootfs_dir, &changed, &layer_path)?;
+        let layer_info =
+            create_layer_with_deletions(rootfs_dir, &changed, &deleted, &layer_path)?;
         Ok(Some(layer_info))
     }
 
@@ -506,20 +509,25 @@ fn handle_run_on_host_unsafe(
     // Capture filesystem state after execution
     let after = DirSnapshot::capture(rootfs_dir)?;
     let changed = before.diff(&after);
+    let deleted = before.deletions(&after);
 
-    if changed.is_empty() {
+    if changed.is_empty() && deleted.is_empty() {
         if !quiet {
             println!("→ No filesystem changes detected");
         }
         return Ok(None);
     }
 
-    // Create layer from changes
+    // Create layer from changes (and OCI whiteouts for deletions)
     let layer_path = layers_dir.join(format!("layer_{}.tar.gz", layer_index));
-    let layer_info = create_layer(rootfs_dir, &changed, &layer_path)?;
+    let layer_info = create_layer_with_deletions(rootfs_dir, &changed, &deleted, &layer_path)?;
 
     if !quiet {
-        println!("→ Created layer with {} changes", changed.len());
+        println!(
+            "→ Created layer with {} changes, {} deletions",
+            changed.len(),
+            deleted.len()
+        );
     }
 
     Ok(Some(layer_info))
@@ -657,7 +665,7 @@ pub(super) fn handle_add(
                 .strip_prefix(rootfs_dir)
                 .unwrap_or(target_prefix),
         )];
-        create_layer_with_chown(rootfs_dir, &changed, &layer_path, chown_ids)
+        create_layer_with_chown(rootfs_dir, &changed, &[], &layer_path, chown_ids)
     } else {
         Err(BoxError::BuildError("Invalid ADD destination".to_string()))
     }

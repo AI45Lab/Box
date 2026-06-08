@@ -71,6 +71,36 @@ impl DirSnapshot {
         changed.sort();
         changed
     }
+
+    /// Paths present in `self` (before) but absent in `after` (deleted),
+    /// reduced to top-level deletions: a deleted entry whose parent directory
+    /// still exists in `after` (or is the root). Whiteout-ing a deleted
+    /// directory implicitly removes its children, so emitting child whiteouts
+    /// too would be redundant and could confuse extraction order.
+    pub fn deletions(&self, after: &DirSnapshot) -> Vec<PathBuf> {
+        let mut deleted = Vec::new();
+
+        for path in self.entries.keys() {
+            if after.entries.contains_key(path) {
+                continue; // still present
+            }
+            // Only emit when the parent still exists in `after` (so the parent
+            // dir wasn't itself deleted, which would already whiteout this).
+            let parent_present = match path.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => {
+                    after.entries.contains_key(parent)
+                }
+                _ => true, // root-level entry
+            };
+            if parent_present {
+                deleted.push(path.clone());
+            }
+        }
+
+        // Sort for deterministic output
+        deleted.sort();
+        deleted
+    }
 }
 
 /// Recursively walk a directory and collect file entries.
@@ -154,13 +184,27 @@ pub fn create_layer(
     changed_files: &[PathBuf],
     output_path: &Path,
 ) -> Result<LayerInfo> {
-    create_layer_with_chown(rootfs, changed_files, output_path, None)
+    create_layer_with_chown(rootfs, changed_files, &[], output_path, None)
 }
 
-/// Internal: `create_layer` with optional uid/gid override for tar headers.
+/// `create_layer`, additionally writing OCI whiteout markers for `deleted_files`
+/// so files removed by a `RUN` are deleted from lower layers instead of silently
+/// persisting in the built image (which also keeps the image from ever shrinking).
+pub fn create_layer_with_deletions(
+    rootfs: &Path,
+    changed_files: &[PathBuf],
+    deleted_files: &[PathBuf],
+    output_path: &Path,
+) -> Result<LayerInfo> {
+    create_layer_with_chown(rootfs, changed_files, deleted_files, output_path, None)
+}
+
+/// Internal: `create_layer` with optional uid/gid override for tar headers and
+/// OCI whiteout markers (`.wh.<name>`) for `deleted_files`.
 pub(super) fn create_layer_with_chown(
     rootfs: &Path,
     changed_files: &[PathBuf],
+    deleted_files: &[PathBuf],
     output_path: &Path,
     chown: Option<(u32, u32)>,
 ) -> Result<LayerInfo> {
@@ -194,6 +238,41 @@ pub(super) fn create_layer_with_chown(
         } else {
             append_file_with_chown(&mut builder, relative_path, &full_path, &meta, chown)?;
         }
+    }
+
+    // OCI whiteouts for deleted paths: an empty `.wh.<name>` marker beside the
+    // removed entry tells the layer extractor (and any OCI runtime) to delete it
+    // from the lower layers. Without these, a file removed by a `RUN rm` would
+    // silently persist in the built image.
+    for deleted in deleted_files {
+        let Some(file_name) = deleted.file_name() else {
+            continue;
+        };
+        let wh_name = format!(".wh.{}", file_name.to_string_lossy());
+        let wh_path = match deleted.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.join(&wh_name),
+            _ => PathBuf::from(&wh_name),
+        };
+
+        let mut header = tar::Header::new_gnu();
+        header.set_size(0);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_mode(0o644);
+        header.set_mtime(0);
+        if let Some((uid, gid)) = chown {
+            header.set_uid(uid as u64);
+            header.set_gid(gid as u64);
+        }
+        header.set_cksum();
+        builder
+            .append_data(&mut header, &wh_path, std::io::empty())
+            .map_err(|e| {
+                BoxError::BuildError(format!(
+                    "Failed to append whiteout {}: {}",
+                    wh_path.display(),
+                    e
+                ))
+            })?;
     }
 
     // Finish the tar archive AND the gzip stream so every byte is flushed to
@@ -478,6 +557,67 @@ mod tests {
 
         let diff = before.diff(&after);
         assert_eq!(diff, vec![PathBuf::from("b.txt")]);
+    }
+
+    #[test]
+    fn test_snapshot_deletions_top_level_file() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("keep.txt"), "k").unwrap();
+        fs::write(tmp.path().join("gone.txt"), "g").unwrap();
+        let before = DirSnapshot::capture(tmp.path()).unwrap();
+
+        fs::remove_file(tmp.path().join("gone.txt")).unwrap();
+        let after = DirSnapshot::capture(tmp.path()).unwrap();
+
+        assert_eq!(before.deletions(&after), vec![PathBuf::from("gone.txt")]);
+    }
+
+    #[test]
+    fn test_snapshot_deletions_collapses_deleted_dir_to_top_level() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("d")).unwrap();
+        fs::write(tmp.path().join("d").join("a.txt"), "a").unwrap();
+        fs::write(tmp.path().join("d").join("b.txt"), "b").unwrap();
+        let before = DirSnapshot::capture(tmp.path()).unwrap();
+
+        fs::remove_dir_all(tmp.path().join("d")).unwrap();
+        let after = DirSnapshot::capture(tmp.path()).unwrap();
+
+        // Only the directory itself, not its children: whiteout-ing the dir
+        // implicitly removes them.
+        assert_eq!(before.deletions(&after), vec![PathBuf::from("d")]);
+    }
+
+    #[test]
+    fn test_create_layer_emits_whiteout_for_deletions() {
+        use flate2::read::GzDecoder;
+
+        let rootfs = TempDir::new().unwrap();
+        let out = TempDir::new().unwrap();
+        fs::write(rootfs.path().join("kept.txt"), "kept").unwrap();
+        let layer_path = out.path().join("layer.tar.gz");
+
+        create_layer_with_deletions(
+            rootfs.path(),
+            &[PathBuf::from("kept.txt")],
+            &[PathBuf::from("usr/share/doc/removed.txt")],
+            &layer_path,
+        )
+        .unwrap();
+
+        let tar_gz = fs::File::open(&layer_path).unwrap();
+        let mut archive = tar::Archive::new(GzDecoder::new(tar_gz));
+        let names: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+            .collect();
+
+        assert!(
+            names.iter().any(|n| n == "usr/share/doc/.wh.removed.txt"),
+            "expected an OCI whiteout marker, got: {names:?}"
+        );
+        assert!(names.iter().any(|n| n == "kept.txt"));
     }
 
     #[test]
