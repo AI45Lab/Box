@@ -41,7 +41,17 @@ impl VmManager {
         &mut self,
         exec_socket_path: &std::path::Path,
     ) -> Result<()> {
-        const MAX_WAIT_MS: u64 = 10000;
+        // The guest binds the exec server only late in boot (after virtio-fs
+        // pivot, passt network bring-up, and the container spawn — guest-init
+        // cannot start it earlier without forking the container while
+        // multi-threaded, which is unsafe). A cold first run on a slow/loaded
+        // host can push that past the old 10s budget, which surfaced as a false
+        // "heartbeat failed" warning and, for `run -it`, a PTY connect that gave
+        // up before the server came up (issue #3). Wait longer — this is cheap
+        // for healthy boxes (they return as soon as the heartbeat passes) and the
+        // loop already bails out the moment the VM exits, so a fast-exiting
+        // container never stalls for the full budget.
+        const MAX_WAIT_MS: u64 = 30000;
         const POLL_INTERVAL_MS: u64 = 200;
 
         tracing::debug!(
@@ -54,7 +64,10 @@ impl VmManager {
         // Phase 1: Wait for socket file to appear
         loop {
             if start.elapsed().as_millis() >= MAX_WAIT_MS as u128 {
-                tracing::warn!("Exec socket did not appear, exec will not be available");
+                tracing::warn!(
+                    timeout_ms = MAX_WAIT_MS,
+                    "Exec socket did not appear within timeout; exec/attach will connect on demand if the guest exposes it"
+                );
                 return Ok(());
             }
 
@@ -82,9 +95,9 @@ impl VmManager {
             // container shuts the VM down. The shim becomes a zombie the moment
             // the VM halts, so use has_exited (zombie-aware) rather than
             // is_running — without this, a container that exits before its first
-            // heartbeat stalls the whole boot for MAX_WAIT_MS (~10s), which hit
-            // every short-lived `run` that lost the heartbeat race and every
-            // monitor restart of a fast-exiting container.
+            // heartbeat stalls the whole boot for the full MAX_WAIT_MS budget,
+            // which hit every short-lived `run` that lost the heartbeat race and
+            // every monitor restart of a fast-exiting container.
             if let Some(ref handler) = *self.handler.read().await {
                 if handler.has_exited() {
                     tracing::debug!("VM exited before exec server became ready");
@@ -114,7 +127,10 @@ impl VmManager {
             tokio::time::sleep(tokio::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
         }
 
-        tracing::warn!("Exec socket appeared but heartbeat failed, exec will not be available");
+        tracing::warn!(
+            timeout_ms = MAX_WAIT_MS,
+            "Exec server did not pass a heartbeat within timeout; exec/attach connect on demand and may still succeed once the guest finishes starting"
+        );
         Ok(())
     }
 }

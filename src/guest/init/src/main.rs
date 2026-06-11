@@ -43,8 +43,11 @@ impl ExecConfig {
     /// - BOX_EXEC_ENV_*: container environment variables
     /// - BOX_EXEC_WORKDIR: working directory (defaults to "/")
     fn from_env() -> Self {
-        let executable =
-            std::env::var("BOX_EXEC_EXEC").unwrap_or_else(|_| "/sbin/init".to_string());
+        // The runtime always sets BOX_EXEC_EXEC when guest-init is PID 1
+        // (runtime/src/vm/spec.rs), so this default is only a defensive fallback.
+        // Use /bin/sh — universal across distros — never /sbin/init, which does
+        // not exist on Alpine and was the original cause of issue #3.
+        let executable = std::env::var("BOX_EXEC_EXEC").unwrap_or_else(|_| "/bin/sh".to_string());
 
         // Parse args from individual env vars (BOX_EXEC_ARGC + BOX_EXEC_ARG_0..N)
         let args: Vec<String> = match std::env::var("BOX_EXEC_ARGC")

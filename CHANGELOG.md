@@ -4,6 +4,31 @@ All notable changes to A3S Box will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **Slow-boot exec/PTY readiness race (`WARN Exec socket appeared but heartbeat
+  failed`, and `run -it` PTY `Connection refused`) — issue #3.** The guest binds
+  its exec (vsock 4089) and PTY (vsock 4090) servers only late in boot — after
+  the virtio-fs pivot, network bring-up, and the container spawn — and it cannot
+  start them earlier without forking the container while multi-threaded (which
+  would risk a deadlock in the forked child). On a cold first run on a slow or
+  loaded host that bind could land past the host's fixed **10 s** readiness
+  budget, producing a false "heartbeat failed" warning. The host now waits up to
+  **30 s** for the exec heartbeat in `wait_for_exec_ready`. This also fixes
+  `run -it`: boot blocks on that exec-readiness wait *before* attaching the PTY,
+  and the guest brings the exec and PTY servers up back-to-back, so once the exec
+  heartbeat passes the PTY server is already listening and the existing 10 s PTY
+  connect retry succeeds. The wait stays cheap for healthy boxes (it returns the
+  moment the heartbeat passes) and still bails out immediately when the VM exits,
+  so a fast-exiting container never stalls for the full budget. The two readiness
+  warnings were also corrected — exec/attach connect on demand, so a timed-out
+  probe no longer claims "exec will not be available". Note: this addresses the
+  *timing* race on an otherwise-healthy guest; a hard boot failure where the
+  guest never binds the server (e.g. `--network` bridge mode when guest eth0
+  setup fails) is a separate fault and will surface after the wait rather than be
+  masked.
+- Guest-init's defensive `BOX_EXEC_EXEC` default is now `/bin/sh` instead of the
+  non-existent-on-Alpine `/sbin/init`, matching the runtime's real fallback.
+
 ## [2.0.7] — 2026-06-06
 
 ### Added
