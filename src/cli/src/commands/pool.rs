@@ -1,18 +1,27 @@
-//! `a3s-box pool` — Warm VM pool management.
+//! `a3s-box pool` — Warm VM pool daemon + client.
 //!
-//! Pre-boots MicroVMs so that `run` can acquire an already-ready VM
-//! instead of waiting for the full boot sequence (~200ms → ~0ms).
+//! Pre-boots keepalive MicroVMs of one image so a command can run in an
+//! already-ready sandbox instead of paying a full cold boot. `pool start` is the
+//! daemon (pre-warms a pool and serves requests over a Unix socket); `pool run`
+//! is the client (runs a command in a fresh warm sandbox via the guest exec
+//! server, no cold boot). This is the low-risk keepalive+exec MVP from
+//! docs/cow-snapshot-fork-design.md — it removes cold boot from the hot path
+//! without touching guest-init's lifecycle.
 //!
 //! Subcommands:
-//!   pool start --size N --image IMAGE   Start the warm pool
-//!   pool stop                           Drain and stop the pool
-//!   pool status                         Show idle count, hit rate, stats
+//!   pool start --image IMAGE --size N [--socket P]   Daemon: pre-warm + serve
+//!   pool run [--socket P] -- CMD...                  Client: run CMD in a sandbox
+//!   pool stop / pool status                          Discoverability helpers
 
 use clap::{Parser, Subcommand};
+use serde::{Deserialize, Serialize};
 
 use a3s_box_core::config::{BoxConfig, PoolConfig};
 use a3s_box_core::event::EventEmitter;
 use a3s_box_runtime::pool::{PoolStats, WarmPool};
+
+/// Default Unix socket the `pool` daemon listens on.
+const DEFAULT_SOCKET: &str = "/tmp/a3s-box-pool.sock";
 
 /// Manage the warm VM pool.
 #[derive(Parser)]
@@ -24,8 +33,10 @@ pub struct PoolArgs {
 /// Pool subcommands.
 #[derive(Subcommand)]
 pub enum PoolAction {
-    /// Start the warm pool (pre-boot VMs in the background)
+    /// Start the warm pool daemon (pre-boot VMs + serve `pool run` over a socket)
     Start(PoolStartArgs),
+    /// Run a command in a fresh warm sandbox (client of `pool start`)
+    Run(PoolRunArgs),
     /// Drain and stop the warm pool
     Stop(PoolStopArgs),
     /// Show warm pool statistics
@@ -51,9 +62,25 @@ pub struct PoolStartArgs {
     #[arg(long, default_value = "300")]
     pub ttl: u64,
 
+    /// Unix socket to serve `pool run` requests on
+    #[arg(long, default_value = DEFAULT_SOCKET)]
+    pub socket: String,
+
     /// Output as JSON
     #[arg(long)]
     pub json: bool,
+}
+
+/// Arguments for `pool run`.
+#[derive(Parser)]
+pub struct PoolRunArgs {
+    /// Unix socket of the `pool start` daemon
+    #[arg(long, default_value = DEFAULT_SOCKET)]
+    pub socket: String,
+
+    /// Command and arguments to run in a fresh warm sandbox
+    #[arg(last = true, required = true)]
+    pub cmd: Vec<String>,
 }
 
 /// Arguments for `pool stop`.
@@ -72,13 +99,38 @@ pub struct PoolStatusArgs {
     pub json: bool,
 }
 
+/// Wire request/response for the `pool` Unix-socket protocol (length-prefixed JSON).
+#[derive(Serialize, Deserialize)]
+struct RunRequest {
+    cmd: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RunResponse {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    exit_code: i32,
+    error: Option<String>,
+}
+
 /// Execute a pool command.
 pub async fn execute(args: PoolArgs) -> Result<(), Box<dyn std::error::Error>> {
     match args.action {
         PoolAction::Start(a) => execute_start(a).await,
+        PoolAction::Run(a) => execute_run(a).await,
         PoolAction::Stop(a) => execute_stop(a).await,
         PoolAction::Status(a) => execute_status(a).await,
     }
+}
+
+/// Keepalive main process so a pooled VM stays up with its exec server available;
+/// the real `pool run` command runs via exec, not as this main.
+fn keepalive_cmd() -> Vec<String> {
+    vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        "trap 'exit 0' TERM INT; while :; do sleep 3600; done".to_string(),
+    ]
 }
 
 async fn execute_start(args: PoolStartArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -97,8 +149,11 @@ async fn execute_start(args: PoolStartArgs) -> Result<(), Box<dyn std::error::Er
         ..Default::default()
     };
 
+    // Keepalive entrypoint: the pooled VM stays alive with its exec server ready;
+    // `pool run` injects the real command via exec.
     let box_config = BoxConfig {
         image: args.image.clone(),
+        cmd: keepalive_cmd(),
         pool: pool_config.clone(),
         ..Default::default()
     };
@@ -107,7 +162,6 @@ async fn execute_start(args: PoolStartArgs) -> Result<(), Box<dyn std::error::Er
     let mut pool = WarmPool::start(pool_config, box_config, emitter).await?;
 
     let stats = pool.stats().await;
-
     if args.json {
         println!("{}", format_stats_json(&args.image, &stats));
     } else {
@@ -117,33 +171,182 @@ async fn execute_start(args: PoolStartArgs) -> Result<(), Box<dyn std::error::Er
         println!("  max:      {}", args.max);
         println!("  ttl:      {}s", args.ttl);
         println!("  idle:     {}", stats.idle_count);
+        println!("  socket:   {}", args.socket);
     }
 
-    // Keep pool alive until signal
-    tokio::signal::ctrl_c().await?;
+    serve(&pool, &args.socket, args.json).await?;
 
     if !args.json {
-        println!("\nDraining warm pool...");
+        println!("Draining warm pool...");
     }
     pool.drain().await?;
     if !args.json {
         println!("Done.");
     }
-
     Ok(())
+}
+
+/// Accept `pool run` connections until Ctrl-C. Requests are served sequentially
+/// (one sandbox at a time) — simple and correct for the MVP; concurrency can be
+/// added later once the lifecycle is proven.
+#[cfg(not(windows))]
+async fn serve(
+    pool: &WarmPool,
+    socket: &str,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use tokio::net::UnixListener;
+
+    let _ = std::fs::remove_file(socket);
+    let listener = UnixListener::bind(socket)?;
+    if !json {
+        println!("Listening on {} (Ctrl-C to drain and stop)", socket);
+    }
+
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (mut stream, _) = accepted?;
+                if let Err(e) = handle_conn(pool, &mut stream).await {
+                    tracing::warn!(error = %e, "pool connection failed");
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                let _ = std::fs::remove_file(socket);
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+async fn handle_conn(pool: &WarmPool, stream: &mut tokio::net::UnixStream) -> std::io::Result<()> {
+    // 60s exec cap — generous for a sandbox command.
+    const EXEC_TIMEOUT_NS: u64 = 60_000_000_000;
+
+    let req: RunRequest = serde_json::from_slice(&read_frame(stream).await?)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+    // Acquire a warm VM and run the command. Keep the VM so we can tear it down
+    // AFTER responding (a one-shot sandbox is discarded; the pool replenishes a
+    // fresh one) — the client's latency must not include VM teardown.
+    let mut used_vm = None;
+    let resp = match pool.acquire().await {
+        Ok(vm) => {
+            let resp = match vm.exec_command(req.cmd, EXEC_TIMEOUT_NS).await {
+                Ok(o) => RunResponse {
+                    stdout: o.stdout,
+                    stderr: o.stderr,
+                    exit_code: o.exit_code,
+                    error: None,
+                },
+                Err(e) => RunResponse {
+                    stdout: vec![],
+                    stderr: vec![],
+                    exit_code: -1,
+                    error: Some(e.to_string()),
+                },
+            };
+            used_vm = Some(vm);
+            resp
+        }
+        Err(e) => RunResponse {
+            stdout: vec![],
+            stderr: vec![],
+            exit_code: -1,
+            error: Some(format!("acquire failed: {e}")),
+        },
+    };
+
+    let bytes = serde_json::to_vec(&resp)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    write_frame(stream, &bytes).await?;
+
+    // Tear down the used sandbox in the background so neither the client nor the
+    // daemon's accept loop blocks on it.
+    if let Some(mut vm) = used_vm {
+        tokio::spawn(async move {
+            let _ = vm.destroy().await;
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+async fn execute_run(args: PoolRunArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+    use tokio::net::UnixStream;
+
+    let mut stream = UnixStream::connect(&args.socket).await.map_err(|e| {
+        format!(
+            "Failed to connect to pool daemon at {} ({}). Is `a3s-box pool start` running?",
+            args.socket, e
+        )
+    })?;
+
+    write_frame(
+        &mut stream,
+        &serde_json::to_vec(&RunRequest { cmd: args.cmd })?,
+    )
+    .await?;
+    let resp: RunResponse = serde_json::from_slice(&read_frame(&mut stream).await?)?;
+
+    if let Some(err) = resp.error {
+        eprintln!("pool error: {err}");
+        std::process::exit(1);
+    }
+    std::io::stdout().write_all(&resp.stdout)?;
+    std::io::stderr().write_all(&resp.stderr)?;
+    std::process::exit(resp.exit_code);
+}
+
+#[cfg(windows)]
+async fn serve(
+    _pool: &WarmPool,
+    _socket: &str,
+    _json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!(
+        "pool socket serving is not supported on Windows; pool stays pre-warmed until Ctrl-C."
+    );
+    tokio::signal::ctrl_c().await?;
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn execute_run(_args: PoolRunArgs) -> Result<(), Box<dyn std::error::Error>> {
+    Err("`pool run` is not supported on Windows".into())
+}
+
+/// Length-prefixed (u32 LE) framing for the Unix-socket protocol.
+#[cfg(not(windows))]
+async fn write_frame<W: tokio::io::AsyncWriteExt + Unpin>(
+    w: &mut W,
+    data: &[u8],
+) -> std::io::Result<()> {
+    w.write_all(&(data.len() as u32).to_le_bytes()).await?;
+    w.write_all(data).await?;
+    w.flush().await
+}
+
+#[cfg(not(windows))]
+async fn read_frame<R: tokio::io::AsyncReadExt + Unpin>(r: &mut R) -> std::io::Result<Vec<u8>> {
+    let mut len = [0u8; 4];
+    r.read_exact(&mut len).await?;
+    let mut buf = vec![0u8; u32::from_le_bytes(len) as usize];
+    r.read_exact(&mut buf).await?;
+    Ok(buf)
 }
 
 async fn execute_stop(_args: PoolStopArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Pool stop is handled by sending SIGINT to the `pool start` process.
-    // This subcommand exists for discoverability and future daemon support.
     eprintln!("Send SIGINT (Ctrl-C) to the running `a3s-box pool start` process to drain and stop the pool.");
     Ok(())
 }
 
 async fn execute_status(_args: PoolStatusArgs) -> Result<(), Box<dyn std::error::Error>> {
-    // Pool status requires a running pool instance. In the current in-process
-    // model, status is printed by the `pool start` process itself.
-    // This subcommand is a placeholder for future daemon/IPC support.
+    // Status lives in the running daemon; expose via Prometheus for now.
     eprintln!("Pool status is shown by the running `a3s-box pool start` process.");
     eprintln!("Use Prometheus metrics (a3s_box_warm_pool_*) for live observability.");
     Ok(())
@@ -214,9 +417,37 @@ mod tests {
     fn test_format_stats_json_is_valid_structure() {
         let stats = sample_stats();
         let json = format_stats_json("alpine:latest", &stats);
-        // Must start and end with braces
         assert!(json.starts_with('{'));
         assert!(json.ends_with('}'));
+    }
+
+    #[test]
+    fn test_keepalive_cmd_is_a_sleep_loop() {
+        let c = keepalive_cmd();
+        assert_eq!(c[0], "/bin/sh");
+        assert!(c.last().unwrap().contains("sleep"));
+    }
+
+    #[test]
+    fn test_run_request_response_roundtrip() {
+        let req = RunRequest {
+            cmd: vec!["echo".into(), "hi".into()],
+        };
+        let bytes = serde_json::to_vec(&req).unwrap();
+        let parsed: RunRequest = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed.cmd, vec!["echo", "hi"]);
+
+        let resp = RunResponse {
+            stdout: b"hi\n".to_vec(),
+            stderr: vec![],
+            exit_code: 0,
+            error: None,
+        };
+        let rb = serde_json::to_vec(&resp).unwrap();
+        let rp: RunResponse = serde_json::from_slice(&rb).unwrap();
+        assert_eq!(rp.stdout, b"hi\n");
+        assert_eq!(rp.exit_code, 0);
+        assert!(rp.error.is_none());
     }
 
     #[tokio::test]
@@ -226,6 +457,7 @@ mod tests {
             size: 0,
             max: 5,
             ttl: 300,
+            socket: DEFAULT_SOCKET.to_string(),
             json: false,
         };
         let result = execute_start(args).await;
@@ -240,6 +472,7 @@ mod tests {
             size: 10,
             max: 5,
             ttl: 300,
+            socket: DEFAULT_SOCKET.to_string(),
             json: false,
         };
         let result = execute_start(args).await;
@@ -252,31 +485,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_stop_is_ok() {
-        let args = PoolStopArgs { json: false };
-        // stop is a no-op (prints message), should not error
-        let result = execute_stop(args).await;
+        let result = execute_stop(PoolStopArgs { json: false }).await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn test_execute_status_is_ok() {
-        let args = PoolStatusArgs { json: false };
-        let result = execute_status(args).await;
+        let result = execute_status(PoolStatusArgs { json: false }).await;
         assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_pool_start_args_defaults() {
-        // Verify default values match expected warm pool behavior
-        let args = PoolStartArgs {
-            image: "alpine:latest".to_string(),
-            size: 2,
-            max: 8,
-            ttl: 300,
-            json: false,
-        };
-        assert_eq!(args.size, 2);
-        assert_eq!(args.max, 8);
-        assert_eq!(args.ttl, 300);
     }
 }
