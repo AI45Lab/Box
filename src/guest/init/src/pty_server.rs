@@ -15,51 +15,81 @@ use tracing::{error, warn};
 #[cfg(target_os = "linux")]
 use crate::user::parse_process_user;
 
-/// Run the PTY server, listening on vsock port 4090.
-///
-/// On Linux, binds to `AF_VSOCK` with `VMADDR_CID_ANY`.
-/// On non-Linux platforms, this is a no-op (development stub).
-pub fn run_pty_server() -> Result<(), Box<dyn std::error::Error>> {
-    info!("Starting PTY server on vsock port {}", PTY_VSOCK_PORT);
+/// A bound, listening PTY-server socket — produced by [`bind_pty_server`] and
+/// consumed by [`serve_pty_server`]. Same early-bind rationale as
+/// [`crate::exec_server::ExecListener`]: bind on the main thread before the
+/// container fork (fork-safe, fills the listen backlog), accept later in a
+/// thread. On non-Linux this is an inert placeholder.
+#[cfg(target_os = "linux")]
+pub struct PtyListener(std::os::fd::OwnedFd);
+#[cfg(not(target_os = "linux"))]
+pub struct PtyListener;
 
+/// Bind + listen the PTY vsock socket (port 4090). Pure socket syscalls, safe to
+/// call on the main thread before the container fork.
+pub fn bind_pty_server() -> Result<PtyListener, Box<dyn std::error::Error>> {
     #[cfg(target_os = "linux")]
     {
-        run_vsock_pty_server()?;
+        use nix::sys::socket::{
+            bind, listen, socket, AddressFamily, Backlog, SockFlag, SockType, VsockAddr,
+        };
+        use std::os::fd::AsRawFd;
+
+        let sock_fd = socket(
+            AddressFamily::Vsock,
+            SockType::Stream,
+            SockFlag::empty(),
+            None,
+        )?;
+
+        // Set CLOEXEC manually since SOCK_CLOEXEC isn't available in nix 0.29 on
+        // macOS — and so the forked container never inherits the listening socket.
+        unsafe {
+            libc::fcntl(sock_fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+
+        let addr = VsockAddr::new(libc::VMADDR_CID_ANY, PTY_VSOCK_PORT);
+        bind(sock_fd.as_raw_fd(), &addr)?;
+        listen(&sock_fd, Backlog::new(4)?)?;
+
+        info!("PTY server listening on vsock port {}", PTY_VSOCK_PORT);
+        Ok(PtyListener(sock_fd))
     }
 
     #[cfg(not(target_os = "linux"))]
     {
         info!("PTY server not available on non-Linux platform (development mode)");
+        Ok(PtyListener)
     }
-
-    Ok(())
 }
 
-/// Linux vsock PTY server implementation.
-#[cfg(target_os = "linux")]
-fn run_vsock_pty_server() -> Result<(), Box<dyn std::error::Error>> {
-    use nix::sys::socket::{
-        accept, bind, listen, socket, AddressFamily, Backlog, SockFlag, SockType, VsockAddr,
-    };
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-
-    let sock_fd = socket(
-        AddressFamily::Vsock,
-        SockType::Stream,
-        SockFlag::empty(),
-        None,
-    )?;
-
-    // Set CLOEXEC manually since SOCK_CLOEXEC isn't available in nix 0.29 on macOS
-    unsafe {
-        libc::fcntl(sock_fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+/// Run the PTY accept loop on an already-bound listener. Intended to run on its
+/// own thread for the VM's lifetime; never returns under normal operation.
+pub fn serve_pty_server(listener: PtyListener) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(target_os = "linux")]
+    {
+        run_pty_accept_loop(listener.0)
     }
 
-    let addr = VsockAddr::new(libc::VMADDR_CID_ANY, PTY_VSOCK_PORT);
-    bind(sock_fd.as_raw_fd(), &addr)?;
-    listen(&sock_fd, Backlog::new(4)?)?;
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = listener;
+        Ok(())
+    }
+}
 
-    info!("PTY server listening on vsock port {}", PTY_VSOCK_PORT);
+/// Bind then serve in one call. Kept for callers that don't need the early-bind
+/// split; guest-init's boot path uses `bind_*` + `serve_*` directly.
+pub fn run_pty_server() -> Result<(), Box<dyn std::error::Error>> {
+    info!("Starting PTY server on vsock port {}", PTY_VSOCK_PORT);
+    serve_pty_server(bind_pty_server()?)
+}
+
+/// The PTY server accept loop.
+#[cfg(target_os = "linux")]
+fn run_pty_accept_loop(sock_fd: std::os::fd::OwnedFd) -> Result<(), Box<dyn std::error::Error>> {
+    use nix::sys::socket::accept;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
     loop {
         match accept(sock_fd.as_raw_fd()) {
@@ -215,6 +245,11 @@ fn handle_pty_connection(fd: std::os::fd::OwnedFd) -> Result<(), Box<dyn std::er
         ForkResult::Parent { child } => {
             // Parent: relay data between vsock and PTY master
             drop(slave_fd);
+
+            // Register the PTY child with the reaper so PID 1 leaves it for us to
+            // reap (relay_pty_data waitpid's it for the real exit code). The guard
+            // unregisters when this branch returns.
+            let _reap_guard = crate::reaper::manage_pid(child.as_raw());
 
             let exit_code = relay_pty_data(&mut stream, &master_fd, child);
 

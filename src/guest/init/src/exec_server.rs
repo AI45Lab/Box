@@ -67,52 +67,88 @@ const EXEC_CONTROL_FLUSH: &[u8] = b"flush";
 /// match the host's `EXEC_FLUSH_ACK` in `runtime/src/grpc/exec.rs`.
 const EXEC_FLUSH_ACK: &[u8] = b"flush-ack";
 
-/// Run the exec server, listening on vsock port 4089.
+/// A bound, listening exec-server socket — produced by [`bind_exec_server`] and
+/// consumed by [`serve_exec_server`].
 ///
-/// On Linux, binds to `AF_VSOCK` with `VMADDR_CID_ANY`.
-/// On non-Linux platforms, this is a no-op (development stub).
-pub fn run_exec_server() -> Result<(), Box<dyn std::error::Error>> {
-    info!("Starting exec server on vsock port {}", EXEC_VSOCK_PORT);
+/// Splitting bind from serve lets guest-init bind the exec vsock port EARLY on
+/// the main thread (pure socket/bind/listen syscalls — no thread spawn, so the
+/// later single-threaded container `fork()` stays fork-safe) while the accept
+/// loop runs afterwards in its own thread. Binding early fills the listen
+/// backlog from the start of boot, so a host connect QUEUES instead of being
+/// refused while the slower boot steps (network, container spawn) finish — this
+/// removes the "Connection refused" / heartbeat race of issue #3. On non-Linux
+/// this is an inert placeholder so callers stay platform-agnostic.
+#[cfg(target_os = "linux")]
+pub struct ExecListener(std::os::fd::OwnedFd);
+#[cfg(not(target_os = "linux"))]
+pub struct ExecListener;
 
+/// Bind + listen the exec vsock socket (port 4089). Pure socket syscalls, safe
+/// to call on the main thread before the container fork.
+pub fn bind_exec_server() -> Result<ExecListener, Box<dyn std::error::Error>> {
     #[cfg(target_os = "linux")]
     {
-        run_vsock_server()?;
+        use nix::sys::socket::{
+            bind, listen, socket, AddressFamily, Backlog, SockFlag, SockType, VsockAddr,
+        };
+        use std::os::fd::AsRawFd;
+
+        let sock_fd = socket(
+            AddressFamily::Vsock,
+            SockType::Stream,
+            SockFlag::empty(),
+            None,
+        )?;
+
+        // Set CLOEXEC manually since SOCK_CLOEXEC isn't available in nix 0.29 on
+        // macOS — and so the forked container never inherits the listening socket.
+        unsafe {
+            libc::fcntl(sock_fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+
+        let addr = VsockAddr::new(libc::VMADDR_CID_ANY, EXEC_VSOCK_PORT);
+        bind(sock_fd.as_raw_fd(), &addr)?;
+        listen(&sock_fd, Backlog::new(4)?)?;
+
+        info!("Exec server listening on vsock port {}", EXEC_VSOCK_PORT);
+        Ok(ExecListener(sock_fd))
     }
 
     #[cfg(not(target_os = "linux"))]
     {
         info!("Exec server not available on non-Linux platform (development mode)");
+        Ok(ExecListener)
     }
-
-    Ok(())
 }
 
-/// Linux vsock server implementation.
-#[cfg(target_os = "linux")]
-fn run_vsock_server() -> Result<(), Box<dyn std::error::Error>> {
-    use nix::sys::socket::{
-        accept, bind, listen, socket, AddressFamily, Backlog, SockFlag, SockType, VsockAddr,
-    };
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    use tracing::error;
-
-    let sock_fd = socket(
-        AddressFamily::Vsock,
-        SockType::Stream,
-        SockFlag::empty(),
-        None,
-    )?;
-
-    // Set CLOEXEC manually since SOCK_CLOEXEC isn't available in nix 0.29 on macOS
-    unsafe {
-        libc::fcntl(sock_fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+/// Run the exec accept loop on an already-bound listener. Intended to run on its
+/// own thread for the VM's lifetime; never returns under normal operation.
+pub fn serve_exec_server(listener: ExecListener) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(target_os = "linux")]
+    {
+        run_accept_loop(listener.0)
     }
 
-    let addr = VsockAddr::new(libc::VMADDR_CID_ANY, EXEC_VSOCK_PORT);
-    bind(sock_fd.as_raw_fd(), &addr)?;
-    listen(&sock_fd, Backlog::new(4)?)?;
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = listener;
+        Ok(())
+    }
+}
 
-    info!("Exec server listening on vsock port {}", EXEC_VSOCK_PORT);
+/// Bind then serve in one call. Kept for callers that don't need the early-bind
+/// split (e.g. tests); guest-init's boot path uses `bind_*` + `serve_*` directly.
+pub fn run_exec_server() -> Result<(), Box<dyn std::error::Error>> {
+    info!("Starting exec server on vsock port {}", EXEC_VSOCK_PORT);
+    serve_exec_server(bind_exec_server()?)
+}
+
+/// The exec server accept loop.
+#[cfg(target_os = "linux")]
+fn run_accept_loop(sock_fd: std::os::fd::OwnedFd) -> Result<(), Box<dyn std::error::Error>> {
+    use nix::sys::socket::accept;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use tracing::error;
 
     loop {
         match accept(sock_fd.as_raw_fd()) {
@@ -715,8 +751,12 @@ fn execute_command(
         Err(output) => return output,
     };
 
-    let mut child = match command.spawn() {
-        Ok(child) => child,
+    // Spawn under the reaper registry: the pid is marked MANAGED before the PID 1
+    // supervision loop can see it, so the loop leaves this child for us to reap
+    // (and read its real exit code) instead of stealing it. The guard unregisters
+    // the pid when this function returns (all paths).
+    let (mut child, _reap_guard) = match crate::reaper::spawn_managed(|| command.spawn()) {
+        Ok(pair) => pair,
         Err(e) => {
             return ExecOutput {
                 stdout: vec![],
@@ -1007,8 +1047,10 @@ fn execute_command_streaming(
         }
     };
 
-    let mut child = match command.spawn() {
-        Ok(child) => child,
+    // Spawn under the reaper registry (see one-shot path) so PID 1 leaves this
+    // streaming child for us to reap; the guard unregisters on return.
+    let (mut child, _reap_guard) = match crate::reaper::spawn_managed(|| command.spawn()) {
+        Ok(pair) => pair,
         Err(e) => {
             let output = ExecOutput {
                 stdout: vec![],
