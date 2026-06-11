@@ -29,6 +29,14 @@ pub fn set_container_pid(pid: i32) {
     CONTAINER_PID.store(pid, Ordering::SeqCst);
 }
 
+/// The main container PID (-1 if not yet spawned, -2 while a deferred spawn is in
+/// flight). The PID 1 supervision loop reads this each tick, so a deferred main
+/// published here (after an IDLE boot) is recognized as the container and reaped
+/// for its real exit code.
+pub fn container_pid() -> i32 {
+    CONTAINER_PID.load(Ordering::SeqCst)
+}
+
 /// Host→guest control to gracefully stop the container: deliver the given signal
 /// number to the main container process. `signal-main:<N>` (e.g. `signal-main:15`
 /// for SIGTERM, `signal-main:2` for the image STOPSIGNAL=SIGINT). The container
@@ -38,6 +46,19 @@ pub fn set_container_pid(pid: i32) {
 const EXEC_CONTROL_SIGNAL_MAIN: &[u8] = b"signal-main:";
 #[cfg(target_os = "linux")]
 const EXEC_SIGNAL_MAIN_ACK: &[u8] = b"signal-main-ack";
+
+/// Host→guest control to spawn the container MAIN process on demand — for VMs that
+/// booted IDLE (`BOX_DEFERRED_MAIN=1`, e.g. a pre-warmed pool sandbox). Payload is
+/// `spawn-main:<json {executable,args,env,workdir}>`. The spawned process becomes
+/// the container main: it inherits PID 1's console fds (so its stdout/stderr reach
+/// the json-file logs, unlike a piped exec) and the supervision loop reaps it for
+/// the real exit code. Must match the host prefix in `runtime/src/grpc/exec.rs`.
+#[cfg(target_os = "linux")]
+const EXEC_CONTROL_SPAWN_MAIN: &[u8] = b"spawn-main:";
+#[cfg(target_os = "linux")]
+const EXEC_SPAWN_MAIN_ACK: &[u8] = b"spawn-main-ack";
+#[cfg(target_os = "linux")]
+const EXEC_SPAWN_MAIN_NACK: &[u8] = b"spawn-main-nack:";
 
 /// Deliver `sig` to the main container process (best-effort).
 #[cfg(target_os = "linux")]
@@ -53,6 +74,136 @@ fn signal_main_process(sig: i32) {
         }
     } else {
         warn!(sig, "Graceful stop requested but container PID is unknown");
+    }
+}
+
+/// The container command, stashed at boot (parsed from BOX_EXEC_*), so a later
+/// `spawn-main` trigger can run it as the main without the host re-sending it.
+#[cfg(target_os = "linux")]
+#[derive(serde::Deserialize)]
+struct DeferredMainSpec {
+    executable: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    env: Vec<(String, String)>,
+    #[serde(default)]
+    workdir: Option<String>,
+    #[serde(default)]
+    user: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+static DEFERRED_MAIN: std::sync::Mutex<Option<DeferredMainSpec>> = std::sync::Mutex::new(None);
+
+/// Stash the container command for a deferred (IDLE) boot. The command already
+/// reached the guest via BOX_EXEC_*, so the host only sends a bare spawn-main
+/// trigger post-readiness; the guest runs the stashed command as its main.
+#[cfg(target_os = "linux")]
+pub fn set_deferred_main_spec(
+    executable: String,
+    args: Vec<String>,
+    env: Vec<(String, String)>,
+    workdir: Option<String>,
+    user: Option<String>,
+) {
+    *DEFERRED_MAIN.lock().unwrap_or_else(|e| e.into_inner()) = Some(DeferredMainSpec {
+        executable,
+        args,
+        env,
+        workdir,
+        user,
+    });
+}
+
+/// Spawn the deferred container main (after an IDLE boot). The child inherits PID
+/// 1's stdout/stderr — fds 1/2 = the virtio-console — so its output reaches
+/// `console.log` → `container.json`, exactly like a boot-spawned main (and unlike a
+/// `Stdio::piped` exec, whose output only flows over the exec stream). It is spawned
+/// via `Command::spawn` (the same clone/exec the exec server already uses safely),
+/// NOT `namespace::spawn_isolated`'s raw `fork()` — whose heavy allocating child
+/// code could deadlock from this multi-threaded PID 1. The pid is published WHILE
+/// still registered MANAGED (the reaper can't reap it as an orphan before the
+/// hand-off), then released to the supervision loop, which reaps it for the real
+/// exit code. A CAS makes only the first spawn-main win.
+#[cfg(target_os = "linux")]
+fn spawn_deferred_main(frame: Option<DeferredMainSpec>) -> Result<i32, String> {
+    // Use the command carried in the frame (the pool path — a pre-warmed VM gets
+    // its per-request command here), else the one stashed at boot from BOX_EXEC_*
+    // (the `run` path, where the command is known at boot).
+    let (executable, args, env, workdir, user) = match frame {
+        Some(s) => (s.executable, s.args, s.env, s.workdir, s.user),
+        None => {
+            let guard = DEFERRED_MAIN.lock().unwrap_or_else(|e| e.into_inner());
+            let spec = guard.as_ref().ok_or("no deferred-main command set")?;
+            (
+                spec.executable.clone(),
+                spec.args.clone(),
+                spec.env.clone(),
+                spec.workdir.clone(),
+                spec.user.clone(),
+            )
+        }
+    };
+
+    // cmd vector + env. Include the guest's own A3S_SEC_* control vars so
+    // build_command applies the SAME seccomp/user/no-new-privs as a boot-spawned
+    // main (the container env carries them on a normal exec; here we add them).
+    let mut cmd_vec = Vec::with_capacity(1 + args.len());
+    cmd_vec.push(executable);
+    cmd_vec.extend(args);
+    let mut env_entries: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    for (k, v) in std::env::vars() {
+        if k.starts_with("A3S_SEC_") {
+            env_entries.push(format!("{k}={v}"));
+        }
+    }
+
+    // Reuse the exec server's secured command builder (seccomp + user + no-new-privs
+    // via async-signal-safe pre_exec — already safe to spawn from this multi-threaded
+    // PID 1), then override stdio to INHERIT so the main's stdout/stderr reach PID
+    // 1's console fds (→ json-file logs), unlike an exec's piped stdio.
+    let (mut command, _timeout) = build_command(
+        ExecCommandSpec {
+            cmd: &cmd_vec,
+            timeout_ns: 0,
+            env: &env_entries,
+            working_dir: workdir.as_deref(),
+            rootfs: None,
+            stdin_data: None,
+            stdin_streaming: false,
+            user: user.as_deref(),
+        },
+        None,
+    )
+    .map_err(|out| String::from_utf8_lossy(&out.stderr).into_owned())?;
+    command
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .stdin(std::process::Stdio::null());
+
+    // Idempotency: claim the sentinel (-1 → -2 pending); a second spawn-main loses.
+    if CONTAINER_PID
+        .compare_exchange(-1, -2, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err("container main already spawned".to_string());
+    }
+
+    match crate::reaper::spawn_managed(|| command.spawn()) {
+        Ok((child, guard)) => {
+            let pid = child.id() as i32;
+            // Publish the real pid (over the -2 marker) while still MANAGED, then
+            // release ownership: now the loop's `pid == container_pid` branch reaps.
+            CONTAINER_PID.store(pid, Ordering::SeqCst);
+            std::mem::forget(child); // PID 1's reaper owns it — do not double-reap
+            drop(guard);
+            Ok(pid)
+        }
+        Err(e) => {
+            CONTAINER_PID.store(-1, Ordering::SeqCst); // reset so a retry is possible
+            Err(format!("spawn failed: {e}"))
+        }
     }
 }
 
@@ -207,6 +358,34 @@ fn handle_connection(fd: std::os::fd::OwnedFd) -> Result<(), Box<dyn std::error:
                 .unwrap_or(libc::SIGTERM);
             signal_main_process(sig);
             write_frame(&mut stream, FrameType::Control as u8, EXEC_SIGNAL_MAIN_ACK)?;
+            std::mem::forget(fd);
+            return Ok(());
+        }
+        // Deferred-main control: spawn the container main on demand (IDLE boot).
+        if frame_type == FrameType::Control as u8 && payload.starts_with(EXEC_CONTROL_SPAWN_MAIN) {
+            // Optional JSON body carries the command (pool path); empty body uses
+            // the command stashed at boot (run path).
+            let body = &payload[EXEC_CONTROL_SPAWN_MAIN.len()..];
+            let result = if body.is_empty() {
+                spawn_deferred_main(None)
+            } else {
+                match serde_json::from_slice::<DeferredMainSpec>(body) {
+                    Ok(spec) => spawn_deferred_main(Some(spec)),
+                    Err(e) => Err(format!("invalid spawn-main spec: {e}")),
+                }
+            };
+            match result {
+                Ok(pid) => {
+                    info!(pid, "Deferred container main spawned");
+                    write_frame(&mut stream, FrameType::Control as u8, EXEC_SPAWN_MAIN_ACK)?;
+                }
+                Err(e) => {
+                    warn!(error = %e, "spawn-main failed");
+                    let mut nack = EXEC_SPAWN_MAIN_NACK.to_vec();
+                    nack.extend_from_slice(e.as_bytes());
+                    write_frame(&mut stream, FrameType::Control as u8, &nack)?;
+                }
+            }
             std::mem::forget(fd);
             return Ok(());
         }

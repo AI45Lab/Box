@@ -358,22 +358,52 @@ fn run_init() -> Result<(), Box<dyn std::error::Error>> {
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
 
-    let container_pid_raw = namespace::spawn_isolated(
-        &namespace_config,
-        &exec_config.executable,
-        &args_refs,
-        &env_refs,
-        &exec_config.workdir,
-        exec_config.user.as_deref(),
-    )?;
-    let container_pid = nix::unistd::Pid::from_raw(container_pid_raw as i32);
+    // Deferred-main (BOX_DEFERRED_MAIN=1): boot IDLE — skip the boot spawn and let
+    // the container main be spawned later by a `spawn-main` control frame (for a
+    // pre-warmed/pooled sandbox). CONTAINER_PID stays the -1 sentinel; the exec
+    // server + supervision loop start as usual, so host readiness still passes
+    // (the heartbeat handshake has no container-pid dependency).
+    let deferred_main = std::env::var("BOX_DEFERRED_MAIN")
+        .map(|v| v == "1")
+        .unwrap_or(false);
 
-    info!("Container process started with PID {}", container_pid);
+    let container_pid = if deferred_main {
+        info!("BOX_DEFERRED_MAIN=1 — booting IDLE; container main deferred to a spawn-main control frame");
+        // Stash the parsed command so a later spawn-main trigger runs it as main.
+        #[cfg(target_os = "linux")]
+        exec_server::set_deferred_main_spec(
+            exec_config.executable.clone(),
+            exec_config.args.clone(),
+            exec_config
+                .env
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            if exec_config.workdir.is_empty() {
+                None
+            } else {
+                Some(exec_config.workdir.clone())
+            },
+            exec_config.user.clone(),
+        );
+        nix::unistd::Pid::from_raw(-1)
+    } else {
+        let container_pid_raw = namespace::spawn_isolated(
+            &namespace_config,
+            &exec_config.executable,
+            &args_refs,
+            &env_refs,
+            &exec_config.workdir,
+            exec_config.user.as_deref(),
+        )?;
+        info!("Container process started with PID {}", container_pid_raw);
 
-    // Make the main container PID available to the exec server so a host
-    // graceful-stop request (signal-main control frame) can deliver the
-    // STOPSIGNAL to it. Must be set before the exec server thread starts.
-    exec_server::set_container_pid(container_pid_raw as i32);
+        // Make the main container PID available to the exec server so a host
+        // graceful-stop request (signal-main control frame) can deliver the
+        // STOPSIGNAL to it. Must be set before the exec server thread starts.
+        exec_server::set_container_pid(container_pid_raw as i32);
+        nix::unistd::Pid::from_raw(container_pid_raw as i32)
+    };
 
     expose_container_env_to_exec(&exec_config);
 
@@ -1028,13 +1058,25 @@ fn wait_for_children(container_pid: nix::unistd::Pid) -> Result<(), Box<dyn std:
                 Ok(WaitStatus::Signaled(pid, signal, _)) => (pid, 128 + signal as i32, true),
                 // No exited child right now: stop draining and poll again later.
                 Ok(_) => break,
-                // No children at all (container already gone): nothing to supervise.
-                Err(nix::errno::Errno::ECHILD) => return Ok(()),
+                // No children right now. In deferred-main mode (IDLE boot) the
+                // container main has not been spawned yet — keep waiting for the
+                // spawn-main frame rather than exiting (which would halt the VM
+                // before the main ever runs). Otherwise the container is gone: done.
+                Err(nix::errno::Errno::ECHILD) => {
+                    if exec_server::container_pid() < 0 {
+                        break;
+                    }
+                    return Ok(());
+                }
                 // Transient error: retry on the next tick.
                 Err(_) => break,
             };
 
-            if pid == container_pid {
+            // Read the container pid fresh each iteration: a deferred main (IDLE
+            // boot) publishes it late via spawn-main; the eager path set it at boot.
+            // The -1/-2 sentinels (unset/pending) never match a real pid.
+            let cpid = exec_server::container_pid();
+            if cpid >= 0 && pid.as_raw() == cpid {
                 // The container drives the VM lifecycle: reap it and exit with its
                 // status so the host (and detached `run -d wait`) sees the real code.
                 let _ = waitpid(pid, None);

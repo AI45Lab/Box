@@ -20,6 +20,10 @@ const EXEC_FLUSH_ACK: &[u8] = b"flush-ack";
 /// received and the signal delivered. Must match the guest's
 /// `EXEC_SIGNAL_MAIN_ACK` in `guest/init/src/exec_server.rs`.
 const EXEC_SIGNAL_MAIN_ACK: &[u8] = b"signal-main-ack";
+/// Guest→host acknowledgement that a `spawn-main` deferred-main control was
+/// received and the container main spawned. Matches the guest's
+/// `EXEC_SPAWN_MAIN_ACK` in `guest/init/src/exec_server.rs`.
+const EXEC_SPAWN_MAIN_ACK: &[u8] = b"spawn-main-ack";
 
 type ExecFrameReader = a3s_transport::FrameReader<tokio::io::ReadHalf<tokio::net::UnixStream>>;
 type ExecFrameWriter = a3s_transport::FrameWriter<tokio::io::WriteHalf<tokio::net::UnixStream>>;
@@ -269,6 +273,42 @@ impl ExecClient {
             Ok(Some(f))
                 if f.frame_type == a3s_transport::FrameType::Control
                     && f.payload == EXEC_SIGNAL_MAIN_ACK =>
+            {
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Ask a guest that booted IDLE (`BOX_DEFERRED_MAIN=1`) to spawn its container
+    /// command — already known to the guest via BOX_EXEC_* — as the MAIN process.
+    /// The spawned main inherits the console (so its output reaches the json-file
+    /// logs) and drives the VM lifecycle. Returns `Ok(true)` if acknowledged.
+    pub async fn spawn_main(&self, spec_json: Option<&[u8]>) -> Result<bool> {
+        let mut stream = match UnixStream::connect(&self.socket_path).await {
+            Ok(s) => s,
+            Err(_) => return Ok(false),
+        };
+
+        let mut payload = b"spawn-main:".to_vec();
+        if let Some(json) = spec_json {
+            payload.extend_from_slice(json);
+        }
+        let frame = a3s_transport::Frame::control(payload);
+        let encoded = frame
+            .encode()
+            .map_err(|e| BoxError::ExecError(format!("spawn-main frame encode failed: {}", e)))?;
+
+        if stream.write_all(&encoded).await.is_err() {
+            return Ok(false);
+        }
+
+        let (r, _w) = tokio::io::split(stream);
+        let mut reader = a3s_transport::FrameReader::new(r);
+        match reader.read_frame().await {
+            Ok(Some(f))
+                if f.frame_type == a3s_transport::FrameType::Control
+                    && f.payload == EXEC_SPAWN_MAIN_ACK =>
             {
                 Ok(true)
             }

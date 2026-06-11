@@ -47,7 +47,8 @@ The ignored `core_smoke` suite covers the core CLI path on a real MicroVM host:
 - non-TTY `exec`, PTY, `attach`, `logs`, `stop`, `wait`, and `rm`;
 - TCP published ports with host loopback HTTP reachability;
 - bridge network endpoint allocation, peer `/etc/hosts`, connect/disconnect, and force removal cleanup;
-- named volumes, `cp`, `diff`, `export`, `commit`, `snapshot`, restart-policy monitor recovery, and Compose health/volume flow.
+- named volumes, `cp`, `diff`, `export`, `commit`, `snapshot`, restart-policy monitor recovery, and Compose health/volume flow;
+- warm pool (`pool start`/`pool run`): pre-warmed sandboxes served over a socket, with backpressure and multi-image lazy pools; `--deferred` runs each command as the box's real main for full box semantics (real exit code + json-file console logs) with no cold boot.
 
 The most recent local record in this branch: all 14 ignored `core_smoke` tests
 passed on macOS HVF with an offline Alpine OCI archive, and the ignored

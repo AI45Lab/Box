@@ -310,6 +310,13 @@ pub struct BoxConfig {
     #[serde(default)]
     pub pool: PoolConfig,
 
+    /// Boot the VM IDLE — do not spawn the container main at boot; instead the
+    /// main is started later by a `spawn-main` control frame. Used by the pool so a
+    /// pre-warmed sandbox runs a per-request command as its real main, with full box
+    /// semantics (exit code + json-file console logs) and no cold boot.
+    #[serde(default)]
+    pub deferred_main: bool,
+
     /// Port mappings: "host_port:guest_port" (e.g., "8080:80")
     /// Maps host ports to guest ports via TSI (Transparent Socket Impersonation).
     #[serde(default)]
@@ -407,6 +414,7 @@ impl Default for BoxConfig {
             extra_env: vec![],
             cache: CacheConfig::default(),
             pool: PoolConfig::default(),
+            deferred_main: false,
             port_map: vec![],
             dns: vec![],
             add_hosts: vec![],

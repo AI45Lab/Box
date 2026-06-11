@@ -132,6 +132,17 @@ impl VmManager {
                 env.push((format!("BOX_EXEC_ARG_{}", i), arg.clone()));
             }
 
+            // Prototype: deferred-main-spawn. If the host set BOX_DEFERRED_MAIN=1,
+            // tell guest init to boot IDLE; the runtime then sends a spawn-main
+            // control frame post-readiness to run the command above as the main.
+            if self.config.deferred_main
+                || std::env::var("BOX_DEFERRED_MAIN")
+                    .map(|v| v == "1")
+                    .unwrap_or(false)
+            {
+                env.push(("BOX_DEFERRED_MAIN".to_string(), "1".to_string()));
+            }
+
             // Pass the effective working directory to guest init so PID 1 and
             // the container entrypoint agree even when no OCI WORKDIR is set.
             env.push(("BOX_EXEC_WORKDIR".to_string(), workdir.clone()));
