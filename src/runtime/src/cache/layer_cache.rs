@@ -323,7 +323,7 @@ pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
         } else if meta.is_dir() {
             copy_dir_recursive(&src_path, &dst_path)?;
         } else {
-            std::fs::copy(&src_path, &dst_path).map_err(|e| {
+            copy_file_cow(&src_path, &dst_path).map_err(|e| {
                 BoxError::CacheError(format!(
                     "Failed to copy {} to {}: {}",
                     src_path.display(),
@@ -336,6 +336,46 @@ pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Copy a regular file, preferring a copy-on-write reflink (`FICLONE`) so a new
+/// box's rootfs shares blocks with the cached image — instant, no extra disk — on
+/// reflink-capable filesystems (btrfs, XFS `reflink=1`, bcachefs). Falls back to a
+/// plain byte copy when reflink is unsupported (e.g. ext4) or the source and
+/// destination are on different filesystems. Overlay is preferred on Linux, so
+/// this only runs on the `CopyProvider` fallback path.
+fn copy_file_cow(src: &Path, dst: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        // FICLONE = _IOW(0x94, 9, int)
+        const FICLONE: libc::c_ulong = 0x4004_9409;
+        let reflinked = (|| -> std::io::Result<bool> {
+            let s = std::fs::File::open(src)?;
+            let d = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(dst)?;
+            // SAFETY: FICLONE's argument is the source fd; both fds are valid for
+            // the call. A non-zero return (unsupported FS / cross-device) just
+            // means "fall back to a byte copy".
+            let rc = unsafe { libc::ioctl(d.as_raw_fd(), FICLONE, s.as_raw_fd()) };
+            if rc != 0 {
+                return Ok(false);
+            }
+            // FICLONE clones data only — copy the permission bits like fs::copy.
+            if let Ok(perm) = s.metadata().map(|m| m.permissions()) {
+                let _ = d.set_permissions(perm);
+            }
+            Ok(true)
+        })()
+        .unwrap_or(false);
+        if reflinked {
+            return Ok(());
+        }
+    }
+    std::fs::copy(src, dst).map(|_| ())
 }
 
 /// Calculate the total size of a directory recursively.
@@ -899,5 +939,42 @@ mod tests {
 
         cache.invalidate(digest).unwrap();
         assert!(cache.get(digest).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_copy_file_cow_preserves_content_and_mode() {
+        // Works whether the FS supports reflink (FICLONE) or falls back to a byte
+        // copy — both must preserve content and the permission bits.
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src.bin");
+        let dst = tmp.path().join("dst.bin");
+        std::fs::write(&src, b"hello copy-on-write").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        copy_file_cow(&src, &dst).unwrap();
+
+        assert_eq!(std::fs::read(&dst).unwrap(), b"hello copy-on-write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dst).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o755, "executable bit must survive the copy");
+        }
+    }
+
+    #[test]
+    fn test_copy_file_cow_overwrites_existing_dst() {
+        // FICLONE and the fs::copy fallback both truncate the destination.
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        std::fs::write(&src, b"new").unwrap();
+        std::fs::write(&dst, b"old-and-longer").unwrap();
+        copy_file_cow(&src, &dst).unwrap();
+        assert_eq!(std::fs::read(&dst).unwrap(), b"new");
     }
 }
