@@ -284,13 +284,17 @@ impl ExecClient {
     /// command — already known to the guest via BOX_EXEC_* — as the MAIN process.
     /// The spawned main inherits the console (so its output reaches the json-file
     /// logs) and drives the VM lifecycle. Returns `Ok(true)` if acknowledged.
-    pub async fn spawn_main(&self) -> Result<bool> {
+    pub async fn spawn_main(&self, spec_json: Option<&[u8]>) -> Result<bool> {
         let mut stream = match UnixStream::connect(&self.socket_path).await {
             Ok(s) => s,
             Err(_) => return Ok(false),
         };
 
-        let frame = a3s_transport::Frame::control(b"spawn-main:".to_vec());
+        let mut payload = b"spawn-main:".to_vec();
+        if let Some(json) = spec_json {
+            payload.extend_from_slice(json);
+        }
+        let frame = a3s_transport::Frame::control(payload);
         let encoded = frame
             .encode()
             .map_err(|e| BoxError::ExecError(format!("spawn-main frame encode failed: {}", e)))?;

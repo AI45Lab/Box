@@ -72,6 +72,12 @@ pub struct PoolStartArgs {
     #[arg(long, value_delimiter = ',')]
     pub warm: Vec<String>,
 
+    /// Boot pooled VMs IDLE and run each `pool run` command as the box's real MAIN
+    /// (full box semantics: exit code + json-file console logs), instead of
+    /// exec-into-keepalive.
+    #[arg(long)]
+    pub deferred: bool,
+
     /// Output as JSON
     #[arg(long)]
     pub json: bool,
@@ -176,6 +182,17 @@ fn keepalive_cmd() -> Vec<String> {
     ]
 }
 
+/// Build the `spawn-main` JSON spec for a deferred-mode pool command (executable +
+/// args + a standard PATH so the binary resolves like a normal container main).
+fn deferred_spec_json(cmd: &[String]) -> Vec<u8> {
+    let spec = serde_json::json!({
+        "executable": cmd.first().map(String::as_str).unwrap_or("/bin/sh"),
+        "args": cmd.get(1..).unwrap_or(&[]),
+        "env": [["PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]],
+    });
+    serde_json::to_vec(&spec).unwrap_or_default()
+}
+
 /// Parse a `--warm` entry of the form `image[=count]` (count defaults to `default_size`).
 fn parse_warm_spec(entry: &str, default_size: usize) -> Result<(String, usize), String> {
     match entry.split_once('=') {
@@ -212,6 +229,9 @@ struct PoolRegistry {
     size: usize,
     max: usize,
     ttl: u64,
+    /// When true, pooled VMs boot IDLE and `pool run` spawns the command as the
+    /// box's real MAIN (full box semantics), instead of exec-into-keepalive.
+    deferred: bool,
 }
 
 impl PoolRegistry {
@@ -234,8 +254,11 @@ impl PoolRegistry {
         };
         let box_config = BoxConfig {
             image: image.to_string(),
+            // In deferred mode the VM boots IDLE (keepalive cmd is stashed but
+            // unused — the per-request command arrives via spawn-main).
             cmd: keepalive_cmd(),
             pool: pool_config.clone(),
+            deferred_main: self.deferred,
             ..Default::default()
         };
         let pool = std::sync::Arc::new(
@@ -303,6 +326,7 @@ async fn execute_start(args: PoolStartArgs) -> Result<(), Box<dyn std::error::Er
         size: args.size,
         max: args.max,
         ttl: args.ttl,
+        deferred: args.deferred,
     });
 
     // Pre-warm the default image, if one was given.
@@ -450,8 +474,21 @@ async fn handle_conn(
                     .expect("pool semaphore is never closed");
                 match entry.pool.acquire().await {
                     Err(e) => err_resp(format!("acquire failed: {e}")),
-                    Ok(vm) => {
-                        let resp = match vm.exec_command(run.cmd, EXEC_TIMEOUT_NS).await {
+                    Ok(mut vm) => {
+                        // Deferred-main: run the command as the box's real MAIN
+                        // (full box semantics — exit code + json-file console logs).
+                        // Otherwise exec it in the keepalive VM (output via the
+                        // exec stream).
+                        let result = if registry.deferred {
+                            vm.run_deferred_main(
+                                &deferred_spec_json(&run.cmd),
+                                std::time::Duration::from_secs(60),
+                            )
+                            .await
+                        } else {
+                            vm.exec_command(run.cmd, EXEC_TIMEOUT_NS).await
+                        };
+                        let resp = match result {
                             Ok(o) => RunResponse {
                                 stdout: o.stdout,
                                 stderr: o.stderr,
@@ -763,6 +800,7 @@ mod tests {
             ttl: 300,
             socket: DEFAULT_SOCKET.to_string(),
             warm: vec![],
+            deferred: false,
             json: false,
         };
         let result = execute_start(args).await;
@@ -779,6 +817,7 @@ mod tests {
             ttl: 300,
             socket: DEFAULT_SOCKET.to_string(),
             warm: vec![],
+            deferred: false,
             json: false,
         };
         let result = execute_start(args).await;

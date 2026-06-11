@@ -80,11 +80,16 @@ fn signal_main_process(sig: i32) {
 /// The container command, stashed at boot (parsed from BOX_EXEC_*), so a later
 /// `spawn-main` trigger can run it as the main without the host re-sending it.
 #[cfg(target_os = "linux")]
+#[derive(serde::Deserialize)]
 struct DeferredMainSpec {
     executable: String,
+    #[serde(default)]
     args: Vec<String>,
+    #[serde(default)]
     env: Vec<(String, String)>,
+    #[serde(default)]
     workdir: Option<String>,
+    #[serde(default)]
     user: Option<String>,
 }
 
@@ -122,18 +127,23 @@ pub fn set_deferred_main_spec(
 /// hand-off), then released to the supervision loop, which reaps it for the real
 /// exit code. A CAS makes only the first spawn-main win.
 #[cfg(target_os = "linux")]
-fn spawn_deferred_main() -> Result<i32, String> {
-    // The container command + user, stashed at boot from BOX_EXEC_*.
-    let (executable, args, env, workdir, user) = {
-        let guard = DEFERRED_MAIN.lock().unwrap_or_else(|e| e.into_inner());
-        let spec = guard.as_ref().ok_or("no deferred-main command set")?;
-        (
-            spec.executable.clone(),
-            spec.args.clone(),
-            spec.env.clone(),
-            spec.workdir.clone(),
-            spec.user.clone(),
-        )
+fn spawn_deferred_main(frame: Option<DeferredMainSpec>) -> Result<i32, String> {
+    // Use the command carried in the frame (the pool path — a pre-warmed VM gets
+    // its per-request command here), else the one stashed at boot from BOX_EXEC_*
+    // (the `run` path, where the command is known at boot).
+    let (executable, args, env, workdir, user) = match frame {
+        Some(s) => (s.executable, s.args, s.env, s.workdir, s.user),
+        None => {
+            let guard = DEFERRED_MAIN.lock().unwrap_or_else(|e| e.into_inner());
+            let spec = guard.as_ref().ok_or("no deferred-main command set")?;
+            (
+                spec.executable.clone(),
+                spec.args.clone(),
+                spec.env.clone(),
+                spec.workdir.clone(),
+                spec.user.clone(),
+            )
+        }
     };
 
     // cmd vector + env. Include the guest's own A3S_SEC_* control vars so
@@ -353,7 +363,18 @@ fn handle_connection(fd: std::os::fd::OwnedFd) -> Result<(), Box<dyn std::error:
         }
         // Deferred-main control: spawn the container main on demand (IDLE boot).
         if frame_type == FrameType::Control as u8 && payload.starts_with(EXEC_CONTROL_SPAWN_MAIN) {
-            match spawn_deferred_main() {
+            // Optional JSON body carries the command (pool path); empty body uses
+            // the command stashed at boot (run path).
+            let body = &payload[EXEC_CONTROL_SPAWN_MAIN.len()..];
+            let result = if body.is_empty() {
+                spawn_deferred_main(None)
+            } else {
+                match serde_json::from_slice::<DeferredMainSpec>(body) {
+                    Ok(spec) => spawn_deferred_main(Some(spec)),
+                    Err(e) => Err(format!("invalid spawn-main spec: {e}")),
+                }
+            };
+            match result {
                 Ok(pid) => {
                     info!(pid, "Deferred container main spawned");
                     write_frame(&mut stream, FrameType::Control as u8, EXEC_SPAWN_MAIN_ACK)?;

@@ -489,6 +489,80 @@ impl VmManager {
         Ok(None)
     }
 
+    /// Run a command as the container MAIN in an IDLE-booted (deferred-main) VM.
+    ///
+    /// Sends the `spawn-main` control frame carrying `spec_json` (the command),
+    /// waits for the main to exit (which halts the VM), and returns its real exit
+    /// code + the box's json-file console logs split by stream. This is the full-
+    /// box-semantics counterpart to [`Self::exec_command`] (whose output is piped
+    /// over the exec stream, not the json-file logs).
+    #[cfg(unix)]
+    pub async fn run_deferred_main(
+        &mut self,
+        spec_json: &[u8],
+        timeout: std::time::Duration,
+    ) -> Result<a3s_box_core::exec::ExecOutput> {
+        let acked = {
+            let client = self
+                .exec_client
+                .as_ref()
+                .ok_or_else(|| BoxError::ExecError("Exec client not connected".to_string()))?;
+            client.spawn_main(Some(spec_json)).await?
+        };
+        if !acked {
+            return Err(BoxError::ExecError(
+                "spawn-main was not acknowledged by the guest".to_string(),
+            ));
+        }
+
+        // Wait for the main to exit — guest-init persists the code and halts the VM.
+        let start = std::time::Instant::now();
+        let exit_code = loop {
+            if let Some(code) = self.try_wait_exit().await? {
+                break code;
+            }
+            if start.elapsed() >= timeout {
+                return Err(BoxError::ExecError(
+                    "deferred main did not exit within the timeout".to_string(),
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+
+        // Let the shim's log processor finish draining console.log into the json
+        // file (it flushes as the VM halts) before reading the captured output.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let (stdout, stderr) = self.read_container_logs();
+        Ok(a3s_box_core::exec::ExecOutput {
+            stdout,
+            stderr,
+            exit_code,
+        })
+    }
+
+    /// Read the box's json-file console logs, split into stdout/stderr by stream.
+    fn read_container_logs(&self) -> (Vec<u8>, Vec<u8>) {
+        let path = self
+            .home_dir
+            .join("boxes")
+            .join(&self.box_id)
+            .join("logs")
+            .join("container.json");
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            for line in content.lines() {
+                if let Ok(entry) = serde_json::from_str::<a3s_box_core::log::LogEntry>(line) {
+                    if entry.stream == "stderr" {
+                        err.extend_from_slice(entry.log.as_bytes());
+                    } else {
+                        out.extend_from_slice(entry.log.as_bytes());
+                    }
+                }
+            }
+        }
+        (out, err)
+    }
+
     /// Execute a command in the guest VM.
     ///
     /// Requires the VM to be in Ready, Busy, or Compacting state.
@@ -732,13 +806,17 @@ impl VmManager {
         // now that the exec server is ready, tell it to spawn the container command
         // (already passed via BOX_EXEC_*) as the MAIN process — full box semantics
         // (exit code + json-file console logs) without a cold boot.
+        // Auto-trigger spawn-main only for the env-driven `run` path, where the
+        // command is known at boot. The pool sets config.deferred_main to boot the
+        // VM IDLE but drives spawn-main EXPLICITLY per request (the per-request
+        // command isn't known at pre-warm), so a pool VM must NOT auto-trigger here.
         #[cfg(unix)]
         if std::env::var("BOX_DEFERRED_MAIN")
             .map(|v| v == "1")
             .unwrap_or(false)
         {
             if let Some(client) = self.exec_client.as_ref() {
-                match client.spawn_main().await {
+                match client.spawn_main(None).await {
                     Ok(true) => tracing::info!("deferred container main spawned"),
                     Ok(false) => tracing::warn!("deferred spawn-main not acknowledged"),
                     Err(e) => tracing::warn!(error = %e, "deferred spawn-main failed"),
