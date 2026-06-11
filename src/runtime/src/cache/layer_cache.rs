@@ -940,4 +940,41 @@ mod tests {
         cache.invalidate(digest).unwrap();
         assert!(cache.get(digest).unwrap().is_none());
     }
+
+    #[test]
+    fn test_copy_file_cow_preserves_content_and_mode() {
+        // Works whether the FS supports reflink (FICLONE) or falls back to a byte
+        // copy — both must preserve content and the permission bits.
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src.bin");
+        let dst = tmp.path().join("dst.bin");
+        std::fs::write(&src, b"hello copy-on-write").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        copy_file_cow(&src, &dst).unwrap();
+
+        assert_eq!(std::fs::read(&dst).unwrap(), b"hello copy-on-write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dst).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o755, "executable bit must survive the copy");
+        }
+    }
+
+    #[test]
+    fn test_copy_file_cow_overwrites_existing_dst() {
+        // FICLONE and the fs::copy fallback both truncate the destination.
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        std::fs::write(&src, b"new").unwrap();
+        std::fs::write(&dst, b"old-and-longer").unwrap();
+        copy_file_cow(&src, &dst).unwrap();
+        assert_eq!(std::fs::read(&dst).unwrap(), b"new");
+    }
 }
