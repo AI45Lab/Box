@@ -8,22 +8,34 @@ use crate::grpc::ExecClient;
 use super::VmManager;
 
 impl VmManager {
-    /// Wait for the VM process to be running (for generic OCI images without an agent).
+    /// Confirm the VM didn't fail on launch (for generic OCI images without an agent).
     ///
-    /// Gives the VM a brief moment to start, then verifies the process hasn't exited.
+    /// A bad config makes libkrun exit within milliseconds, so we only need a short
+    /// window to catch an *immediate* crash and fail loudly. Poll for that instead
+    /// of a fixed 1 s sleep — it shaved ~750 ms off every boot. Crashes that happen
+    /// later are caught by `wait_for_exec_ready`'s `has_exited` checks, which gate
+    /// the rest of boot anyway.
     pub(crate) async fn wait_for_vm_running(&self) -> Result<()> {
-        const STABILIZE_MS: u64 = 1000;
+        const MAX_WAIT_MS: u64 = 250;
+        const POLL_MS: u64 = 25;
 
-        tracing::debug!("Waiting for VM process to stabilize");
-        tokio::time::sleep(tokio::time::Duration::from_millis(STABILIZE_MS)).await;
-
-        if let Some(ref handler) = *self.handler.read().await {
-            if !handler.is_running() {
-                return Err(BoxError::BoxBootError {
-                    message: "VM process exited immediately after start".to_string(),
-                    hint: Some("Check console output for errors".to_string()),
-                });
+        tracing::debug!("Confirming VM process started");
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(ref handler) = *self.handler.read().await {
+                // has_exited is zombie-aware (a halted VM's shim becomes a zombie);
+                // is_running's kill(pid,0) would still report it alive.
+                if handler.has_exited() {
+                    return Err(BoxError::BoxBootError {
+                        message: "VM process exited immediately after start".to_string(),
+                        hint: Some("Check console output for errors".to_string()),
+                    });
+                }
             }
+            if start.elapsed().as_millis() >= MAX_WAIT_MS as u128 {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(POLL_MS)).await;
         }
 
         tracing::debug!("VM process is running");

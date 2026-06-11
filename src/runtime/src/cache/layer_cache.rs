@@ -323,7 +323,7 @@ pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
         } else if meta.is_dir() {
             copy_dir_recursive(&src_path, &dst_path)?;
         } else {
-            std::fs::copy(&src_path, &dst_path).map_err(|e| {
+            copy_file_cow(&src_path, &dst_path).map_err(|e| {
                 BoxError::CacheError(format!(
                     "Failed to copy {} to {}: {}",
                     src_path.display(),
@@ -336,6 +336,46 @@ pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Copy a regular file, preferring a copy-on-write reflink (`FICLONE`) so a new
+/// box's rootfs shares blocks with the cached image — instant, no extra disk — on
+/// reflink-capable filesystems (btrfs, XFS `reflink=1`, bcachefs). Falls back to a
+/// plain byte copy when reflink is unsupported (e.g. ext4) or the source and
+/// destination are on different filesystems. Overlay is preferred on Linux, so
+/// this only runs on the `CopyProvider` fallback path.
+fn copy_file_cow(src: &Path, dst: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        // FICLONE = _IOW(0x94, 9, int)
+        const FICLONE: libc::c_ulong = 0x4004_9409;
+        let reflinked = (|| -> std::io::Result<bool> {
+            let s = std::fs::File::open(src)?;
+            let d = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(dst)?;
+            // SAFETY: FICLONE's argument is the source fd; both fds are valid for
+            // the call. A non-zero return (unsupported FS / cross-device) just
+            // means "fall back to a byte copy".
+            let rc = unsafe { libc::ioctl(d.as_raw_fd(), FICLONE, s.as_raw_fd()) };
+            if rc != 0 {
+                return Ok(false);
+            }
+            // FICLONE clones data only — copy the permission bits like fs::copy.
+            if let Ok(perm) = s.metadata().map(|m| m.permissions()) {
+                let _ = d.set_permissions(perm);
+            }
+            Ok(true)
+        })()
+        .unwrap_or(false);
+        if reflinked {
+            return Ok(());
+        }
+    }
+    std::fs::copy(src, dst).map(|_| ())
 }
 
 /// Calculate the total size of a directory recursively.
