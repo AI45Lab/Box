@@ -475,8 +475,9 @@ fn test_real_compose_smoke() {
 
 /// Warm-pool daemon end-to-end: `pool start` pre-warms VMs, then `pool run`
 /// executes a command in a fresh warm sandbox via the guest exec server (no cold
-/// boot). Also exercises CONCURRENT `pool run`s — the daemon serves them
-/// concurrently. Host-backed (needs KVM + a runnable image).
+/// boot). Also exercises CONCURRENT `pool run`s (served concurrently) and a
+/// LAZY second image via `pool run --image`. Host-backed (needs KVM + a runnable
+/// image).
 #[test]
 #[ignore]
 fn test_real_pool_warm_run() {
@@ -563,6 +564,27 @@ fn test_real_pool_warm_run() {
             );
         }
     });
+
+    // Multi-image: a second image the daemon was NOT started with — its pool is
+    // created lazily on the first `pool run --image`.
+    let second = format!("coverage-pool-second:{}", unique_tag("img2"));
+    cli.ok(&["tag", &image, &second]);
+    let (out2, err2, ok2) = cli.output(&[
+        "pool",
+        "run",
+        "--socket",
+        socket.as_str(),
+        "--image",
+        second.as_str(),
+        "--",
+        "echo",
+        "multiimg-ok",
+    ]);
+    assert!(
+        ok2,
+        "multi-image pool run failed.\nstdout:\n{out2}\nstderr:\n{err2}"
+    );
+    assert!(out2.contains("multiimg-ok"), "unexpected output: {out2:?}");
 
     let _ = daemon.kill();
     let _ = daemon.wait();

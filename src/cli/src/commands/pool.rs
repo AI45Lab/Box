@@ -46,9 +46,10 @@ pub enum PoolAction {
 /// Arguments for `pool start`.
 #[derive(Parser)]
 pub struct PoolStartArgs {
-    /// OCI image to pre-boot (e.g. alpine:latest)
+    /// Image to pre-warm (optional). Sandboxes default to this image; `pool run`
+    /// may request any other image, which the daemon warms on first use.
     #[arg(long)]
-    pub image: String,
+    pub image: Option<String>,
 
     /// Number of VMs to keep pre-booted (min_idle)
     #[arg(long, default_value = "2")]
@@ -78,6 +79,11 @@ pub struct PoolRunArgs {
     #[arg(long, default_value = DEFAULT_SOCKET)]
     pub socket: String,
 
+    /// Image to run in (defaults to the daemon's --image). The daemon warms a
+    /// pool for this image on first use.
+    #[arg(long)]
+    pub image: Option<String>,
+
     /// Command and arguments to run in a fresh warm sandbox
     #[arg(last = true, required = true)]
     pub cmd: Vec<String>,
@@ -102,6 +108,9 @@ pub struct PoolStatusArgs {
 /// Wire request/response for the `pool` Unix-socket protocol (length-prefixed JSON).
 #[derive(Serialize, Deserialize)]
 struct RunRequest {
+    /// Image to run in; `None` means use the daemon's default image.
+    #[serde(default)]
+    image: Option<String>,
     cmd: Vec<String>,
 }
 
@@ -133,6 +142,62 @@ fn keepalive_cmd() -> Vec<String> {
     ]
 }
 
+/// A registry of warm pools keyed by image, created lazily on first use, so one
+/// daemon can serve sandboxes of different images.
+struct PoolRegistry {
+    pools: tokio::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<WarmPool>>>,
+    default_image: Option<String>,
+    size: usize,
+    max: usize,
+    ttl: u64,
+}
+
+impl PoolRegistry {
+    /// The warm pool for `image`, lazily started (and pre-warmed in the background)
+    /// on first use. `WarmPool::start` returns once the replenisher is spawned, so
+    /// holding the map lock across it is brief.
+    async fn get_or_create(&self, image: &str) -> Result<std::sync::Arc<WarmPool>, String> {
+        let mut pools = self.pools.lock().await;
+        if let Some(pool) = pools.get(image) {
+            return Ok(pool.clone());
+        }
+        let pool_config = PoolConfig {
+            enabled: true,
+            min_idle: self.size,
+            max_size: self.max,
+            idle_ttl_secs: self.ttl,
+            ..Default::default()
+        };
+        let box_config = BoxConfig {
+            image: image.to_string(),
+            cmd: keepalive_cmd(),
+            pool: pool_config.clone(),
+            ..Default::default()
+        };
+        let pool = std::sync::Arc::new(
+            WarmPool::start(pool_config, box_config, EventEmitter::new(256))
+                .await
+                .map_err(|e| e.to_string())?,
+        );
+        pools.insert(image.to_string(), pool.clone());
+        Ok(pool)
+    }
+
+    /// Resolve the image for a request: the requested one, else the daemon default.
+    fn resolve_image(&self, requested: Option<String>) -> Option<String> {
+        requested.or_else(|| self.default_image.clone())
+    }
+
+    /// Stop replenishment and destroy idle VMs across all pools (shutdown).
+    async fn drain_all(&self) {
+        let pools = self.pools.lock().await;
+        for pool in pools.values() {
+            pool.signal_shutdown();
+            let _ = pool.drain_idle().await;
+        }
+    }
+}
+
 async fn execute_start(args: PoolStartArgs) -> Result<(), Box<dyn std::error::Error>> {
     if args.size == 0 {
         return Err("--size must be greater than 0".into());
@@ -141,41 +206,42 @@ async fn execute_start(args: PoolStartArgs) -> Result<(), Box<dyn std::error::Er
         return Err(format!("--size ({}) cannot exceed --max ({})", args.size, args.max).into());
     }
 
-    let pool_config = PoolConfig {
-        enabled: true,
-        min_idle: args.size,
-        max_size: args.max,
-        idle_ttl_secs: args.ttl,
-        ..Default::default()
+    let registry = std::sync::Arc::new(PoolRegistry {
+        pools: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        default_image: args.image.clone(),
+        size: args.size,
+        max: args.max,
+        ttl: args.ttl,
+    });
+
+    // Pre-warm the default image, if one was given.
+    let default_stats = if let Some(ref image) = args.image {
+        let pool = registry.get_or_create(image).await?;
+        Some((image.clone(), pool.stats().await))
+    } else {
+        None
     };
 
-    // Keepalive entrypoint: the pooled VM stays alive with its exec server ready;
-    // `pool run` injects the real command via exec.
-    let box_config = BoxConfig {
-        image: args.image.clone(),
-        cmd: keepalive_cmd(),
-        pool: pool_config.clone(),
-        ..Default::default()
-    };
-
-    let emitter = EventEmitter::new(256);
-    // Behind an Arc so the socket server can serve requests concurrently.
-    let pool = std::sync::Arc::new(WarmPool::start(pool_config, box_config, emitter).await?);
-
-    let stats = pool.stats().await;
     if args.json {
-        println!("{}", format_stats_json(&args.image, &stats));
+        match &default_stats {
+            Some((image, stats)) => println!("{}", format_stats_json(image, stats)),
+            None => println!(
+                r#"{{"default_image":null,"max":{},"socket":"{}"}}"#,
+                args.max, args.socket
+            ),
+        }
     } else {
         println!("Warm pool started");
-        println!("  image:    {}", args.image);
-        println!("  min_idle: {}", args.size);
+        match &args.image {
+            Some(i) => println!("  default image: {i} (pre-warming {})", args.size),
+            None => println!("  default image: (none — `pool run` must pass --image)"),
+        }
         println!("  max:      {}", args.max);
         println!("  ttl:      {}s", args.ttl);
-        println!("  idle:     {}", stats.idle_count);
         println!("  socket:   {}", args.socket);
     }
 
-    serve(pool, &args.socket, args.json).await?;
+    serve(registry, &args.socket, args.json).await?;
 
     if !args.json {
         println!("Done.");
@@ -188,7 +254,7 @@ async fn execute_start(args: PoolStartArgs) -> Result<(), Box<dyn std::error::Er
 /// replenisher and destroy idle VMs (in-flight requests keep their own acquired VM).
 #[cfg(not(windows))]
 async fn serve(
-    pool: std::sync::Arc<WarmPool>,
+    registry: std::sync::Arc<PoolRegistry>,
     socket: &str,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -204,9 +270,9 @@ async fn serve(
         tokio::select! {
             accepted = listener.accept() => {
                 let (mut stream, _) = accepted?;
-                let pool = pool.clone();
+                let registry = registry.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_conn(&pool, &mut stream).await {
+                    if let Err(e) = handle_conn(&registry, &mut stream).await {
                         tracing::warn!(error = %e, "pool connection failed");
                     }
                 });
@@ -214,10 +280,9 @@ async fn serve(
             _ = tokio::signal::ctrl_c() => {
                 let _ = std::fs::remove_file(socket);
                 if !json {
-                    println!("Draining warm pool...");
+                    println!("Draining warm pools...");
                 }
-                pool.signal_shutdown();
-                let _ = pool.drain_idle().await;
+                registry.drain_all().await;
                 break;
             }
         }
@@ -226,41 +291,51 @@ async fn serve(
 }
 
 #[cfg(not(windows))]
-async fn handle_conn(pool: &WarmPool, stream: &mut tokio::net::UnixStream) -> std::io::Result<()> {
+fn err_resp(msg: impl Into<String>) -> RunResponse {
+    RunResponse {
+        stdout: vec![],
+        stderr: vec![],
+        exit_code: -1,
+        error: Some(msg.into()),
+    }
+}
+
+#[cfg(not(windows))]
+async fn handle_conn(
+    registry: &PoolRegistry,
+    stream: &mut tokio::net::UnixStream,
+) -> std::io::Result<()> {
     // 60s exec cap — generous for a sandbox command.
     const EXEC_TIMEOUT_NS: u64 = 60_000_000_000;
 
     let req: RunRequest = serde_json::from_slice(&read_frame(stream).await?)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-    // Acquire a warm VM and run the command. Keep the VM so we can tear it down
-    // AFTER responding (a one-shot sandbox is discarded; the pool replenishes a
-    // fresh one) — the client's latency must not include VM teardown.
+    // Resolve the image, get-or-create its pool, acquire a warm VM, run the
+    // command. Keep the VM so we tear it down AFTER responding (a one-shot sandbox
+    // is discarded; the pool replenishes a fresh one) — the client's latency must
+    // not include VM teardown.
     let mut used_vm = None;
-    let resp = match pool.acquire().await {
-        Ok(vm) => {
-            let resp = match vm.exec_command(req.cmd, EXEC_TIMEOUT_NS).await {
-                Ok(o) => RunResponse {
-                    stdout: o.stdout,
-                    stderr: o.stderr,
-                    exit_code: o.exit_code,
-                    error: None,
-                },
-                Err(e) => RunResponse {
-                    stdout: vec![],
-                    stderr: vec![],
-                    exit_code: -1,
-                    error: Some(e.to_string()),
-                },
-            };
-            used_vm = Some(vm);
-            resp
-        }
-        Err(e) => RunResponse {
-            stdout: vec![],
-            stderr: vec![],
-            exit_code: -1,
-            error: Some(format!("acquire failed: {e}")),
+    let resp = match registry.resolve_image(req.image) {
+        None => err_resp("no image: pass --image or start the daemon with --image"),
+        Some(image) => match registry.get_or_create(&image).await {
+            Err(e) => err_resp(format!("pool for {image}: {e}")),
+            Ok(pool) => match pool.acquire().await {
+                Err(e) => err_resp(format!("acquire failed: {e}")),
+                Ok(vm) => {
+                    let resp = match vm.exec_command(req.cmd, EXEC_TIMEOUT_NS).await {
+                        Ok(o) => RunResponse {
+                            stdout: o.stdout,
+                            stderr: o.stderr,
+                            exit_code: o.exit_code,
+                            error: None,
+                        },
+                        Err(e) => err_resp(e.to_string()),
+                    };
+                    used_vm = Some(vm);
+                    resp
+                }
+            },
         },
     };
 
@@ -292,7 +367,10 @@ async fn execute_run(args: PoolRunArgs) -> Result<(), Box<dyn std::error::Error>
 
     write_frame(
         &mut stream,
-        &serde_json::to_vec(&RunRequest { cmd: args.cmd })?,
+        &serde_json::to_vec(&RunRequest {
+            image: args.image,
+            cmd: args.cmd,
+        })?,
     )
     .await?;
     let resp: RunResponse = serde_json::from_slice(&read_frame(&mut stream).await?)?;
@@ -308,7 +386,7 @@ async fn execute_run(args: PoolRunArgs) -> Result<(), Box<dyn std::error::Error>
 
 #[cfg(windows)]
 async fn serve(
-    _pool: &WarmPool,
+    _registry: std::sync::Arc<PoolRegistry>,
     _socket: &str,
     _json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -436,11 +514,17 @@ mod tests {
     #[test]
     fn test_run_request_response_roundtrip() {
         let req = RunRequest {
+            image: Some("alpine:latest".into()),
             cmd: vec!["echo".into(), "hi".into()],
         };
         let bytes = serde_json::to_vec(&req).unwrap();
         let parsed: RunRequest = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed.cmd, vec!["echo", "hi"]);
+        assert_eq!(parsed.image.as_deref(), Some("alpine:latest"));
+
+        // image is optional on the wire (older clients / default-image daemons).
+        let no_img: RunRequest = serde_json::from_slice(br#"{"cmd":["ls"]}"#).unwrap();
+        assert!(no_img.image.is_none());
 
         let resp = RunResponse {
             stdout: b"hi\n".to_vec(),
@@ -458,7 +542,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_start_size_zero_fails() {
         let args = PoolStartArgs {
-            image: "alpine:latest".to_string(),
+            image: Some("alpine:latest".to_string()),
             size: 0,
             max: 5,
             ttl: 300,
@@ -473,7 +557,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_start_size_exceeds_max_fails() {
         let args = PoolStartArgs {
-            image: "alpine:latest".to_string(),
+            image: Some("alpine:latest".to_string()),
             size: 10,
             max: 5,
             ttl: 300,
@@ -506,6 +590,7 @@ mod tests {
         // write_frame then read_frame must return the exact bytes.
         let (mut a, mut b) = tokio::io::duplex(4096);
         let payload = serde_json::to_vec(&RunRequest {
+            image: None,
             cmd: vec!["echo".into(), "hi there".into()],
         })
         .unwrap();
@@ -544,6 +629,7 @@ mod tests {
 
         let mut client = UnixStream::connect(&sock).await.unwrap();
         let req = RunRequest {
+            image: Some("alpine:latest".into()),
             cmd: vec!["ls".into(), "-la".into()],
         };
         write_frame(&mut client, &serde_json::to_vec(&req).unwrap())
