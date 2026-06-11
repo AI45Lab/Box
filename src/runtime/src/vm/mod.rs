@@ -728,6 +728,24 @@ impl VmManager {
             }
         }
 
+        // Prototype: deferred-main-spawn. The guest booted IDLE (BOX_DEFERRED_MAIN);
+        // now that the exec server is ready, tell it to spawn the container command
+        // (already passed via BOX_EXEC_*) as the MAIN process — full box semantics
+        // (exit code + json-file console logs) without a cold boot.
+        #[cfg(unix)]
+        if std::env::var("BOX_DEFERRED_MAIN")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
+            if let Some(client) = self.exec_client.as_ref() {
+                match client.spawn_main().await {
+                    Ok(true) => tracing::info!("deferred container main spawned"),
+                    Ok(false) => tracing::warn!("deferred spawn-main not acknowledged"),
+                    Err(e) => tracing::warn!(error = %e, "deferred spawn-main failed"),
+                }
+            }
+        }
+
         // 5b2. Store socket paths for CRI streaming access
         self.exec_socket_path = Some(layout.exec_socket_path.clone());
         self.pty_socket_path = Some(layout.pty_socket_path.clone());
