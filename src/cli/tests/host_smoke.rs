@@ -472,3 +472,98 @@ fn test_real_compose_smoke() {
     let ps = cli.ok(&["ps", "-a"]);
     assert!(!ps.contains(service_box));
 }
+
+/// Warm-pool daemon end-to-end: `pool start` pre-warms VMs, then `pool run`
+/// executes a command in a fresh warm sandbox via the guest exec server (no cold
+/// boot). Also exercises CONCURRENT `pool run`s — the daemon serves them
+/// concurrently. Host-backed (needs KVM + a runnable image).
+#[test]
+#[ignore]
+fn test_real_pool_warm_run() {
+    let cli = CliTest::new();
+    let image = host_smoke_image();
+    seed_runnable_alpine_image(&cli, &image);
+    let socket = cli
+        .home_path()
+        .join("pool.sock")
+        .to_str()
+        .expect("utf8 socket path")
+        .to_string();
+
+    // Daemon: pre-warm a small pool and listen on the socket.
+    let mut daemon = cli.spawn_background(&[
+        "pool",
+        "start",
+        "--image",
+        image.as_str(),
+        "--size",
+        "3",
+        "--max",
+        "6",
+        "--socket",
+        socket.as_str(),
+    ]);
+
+    // The daemon binds the socket once WarmPool::start returns; wait for it.
+    let sock_path = cli.home_path().join("pool.sock");
+    let start = std::time::Instant::now();
+    while !sock_path.exists() {
+        if start.elapsed() > Duration::from_secs(120) {
+            let _ = daemon.kill();
+            panic!("pool daemon never created its socket");
+        }
+        if let Ok(Some(status)) = daemon.try_wait() {
+            panic!("pool daemon exited early: {status}");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // Give the pool a moment to have at least one idle VM ready.
+    std::thread::sleep(Duration::from_secs(5));
+
+    // Single warm run.
+    let (out, err, ok) = cli.output(&[
+        "pool",
+        "run",
+        "--socket",
+        socket.as_str(),
+        "--",
+        "echo",
+        "pool-e2e-ok",
+    ]);
+    assert!(ok, "pool run failed.\nstdout:\n{out}\nstderr:\n{err}");
+    assert!(out.contains("pool-e2e-ok"), "unexpected output: {out:?}");
+
+    // Concurrent runs — the daemon serves them concurrently.
+    std::thread::scope(|s| {
+        let handles: Vec<_> = (0..3)
+            .map(|i| {
+                let cli = &cli;
+                let socket = socket.as_str();
+                s.spawn(move || {
+                    let tag = format!("conc-{i}");
+                    let (out, _e, ok) = cli.output(&[
+                        "pool",
+                        "run",
+                        "--socket",
+                        socket,
+                        "--",
+                        "echo",
+                        tag.as_str(),
+                    ]);
+                    (ok, out, tag)
+                })
+            })
+            .collect();
+        for h in handles {
+            let (ok, out, tag) = h.join().expect("concurrent run thread panicked");
+            assert!(ok, "concurrent pool run failed: {out}");
+            assert!(
+                out.contains(&tag),
+                "concurrent run output {out:?} missing {tag}"
+            );
+        }
+    });
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+}

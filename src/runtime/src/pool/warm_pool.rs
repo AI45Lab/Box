@@ -313,6 +313,28 @@ impl WarmPool {
         Ok(())
     }
 
+    /// Destroy all idle VMs without consuming the pool (`&self`), so it can be
+    /// shut down from behind an `Arc` (e.g. a daemon serving concurrent requests).
+    /// Pair with [`Self::signal_shutdown`] first to stop the background replenisher;
+    /// its task then exits on its own (it watches the shutdown channel).
+    pub async fn drain_idle(&self) -> Result<()> {
+        let mut idle = self.idle.lock().await;
+        let count = idle.len();
+        for warm_vm in idle.drain(..) {
+            let mut vm = warm_vm.vm;
+            if let Err(e) = vm.destroy().await {
+                tracing::warn!(
+                    box_id = %vm.box_id(),
+                    error = %e,
+                    "Failed to destroy pooled VM during drain_idle"
+                );
+            }
+        }
+        self.stats.lock().await.idle_count = 0;
+        tracing::info!(destroyed = count, "Warm pool idle VMs drained");
+        Ok(())
+    }
+
     /// Remove and destroy specific idle VMs by their box IDs.
     ///
     /// Used when `fill_to_min` partially fails and needs to rollback

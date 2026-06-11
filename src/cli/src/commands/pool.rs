@@ -159,7 +159,8 @@ async fn execute_start(args: PoolStartArgs) -> Result<(), Box<dyn std::error::Er
     };
 
     let emitter = EventEmitter::new(256);
-    let mut pool = WarmPool::start(pool_config, box_config, emitter).await?;
+    // Behind an Arc so the socket server can serve requests concurrently.
+    let pool = std::sync::Arc::new(WarmPool::start(pool_config, box_config, emitter).await?);
 
     let stats = pool.stats().await;
     if args.json {
@@ -174,24 +175,20 @@ async fn execute_start(args: PoolStartArgs) -> Result<(), Box<dyn std::error::Er
         println!("  socket:   {}", args.socket);
     }
 
-    serve(&pool, &args.socket, args.json).await?;
+    serve(pool, &args.socket, args.json).await?;
 
-    if !args.json {
-        println!("Draining warm pool...");
-    }
-    pool.drain().await?;
     if !args.json {
         println!("Done.");
     }
     Ok(())
 }
 
-/// Accept `pool run` connections until Ctrl-C. Requests are served sequentially
-/// (one sandbox at a time) — simple and correct for the MVP; concurrency can be
-/// added later once the lifecycle is proven.
+/// Accept `pool run` connections until Ctrl-C, serving each request concurrently
+/// so independent sandboxes don't queue behind one another. On shutdown, stop the
+/// replenisher and destroy idle VMs (in-flight requests keep their own acquired VM).
 #[cfg(not(windows))]
 async fn serve(
-    pool: &WarmPool,
+    pool: std::sync::Arc<WarmPool>,
     socket: &str,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -207,12 +204,20 @@ async fn serve(
         tokio::select! {
             accepted = listener.accept() => {
                 let (mut stream, _) = accepted?;
-                if let Err(e) = handle_conn(pool, &mut stream).await {
-                    tracing::warn!(error = %e, "pool connection failed");
-                }
+                let pool = pool.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_conn(&pool, &mut stream).await {
+                        tracing::warn!(error = %e, "pool connection failed");
+                    }
+                });
             }
             _ = tokio::signal::ctrl_c() => {
                 let _ = std::fs::remove_file(socket);
+                if !json {
+                    println!("Draining warm pool...");
+                }
+                pool.signal_shutdown();
+                let _ = pool.drain_idle().await;
                 break;
             }
         }
