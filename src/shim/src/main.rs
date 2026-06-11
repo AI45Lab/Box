@@ -75,6 +75,42 @@ fn main() {
     }
 }
 
+/// Opt-in (env `A3S_BOX_KSM=1`): mark this shim's anonymous memory — including
+/// libkrun's guest RAM, which `start_enter` allocates as anonymous `mmap` after
+/// this runs — as KSM-mergeable via `prctl(PR_SET_MEMORY_MERGE)` (Linux 6.4+).
+/// With KSM enabled on the host (`/sys/kernel/mm/ksm/run = 1`), identical pages
+/// across same-image microVMs (kernel text, common runtime/libs) are deduplicated
+/// by ksmd, so N warm VMs of one image cost far less host RAM than N× their size.
+/// Best-effort: a no-op when the env is unset or on pre-6.4 kernels (EINVAL).
+#[cfg(target_os = "linux")]
+fn maybe_enable_ksm_merge() {
+    // PR_SET_MEMORY_MERGE (since Linux 6.4) — not in all libc versions, so use
+    // the numeric value directly.
+    const PR_SET_MEMORY_MERGE: libc::c_int = 67;
+
+    let enabled = std::env::var("A3S_BOX_KSM")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    if !enabled {
+        return;
+    }
+
+    // SAFETY: PR_SET_MEMORY_MERGE takes a single scalar (enable=1); no pointers
+    // or out-params. A non-zero return (e.g. pre-6.4 kernel → EINVAL) is non-fatal.
+    let rc = unsafe { libc::prctl(PR_SET_MEMORY_MERGE, 1, 0, 0, 0) };
+    if rc == 0 {
+        tracing::info!("KSM page-merging enabled for guest memory (PR_SET_MEMORY_MERGE)");
+    } else {
+        tracing::warn!(
+            error = %std::io::Error::last_os_error(),
+            "A3S_BOX_KSM set but PR_SET_MEMORY_MERGE failed (needs Linux 6.4+); continuing without KSM"
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn maybe_enable_ksm_merge() {}
+
 fn run() -> Result<()> {
     let args = Args::parse();
 
@@ -128,6 +164,9 @@ fn run() -> Result<()> {
         rootfs = %spec.rootfs_path.display(),
         "Starting VM"
     );
+
+    // Opt-in KSM: mark guest memory mergeable before libkrun allocates it.
+    maybe_enable_ksm_merge();
 
     // Validate rootfs exists
     if !spec.rootfs_path.exists() {
