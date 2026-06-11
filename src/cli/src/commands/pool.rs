@@ -494,4 +494,73 @@ mod tests {
         let result = execute_status(PoolStatusArgs { json: false }).await;
         assert!(result.is_ok());
     }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_frame_roundtrip() {
+        // write_frame then read_frame must return the exact bytes.
+        let (mut a, mut b) = tokio::io::duplex(4096);
+        let payload = serde_json::to_vec(&RunRequest {
+            cmd: vec!["echo".into(), "hi there".into()],
+        })
+        .unwrap();
+        write_frame(&mut a, &payload).await.unwrap();
+        let got = read_frame(&mut b).await.unwrap();
+        let parsed: RunRequest = serde_json::from_slice(&got).unwrap();
+        assert_eq!(parsed.cmd, vec!["echo", "hi there"]);
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_socket_request_response_protocol() {
+        // Exercise the full client/server wire protocol over a real Unix socket
+        // (the exact framing `serve` and `pool run` use), with a stub server
+        // standing in for the VM pool's acquire+exec.
+        use tokio::net::{UnixListener, UnixStream};
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("pool.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let req: RunRequest =
+                serde_json::from_slice(&read_frame(&mut s).await.unwrap()).unwrap();
+            let resp = RunResponse {
+                stdout: format!("ran {:?}", req.cmd).into_bytes(),
+                stderr: vec![],
+                exit_code: 0,
+                error: None,
+            };
+            write_frame(&mut s, &serde_json::to_vec(&resp).unwrap())
+                .await
+                .unwrap();
+        });
+
+        let mut client = UnixStream::connect(&sock).await.unwrap();
+        let req = RunRequest {
+            cmd: vec!["ls".into(), "-la".into()],
+        };
+        write_frame(&mut client, &serde_json::to_vec(&req).unwrap())
+            .await
+            .unwrap();
+        let resp: RunResponse =
+            serde_json::from_slice(&read_frame(&mut client).await.unwrap()).unwrap();
+
+        assert_eq!(resp.exit_code, 0);
+        assert!(resp.error.is_none());
+        assert!(String::from_utf8_lossy(&resp.stdout).contains("ls"));
+        server.await.unwrap();
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_read_frame_truncated_errors() {
+        // A truncated stream must error, not hang or panic.
+        use tokio::io::AsyncWriteExt;
+        let (mut a, mut b) = tokio::io::duplex(64);
+        a.write_all(&[1u8, 0]).await.unwrap(); // partial 4-byte length prefix
+        drop(a);
+        assert!(read_frame(&mut b).await.is_err());
+    }
 }
