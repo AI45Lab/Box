@@ -105,12 +105,26 @@ pub struct PoolStopArgs {
 /// Arguments for `pool status`.
 #[derive(Parser)]
 pub struct PoolStatusArgs {
+    /// Unix socket of the `pool start` daemon
+    #[arg(long, default_value = DEFAULT_SOCKET)]
+    pub socket: String,
+
     /// Output as JSON
     #[arg(long)]
     pub json: bool,
 }
 
-/// Wire request/response for the `pool` Unix-socket protocol (length-prefixed JSON).
+/// Wire protocol for the `pool` Unix socket (length-prefixed JSON).
+///
+/// Client→daemon request: run a command, or query status. Tagged so the daemon
+/// can dispatch; the client parses the response type matching what it sent.
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+enum Request {
+    Run(RunRequest),
+    Status,
+}
+
 #[derive(Serialize, Deserialize)]
 struct RunRequest {
     /// Image to run in; `None` means use the daemon's default image.
@@ -125,6 +139,21 @@ struct RunResponse {
     stderr: Vec<u8>,
     exit_code: i32,
     error: Option<String>,
+}
+
+/// Live stats for one image's warm pool.
+#[derive(Serialize, Deserialize)]
+struct ImageStat {
+    image: String,
+    idle: usize,
+    total_created: u64,
+    total_acquired: u64,
+    total_evicted: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StatusResponse {
+    images: Vec<ImageStat>,
 }
 
 /// Execute a pool command.
@@ -227,6 +256,24 @@ impl PoolRegistry {
             pool.signal_shutdown();
             let _ = pool.drain_idle().await;
         }
+    }
+
+    /// Snapshot live per-image stats, sorted by image name.
+    async fn stats(&self) -> Vec<ImageStat> {
+        let pools = self.pools.lock().await;
+        let mut out = Vec::with_capacity(pools.len());
+        for (image, pool) in pools.iter() {
+            let s = pool.stats().await;
+            out.push(ImageStat {
+                image: image.clone(),
+                idle: s.idle_count,
+                total_created: s.total_created,
+                total_acquired: s.total_acquired,
+                total_evicted: s.total_evicted,
+            });
+        }
+        out.sort_by(|a, b| a.image.cmp(&b.image));
+        out
     }
 }
 
@@ -354,22 +401,35 @@ async fn handle_conn(
     // 60s exec cap — generous for a sandbox command.
     const EXEC_TIMEOUT_NS: u64 = 60_000_000_000;
 
-    let req: RunRequest = serde_json::from_slice(&read_frame(stream).await?)
+    let req: Request = serde_json::from_slice(&read_frame(stream).await?)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+    // `status` is a simple query — answer and return.
+    let run = match req {
+        Request::Status => {
+            let resp = StatusResponse {
+                images: registry.stats().await,
+            };
+            let bytes = serde_json::to_vec(&resp)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            return write_frame(stream, &bytes).await;
+        }
+        Request::Run(run) => run,
+    };
 
     // Resolve the image, get-or-create its pool, acquire a warm VM, run the
     // command. Keep the VM so we tear it down AFTER responding (a one-shot sandbox
     // is discarded; the pool replenishes a fresh one) — the client's latency must
     // not include VM teardown.
     let mut used_vm = None;
-    let resp = match registry.resolve_image(req.image) {
+    let resp = match registry.resolve_image(run.image) {
         None => err_resp("no image: pass --image or start the daemon with --image"),
         Some(image) => match registry.get_or_create(&image).await {
             Err(e) => err_resp(format!("pool for {image}: {e}")),
             Ok(pool) => match pool.acquire().await {
                 Err(e) => err_resp(format!("acquire failed: {e}")),
                 Ok(vm) => {
-                    let resp = match vm.exec_command(req.cmd, EXEC_TIMEOUT_NS).await {
+                    let resp = match vm.exec_command(run.cmd, EXEC_TIMEOUT_NS).await {
                         Ok(o) => RunResponse {
                             stdout: o.stdout,
                             stderr: o.stderr,
@@ -413,10 +473,10 @@ async fn execute_run(args: PoolRunArgs) -> Result<(), Box<dyn std::error::Error>
 
     write_frame(
         &mut stream,
-        &serde_json::to_vec(&RunRequest {
+        &serde_json::to_vec(&Request::Run(RunRequest {
             image: args.image,
             cmd: args.cmd,
-        })?,
+        }))?,
     )
     .await?;
     let resp: RunResponse = serde_json::from_slice(&read_frame(&mut stream).await?)?;
@@ -474,11 +534,42 @@ async fn execute_stop(_args: PoolStopArgs) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
-async fn execute_status(_args: PoolStatusArgs) -> Result<(), Box<dyn std::error::Error>> {
-    // Status lives in the running daemon; expose via Prometheus for now.
-    eprintln!("Pool status is shown by the running `a3s-box pool start` process.");
-    eprintln!("Use Prometheus metrics (a3s_box_warm_pool_*) for live observability.");
+#[cfg(not(windows))]
+async fn execute_status(args: PoolStatusArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use tokio::net::UnixStream;
+
+    let mut stream = UnixStream::connect(&args.socket).await.map_err(|e| {
+        format!(
+            "Failed to connect to pool daemon at {} ({}). Is `a3s-box pool start` running?",
+            args.socket, e
+        )
+    })?;
+
+    write_frame(&mut stream, &serde_json::to_vec(&Request::Status)?).await?;
+    let resp: StatusResponse = serde_json::from_slice(&read_frame(&mut stream).await?)?;
+
+    if args.json {
+        println!("{}", serde_json::to_string(&resp.images)?);
+    } else if resp.images.is_empty() {
+        println!("No warm pools yet (no images warmed).");
+    } else {
+        println!(
+            "{:<40} {:>5} {:>8} {:>9} {:>8}",
+            "IMAGE", "IDLE", "CREATED", "ACQUIRED", "EVICTED"
+        );
+        for s in &resp.images {
+            println!(
+                "{:<40} {:>5} {:>8} {:>9} {:>8}",
+                s.image, s.idle, s.total_created, s.total_acquired, s.total_evicted
+            );
+        }
+    }
     Ok(())
+}
+
+#[cfg(windows)]
+async fn execute_status(_args: PoolStatusArgs) -> Result<(), Box<dyn std::error::Error>> {
+    Err("`pool status` is not supported on Windows".into())
 }
 
 /// Format pool stats as a JSON string.
@@ -648,10 +739,47 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[cfg(not(windows))]
     #[tokio::test]
-    async fn test_execute_status_is_ok() {
-        let result = execute_status(PoolStatusArgs { json: false }).await;
-        assert!(result.is_ok());
+    async fn test_execute_status_no_daemon_errors() {
+        // With no daemon listening, status fails with a connect hint (not a panic).
+        let result = execute_status(PoolStatusArgs {
+            socket: "/tmp/a3s-box-pool-does-not-exist.sock".to_string(),
+            json: false,
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("pool daemon"));
+    }
+
+    #[test]
+    fn test_request_envelope_tagging() {
+        // Run carries an op tag + the flattened RunRequest; Status is a bare tag.
+        let run = serde_json::to_string(&Request::Run(RunRequest {
+            image: Some("alpine".into()),
+            cmd: vec!["echo".into(), "hi".into()],
+        }))
+        .unwrap();
+        assert!(run.contains(r#""op":"run""#));
+        assert!(run.contains(r#""cmd":["echo","hi"]"#));
+
+        let status = serde_json::to_string(&Request::Status).unwrap();
+        assert_eq!(status, r#"{"op":"status"}"#);
+
+        // StatusResponse round-trips.
+        let sr = StatusResponse {
+            images: vec![ImageStat {
+                image: "alpine".into(),
+                idle: 2,
+                total_created: 5,
+                total_acquired: 3,
+                total_evicted: 1,
+            }],
+        };
+        let parsed: StatusResponse =
+            serde_json::from_slice(&serde_json::to_vec(&sr).unwrap()).unwrap();
+        assert_eq!(parsed.images[0].image, "alpine");
+        assert_eq!(parsed.images[0].idle, 2);
     }
 
     #[cfg(not(windows))]
