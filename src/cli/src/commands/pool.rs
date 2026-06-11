@@ -731,6 +731,23 @@ mod tests {
         assert!(parse_warm_spec("=4", 2).is_err());
     }
 
+    #[test]
+    fn test_deferred_spec_json() {
+        // The spawn-main spec for a deferred pool run: executable + args + a PATH
+        // so the binary resolves like a normal container main.
+        let json = deferred_spec_json(&["sh".into(), "-c".into(), "echo hi".into()]);
+        let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(v["executable"], "sh");
+        assert_eq!(v["args"][0], "-c");
+        assert_eq!(v["args"][1], "echo hi");
+        assert_eq!(v["env"][0][0], "PATH");
+        assert!(v["env"][0][1].as_str().unwrap().contains("/bin"));
+        // Empty cmd falls back to a shell rather than panicking.
+        let j2 = deferred_spec_json(&[]);
+        let v2: serde_json::Value = serde_json::from_slice(&j2).unwrap();
+        assert_eq!(v2["executable"], "/bin/sh");
+    }
+
     #[tokio::test]
     async fn test_backpressure_bounds_concurrency() {
         // The contract PoolEntry relies on: a permit (held until teardown) caps

@@ -600,3 +600,83 @@ fn test_real_pool_warm_run() {
     let _ = daemon.kill();
     let _ = daemon.wait();
 }
+
+/// Deferred-main pool end-to-end: `pool start --deferred` boots pooled VMs IDLE,
+/// and `pool run` spawns the command as the box's real MAIN — full box semantics
+/// (stdout/stderr from the box's json-file console logs + the real exit code),
+/// unlike the keepalive+exec MVP's exec-stream output. Host-backed (KVM).
+#[test]
+#[ignore]
+fn test_real_pool_deferred_main() {
+    let cli = CliTest::new();
+    let image = host_smoke_image();
+    seed_runnable_alpine_image(&cli, &image);
+    let socket = cli
+        .home_path()
+        .join("pd.sock")
+        .to_str()
+        .expect("utf8 socket path")
+        .to_string();
+
+    let mut daemon = cli.spawn_background(&[
+        "pool",
+        "start",
+        "--deferred",
+        "--image",
+        image.as_str(),
+        "--size",
+        "2",
+        "--max",
+        "4",
+        "--socket",
+        socket.as_str(),
+    ]);
+
+    let sock_path = cli.home_path().join("pd.sock");
+    let start = std::time::Instant::now();
+    while !sock_path.exists() {
+        if start.elapsed() > Duration::from_secs(120) {
+            let _ = daemon.kill();
+            panic!("deferred pool daemon never created its socket");
+        }
+        if let Ok(Some(status)) = daemon.try_wait() {
+            panic!("deferred pool daemon exited early: {status}");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    std::thread::sleep(Duration::from_secs(5));
+
+    // Full box semantics: stdout + stderr come back from the box's json-file logs.
+    let (out, err, ok) = cli.output(&[
+        "pool",
+        "run",
+        "--socket",
+        socket.as_str(),
+        "--",
+        "sh",
+        "-c",
+        "echo deferred-stdout; echo deferred-stderr 1>&2; exit 0",
+    ]);
+    assert!(
+        ok,
+        "deferred pool run failed.\nstdout:\n{out}\nstderr:\n{err}"
+    );
+    assert!(out.contains("deferred-stdout"), "missing stdout: {out:?}");
+    assert!(err.contains("deferred-stderr"), "missing stderr: {err:?}");
+
+    // The real container exit code propagates (not the exec-stream's).
+    let (_o, _e, ok2) = cli.output(&[
+        "pool",
+        "run",
+        "--socket",
+        socket.as_str(),
+        "--",
+        "sh",
+        "-c",
+        "exit 7",
+    ]);
+    assert!(!ok2, "expected a non-zero exit from the deferred main");
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+}
