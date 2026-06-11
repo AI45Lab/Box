@@ -986,55 +986,105 @@ fn remount_rootfs_readonly() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Wait for the main container process.
+/// Supervise children as PID 1: propagate the container's exit, and reap orphans.
 ///
-/// Exec and PTY requests run in other guest-init threads and wait for their
-/// own child processes. The main supervision loop must not call waitpid(-1),
-/// otherwise it can reap those children before the request handler observes
-/// their exit status.
+/// Exec and PTY request handlers reap their OWN children (each `waitpid`s a
+/// specific pid) to read the real exit status, so this loop must not steal them
+/// with a blind `waitpid(-1)`. It peeks exited children non-destructively with
+/// `waitid(WNOWAIT)` and, via the [`reaper`](a3s_box_guest_init::reaper)
+/// registry, reaps only the container (→ VM lifecycle / exit code) and UNMANAGED
+/// children — reparented grandchildren and the sidecar — leaving handler-managed
+/// children for their handler. This propagates the container exit code AND fixes
+/// the zombie leak (orphans were previously never reaped until shutdown).
+#[cfg(target_os = "linux")]
 fn wait_for_children(container_pid: nix::unistd::Pid) -> Result<(), Box<dyn std::error::Error>> {
-    use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+    use a3s_box_guest_init::reaper;
+    use nix::sys::wait::{waitid, waitpid, Id, WaitPidFlag, WaitStatus};
 
     /// Maximum time to wait for children after forwarding SIGTERM (5 seconds).
     const CHILD_SHUTDOWN_TIMEOUT_MS: u64 = 5000;
 
-    info!("Waiting for container process {}", container_pid);
+    info!(
+        "Supervising children as PID 1; container PID {}",
+        container_pid
+    );
 
     loop {
-        // Check if shutdown was requested via SIGTERM
         if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
             info!("SIGTERM received, initiating graceful shutdown");
             graceful_shutdown(CHILD_SHUTDOWN_TIMEOUT_MS);
             return Ok(());
         }
 
+        // Drain currently-exited children. `WNOWAIT` peeks without reaping, so a
+        // handler-managed child stays reapable by its handler; we break on it and
+        // revisit next tick (the handler clears it within its own poll interval).
+        loop {
+            let (pid, code, signaled) = match waitid(
+                Id::All,
+                WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT | WaitPidFlag::WNOHANG,
+            ) {
+                Ok(WaitStatus::Exited(pid, status)) => (pid, status, false),
+                Ok(WaitStatus::Signaled(pid, signal, _)) => (pid, 128 + signal as i32, true),
+                // No exited child right now: stop draining and poll again later.
+                Ok(_) => break,
+                // No children at all (container already gone): nothing to supervise.
+                Err(nix::errno::Errno::ECHILD) => return Ok(()),
+                // Transient error: retry on the next tick.
+                Err(_) => break,
+            };
+
+            if pid == container_pid {
+                // The container drives the VM lifecycle: reap it and exit with its
+                // status so the host (and detached `run -d wait`) sees the real code.
+                let _ = waitpid(pid, None);
+                if signaled {
+                    error!("Container process {} terminated (exit code {})", pid, code);
+                } else {
+                    info!("Container process {} exited with status {}", pid, code);
+                }
+                persist_exit_code(code);
+                process::exit(code);
+            } else if reaper::is_managed(pid.as_raw()) {
+                // Owned by an exec/PTY handler, which reaps it for the real status.
+                // Stop draining; it clears shortly and we revisit on the next tick.
+                break;
+            } else {
+                // Orphan (reparented grandchild) or the sidecar: reap it here so it
+                // does not linger as a zombie. Keep draining for more.
+                let _ = waitpid(pid, Some(WaitPidFlag::WNOHANG));
+            }
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Non-Linux development stub: just wait for the container process to exit.
+#[cfg(not(target_os = "linux"))]
+fn wait_for_children(container_pid: nix::unistd::Pid) -> Result<(), Box<dyn std::error::Error>> {
+    use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+
+    loop {
+        if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         match waitpid(container_pid, Some(WaitPidFlag::WNOHANG)) {
-            Ok(WaitStatus::Exited(pid, status)) => {
-                info!("Container process {} exited with status {}", pid, status);
+            Ok(WaitStatus::Exited(_, status)) => {
                 persist_exit_code(status);
                 process::exit(status);
             }
-            Ok(WaitStatus::Signaled(pid, signal, _)) => {
-                error!("Container process {} killed by signal {:?}", pid, signal);
+            Ok(WaitStatus::Signaled(_, signal, _)) => {
                 persist_exit_code(128 + signal as i32);
                 process::exit(128 + signal as i32);
             }
             Ok(WaitStatus::StillAlive) => {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            Ok(_) => {
-                // Other status, continue waiting
-            }
-            Err(nix::errno::Errno::ECHILD) => {
-                info!("Container process {} is no longer a child", container_pid);
-                break;
-            }
-            Err(e) => {
-                return Err(format!("waitpid failed: {}", e).into());
-            }
+            Ok(_) => {}
+            Err(_) => break,
         }
     }
-
     Ok(())
 }
 
@@ -1053,6 +1103,9 @@ fn persist_exit_code(code: i32) {
 }
 
 /// Perform graceful shutdown: forward SIGTERM to children, wait, then force-kill.
+/// Only the Linux supervision loop drives this (the non-Linux dev stub exits the
+/// process directly), so it is gated to avoid a dead-code warning on macOS.
+#[cfg(target_os = "linux")]
 fn graceful_shutdown(timeout_ms: u64) {
     // Step 1: Send SIGTERM to all processes (except ourselves, PID 1)
     #[cfg(target_os = "linux")]

@@ -246,6 +246,11 @@ fn handle_pty_connection(fd: std::os::fd::OwnedFd) -> Result<(), Box<dyn std::er
             // Parent: relay data between vsock and PTY master
             drop(slave_fd);
 
+            // Register the PTY child with the reaper so PID 1 leaves it for us to
+            // reap (relay_pty_data waitpid's it for the real exit code). The guard
+            // unregisters when this branch returns.
+            let _reap_guard = crate::reaper::manage_pid(child.as_raw());
+
             let exit_code = relay_pty_data(&mut stream, &master_fd, child);
 
             // Send exit frame
