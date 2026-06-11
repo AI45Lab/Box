@@ -764,8 +764,8 @@ fn mount_user_volumes() -> Result<(), Box<dyn std::error::Error>> {
                 let guest_path = parts[1];
                 // Flags after the guest path may appear in any order: "ro", "file".
                 // The host decides "file" (it can stat the source); the guest obeys.
-                let read_only = parts[2..].iter().any(|&m| m == "ro");
-                let is_file = parts[2..].iter().any(|&m| m == "file");
+                let read_only = parts[2..].contains(&"ro");
+                let is_file = parts[2..].contains(&"file");
 
                 let flags = if read_only {
                     MsFlags::MS_RDONLY

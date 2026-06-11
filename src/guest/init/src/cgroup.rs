@@ -86,22 +86,6 @@ fn shares_to_weight(shares: u64) -> u64 {
     (1 + ((shares - 2) * 9999) / 262_142).clamp(1, 10_000)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::shares_to_weight;
-
-    #[test]
-    fn test_shares_to_weight_mapping() {
-        // Endpoints + the cgroup v1 default map to the runc-equivalent weights.
-        assert_eq!(shares_to_weight(2), 1);
-        assert_eq!(shares_to_weight(262_144), 10_000);
-        assert_eq!(shares_to_weight(1024), 39); // runc's mapping for the default
-                                                // Out-of-range inputs are clamped, never panic / overflow.
-        assert_eq!(shares_to_weight(0), 1);
-        assert_eq!(shares_to_weight(u64::MAX), 10_000);
-    }
-}
-
 /// A per-container cgroup v2 (memory + cpu limits). Dropping it removes the
 /// cgroup directory.
 pub struct ContainerCgroup {
@@ -200,5 +184,21 @@ impl Drop for ContainerCgroup {
         if let Err(error) = std::fs::remove_dir(&self.path) {
             debug!(error = %error, path = %self.path, "cgroup: cleanup rmdir failed");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shares_to_weight;
+
+    #[test]
+    fn test_shares_to_weight_mapping() {
+        // Endpoints + the cgroup v1 default map to the runc-equivalent weights.
+        assert_eq!(shares_to_weight(2), 1);
+        assert_eq!(shares_to_weight(262_144), 10_000);
+        assert_eq!(shares_to_weight(1024), 39); // runc's mapping for the default
+                                                // Out-of-range inputs are clamped, never panic / overflow.
+        assert_eq!(shares_to_weight(0), 1);
+        assert_eq!(shares_to_weight(u64::MAX), 10_000);
     }
 }
