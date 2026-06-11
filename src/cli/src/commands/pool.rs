@@ -67,6 +67,11 @@ pub struct PoolStartArgs {
     #[arg(long, default_value = DEFAULT_SOCKET)]
     pub socket: String,
 
+    /// Extra images to pre-warm at startup, `image[=count]` (count defaults to
+    /// --size). Repeat or comma-separate: `--warm python:3=4,node:20`.
+    #[arg(long, value_delimiter = ',')]
+    pub warm: Vec<String>,
+
     /// Output as JSON
     #[arg(long)]
     pub json: bool,
@@ -142,6 +147,24 @@ fn keepalive_cmd() -> Vec<String> {
     ]
 }
 
+/// Parse a `--warm` entry of the form `image[=count]` (count defaults to `default_size`).
+fn parse_warm_spec(entry: &str, default_size: usize) -> Result<(String, usize), String> {
+    match entry.split_once('=') {
+        Some((image, count)) => {
+            let image = image.trim();
+            if image.is_empty() {
+                return Err(format!("missing image in '{entry}'"));
+            }
+            let count: usize = count
+                .trim()
+                .parse()
+                .map_err(|_| format!("invalid warm count in '{entry}'"))?;
+            Ok((image.to_string(), count))
+        }
+        None => Ok((entry.trim().to_string(), default_size)),
+    }
+}
+
 /// A registry of warm pools keyed by image, created lazily on first use, so one
 /// daemon can serve sandboxes of different images.
 struct PoolRegistry {
@@ -154,17 +177,21 @@ struct PoolRegistry {
 
 impl PoolRegistry {
     /// The warm pool for `image`, lazily started (and pre-warmed in the background)
-    /// on first use. `WarmPool::start` returns once the replenisher is spawned, so
-    /// holding the map lock across it is brief.
-    async fn get_or_create(&self, image: &str) -> Result<std::sync::Arc<WarmPool>, String> {
+    /// on first use, with `min_idle = size`. `WarmPool::start` returns once the
+    /// replenisher is spawned, so holding the map lock across it is brief.
+    async fn get_or_create_with_size(
+        &self,
+        image: &str,
+        size: usize,
+    ) -> Result<std::sync::Arc<WarmPool>, String> {
         let mut pools = self.pools.lock().await;
         if let Some(pool) = pools.get(image) {
             return Ok(pool.clone());
         }
         let pool_config = PoolConfig {
             enabled: true,
-            min_idle: self.size,
-            max_size: self.max,
+            min_idle: size,
+            max_size: self.max.max(size),
             idle_ttl_secs: self.ttl,
             ..Default::default()
         };
@@ -181,6 +208,11 @@ impl PoolRegistry {
         );
         pools.insert(image.to_string(), pool.clone());
         Ok(pool)
+    }
+
+    /// Lazy pool for `image` at the daemon's default size.
+    async fn get_or_create(&self, image: &str) -> Result<std::sync::Arc<WarmPool>, String> {
+        self.get_or_create_with_size(image, self.size).await
     }
 
     /// Resolve the image for a request: the requested one, else the daemon default.
@@ -222,6 +254,17 @@ async fn execute_start(args: PoolStartArgs) -> Result<(), Box<dyn std::error::Er
         None
     };
 
+    // Pre-warm any extra images requested via --warm.
+    let mut warmed_extra: Vec<(String, usize)> = Vec::new();
+    for entry in &args.warm {
+        let (image, count) = parse_warm_spec(entry, args.size)?;
+        if count == 0 {
+            return Err(format!("--warm count must be > 0 (in '{entry}')").into());
+        }
+        registry.get_or_create_with_size(&image, count).await?;
+        warmed_extra.push((image, count));
+    }
+
     if args.json {
         match &default_stats {
             Some((image, stats)) => println!("{}", format_stats_json(image, stats)),
@@ -235,6 +278,9 @@ async fn execute_start(args: PoolStartArgs) -> Result<(), Box<dyn std::error::Er
         match &args.image {
             Some(i) => println!("  default image: {i} (pre-warming {})", args.size),
             None => println!("  default image: (none — `pool run` must pass --image)"),
+        }
+        for (image, count) in &warmed_extra {
+            println!("  pre-warmed: {image} (size {count})");
         }
         println!("  max:      {}", args.max);
         println!("  ttl:      {}s", args.ttl);
@@ -512,6 +558,28 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_warm_spec() {
+        // image=count
+        assert_eq!(
+            parse_warm_spec("python:3=4", 2).unwrap(),
+            ("python:3".to_string(), 4)
+        );
+        // bare image → default size
+        assert_eq!(
+            parse_warm_spec("node:20", 7).unwrap(),
+            ("node:20".to_string(), 7)
+        );
+        // whitespace tolerated
+        assert_eq!(
+            parse_warm_spec("  alpine = 3 ", 2).unwrap(),
+            ("alpine".to_string(), 3)
+        );
+        // bad count / empty image error out
+        assert!(parse_warm_spec("alpine=notanum", 2).is_err());
+        assert!(parse_warm_spec("=4", 2).is_err());
+    }
+
+    #[test]
     fn test_run_request_response_roundtrip() {
         let req = RunRequest {
             image: Some("alpine:latest".into()),
@@ -547,6 +615,7 @@ mod tests {
             max: 5,
             ttl: 300,
             socket: DEFAULT_SOCKET.to_string(),
+            warm: vec![],
             json: false,
         };
         let result = execute_start(args).await;
@@ -562,6 +631,7 @@ mod tests {
             max: 5,
             ttl: 300,
             socket: DEFAULT_SOCKET.to_string(),
+            warm: vec![],
             json: false,
         };
         let result = execute_start(args).await;

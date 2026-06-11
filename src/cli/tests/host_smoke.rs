@@ -476,14 +476,18 @@ fn test_real_compose_smoke() {
 /// Warm-pool daemon end-to-end: `pool start` pre-warms VMs, then `pool run`
 /// executes a command in a fresh warm sandbox via the guest exec server (no cold
 /// boot). Also exercises CONCURRENT `pool run`s (served concurrently) and a
-/// LAZY second image via `pool run --image`. Host-backed (needs KVM + a runnable
-/// image).
+/// SECOND image pre-warmed at startup via `--warm`, run with `pool run --image`.
+/// Host-backed (needs KVM + a runnable image).
 #[test]
 #[ignore]
 fn test_real_pool_warm_run() {
     let cli = CliTest::new();
     let image = host_smoke_image();
     seed_runnable_alpine_image(&cli, &image);
+    // A second image (retag of the first) the daemon pre-warms at startup via --warm.
+    let second = format!("coverage-pool-second:{}", unique_tag("img2"));
+    cli.ok(&["tag", &image, &second]);
+    let warm_spec = format!("{second}=2");
     let socket = cli
         .home_path()
         .join("pool.sock")
@@ -491,7 +495,7 @@ fn test_real_pool_warm_run() {
         .expect("utf8 socket path")
         .to_string();
 
-    // Daemon: pre-warm a small pool and listen on the socket.
+    // Daemon: pre-warm the default pool + a second image via --warm; listen on the socket.
     let mut daemon = cli.spawn_background(&[
         "pool",
         "start",
@@ -501,6 +505,8 @@ fn test_real_pool_warm_run() {
         "3",
         "--max",
         "6",
+        "--warm",
+        warm_spec.as_str(),
         "--socket",
         socket.as_str(),
     ]);
@@ -565,10 +571,7 @@ fn test_real_pool_warm_run() {
         }
     });
 
-    // Multi-image: a second image the daemon was NOT started with — its pool is
-    // created lazily on the first `pool run --image`.
-    let second = format!("coverage-pool-second:{}", unique_tag("img2"));
-    cli.ok(&["tag", &image, &second]);
+    // Multi-image: run in the second image, pre-warmed at startup via --warm.
     let (out2, err2, ok2) = cli.output(&[
         "pool",
         "run",
