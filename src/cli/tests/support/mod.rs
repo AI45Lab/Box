@@ -128,6 +128,22 @@ impl CliTest {
         )
     }
 
+    /// Spawn `a3s-box <args>` as a background process (e.g. a daemon), inheriting
+    /// the test env plus `A3S_HOME`. The caller owns the `Child` and must kill it.
+    pub fn spawn_background(&self, args: &[&str]) -> std::process::Child {
+        eprintln!("    $ a3s-box {} &", args.join(" "));
+        self.command(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|e| {
+                panic!(
+                    "failed to spawn background `a3s-box {}`: {e}",
+                    args.join(" ")
+                )
+            })
+    }
+
     pub fn output_with_stdin(&self, args: &[&str], stdin: &[u8]) -> (String, String, bool) {
         eprintln!("    $ printf ... | a3s-box {}", args.join(" "));
 
