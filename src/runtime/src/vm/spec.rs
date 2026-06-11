@@ -342,7 +342,8 @@ impl VmManager {
     /// - If `entrypoint_override` is set, it replaces the OCI ENTRYPOINT
     /// - If ENTRYPOINT is set: executable = ENTRYPOINT[0], args = ENTRYPOINT[1:] + CMD
     /// - If only CMD is set: executable = CMD[0], args = CMD[1:]
-    /// - If neither: fall back to `/sbin/init`
+    /// - If neither: fall back to `/bin/sh` (universal across distros; `/sbin/init`
+    ///   does not exist on Alpine, which was the original cause of issue #3)
     /// - If `cmd_override` is non-empty, it replaces the OCI CMD
     ///
     /// Paths are used as-is since the OCI image is always extracted at rootfs root.
