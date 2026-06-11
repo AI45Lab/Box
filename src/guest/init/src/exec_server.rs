@@ -751,8 +751,12 @@ fn execute_command(
         Err(output) => return output,
     };
 
-    let mut child = match command.spawn() {
-        Ok(child) => child,
+    // Spawn under the reaper registry: the pid is marked MANAGED before the PID 1
+    // supervision loop can see it, so the loop leaves this child for us to reap
+    // (and read its real exit code) instead of stealing it. The guard unregisters
+    // the pid when this function returns (all paths).
+    let (mut child, _reap_guard) = match crate::reaper::spawn_managed(|| command.spawn()) {
+        Ok(pair) => pair,
         Err(e) => {
             return ExecOutput {
                 stdout: vec![],
@@ -1043,8 +1047,10 @@ fn execute_command_streaming(
         }
     };
 
-    let mut child = match command.spawn() {
-        Ok(child) => child,
+    // Spawn under the reaper registry (see one-shot path) so PID 1 leaves this
+    // streaming child for us to reap; the guard unregisters on return.
+    let (mut child, _reap_guard) = match crate::reaper::spawn_managed(|| command.spawn()) {
+        Ok(pair) => pair,
         Err(e) => {
             let output = ExecOutput {
                 stdout: vec![],

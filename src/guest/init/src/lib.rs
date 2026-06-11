@@ -14,6 +14,7 @@ pub mod namespace;
 pub mod network;
 pub mod port_forward;
 pub mod pty_server;
+pub mod reaper;
 pub mod user;
 
 pub use namespace::{spawn_isolated, NamespaceConfig, NamespaceError};
