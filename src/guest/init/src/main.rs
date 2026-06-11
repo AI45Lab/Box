@@ -43,8 +43,11 @@ impl ExecConfig {
     /// - BOX_EXEC_ENV_*: container environment variables
     /// - BOX_EXEC_WORKDIR: working directory (defaults to "/")
     fn from_env() -> Self {
-        let executable =
-            std::env::var("BOX_EXEC_EXEC").unwrap_or_else(|_| "/sbin/init".to_string());
+        // The runtime always sets BOX_EXEC_EXEC when guest-init is PID 1
+        // (runtime/src/vm/spec.rs), so this default is only a defensive fallback.
+        // Use /bin/sh — universal across distros — never /sbin/init, which does
+        // not exist on Alpine and was the original cause of issue #3.
+        let executable = std::env::var("BOX_EXEC_EXEC").unwrap_or_else(|_| "/bin/sh".to_string());
 
         // Parse args from individual env vars (BOX_EXEC_ARGC + BOX_EXEC_ARG_0..N)
         let args: Vec<String> = match std::env::var("BOX_EXEC_ARGC")
@@ -268,6 +271,18 @@ fn run_init() -> Result<(), Box<dyn std::error::Error>> {
     // Step 2.5: Mount tmpfs volumes
     mount_tmpfs_volumes()?;
 
+    // Step 2.6: Bind the exec (vsock 4089) and PTY (vsock 4090) listening sockets
+    // NOW, before the slower network bring-up and container spawn below. These are
+    // pure socket/bind/listen syscalls on this (still single-threaded) main thread,
+    // so the later container fork stays fork-safe; the accept loops are spawned as
+    // threads only after the fork (Step 8). Binding this early fills the listen
+    // backlog from the start of boot, so a host connect QUEUES instead of being
+    // refused while network setup and the container spawn finish — closing the
+    // exec/PTY startup race of issue #3. CLOEXEC on the fds keeps the forked
+    // container from inheriting the listeners.
+    let exec_listener = exec_server::bind_exec_server()?;
+    let pty_listener = pty_server::bind_pty_server()?;
+
     // Step 3: Configure guest network (if passt mode is active).
     // Network setup may write /etc/resolv.conf — must run before read-only remount.
     network::configure_guest_network()?;
@@ -362,9 +377,11 @@ fn run_init() -> Result<(), Box<dyn std::error::Error>> {
 
     expose_container_env_to_exec(&exec_config);
 
-    // Step 8: Start exec server in background thread
-    std::thread::spawn(|| {
-        if let Err(e) = exec_server::run_exec_server() {
+    // Step 8: Start the exec server accept loop on the socket bound in Step 2.6.
+    // (set_container_pid above ran first, so a host signal-main frame still finds
+    // the PID once the loop is serving.)
+    std::thread::spawn(move || {
+        if let Err(e) = exec_server::serve_exec_server(exec_listener) {
             error!("Exec server failed: {}", e);
         }
     });
@@ -376,9 +393,9 @@ fn run_init() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Step 8.5: Start PTY server in background thread
-    std::thread::spawn(|| {
-        if let Err(e) = pty_server::run_pty_server() {
+    // Step 8.5: Start the PTY server accept loop on the socket bound in Step 2.6.
+    std::thread::spawn(move || {
+        if let Err(e) = pty_server::serve_pty_server(pty_listener) {
             error!("PTY server failed: {}", e);
         }
     });
