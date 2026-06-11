@@ -1,9 +1,33 @@
 # Design: P2 — Deferred-Main-Spawn (full box semantics for pooled sandboxes)
 
-Status: **GO-WITH-CONDITIONS** (design + prototype-first). Builds on
-`refactor/init-readiness` (PR #15: early-bind + event-driven readiness + PID1
-reaper) and `feat/p1-template-pool` (PR #18: the warm-sandbox pool controller).
-Derived from an adversarial mapping of the real #15+#18 base.
+Status: **IMPLEMENTED & KVM-verified** (the GO-WITH-CONDITIONS design below was
+confirmed in practice). Builds on PR #15 (early-bind + event-driven readiness +
+PID1 reaper) and PR #18 (the warm-sandbox pool controller).
+
+## 0. Implementation status & usage
+
+```sh
+# Boot a pool of IDLE sandboxes (no container main at boot)...
+a3s-box pool start --deferred --image alpine:latest --size 4 --socket /tmp/p.sock
+# ...then run a command as the box's REAL main — full box semantics:
+a3s-box pool run --socket /tmp/p.sock -- sh -c 'echo hi; exit 7'   # exit 7; output in the json-file logs
+```
+
+What landed (vs the design): a `BOX_DEFERRED_MAIN=1`/`BoxConfig.deferred_main`
+IDLE boot (skip the boot spawn; the `ECHILD`-with-no-container case keeps PID 1
+waiting instead of exiting — see §5/Phase 1); a `spawn-main` control frame (bare
+for the `run` path's boot-stashed command, or carrying a command for the pool,
+which pre-warms before the command is known); the deferred main spawned via the
+exec server's `build_command` (**identical seccomp/user/no-new-privs** to a boot
+main — verified `Seccomp: 2`, `--user 1000`→uid 1000) with stdio overridden to
+`inherit` so its stdout/stderr reach the json-file console logs; the pid
+CAS-published while MANAGED then reaped by the supervision loop for the real exit
+code; `pool start --deferred` + `VmManager::run_deferred_main`. Resource limits
+need no extra work — they are VM-level (libkrun `set_vm_config`), so a deferred
+main shares the boot main's limits. KVM-verified end to end (exit codes 7/3/0,
+stdout+stderr from the json-file logs, seccomp applied — all from a pre-warmed
+pool), with unit (`deferred_spec_json`) + host e2e (`test_real_pool_deferred_main`)
+coverage. Not yet wired: a typed pool API (`Request::SpawnMain`) beyond the CLI.
 
 ## 1. Goal
 
