@@ -194,10 +194,20 @@ fn parse_warm_spec(entry: &str, default_size: usize) -> Result<(String, usize), 
     }
 }
 
+/// One image's warm pool plus a semaphore bounding concurrent in-flight sandboxes.
+/// `WarmPool::acquire` boots on a pool miss with no `max_size` cap, so without this
+/// a burst of `pool run`s would boot unbounded VMs; the permit makes excess
+/// requests queue instead.
+#[derive(Clone)]
+struct PoolEntry {
+    pool: std::sync::Arc<WarmPool>,
+    sem: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
 /// A registry of warm pools keyed by image, created lazily on first use, so one
 /// daemon can serve sandboxes of different images.
 struct PoolRegistry {
-    pools: tokio::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<WarmPool>>>,
+    pools: tokio::sync::Mutex<std::collections::HashMap<String, PoolEntry>>,
     default_image: Option<String>,
     size: usize,
     max: usize,
@@ -205,22 +215,20 @@ struct PoolRegistry {
 }
 
 impl PoolRegistry {
-    /// The warm pool for `image`, lazily started (and pre-warmed in the background)
+    /// The pool entry for `image`, lazily started (and pre-warmed in the background)
     /// on first use, with `min_idle = size`. `WarmPool::start` returns once the
-    /// replenisher is spawned, so holding the map lock across it is brief.
-    async fn get_or_create_with_size(
-        &self,
-        image: &str,
-        size: usize,
-    ) -> Result<std::sync::Arc<WarmPool>, String> {
+    /// replenisher is spawned, so holding the map lock across it is brief. The
+    /// concurrency semaphore is sized to the pool's `max_size`.
+    async fn get_or_create_with_size(&self, image: &str, size: usize) -> Result<PoolEntry, String> {
         let mut pools = self.pools.lock().await;
-        if let Some(pool) = pools.get(image) {
-            return Ok(pool.clone());
+        if let Some(entry) = pools.get(image) {
+            return Ok(entry.clone());
         }
+        let max_size = self.max.max(size);
         let pool_config = PoolConfig {
             enabled: true,
             min_idle: size,
-            max_size: self.max.max(size),
+            max_size,
             idle_ttl_secs: self.ttl,
             ..Default::default()
         };
@@ -235,12 +243,16 @@ impl PoolRegistry {
                 .await
                 .map_err(|e| e.to_string())?,
         );
-        pools.insert(image.to_string(), pool.clone());
-        Ok(pool)
+        let entry = PoolEntry {
+            pool,
+            sem: std::sync::Arc::new(tokio::sync::Semaphore::new(max_size)),
+        };
+        pools.insert(image.to_string(), entry.clone());
+        Ok(entry)
     }
 
     /// Lazy pool for `image` at the daemon's default size.
-    async fn get_or_create(&self, image: &str) -> Result<std::sync::Arc<WarmPool>, String> {
+    async fn get_or_create(&self, image: &str) -> Result<PoolEntry, String> {
         self.get_or_create_with_size(image, self.size).await
     }
 
@@ -252,9 +264,9 @@ impl PoolRegistry {
     /// Stop replenishment and destroy idle VMs across all pools (shutdown).
     async fn drain_all(&self) {
         let pools = self.pools.lock().await;
-        for pool in pools.values() {
-            pool.signal_shutdown();
-            let _ = pool.drain_idle().await;
+        for entry in pools.values() {
+            entry.pool.signal_shutdown();
+            let _ = entry.pool.drain_idle().await;
         }
     }
 
@@ -262,8 +274,8 @@ impl PoolRegistry {
     async fn stats(&self) -> Vec<ImageStat> {
         let pools = self.pools.lock().await;
         let mut out = Vec::with_capacity(pools.len());
-        for (image, pool) in pools.iter() {
-            let s = pool.stats().await;
+        for (image, entry) in pools.iter() {
+            let s = entry.pool.stats().await;
             out.push(ImageStat {
                 image: image.clone(),
                 idle: s.idle_count,
@@ -295,8 +307,8 @@ async fn execute_start(args: PoolStartArgs) -> Result<(), Box<dyn std::error::Er
 
     // Pre-warm the default image, if one was given.
     let default_stats = if let Some(ref image) = args.image {
-        let pool = registry.get_or_create(image).await?;
-        Some((image.clone(), pool.stats().await))
+        let entry = registry.get_or_create(image).await?;
+        Some((image.clone(), entry.pool.stats().await))
     } else {
         None
     };
@@ -421,27 +433,38 @@ async fn handle_conn(
     // command. Keep the VM so we tear it down AFTER responding (a one-shot sandbox
     // is discarded; the pool replenishes a fresh one) — the client's latency must
     // not include VM teardown.
-    let mut used_vm = None;
+    // Holds (vm, permit) until after the response: the permit bounds concurrent
+    // in-flight sandboxes and is released only once the VM is torn down.
+    let mut used = None;
     let resp = match registry.resolve_image(run.image) {
         None => err_resp("no image: pass --image or start the daemon with --image"),
         Some(image) => match registry.get_or_create(&image).await {
             Err(e) => err_resp(format!("pool for {image}: {e}")),
-            Ok(pool) => match pool.acquire().await {
-                Err(e) => err_resp(format!("acquire failed: {e}")),
-                Ok(vm) => {
-                    let resp = match vm.exec_command(run.cmd, EXEC_TIMEOUT_NS).await {
-                        Ok(o) => RunResponse {
-                            stdout: o.stdout,
-                            stderr: o.stderr,
-                            exit_code: o.exit_code,
-                            error: None,
-                        },
-                        Err(e) => err_resp(e.to_string()),
-                    };
-                    used_vm = Some(vm);
-                    resp
+            Ok(entry) => {
+                // Backpressure: wait for a slot so a burst doesn't boot unbounded VMs.
+                let permit = entry
+                    .sem
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("pool semaphore is never closed");
+                match entry.pool.acquire().await {
+                    Err(e) => err_resp(format!("acquire failed: {e}")),
+                    Ok(vm) => {
+                        let resp = match vm.exec_command(run.cmd, EXEC_TIMEOUT_NS).await {
+                            Ok(o) => RunResponse {
+                                stdout: o.stdout,
+                                stderr: o.stderr,
+                                exit_code: o.exit_code,
+                                error: None,
+                            },
+                            Err(e) => err_resp(e.to_string()),
+                        };
+                        used = Some((vm, permit));
+                        resp
+                    }
                 }
-            },
+            }
         },
     };
 
@@ -450,10 +473,11 @@ async fn handle_conn(
     write_frame(stream, &bytes).await?;
 
     // Tear down the used sandbox in the background so neither the client nor the
-    // daemon's accept loop blocks on it.
-    if let Some(mut vm) = used_vm {
+    // daemon's accept loop blocks on it; release the concurrency permit afterwards.
+    if let Some((mut vm, permit)) = used {
         tokio::spawn(async move {
             let _ = vm.destroy().await;
+            drop(permit);
         });
     }
     Ok(())
@@ -668,6 +692,38 @@ mod tests {
         // bad count / empty image error out
         assert!(parse_warm_spec("alpine=notanum", 2).is_err());
         assert!(parse_warm_spec("=4", 2).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_backpressure_bounds_concurrency() {
+        // The contract PoolEntry relies on: a permit (held until teardown) caps
+        // concurrent in-flight sandboxes to the semaphore size, so a burst queues
+        // instead of all running at once.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let sem = Arc::new(tokio::sync::Semaphore::new(2));
+        let live = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..6 {
+            let (sem, live, peak) = (sem.clone(), live.clone(), peak.clone());
+            handles.push(tokio::spawn(async move {
+                let _permit = sem.acquire_owned().await.unwrap();
+                let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                live.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert!(
+            peak.load(Ordering::SeqCst) <= 2,
+            "concurrency exceeded the permit limit"
+        );
     }
 
     #[test]
