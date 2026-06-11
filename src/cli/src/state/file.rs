@@ -189,9 +189,9 @@ impl StateFile {
                 // start_enter takeover means we can't waitpid the VM, so liveness
                 // polling alone would otherwise always yield exit 0.
                 if record.exit_code.is_none() {
-                    if let Ok(contents) = std::fs::read_to_string(
-                        record.box_dir.join("upper").join(".a3s_exit_code"),
-                    ) {
+                    if let Ok(contents) =
+                        std::fs::read_to_string(record.box_dir.join("upper").join(".a3s_exit_code"))
+                    {
                         if let Ok(code) = contents.trim().parse::<i32>() {
                             record.exit_code = Some(code);
                         }

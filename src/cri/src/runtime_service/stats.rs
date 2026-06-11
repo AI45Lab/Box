@@ -321,39 +321,6 @@ pub(super) fn metric_descriptors() -> Vec<MetricDescriptor> {
     ]
 }
 
-#[cfg(test)]
-mod stats_tests {
-    use super::*;
-
-    #[test]
-    fn test_per_container_split_sums_to_total() {
-        let total = VmUsage {
-            cpu_core_nanos: 900,
-            memory_bytes: 300,
-        };
-        let per = total.per_container(3);
-        assert_eq!(per.cpu_core_nanos, 300);
-        assert_eq!(per.memory_bytes, 100);
-        // 0 or 1 container → the full usage (no divide-by-zero, single-container
-        // pods get the whole VM's usage).
-        assert_eq!(total.per_container(0).memory_bytes, 300);
-        assert_eq!(total.per_container(1).cpu_core_nanos, 900);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn test_read_vm_usage_reports_real_memory_for_self() {
-        // Reading the test process's own procfs must yield a non-zero RSS (CPU
-        // may legitimately round to 0 immediately after start, so only memory
-        // is asserted).
-        let usage = read_vm_usage(std::process::id());
-        assert!(
-            usage.memory_bytes > 0,
-            "expected a non-zero RSS reading the test process's own /proc"
-        );
-    }
-}
-
 fn pod_sandbox_metric_labels(sandbox: &PodSandbox) -> HashMap<String, String> {
     HashMap::from([
         ("pod_sandbox_id".to_string(), sandbox.id.clone()),
@@ -430,5 +397,38 @@ pub(super) fn pod_sandbox_metrics(
                 now_ns,
             ),
         ],
+    }
+}
+
+#[cfg(test)]
+mod stats_tests {
+    use super::*;
+
+    #[test]
+    fn test_per_container_split_sums_to_total() {
+        let total = VmUsage {
+            cpu_core_nanos: 900,
+            memory_bytes: 300,
+        };
+        let per = total.per_container(3);
+        assert_eq!(per.cpu_core_nanos, 300);
+        assert_eq!(per.memory_bytes, 100);
+        // 0 or 1 container → the full usage (no divide-by-zero, single-container
+        // pods get the whole VM's usage).
+        assert_eq!(total.per_container(0).memory_bytes, 300);
+        assert_eq!(total.per_container(1).cpu_core_nanos, 900);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_read_vm_usage_reports_real_memory_for_self() {
+        // Reading the test process's own procfs must yield a non-zero RSS (CPU
+        // may legitimately round to 0 immediately after start, so only memory
+        // is asserted).
+        let usage = read_vm_usage(std::process::id());
+        assert!(
+            usage.memory_bytes > 0,
+            "expected a non-zero RSS reading the test process's own /proc"
+        );
     }
 }

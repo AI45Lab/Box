@@ -62,7 +62,10 @@ pub fn extract_layer(layer_path: &Path, target_dir: &Path) -> Result<()> {
         ))
     })?;
     file.seek(SeekFrom::Start(0)).map_err(|e| {
-        BoxError::OciImageError(format!("Failed to rewind layer {}: {e}", layer_path.display()))
+        BoxError::OciImageError(format!(
+            "Failed to rewind layer {}: {e}",
+            layer_path.display()
+        ))
     })?;
 
     let decoder: Box<dyn Read> = if read >= 2 && magic[0] == 0x1f && magic[1] == 0x8b {
@@ -410,6 +413,9 @@ mod tests {
         write_test_tar(File::create(&layer_path).unwrap(), &[("p.txt", b"plain")]);
 
         extract_layer(&layer_path, &target_dir).unwrap();
-        assert_eq!(fs::read_to_string(target_dir.join("p.txt")).unwrap(), "plain");
+        assert_eq!(
+            fs::read_to_string(target_dir.join("p.txt")).unwrap(),
+            "plain"
+        );
     }
 }

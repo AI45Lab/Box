@@ -179,7 +179,11 @@ pub fn is_runtime_console_noise(line: &str) -> bool {
 /// reads. Returns `None` only when `stop` is set AND EOF is reached — i.e. the
 /// VM has exited and `console.log` is fully drained — flushing any final partial
 /// line as the last value before the subsequent `None`.
-fn tail_next_line(reader: &mut impl BufRead, buf: &mut String, stop: &AtomicBool) -> Option<String> {
+fn tail_next_line(
+    reader: &mut impl BufRead,
+    buf: &mut String,
+    stop: &AtomicBool,
+) -> Option<String> {
     loop {
         match reader.read_line(buf) {
             Ok(0) | Err(_) => {
@@ -190,7 +194,7 @@ fn tail_next_line(reader: &mut impl BufRead, buf: &mut String, stop: &AtomicBool
                         return None;
                     }
                     let line = std::mem::take(buf);
-                    return Some(line.trim_end_matches(|c| c == '\n' || c == '\r').to_string());
+                    return Some(line.trim_end_matches(['\n', '\r']).to_string());
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 continue;
@@ -202,7 +206,7 @@ fn tail_next_line(reader: &mut impl BufRead, buf: &mut String, stop: &AtomicBool
             continue;
         }
         let line = std::mem::take(buf);
-        return Some(line.trim_end_matches(|c| c == '\n' || c == '\r').to_string());
+        return Some(line.trim_end_matches(['\n', '\r']).to_string());
     }
 }
 
@@ -210,12 +214,21 @@ fn tail_next_line(reader: &mut impl BufRead, buf: &mut String, stop: &AtomicBool
 /// is drained. Intended to run on a dedicated thread for the VM's lifetime; set
 /// `stop` after the VM exits, then join, to guarantee the final lines are
 /// captured (no teardown race).
-pub fn run_log_processor(console_log: &Path, log_dir: &Path, config: &LogConfig, stop: &AtomicBool) {
+pub fn run_log_processor(
+    console_log: &Path,
+    log_dir: &Path,
+    config: &LogConfig,
+    stop: &AtomicBool,
+) {
     match config.driver {
         LogDriver::None => {}
-        LogDriver::JsonFile => {
-            run_json_file_processor(console_log, log_dir, config.max_size(), config.max_file(), stop)
-        }
+        LogDriver::JsonFile => run_json_file_processor(
+            console_log,
+            log_dir,
+            config.max_size(),
+            config.max_file(),
+            stop,
+        ),
         LogDriver::Syslog => run_syslog_processor(
             console_log,
             config.syslog_address(),
@@ -383,9 +396,18 @@ struct RotatingWriter {
 
 impl RotatingWriter {
     fn new(path: &Path, max_size: u64, max_file: u32) -> std::io::Result<Self> {
-        let file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
         let written = file.metadata()?.len();
-        Ok(Self { path: path.to_path_buf(), file, written, max_size, max_file })
+        Ok(Self {
+            path: path.to_path_buf(),
+            file,
+            written,
+            max_size,
+            max_file,
+        })
     }
 
     fn write_line(&mut self, line: &str) -> std::io::Result<()> {
@@ -414,7 +436,10 @@ impl RotatingWriter {
         let rotated = rotated_path(&self.path, 1);
         compress_file(&self.path, &rotated)?;
         std::fs::remove_file(&self.path)?;
-        self.file = std::fs::OpenOptions::new().create(true).append(true).open(&self.path)?;
+        self.file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
         self.written = 0;
         Ok(())
     }
@@ -558,8 +583,14 @@ mod tests {
         let mut reader = BufReader::new(Cursor::new(b"alpha\r\nbeta\n".to_vec()));
         let mut buf = String::new();
         let stop = AtomicBool::new(true);
-        assert_eq!(tail_next_line(&mut reader, &mut buf, &stop), Some("alpha".to_string()));
-        assert_eq!(tail_next_line(&mut reader, &mut buf, &stop), Some("beta".to_string()));
+        assert_eq!(
+            tail_next_line(&mut reader, &mut buf, &stop),
+            Some("alpha".to_string())
+        );
+        assert_eq!(
+            tail_next_line(&mut reader, &mut buf, &stop),
+            Some("beta".to_string())
+        );
         assert_eq!(tail_next_line(&mut reader, &mut buf, &stop), None);
         assert!(buf.is_empty());
     }
@@ -583,7 +614,9 @@ mod tests {
     fn test_is_runtime_console_noise() {
         assert!(is_runtime_console_noise("init.krun: mount_filesystems ok"));
         assert!(!is_runtime_console_noise("L1"));
-        assert!(!is_runtime_console_noise("starting app (init.krun: ignored)"));
+        assert!(!is_runtime_console_noise(
+            "starting app (init.krun: ignored)"
+        ));
         assert!(!is_runtime_console_noise(""));
     }
 
@@ -599,8 +632,14 @@ mod tests {
         run_json_file_processor(&console, dir.path(), 10 * 1024 * 1024, 3, &stop);
         let json = std::fs::read_to_string(json_log_path(dir.path())).unwrap();
         assert!(json.contains("\"log\":\"AAA\\n\""), "AAA missing: {json}");
-        assert!(json.contains("\"log\":\"BBB\\n\""), "BBB (after a quiet line) missing: {json}");
-        assert!(!json.contains("init.krun"), "runtime noise must be filtered: {json}");
+        assert!(
+            json.contains("\"log\":\"BBB\\n\""),
+            "BBB (after a quiet line) missing: {json}"
+        );
+        assert!(
+            !json.contains("init.krun"),
+            "runtime noise must be filtered: {json}"
+        );
     }
 
     #[test]
@@ -611,6 +650,9 @@ mod tests {
         for i in 0..10 {
             w.write_line(&format!("line-{i}")).unwrap();
         }
-        assert!(rotated_path(&path, 1).exists(), "expected a rotated .1.gz file");
+        assert!(
+            rotated_path(&path, 1).exists(),
+            "expected a rotated .1.gz file"
+        );
     }
 }

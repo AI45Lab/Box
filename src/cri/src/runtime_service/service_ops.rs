@@ -487,8 +487,10 @@ mod cleanup_tests {
 61 30 0:47 / /root/.a3s/images/cri-container-rootfs/sb/ctr/rootfs/data/deep rw - ext4 /dev/sda1 rw
 62 30 0:48 / /root/.a3s/images/cri-container-rootfs/other/x rw - ext4 /dev/sda1 rw
 ";
-        let got =
-            submounts_under(mountinfo, "/root/.a3s/images/cri-container-rootfs/sb/ctr/rootfs");
+        let got = submounts_under(
+            mountinfo,
+            "/root/.a3s/images/cri-container-rootfs/sb/ctr/rootfs",
+        );
         assert_eq!(
             got,
             vec![
@@ -505,6 +507,9 @@ mod cleanup_tests {
 1 2 0:1 / /root/xy rw - ext4 d rw
 ";
         // Exact root match included; a sibling sharing the string prefix is not.
-        assert_eq!(submounts_under(mountinfo, "/root/x"), vec!["/root/x".to_string()]);
+        assert_eq!(
+            submounts_under(mountinfo, "/root/x"),
+            vec!["/root/x".to_string()]
+        );
     }
 }

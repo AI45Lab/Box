@@ -769,7 +769,10 @@ unsafe fn configure_and_start_vm(spec: &InstanceSpec) -> Result<()> {
             use std::os::unix::io::AsRawFd;
             let err_path = console_path.with_file_name("console.err.log");
             let open = |p: &std::path::Path| {
-                std::fs::OpenOptions::new().create(true).append(true).open(p)
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(p)
             };
             if let (Ok(out_f), Ok(err_f)) = (open(console_path), open(&err_path)) {
                 ctx.add_split_console(-1, out_f.as_raw_fd(), err_f.as_raw_fd())?;
@@ -781,7 +784,10 @@ unsafe fn configure_and_start_vm(spec: &InstanceSpec) -> Result<()> {
             }
         }
         if !split_done {
-            tracing::debug!(console_path = console_str, "Redirecting console output (merged)");
+            tracing::debug!(
+                console_path = console_str,
+                "Redirecting console output (merged)"
+            );
             ctx.set_console_output(console_str)?;
         }
     }

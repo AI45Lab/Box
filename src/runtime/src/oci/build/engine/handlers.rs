@@ -331,8 +331,7 @@ pub(super) fn handle_run(
         }
 
         let layer_path = layers_dir.join(format!("layer_{}.tar.gz", layer_index));
-        let layer_info =
-            create_layer_with_deletions(rootfs_dir, &changed, &deleted, &layer_path)?;
+        let layer_info = create_layer_with_deletions(rootfs_dir, &changed, &deleted, &layer_path)?;
         Ok(Some(layer_info))
     }
 
