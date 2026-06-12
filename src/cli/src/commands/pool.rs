@@ -78,6 +78,11 @@ pub struct PoolStartArgs {
     #[arg(long)]
     pub deferred: bool,
 
+    /// Mark pooled VM memory KSM-mergeable so the host dedups identical pages
+    /// across same-image VMs (Linux 6.4+; needs /sys/kernel/mm/ksm/run=1).
+    #[arg(long)]
+    pub ksm: bool,
+
     /// Output as JSON
     #[arg(long)]
     pub json: bool,
@@ -265,6 +270,8 @@ struct PoolRegistry {
     /// When true, pooled VMs boot IDLE and `pool run` spawns the command as the
     /// box's real MAIN (full box semantics), instead of exec-into-keepalive.
     deferred: bool,
+    /// Mark pooled VM memory KSM-mergeable (host page dedup across same-image VMs).
+    ksm: bool,
 }
 
 impl PoolRegistry {
@@ -292,6 +299,7 @@ impl PoolRegistry {
             cmd: keepalive_cmd(),
             pool: pool_config.clone(),
             deferred_main: self.deferred,
+            ksm: self.ksm,
             ..Default::default()
         };
         let pool = std::sync::Arc::new(
@@ -360,6 +368,7 @@ async fn execute_start(args: PoolStartArgs) -> Result<(), Box<dyn std::error::Er
         max: args.max,
         ttl: args.ttl,
         deferred: args.deferred,
+        ksm: args.ksm,
     });
 
     // Pre-warm the default image, if one was given.
@@ -892,6 +901,7 @@ mod tests {
             socket: DEFAULT_SOCKET.to_string(),
             warm: vec![],
             deferred: false,
+            ksm: false,
             json: false,
         };
         let result = execute_start(args).await;
@@ -909,6 +919,7 @@ mod tests {
             socket: DEFAULT_SOCKET.to_string(),
             warm: vec![],
             deferred: false,
+            ksm: false,
             json: false,
         };
         let result = execute_start(args).await;

@@ -413,6 +413,12 @@ impl VmmProvider for VmController {
         cmd.arg("--config").arg(&config_json).stdin(Stdio::null());
         self.configure_shim_stdio(&mut cmd, spec);
 
+        // KSM page-merging: the shim opts its (guest) memory in via prctl when this
+        // env is set; driven by InstanceSpec.ksm (BoxConfig.ksm or A3S_BOX_KSM).
+        if spec.ksm {
+            cmd.env("A3S_BOX_KSM", "1");
+        }
+
         // On macOS, set DYLD_LIBRARY_PATH to help find libkrunfw
         #[cfg(target_os = "macos")]
         {

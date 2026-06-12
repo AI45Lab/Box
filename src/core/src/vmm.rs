@@ -125,6 +125,11 @@ pub struct InstanceSpec {
     /// Guest agent entrypoint
     pub entrypoint: Entrypoint,
 
+    /// Mark guest memory KSM-mergeable (host page dedup across same-image VMs;
+    /// Linux 6.4+, requires /sys/kernel/mm/ksm/run=1 on the host).
+    #[serde(default)]
+    pub ksm: bool,
+
     /// Optional console output file path
     pub console_output: Option<PathBuf>,
 
@@ -175,6 +180,7 @@ impl Default for InstanceSpec {
                 args: Vec::new(),
                 env: Vec::new(),
             },
+            ksm: false,
             console_output: None,
             workdir: "/".to_string(),
             tee_config: None,
@@ -395,6 +401,7 @@ mod tests {
     fn test_instance_spec_serde_roundtrip() {
         let spec = InstanceSpec {
             box_id: "test-box-123".to_string(),
+            ksm: false,
             vcpus: 4,
             memory_mib: 2048,
             rootfs_path: PathBuf::from("/tmp/rootfs"),
