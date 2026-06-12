@@ -112,6 +112,12 @@ pub struct PoolRunArgs {
     #[arg(long, short = 'e')]
     pub env: Vec<String>,
 
+    /// On a --deferred daemon: run via exec instead of as the box's main —
+    /// faster (the VM survives and is returned to use), output via the exec
+    /// stream rather than the json-file logs.
+    #[arg(long)]
+    pub exec: bool,
+
     /// Command and arguments to run in a fresh warm sandbox
     #[arg(last = true, required = true)]
     pub cmd: Vec<String>,
@@ -162,6 +168,10 @@ struct RunRequest {
     /// Extra KEY=VALUE environment entries.
     #[serde(default)]
     env: Vec<String>,
+    /// Force exec mode for this request (valid on a --deferred daemon, whose
+    /// IDLE VMs still serve exec; a keepalive daemon is always exec).
+    #[serde(default)]
+    exec: bool,
     cmd: Vec<String>,
 }
 
@@ -519,9 +529,11 @@ async fn handle_conn(
                     Ok(mut vm) => {
                         // Deferred-main: run the command as the box's real MAIN
                         // (full box semantics — exit code + json-file console logs).
-                        // Otherwise exec it in the keepalive VM (output via the
-                        // exec stream). Both honor user/workdir/env from the request.
-                        let result = if registry.deferred {
+                        // Otherwise exec it (output via the exec stream); `exec:
+                        // true` forces exec mode per request on a deferred daemon
+                        // (its IDLE VMs serve exec just as well). Both honor
+                        // user/workdir/env from the request.
+                        let result = if registry.deferred && !run.exec {
                             vm.run_deferred_main(
                                 &deferred_spec_json(&run),
                                 std::time::Duration::from_secs(60),
@@ -592,6 +604,7 @@ async fn execute_run(args: PoolRunArgs) -> Result<(), Box<dyn std::error::Error>
             user: args.user,
             workdir: args.workdir,
             env: args.env,
+            exec: args.exec,
             cmd: args.cmd,
         }))?,
     )
@@ -797,6 +810,7 @@ mod tests {
             user: Some("1000".into()),
             workdir: Some("/work".into()),
             env: vec!["FOO=bar".into(), "not-a-pair".into()],
+            exec: false,
             cmd: vec!["sh".into(), "-c".into(), "echo hi".into()],
         };
         let json = deferred_spec_json(&req);
@@ -817,6 +831,7 @@ mod tests {
             user: None,
             workdir: None,
             env: vec![],
+            exec: false,
             cmd: vec![],
         };
         let v2: serde_json::Value = serde_json::from_slice(&deferred_spec_json(&req2)).unwrap();
@@ -863,6 +878,7 @@ mod tests {
             user: Some("1000".into()),
             workdir: Some("/tmp".into()),
             env: vec!["FOO=bar".into()],
+            exec: false,
             cmd: vec!["echo".into(), "hi".into()],
         };
         let bytes = serde_json::to_vec(&req).unwrap();
@@ -957,6 +973,7 @@ mod tests {
             user: None,
             workdir: None,
             env: vec![],
+            exec: false,
             cmd: vec!["echo".into(), "hi".into()],
         }))
         .unwrap();
@@ -992,6 +1009,7 @@ mod tests {
             user: None,
             workdir: None,
             env: vec![],
+            exec: false,
             cmd: vec!["echo".into(), "hi there".into()],
         })
         .unwrap();
@@ -1034,6 +1052,7 @@ mod tests {
             user: None,
             workdir: None,
             env: vec![],
+            exec: false,
             cmd: vec!["ls".into(), "-la".into()],
         };
         write_frame(&mut client, &serde_json::to_vec(&req).unwrap())
