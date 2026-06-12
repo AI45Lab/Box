@@ -317,6 +317,12 @@ pub struct BoxConfig {
     #[serde(default)]
     pub deferred_main: bool,
 
+    /// Mark guest memory KSM-mergeable so the host kernel dedups identical pages
+    /// across same-image VMs (Linux 6.4+; needs /sys/kernel/mm/ksm/run=1 on the
+    /// host). Most valuable for pools of same-image sandboxes.
+    #[serde(default)]
+    pub ksm: bool,
+
     /// Port mappings: "host_port:guest_port" (e.g., "8080:80")
     /// Maps host ports to guest ports via TSI (Transparent Socket Impersonation).
     #[serde(default)]
@@ -415,6 +421,7 @@ impl Default for BoxConfig {
             cache: CacheConfig::default(),
             pool: PoolConfig::default(),
             deferred_main: false,
+            ksm: false,
             port_map: vec![],
             dns: vec![],
             add_hosts: vec![],

@@ -344,6 +344,11 @@ impl VmManager {
             network: None, // Network config is set by CLI when --network is specified
             resource_limits: self.config.resource_limits.clone(),
             log_config: self.log_config.clone(),
+            // KSM page-merging: config field, or the A3S_BOX_KSM env override.
+            ksm: self.config.ksm
+                || std::env::var("A3S_BOX_KSM")
+                    .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+                    .unwrap_or(false),
         })
     }
 
