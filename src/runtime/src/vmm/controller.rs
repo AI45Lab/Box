@@ -419,6 +419,17 @@ impl VmmProvider for VmController {
             cmd.env("A3S_BOX_KSM", "1");
         }
 
+        // Snapshot-fork (Phase A, experimental): pass the file-backed-RAM and
+        // snapshot-trigger socket paths through to the shim/libkrun. The box side
+        // sets per-box paths via these envs; the runtime forwards them verbatim.
+        for var in ["KRUN_SNAPSHOT_MEM_FILE", "KRUN_SNAPSHOT_SOCK"] {
+            if let Ok(val) = std::env::var(var) {
+                if !val.is_empty() {
+                    cmd.env(var, val);
+                }
+            }
+        }
+
         // On macOS, set DYLD_LIBRARY_PATH to help find libkrunfw
         #[cfg(target_os = "macos")]
         {
