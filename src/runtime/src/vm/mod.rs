@@ -530,8 +530,25 @@ impl VmManager {
         };
 
         // Let the shim's log processor finish draining console.log into the json
-        // file (it flushes as the VM halts) before reading the captured output.
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        // file (it flushes as the VM halts): poll until container.json stops
+        // growing for one interval (bounded at 1s) instead of a fixed sleep —
+        // fast when the drain is already done, safe when it lags.
+        let json_path = self
+            .home_dir
+            .join("boxes")
+            .join(&self.box_id)
+            .join("logs")
+            .join("container.json");
+        let drain_start = std::time::Instant::now();
+        let mut last_len = u64::MAX;
+        loop {
+            let len = std::fs::metadata(&json_path).map(|m| m.len()).unwrap_or(0);
+            if len == last_len || drain_start.elapsed() >= std::time::Duration::from_secs(1) {
+                break;
+            }
+            last_len = len;
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        }
         let (stdout, stderr) = self.read_container_logs();
         Ok(a3s_box_core::exec::ExecOutput {
             stdout,
