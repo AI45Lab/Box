@@ -422,7 +422,11 @@ impl VmmProvider for VmController {
         // Snapshot-fork (Phase A, experimental): pass the file-backed-RAM and
         // snapshot-trigger socket paths through to the shim/libkrun. The box side
         // sets per-box paths via these envs; the runtime forwards them verbatim.
-        for var in ["KRUN_SNAPSHOT_MEM_FILE", "KRUN_SNAPSHOT_SOCK"] {
+        for var in [
+            "KRUN_SNAPSHOT_MEM_FILE",
+            "KRUN_SNAPSHOT_SOCK",
+            "KRUN_RESTORE_FROM",
+        ] {
             if let Ok(val) = std::env::var(var) {
                 if !val.is_empty() {
                     cmd.env(var, val);
