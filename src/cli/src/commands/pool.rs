@@ -95,6 +95,18 @@ pub struct PoolRunArgs {
     #[arg(long)]
     pub image: Option<String>,
 
+    /// User to run as (uid[:gid] or a name resolved in the container).
+    #[arg(long, short = 'u')]
+    pub user: Option<String>,
+
+    /// Working directory inside the sandbox.
+    #[arg(long, short = 'w')]
+    pub workdir: Option<String>,
+
+    /// Extra environment variables, KEY=VALUE (repeatable).
+    #[arg(long, short = 'e')]
+    pub env: Vec<String>,
+
     /// Command and arguments to run in a fresh warm sandbox
     #[arg(last = true, required = true)]
     pub cmd: Vec<String>,
@@ -136,6 +148,15 @@ struct RunRequest {
     /// Image to run in; `None` means use the daemon's default image.
     #[serde(default)]
     image: Option<String>,
+    /// User to run as (uid[:gid] or name); `None` runs as the image default.
+    #[serde(default)]
+    user: Option<String>,
+    /// Working directory inside the sandbox.
+    #[serde(default)]
+    workdir: Option<String>,
+    /// Extra KEY=VALUE environment entries.
+    #[serde(default)]
+    env: Vec<String>,
     cmd: Vec<String>,
 }
 
@@ -183,12 +204,24 @@ fn keepalive_cmd() -> Vec<String> {
 }
 
 /// Build the `spawn-main` JSON spec for a deferred-mode pool command (executable +
-/// args + a standard PATH so the binary resolves like a normal container main).
-fn deferred_spec_json(cmd: &[String]) -> Vec<u8> {
+/// args + a standard PATH so the binary resolves like a normal container main,
+/// plus optional user/workdir and extra env from the request).
+fn deferred_spec_json(req: &RunRequest) -> Vec<u8> {
+    let mut env: Vec<(String, String)> = vec![(
+        "PATH".to_string(),
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+    )];
+    for entry in &req.env {
+        if let Some((k, v)) = entry.split_once('=') {
+            env.push((k.to_string(), v.to_string()));
+        }
+    }
     let spec = serde_json::json!({
-        "executable": cmd.first().map(String::as_str).unwrap_or("/bin/sh"),
-        "args": cmd.get(1..).unwrap_or(&[]),
-        "env": [["PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]],
+        "executable": req.cmd.first().map(String::as_str).unwrap_or("/bin/sh"),
+        "args": req.cmd.get(1..).unwrap_or(&[]),
+        "env": env,
+        "workdir": req.workdir,
+        "user": req.user,
     });
     serde_json::to_vec(&spec).unwrap_or_default()
 }
@@ -460,7 +493,7 @@ async fn handle_conn(
     // Holds (vm, permit) until after the response: the permit bounds concurrent
     // in-flight sandboxes and is released only once the VM is torn down.
     let mut used = None;
-    let resp = match registry.resolve_image(run.image) {
+    let resp = match registry.resolve_image(run.image.clone()) {
         None => err_resp("no image: pass --image or start the daemon with --image"),
         Some(image) => match registry.get_or_create(&image).await {
             Err(e) => err_resp(format!("pool for {image}: {e}")),
@@ -478,15 +511,26 @@ async fn handle_conn(
                         // Deferred-main: run the command as the box's real MAIN
                         // (full box semantics — exit code + json-file console logs).
                         // Otherwise exec it in the keepalive VM (output via the
-                        // exec stream).
+                        // exec stream). Both honor user/workdir/env from the request.
                         let result = if registry.deferred {
                             vm.run_deferred_main(
-                                &deferred_spec_json(&run.cmd),
+                                &deferred_spec_json(&run),
                                 std::time::Duration::from_secs(60),
                             )
                             .await
                         } else {
-                            vm.exec_command(run.cmd, EXEC_TIMEOUT_NS).await
+                            vm.exec_request(&a3s_box_core::exec::ExecRequest {
+                                cmd: run.cmd,
+                                timeout_ns: EXEC_TIMEOUT_NS,
+                                env: run.env,
+                                working_dir: run.workdir,
+                                rootfs: None,
+                                stdin: None,
+                                stdin_streaming: false,
+                                user: run.user,
+                                streaming: false,
+                            })
+                            .await
                         };
                         let resp = match result {
                             Ok(o) => RunResponse {
@@ -536,6 +580,9 @@ async fn execute_run(args: PoolRunArgs) -> Result<(), Box<dyn std::error::Error>
         &mut stream,
         &serde_json::to_vec(&Request::Run(RunRequest {
             image: args.image,
+            user: args.user,
+            workdir: args.workdir,
+            env: args.env,
             cmd: args.cmd,
         }))?,
     )
@@ -734,18 +781,38 @@ mod tests {
     #[test]
     fn test_deferred_spec_json() {
         // The spawn-main spec for a deferred pool run: executable + args + a PATH
-        // so the binary resolves like a normal container main.
-        let json = deferred_spec_json(&["sh".into(), "-c".into(), "echo hi".into()]);
+        // so the binary resolves like a normal container main, plus per-request
+        // user/workdir and extra env.
+        let req = RunRequest {
+            image: None,
+            user: Some("1000".into()),
+            workdir: Some("/work".into()),
+            env: vec!["FOO=bar".into(), "not-a-pair".into()],
+            cmd: vec!["sh".into(), "-c".into(), "echo hi".into()],
+        };
+        let json = deferred_spec_json(&req);
         let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
         assert_eq!(v["executable"], "sh");
         assert_eq!(v["args"][0], "-c");
         assert_eq!(v["args"][1], "echo hi");
         assert_eq!(v["env"][0][0], "PATH");
         assert!(v["env"][0][1].as_str().unwrap().contains("/bin"));
+        assert_eq!(v["env"][1][0], "FOO");
+        assert_eq!(v["env"][1][1], "bar");
+        assert_eq!(v["env"].as_array().unwrap().len(), 2); // malformed entry dropped
+        assert_eq!(v["user"], "1000");
+        assert_eq!(v["workdir"], "/work");
         // Empty cmd falls back to a shell rather than panicking.
-        let j2 = deferred_spec_json(&[]);
-        let v2: serde_json::Value = serde_json::from_slice(&j2).unwrap();
+        let req2 = RunRequest {
+            image: None,
+            user: None,
+            workdir: None,
+            env: vec![],
+            cmd: vec![],
+        };
+        let v2: serde_json::Value = serde_json::from_slice(&deferred_spec_json(&req2)).unwrap();
         assert_eq!(v2["executable"], "/bin/sh");
+        assert!(v2["user"].is_null());
     }
 
     #[tokio::test]
@@ -784,16 +851,23 @@ mod tests {
     fn test_run_request_response_roundtrip() {
         let req = RunRequest {
             image: Some("alpine:latest".into()),
+            user: Some("1000".into()),
+            workdir: Some("/tmp".into()),
+            env: vec!["FOO=bar".into()],
             cmd: vec!["echo".into(), "hi".into()],
         };
         let bytes = serde_json::to_vec(&req).unwrap();
         let parsed: RunRequest = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed.cmd, vec!["echo", "hi"]);
         assert_eq!(parsed.image.as_deref(), Some("alpine:latest"));
+        assert_eq!(parsed.user.as_deref(), Some("1000"));
+        assert_eq!(parsed.workdir.as_deref(), Some("/tmp"));
+        assert_eq!(parsed.env, vec!["FOO=bar"]);
 
-        // image is optional on the wire (older clients / default-image daemons).
+        // image/user/workdir/env are optional on the wire (older clients).
         let no_img: RunRequest = serde_json::from_slice(br#"{"cmd":["ls"]}"#).unwrap();
         assert!(no_img.image.is_none());
+        assert!(no_img.user.is_none() && no_img.workdir.is_none() && no_img.env.is_empty());
 
         let resp = RunResponse {
             stdout: b"hi\n".to_vec(),
@@ -869,6 +943,9 @@ mod tests {
         // Run carries an op tag + the flattened RunRequest; Status is a bare tag.
         let run = serde_json::to_string(&Request::Run(RunRequest {
             image: Some("alpine".into()),
+            user: None,
+            workdir: None,
+            env: vec![],
             cmd: vec!["echo".into(), "hi".into()],
         }))
         .unwrap();
@@ -901,6 +978,9 @@ mod tests {
         let (mut a, mut b) = tokio::io::duplex(4096);
         let payload = serde_json::to_vec(&RunRequest {
             image: None,
+            user: None,
+            workdir: None,
+            env: vec![],
             cmd: vec!["echo".into(), "hi there".into()],
         })
         .unwrap();
@@ -940,6 +1020,9 @@ mod tests {
         let mut client = UnixStream::connect(&sock).await.unwrap();
         let req = RunRequest {
             image: Some("alpine:latest".into()),
+            user: None,
+            workdir: None,
+            env: vec![],
             cmd: vec!["ls".into(), "-la".into()],
         };
         write_frame(&mut client, &serde_json::to_vec(&req).unwrap())
