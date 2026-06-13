@@ -352,27 +352,16 @@ async fn setup_and_boot(args: &RunArgs) -> Result<RunContext, Box<dyn std::error
     }
 
     if let Err(error) = super::volume::attach_volumes(&volume_names, &box_id) {
-        rollback_booted_setup(
-            &mut vm,
-            &record,
-            stop_signal,
-            stop_timeout_ms,
-            Some(&mut state),
-        )
-        .await;
+        // The record was registered atomically above; un-register it the same way.
+        let _ = StateFile::remove_record(&record.id);
+        rollback_booted_setup(&mut vm, &record, stop_signal, stop_timeout_ms, None).await;
         return Err(error);
     }
 
     let log_dir = box_dir.join("logs");
     if let Err(error) = std::fs::create_dir_all(&log_dir) {
-        rollback_booted_setup(
-            &mut vm,
-            &record,
-            stop_signal,
-            stop_timeout_ms,
-            Some(&mut state),
-        )
-        .await;
+        let _ = StateFile::remove_record(&record.id);
+        rollback_booted_setup(&mut vm, &record, stop_signal, stop_timeout_ms, None).await;
         return Err(error.into());
     }
     // Log processing now runs in the shim for the box's lifetime; see
