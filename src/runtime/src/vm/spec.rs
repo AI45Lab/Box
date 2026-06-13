@@ -15,6 +15,11 @@ const SBIN_INIT: &str = "/sbin/init";
 #[cfg(target_os = "windows")]
 const USR_SBIN_INIT: &str = "/usr/sbin/init";
 
+/// Read an environment variable, returning `None` if unset or empty.
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
 impl VmManager {
     /// Build InstanceSpec from config and layout.
     pub(crate) fn build_instance_spec(&mut self, layout: &BoxLayout) -> Result<InstanceSpec> {
@@ -349,6 +354,24 @@ impl VmManager {
                 || std::env::var("A3S_BOX_KSM")
                     .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
                     .unwrap_or(false),
+            // Snapshot-fork (per-VM): config field, or the env override (single-VM
+            // `run`). The pool / fork daemon set these per-VM via config so one
+            // process can drive a different template/restore per VM.
+            snapshot_mem_file: self
+                .config
+                .snapshot_mem_file
+                .clone()
+                .or_else(|| env_nonempty("KRUN_SNAPSHOT_MEM_FILE")),
+            snapshot_sock: self
+                .config
+                .snapshot_sock
+                .clone()
+                .or_else(|| env_nonempty("KRUN_SNAPSHOT_SOCK")),
+            restore_from: self
+                .config
+                .restore_from
+                .clone()
+                .or_else(|| env_nonempty("KRUN_RESTORE_FROM")),
         })
     }
 

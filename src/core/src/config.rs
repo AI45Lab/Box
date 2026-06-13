@@ -323,6 +323,23 @@ pub struct BoxConfig {
     #[serde(default)]
     pub ksm: bool,
 
+    /// Snapshot-fork (per-VM): file-backed guest RAM path for a snapshot TEMPLATE
+    /// (paired with `snapshot_sock`), or the RAM file to MAP_PRIVATE CoW-restore
+    /// from (paired with `restore_from`).
+    #[serde(default)]
+    pub snapshot_mem_file: Option<String>,
+
+    /// Snapshot-fork (per-VM): unix socket on which libkrun serves snapshot
+    /// requests for a template VM.
+    #[serde(default)]
+    pub snapshot_sock: Option<String>,
+
+    /// Snapshot-fork (per-VM): state file to RESTORE from — this VM resumes the
+    /// snapshotted template (CoW of `snapshot_mem_file`) instead of cold-booting.
+    /// The per-VM seam that lets one process (pool / fork daemon) fork many VMs.
+    #[serde(default)]
+    pub restore_from: Option<String>,
+
     /// Port mappings: "host_port:guest_port" (e.g., "8080:80")
     /// Maps host ports to guest ports via TSI (Transparent Socket Impersonation).
     #[serde(default)]
@@ -422,6 +439,9 @@ impl Default for BoxConfig {
             pool: PoolConfig::default(),
             deferred_main: false,
             ksm: false,
+            snapshot_mem_file: None,
+            snapshot_sock: None,
+            restore_from: None,
             port_map: vec![],
             dns: vec![],
             add_hosts: vec![],

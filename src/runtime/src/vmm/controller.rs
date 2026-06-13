@@ -419,17 +419,27 @@ impl VmmProvider for VmController {
             cmd.env("A3S_BOX_KSM", "1");
         }
 
-        // Snapshot-fork (Phase A, experimental): pass the file-backed-RAM and
-        // snapshot-trigger socket paths through to the shim/libkrun. The box side
-        // sets per-box paths via these envs; the runtime forwards them verbatim.
-        for var in [
-            "KRUN_SNAPSHOT_MEM_FILE",
-            "KRUN_SNAPSHOT_SOCK",
-            "KRUN_RESTORE_FROM",
-        ] {
-            if let Ok(val) = std::env::var(var) {
-                if !val.is_empty() {
+        // Snapshot-fork: set the file-backed-RAM / snapshot-trigger / restore paths
+        // for the shim/libkrun. PER-VM values from the InstanceSpec take precedence —
+        // this is what lets ONE process (the pool / fork daemon) drive a different
+        // template/restore per VM, which a process-global env cannot. Fall back to the
+        // process env only when the spec doesn't set a given var (single-VM `run`).
+        let snap_env: [(&str, Option<&str>); 3] = [
+            ("KRUN_SNAPSHOT_MEM_FILE", spec.snapshot_mem_file.as_deref()),
+            ("KRUN_SNAPSHOT_SOCK", spec.snapshot_sock.as_deref()),
+            ("KRUN_RESTORE_FROM", spec.restore_from.as_deref()),
+        ];
+        for (var, spec_val) in snap_env {
+            match spec_val {
+                Some(val) if !val.is_empty() => {
                     cmd.env(var, val);
+                }
+                _ => {
+                    if let Ok(val) = std::env::var(var) {
+                        if !val.is_empty() {
+                            cmd.env(var, val);
+                        }
+                    }
                 }
             }
         }

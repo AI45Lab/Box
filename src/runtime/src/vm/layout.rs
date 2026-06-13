@@ -108,7 +108,7 @@ impl VmManager {
         // just-run template). The restored guest's main is already running, so no
         // image config (entrypoint/env) is needed.
         #[cfg(unix)]
-        if super::is_restore_mode() {
+        if super::is_restore_mode(&self.config) {
             let cache_key = RootfsCache::compute_key(reference, &[], &[], &[]);
             if let Some(cached_path) = self.try_rootfs_cache_path(&cache_key)? {
                 let rootfs_path = self.rootfs_provider.prepare(&box_dir, &cached_path)?;

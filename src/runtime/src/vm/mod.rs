@@ -811,7 +811,7 @@ impl VmManager {
                 // wait would stall registration on its safety cap — do one best-effort
                 // probe instead. A normal boot waits for the Heartbeat health check.
                 #[cfg(unix)]
-                if is_restore_mode() {
+                if is_restore_mode(&self.config) {
                     self.probe_exec_ready_once(&layout.exec_socket_path).await;
                 } else {
                     self.wait_for_exec_ready(&layout.exec_socket_path).await?;
@@ -837,7 +837,7 @@ impl VmManager {
         // A restored guest's main is ALREADY running (captured in the snapshot), so
         // it must never re-spawn — doing so would start a duplicate main.
         #[cfg(unix)]
-        if !is_restore_mode()
+        if !is_restore_mode(&self.config)
             && std::env::var("BOX_DEFERRED_MAIN")
                 .map(|v| v == "1")
                 .unwrap_or(false)
@@ -1223,16 +1223,19 @@ impl VmManager {
     }
 }
 
-/// Whether this boot is a snapshot-fork restore. The restore is driven by libkrun
-/// reading `KRUN_RESTORE_FROM` (the controller forwards it to the shim verbatim), so
-/// the runtime detects restore mode from the same env var the user/pool sets — the
-/// guest is resumed already-booted rather than cold-booted. Mirrors how the deferred-
-/// main auto-spawn keys off `BOX_DEFERRED_MAIN`.
+/// Whether this boot is a snapshot-fork restore (the guest is resumed already-booted
+/// rather than cold-booted). PER-VM: a pool / fork daemon sets `config.restore_from`
+/// so one process can restore different VMs; the single-VM `run` path uses the
+/// `KRUN_RESTORE_FROM` env. Either source means restore mode.
 #[cfg(unix)]
-fn is_restore_mode() -> bool {
-    std::env::var("KRUN_RESTORE_FROM")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false)
+fn is_restore_mode(config: &BoxConfig) -> bool {
+    config
+        .restore_from
+        .as_deref()
+        .is_some_and(|s| !s.is_empty())
+        || std::env::var("KRUN_RESTORE_FROM")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
 }
 
 /// Simple FNV-1a hash for generating short deterministic hashes from strings.

@@ -130,6 +130,25 @@ pub struct InstanceSpec {
     #[serde(default)]
     pub ksm: bool,
 
+    /// Snapshot-fork (per-VM): file-backed guest RAM path. When set (with
+    /// `snapshot_sock`), this VM boots as a snapshot TEMPLATE — guest RAM is
+    /// file-backed so it can be snapshotted on demand.
+    #[serde(default)]
+    pub snapshot_mem_file: Option<String>,
+
+    /// Snapshot-fork (per-VM): unix socket on which libkrun serves snapshot
+    /// requests for this template VM.
+    #[serde(default)]
+    pub snapshot_sock: Option<String>,
+
+    /// Snapshot-fork (per-VM): when set (with `snapshot_mem_file`), this VM is a
+    /// RESTORE — it resumes the snapshotted template from this state file with
+    /// MAP_PRIVATE CoW of the RAM file, instead of cold-booting. This is the
+    /// per-VM seam that lets one process fork many VMs (the pool / fork daemon),
+    /// which a process-global `KRUN_RESTORE_FROM` env cannot express.
+    #[serde(default)]
+    pub restore_from: Option<String>,
+
     /// Optional console output file path
     pub console_output: Option<PathBuf>,
 
@@ -181,6 +200,9 @@ impl Default for InstanceSpec {
                 env: Vec::new(),
             },
             ksm: false,
+            snapshot_mem_file: None,
+            snapshot_sock: None,
+            restore_from: None,
             console_output: None,
             workdir: "/".to_string(),
             tee_config: None,

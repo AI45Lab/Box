@@ -22,7 +22,7 @@ impl VmManager {
         // (no cold boot), so a short grace catches an immediate restore failure while
         // saving ~200ms on the fork fast-path; a cold boot keeps the longer grace.
         #[cfg(unix)]
-        let max_wait_ms: u64 = if super::is_restore_mode() { 40 } else { 250 };
+        let max_wait_ms: u64 = if super::is_restore_mode(&self.config) { 40 } else { 250 };
         #[cfg(not(unix))]
         let max_wait_ms: u64 = 250;
         const POLL_MS: u64 = 10;
