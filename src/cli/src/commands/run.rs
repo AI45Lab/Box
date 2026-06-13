@@ -334,16 +334,12 @@ async fn setup_and_boot(args: &RunArgs) -> Result<RunContext, Box<dyn std::error
         .map(|secs| secs * 1000)
         .unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT_MS);
     let anonymous_volumes = vm.anonymous_volumes().to_vec();
-    let mut state = StateFile::load_default()?;
-    if let Err(error) = state.add(record.clone()) {
-        rollback_booted_setup(
-            &mut vm,
-            &record,
-            stop_signal,
-            stop_timeout_ms,
-            Some(&mut state),
-        )
-        .await;
+    // Register atomically (load-fresh-under-lock → push → write). A stale
+    // `load_default()` + `state.add()` (save the in-memory snapshot) is a
+    // lost-update race: concurrent fork registrations clobber each other's records,
+    // so a burst of N forks would leave only a fraction registered.
+    if let Err(error) = StateFile::add_record(record.clone()) {
+        rollback_booted_setup(&mut vm, &record, stop_signal, stop_timeout_ms, None).await;
         return Err(error.into());
     }
 
