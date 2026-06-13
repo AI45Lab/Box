@@ -663,16 +663,25 @@ impl WarmPool {
                             let needed = effective_min_idle - current;
                             tracing::debug!(current, needed, min_idle = effective_min_idle, "Replenishing warm pool");
 
+                            // Fill the `needed` slots CONCURRENTLY rather than one
+                            // boot at a time — a snapshot-fork restore (or even a cold
+                            // boot) overlaps its readiness wait, so a batch fills in
+                            // roughly one boot's time instead of N×. For snapshot-fork
+                            // the first task builds the template under ensure_template's
+                            // lock; the rest wait then restore in parallel.
+                            let mut set = tokio::task::JoinSet::new();
                             for _ in 0..needed {
-                                match Self::boot_or_restore(
-                                    config.snapshot_fork,
-                                    &box_config,
-                                    &event_emitter,
-                                    &template,
-                                )
-                                .await
-                                {
-                                    Ok(vm) => {
+                                let sf = config.snapshot_fork;
+                                let bc = box_config.clone();
+                                let ee = event_emitter.clone();
+                                let tpl = Arc::clone(&template);
+                                set.spawn(async move {
+                                    WarmPool::boot_or_restore(sf, &bc, &ee, &tpl).await
+                                });
+                            }
+                            while let Some(joined) = set.join_next().await {
+                                match joined {
+                                    Ok(Ok(vm)) => {
                                         let box_id = vm.box_id().to_string();
                                         let mut pool = idle.lock().await;
                                         pool.push(WarmVm {
@@ -682,18 +691,19 @@ impl WarmPool {
                                         let mut s = stats.lock().await;
                                         s.total_created += 1;
                                         s.idle_count = pool.len();
+                                        drop(s);
+                                        drop(pool);
 
                                         event_emitter.emit(BoxEvent::with_string(
                                             "pool.vm.created",
                                             format!("Replenished VM {}", box_id),
                                         ));
                                     }
+                                    Ok(Err(e)) => {
+                                        tracing::warn!(error = %e, "Failed to replenish warm pool");
+                                    }
                                     Err(e) => {
-                                        tracing::warn!(
-                                            error = %e,
-                                            "Failed to replenish warm pool"
-                                        );
-                                        break;
+                                        tracing::warn!(error = %e, "Replenish task join error");
                                     }
                                 }
                             }
