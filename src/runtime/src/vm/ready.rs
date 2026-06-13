@@ -118,4 +118,33 @@ impl VmManager {
             tokio::time::sleep(POLL_INTERVAL).await;
         }
     }
+
+    /// Single best-effort exec-server probe for snapshot-restore boots.
+    ///
+    /// A restored guest is already past boot, so its exec server never re-signals
+    /// readiness the way a cold boot does — blocking on [`wait_for_exec_ready`]'s
+    /// cold-boot loop would stall registration for up to its safety cap. Instead try
+    /// exactly one connect + heartbeat to populate `exec_client` if the guest answers
+    /// promptly, and otherwise proceed immediately: exec/attach connect on demand.
+    #[cfg(unix)]
+    pub(crate) async fn probe_exec_ready_once(&mut self, exec_socket_path: &std::path::Path) {
+        use tokio::time::Duration;
+        const ATTEMPT_TIMEOUT: Duration = Duration::from_millis(500);
+
+        if let Ok(Ok(client)) =
+            tokio::time::timeout(ATTEMPT_TIMEOUT, ExecClient::connect(exec_socket_path)).await
+        {
+            match tokio::time::timeout(ATTEMPT_TIMEOUT, client.heartbeat()).await {
+                Ok(Ok(true)) => {
+                    tracing::debug!("restore: exec server heartbeat passed");
+                    self.exec_client = Some(client);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        tracing::debug!(
+            "restore: exec server did not answer an immediate heartbeat; exec/attach will connect on demand"
+        );
+    }
 }
