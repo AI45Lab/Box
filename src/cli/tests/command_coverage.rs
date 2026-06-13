@@ -54,10 +54,12 @@ const TOP_LEVEL_COMMANDS: &[&str] = &[
     "tag",
     "save",
     "load",
+    "import",
     "cp",
     "network",
     "volume",
     "df",
+    "prune",
     "system-prune",
     "version",
     "info",
@@ -187,6 +189,7 @@ fn test_local_state_command_smoke() {
     cli.ok(&["snapshot", "ls", "--json"]);
     cli.ok(&["pool", "status"]);
     cli.ok(&["pool", "stop"]);
+    cli.ok(&["prune", "--force"]);
     cli.ok(&["image-prune", "--force"]);
     cli.ok(&["system-prune", "--force"]);
     cli.ok(&["rmi", "--force", "missing:latest"]);

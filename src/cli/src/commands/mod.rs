@@ -45,6 +45,7 @@ mod run;
 mod save;
 mod seal;
 mod shell;
+mod prune;
 mod snapshot;
 mod start;
 mod stats;
@@ -175,6 +176,9 @@ pub enum Command {
     Volume(volume::VolumeArgs),
     /// Show disk usage
     Df(df::DfArgs),
+    /// Remove all stopped boxes (Docker `container prune`)
+    #[command(visible_alias = "container-prune")]
+    Prune(prune::PruneArgs),
     /// Remove all unused data (stopped boxes and unused images)
     SystemPrune(system_prune::SystemPruneArgs),
     /// Show version information
@@ -337,6 +341,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Network(args) => network::execute(args).await,
         Command::Volume(args) => volume::execute(args).await,
         Command::Df(args) => df::execute(args).await,
+        Command::Prune(args) => prune::execute(args).await,
         Command::SystemPrune(args) => system_prune::execute(args).await,
         Command::Version(args) => version::execute(args).await,
         Command::Info(args) => info::execute(args).await,
