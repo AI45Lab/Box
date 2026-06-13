@@ -424,6 +424,9 @@ mod tests {
         let spec = InstanceSpec {
             box_id: "test-box-123".to_string(),
             ksm: false,
+            snapshot_mem_file: None,
+            snapshot_sock: None,
+            restore_from: None,
             vcpus: 4,
             memory_mib: 2048,
             rootfs_path: PathBuf::from("/tmp/rootfs"),
