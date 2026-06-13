@@ -677,12 +677,19 @@ async fn execute_stop(_args: PoolStopArgs) -> Result<(), Box<dyn std::error::Err
 async fn execute_status(args: PoolStatusArgs) -> Result<(), Box<dyn std::error::Error>> {
     use tokio::net::UnixStream;
 
-    let mut stream = UnixStream::connect(&args.socket).await.map_err(|e| {
-        format!(
-            "Failed to connect to pool daemon at {} ({}). Is `a3s-box pool start` running?",
-            args.socket, e
-        )
-    })?;
+    // No daemon running is not an error for a status query — report "nothing" and
+    // succeed, like `ps` with no boxes. (Only a connected daemon that misbehaves is.)
+    let mut stream = match UnixStream::connect(&args.socket).await {
+        Ok(stream) => stream,
+        Err(_) => {
+            if args.json {
+                println!("[]");
+            } else {
+                println!("No pool daemon running (start one with `a3s-box pool start`).");
+            }
+            return Ok(());
+        }
+    };
 
     write_frame(&mut stream, &serde_json::to_vec(&Request::Status)?).await?;
     let resp: StatusResponse = serde_json::from_slice(&read_frame(&mut stream).await?)?;
