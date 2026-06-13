@@ -9,6 +9,16 @@ use std::time::Duration;
 mod support;
 use support::{assert_json_array_contains, read_file_from_saved_oci_tar, unique_tag, CliTest};
 
+/// Parse `inspect`/`image-inspect` output and return the single record. Both
+/// commands emit a Docker-style JSON array `[{...}]`, so callers want element 0.
+fn parse_inspect(out: &str) -> serde_json::Value {
+    let v: serde_json::Value = serde_json::from_str(out).expect("inspect output should be JSON");
+    match v {
+        serde_json::Value::Array(mut a) if !a.is_empty() => a.remove(0),
+        other => other,
+    }
+}
+
 const TOP_LEVEL_COMMANDS: &[&str] = &[
     "run",
     "create",
@@ -233,13 +243,7 @@ fn test_local_state_command_smoke() {
     ]);
     let inspect = cli.ok(&["inspect", "cov-created"]);
     assert!(inspect.contains("cov-created"));
-    let inspect_json: serde_json::Value =
-        serde_json::from_str(&inspect).expect("inspect output should be JSON");
-    // inspect returns a Docker-style array; the single box is element 0.
-    let inspect_json = match inspect_json {
-        serde_json::Value::Array(mut a) if !a.is_empty() => a.remove(0),
-        other => other,
-    };
+    let inspect_json = parse_inspect(&inspect);
     assert_eq!(
         inspect_json["cmd"],
         serde_json::json!(["/bin/sh", "-c", "echo created-command"])
@@ -258,8 +262,7 @@ fn test_local_state_command_smoke() {
     ]);
     cli.ok(&["network", "connect", "covconnect", "cov-renamed"]);
     let connected = cli.ok(&["inspect", "cov-renamed"]);
-    let connected: serde_json::Value =
-        serde_json::from_str(&connected).expect("connected inspect output should be JSON");
+    let connected = parse_inspect(&connected);
     assert_eq!(connected["network_name"], "covconnect");
     assert_eq!(
         connected["network_mode"],
@@ -270,8 +273,7 @@ fn test_local_state_command_smoke() {
     assert!(connected_network.contains("10.124.0.2"));
     cli.ok(&["network", "disconnect", "covconnect", "cov-renamed"]);
     let disconnected = cli.ok(&["inspect", "cov-renamed"]);
-    let disconnected: serde_json::Value =
-        serde_json::from_str(&disconnected).expect("disconnected inspect output should be JSON");
+    let disconnected = parse_inspect(&disconnected);
     assert_eq!(disconnected["network_name"], serde_json::Value::Null);
     assert_eq!(disconnected["network_mode"], serde_json::json!("tsi"));
     cli.ok(&["network", "rm", "covconnect"]);
@@ -279,8 +281,7 @@ fn test_local_state_command_smoke() {
     cli.ok(&["network", "connect", "covforce", "cov-renamed"]);
     cli.ok(&["network", "rm", "--force", "covforce"]);
     let force_disconnected = cli.ok(&["inspect", "cov-renamed"]);
-    let force_disconnected: serde_json::Value = serde_json::from_str(&force_disconnected)
-        .expect("force-disconnected inspect output should be JSON");
+    let force_disconnected = parse_inspect(&force_disconnected);
     assert_eq!(force_disconnected["network_name"], serde_json::Value::Null);
     assert_eq!(force_disconnected["network_mode"], serde_json::json!("tsi"));
     let formatted = cli.ok(&["ps", "-a", "--format", "{{.Names}} {{.Status}}"]);
@@ -333,13 +334,7 @@ CMD ["cat", "/opt/message.txt"]
     );
 
     let inspect = cli.ok(&["image-inspect", &image]);
-    let inspect: serde_json::Value =
-        serde_json::from_str(&inspect).expect("image-inspect output should be JSON");
-    // image-inspect returns a Docker-style array; inspect the single image (elem 0).
-    let inspect = match inspect {
-        serde_json::Value::Array(mut a) if !a.is_empty() => a.remove(0),
-        other => other,
-    };
+    let inspect = parse_inspect(&inspect);
     assert_eq!(inspect["Reference"], image);
     assert_eq!(inspect["LayerCount"], 1);
     assert_eq!(
