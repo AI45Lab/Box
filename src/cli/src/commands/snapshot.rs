@@ -226,8 +226,9 @@ async fn execute_restore(args: SnapshotRestoreArgs) -> Result<(), Box<dyn std::e
         oom_score_adj: None,
     };
 
-    let mut state = StateFile::load_default()?;
-    state.add(record)?;
+    // Atomic append under the state lock so a concurrent writer (run/monitor/
+    // compose/health) cannot clobber this registration with a stale snapshot.
+    StateFile::add_record(record)?;
 
     println!("{}", box_id);
     Ok(())

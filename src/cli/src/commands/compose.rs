@@ -592,7 +592,10 @@ async fn execute_up(
                 .await;
             }
         };
-        if let Err(error) = state.add(record) {
+        // Atomic append under the state lock (load-fresh + push + save): a plain
+        // state.add() saved a snapshot loaded before concurrent health/sibling
+        // writes, clobbering them (the lost-registration → orphan-VM race).
+        if let Err(error) = StateFile::add_record(record) {
             let rollback_services = rollback_with_current(&started_services, service_box);
             return rollback_compose_up(&mut state, &rollback_services, &created_networks, error)
                 .await;
