@@ -42,8 +42,13 @@ fn ensure_cgroup2_ready() -> bool {
             MsFlags::empty(),
             None::<&str>,
         ) {
-            warn!(error = %error, "cgroup: failed to mount cgroup2");
-            return false;
+            // A concurrent caller may have mounted it between our check and this
+            // mount (EBUSY): only treat it as a failure if the hierarchy still
+            // isn't there, so one of two racing execs doesn't skip enforcement.
+            if std::fs::metadata(&controllers_path).is_err() {
+                warn!(error = %error, "cgroup: failed to mount cgroup2");
+                return false;
+            }
         }
     }
 

@@ -354,7 +354,7 @@ fn handle_connection(fd: std::os::fd::OwnedFd) -> Result<(), Box<dyn std::error:
             let sig = std::str::from_utf8(&payload[EXEC_CONTROL_SIGNAL_MAIN.len()..])
                 .ok()
                 .and_then(|s| s.trim().parse::<i32>().ok())
-                .filter(|n| *n > 0 && *n < 64)
+                .filter(|n| *n > 0 && *n <= 64) // valid Linux signals are 1..=SIGRTMAX(64)
                 .unwrap_or(libc::SIGTERM);
             signal_main_process(sig);
             write_frame(&mut stream, FrameType::Control as u8, EXEC_SIGNAL_MAIN_ACK)?;
