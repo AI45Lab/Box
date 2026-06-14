@@ -127,10 +127,19 @@ async fn stream_and_verify_blob(
             });
         }
         None => {
-            tracing::warn!(
-                digest = %descriptor.digest,
-                "Unrecognized digest algorithm; skipping {what} content verification"
-            );
+            // We can only verify sha256. Refuse to store a blob whose digest
+            // algorithm we cannot check rather than silently trust the registry's
+            // bytes — otherwise a malicious/MITM registry could serve arbitrary
+            // content under a sha512:/unknown digest and have it reach the rootfs.
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(BoxError::RegistryError {
+                registry: registry.to_string(),
+                message: format!(
+                    "{what} uses an unsupported digest algorithm ({}); refusing to store \
+                     unverifiable content (only sha256 is supported)",
+                    descriptor.digest
+                ),
+            });
         }
     }
 
