@@ -74,11 +74,11 @@ fn parse_signal(name: &str) -> Result<i32, String> {
 
 pub async fn execute(args: KillArgs) -> Result<(), Box<dyn std::error::Error>> {
     let signal = parse_signal(&args.signal)?;
-    let mut state = StateFile::load_default()?;
+    let state = StateFile::load_default()?;
     let mut errors: Vec<String> = Vec::new();
 
     for query in &args.boxes {
-        if let Err(e) = kill_one(&mut state, query, signal).await {
+        if let Err(e) = kill_one(&state, query, signal).await {
             errors.push(format!("{query}: {e}"));
         }
     }
@@ -91,7 +91,7 @@ pub async fn execute(args: KillArgs) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn kill_one(
-    state: &mut StateFile,
+    state: &StateFile,
     query: &str,
     signal: i32,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -138,29 +138,38 @@ async fn kill_one(
         }
     }
 
-    // Only update state to stopped for terminating signals
+    // Only update state to stopped for terminating signals. Each state write
+    // goes through the atomic load-fresh + mutate + save primitive so it cannot
+    // clobber a concurrent run/monitor/compose write with our pre-await snapshot.
     if is_stopping_signal(signal) {
         if record.auto_remove {
             cleanup::cleanup_removed_box(&record);
-            state.remove(&box_id)?;
+            StateFile::remove_record(&box_id)?;
             println!("{name} (auto-removed)");
             return Ok(());
         }
 
         cleanup::cleanup_stopped_box(&record);
 
-        let state_record = resolve::resolve_mut(state, &box_id)?;
-        state_record.status = "stopped".to_string();
-        state_record.pid = None;
-        state_record.stopped_by_user = true;
-        state_record.exit_code = Some(signaled_exit_code(signal));
-        state_record.health_status = "none".to_string();
-        state_record.health_retries = 0;
-        state.save()?;
+        let exit_code = signaled_exit_code(signal);
+        StateFile::modify(|s| {
+            if let Some(state_record) = s.find_by_id_mut(&box_id) {
+                state_record.status = "stopped".to_string();
+                state_record.pid = None;
+                state_record.stopped_by_user = true;
+                state_record.exit_code = Some(exit_code);
+                state_record.health_status = "none".to_string();
+                state_record.health_retries = 0;
+            }
+            Ok::<(), std::io::Error>(())
+        })?;
     } else if let Some(new_status) = signal_status_transition(signal) {
-        let state_record = resolve::resolve_mut(state, &box_id)?;
-        state_record.status = new_status.to_string();
-        state.save()?;
+        StateFile::modify(|s| {
+            if let Some(state_record) = s.find_by_id_mut(&box_id) {
+                state_record.status = new_status.to_string();
+            }
+            Ok::<(), std::io::Error>(())
+        })?;
     }
 
     println!("{name}");

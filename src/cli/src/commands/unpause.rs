@@ -18,11 +18,11 @@ pub struct UnpauseArgs {
 }
 
 pub async fn execute(args: UnpauseArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let mut state = StateFile::load_default()?;
+    let state = StateFile::load_default()?;
     let mut errors: Vec<String> = Vec::new();
 
     for query in &args.boxes {
-        if let Err(e) = unpause_one(&mut state, query) {
+        if let Err(e) = unpause_one(&state, query) {
             errors.push(format!("{query}: {e}"));
         }
     }
@@ -34,7 +34,7 @@ pub async fn execute(args: UnpauseArgs) -> Result<(), Box<dyn std::error::Error>
     }
 }
 
-fn unpause_one(state: &mut StateFile, query: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn unpause_one(state: &StateFile, query: &str) -> Result<(), Box<dyn std::error::Error>> {
     let record = resolve::resolve(state, query)?;
 
     if record.status != "paused" {
@@ -64,9 +64,14 @@ fn unpause_one(state: &mut StateFile, query: &str) -> Result<(), Box<dyn std::er
         process::send_signal(pid, libc::SIGCONT)
             .map_err(|err| format!("Failed to unpause box {name} with SIGCONT: {err}"))?;
 
-        let record = resolve::resolve_mut(state, &box_id)?;
-        record.status = "running".to_string();
-        state.save()?;
+        // Persist the status flip atomically under the state lock so it cannot
+        // clobber a concurrent writer with our pre-signal snapshot.
+        StateFile::modify(|s| {
+            if let Some(record) = s.find_by_id_mut(&box_id) {
+                record.status = "running".to_string();
+            }
+            Ok::<(), std::io::Error>(())
+        })?;
 
         println!("{name}");
         Ok(())
@@ -86,32 +91,30 @@ mod tests {
 
     #[test]
     fn test_unpause_rejects_running() {
-        let (_tmp, mut state) = setup_state(vec![make_record(
+        let (_tmp, state) = setup_state(vec![make_record(
             "id-1",
             "running_box",
             "running",
             Some(99999),
         )]);
-        let result = unpause_one(&mut state, "running_box");
+        let result = unpause_one(&state, "running_box");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Cannot unpause"));
     }
 
     #[test]
     fn test_unpause_rejects_stopped() {
-        let (_tmp, mut state) =
-            setup_state(vec![make_record("id-1", "stopped_box", "stopped", None)]);
-        let result = unpause_one(&mut state, "stopped_box");
+        let (_tmp, state) = setup_state(vec![make_record("id-1", "stopped_box", "stopped", None)]);
+        let result = unpause_one(&state, "stopped_box");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Cannot unpause"));
     }
 
     #[test]
     fn test_unpause_rejects_paused_without_pid() {
-        let (_tmp, mut state) =
-            setup_state(vec![make_record("id-1", "paused_box", "paused", None)]);
+        let (_tmp, state) = setup_state(vec![make_record("id-1", "paused_box", "paused", None)]);
 
-        let result = unpause_one(&mut state, "paused_box");
+        let result = unpause_one(&state, "paused_box");
 
         assert!(result.is_err());
         let error = result.unwrap_err().to_string();
@@ -126,8 +129,8 @@ mod tests {
 
     #[test]
     fn test_unpause_not_found() {
-        let (_tmp, mut state) = setup_state(vec![]);
-        let result = unpause_one(&mut state, "nonexistent");
+        let (_tmp, state) = setup_state(vec![]);
+        let result = unpause_one(&state, "nonexistent");
         assert!(result.is_err());
     }
 }

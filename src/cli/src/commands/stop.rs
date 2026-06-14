@@ -23,11 +23,11 @@ pub struct StopArgs {
 }
 
 pub async fn execute(args: StopArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let mut state = StateFile::load_default()?;
+    let state = StateFile::load_default()?;
     let mut errors: Vec<String> = Vec::new();
 
     for query in &args.boxes {
-        if let Err(e) = stop_one(&mut state, query, args.timeout).await {
+        if let Err(e) = stop_one(&state, query, args.timeout).await {
             errors.push(format!("{query}: {e}"));
         }
     }
@@ -40,7 +40,7 @@ pub async fn execute(args: StopArgs) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn stop_one(
-    state: &mut StateFile,
+    state: &StateFile,
     query: &str,
     timeout: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -80,23 +80,28 @@ async fn stop_one(
 
     if auto_remove {
         cleanup::cleanup_removed_box(&record_snapshot);
-        state.remove(&box_id)?;
+        StateFile::remove_record(&box_id)?;
         println!("{name} (auto-removed)");
         return Ok(());
     }
 
     cleanup::cleanup_stopped_box(&record_snapshot);
 
-    // Update state
-    let record = resolve::resolve_mut(state, &box_id)?;
-    record.status = "stopped".to_string();
-    record.pid = None;
-    record.stopped_by_user = true;
-    record.exit_code = stopped_exit_code(previous_exit_code, stop_outcome, stop_signal);
-    record.health_status = "none".to_string();
-    record.health_retries = 0;
-
-    state.save()?;
+    // Apply the status change atomically (load-fresh + mutate + save under the
+    // state lock) so it cannot clobber a concurrent run/monitor/compose write
+    // with our pre-await snapshot.
+    let new_exit_code = stopped_exit_code(previous_exit_code, stop_outcome, stop_signal);
+    StateFile::modify(|s| {
+        if let Some(record) = s.find_by_id_mut(&box_id) {
+            record.status = "stopped".to_string();
+            record.pid = None;
+            record.stopped_by_user = true;
+            record.exit_code = new_exit_code;
+            record.health_status = "none".to_string();
+            record.health_retries = 0;
+        }
+        Ok::<(), std::io::Error>(())
+    })?;
     println!("{name}");
 
     Ok(())
