@@ -76,12 +76,21 @@ fn setup_main_stdio_pipes() -> Option<StdioRelayFds> {
     // child's dup2 onto fd 1/2 clears CLOEXEC there so only those survive exec.
     let mut out_fds = [0 as RawFd; 2];
     let mut err_fds = [0 as RawFd; 2];
-    if unsafe { libc::pipe2(out_fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0
-        || unsafe { libc::pipe2(err_fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0
-    {
+    if unsafe { libc::pipe2(out_fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
         unsafe {
             libc::close(console_out);
             libc::close(console_err);
+        }
+        return None;
+    }
+    if unsafe { libc::pipe2(err_fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
+        // The out-pipe succeeded; close it too so a failed err-pipe (e.g. EMFILE)
+        // doesn't leak the two out-pipe fds.
+        unsafe {
+            libc::close(console_out);
+            libc::close(console_err);
+            libc::close(out_fds[0]);
+            libc::close(out_fds[1]);
         }
         return None;
     }
