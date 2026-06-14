@@ -452,6 +452,11 @@ async fn execute_up(
                 &box_dir,
                 &box_dir.join("sockets/exec.sock"),
             );
+            // Release the overlay mount before deleting the box dir, else
+            // remove_dir_all recurses into the live mount ("Stale file handle")
+            // and leaks it — the same class as the rm/restart leak fixed in #33,
+            // which cleanup_box_resources (volumes + network only) does not cover.
+            a3s_box_runtime::rootfs::unmount_box_overlay(&box_dir.join("merged"));
             let _ = std::fs::remove_dir_all(&box_dir);
             return rollback_compose_up(
                 &mut state,
@@ -803,6 +808,10 @@ fn cleanup_service_box(svc: &ServiceBox) {
         svc.network_name.as_deref(),
     );
     crate::cleanup::cleanup_anonymous_volumes(&svc.anonymous_volumes);
+    // Release the overlay mount before deleting the box dir, else remove_dir_all
+    // recurses into the live mount ("Stale file handle") and leaks it (#33).
+    // cleanup_box_resources above only detaches volumes + network, not the mount.
+    a3s_box_runtime::rootfs::unmount_box_overlay(&svc.box_dir.join("merged"));
     let _ = std::fs::remove_dir_all(&svc.box_dir);
     crate::cleanup::cleanup_external_socket_dir(&svc.box_dir, &svc.exec_socket_path);
 }
