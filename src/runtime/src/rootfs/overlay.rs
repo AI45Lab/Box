@@ -14,6 +14,19 @@ use a3s_box_core::error::{BoxError, Result};
 /// 1. `mount(2)` syscall (requires CAP_SYS_ADMIN or unprivileged overlay)
 /// 2. `mount` command as fallback
 pub fn overlay_mount(lower: &Path, upper: &Path, work: &Path, merged: &Path) -> Result<()> {
+    // overlayfs mount options are comma-delimited with no escaping, so a comma in
+    // any path would be parsed as an option boundary and silently corrupt the
+    // mount. Refuse instead. Box dirs are UUID-based today, so this never trips in
+    // practice — it's a guard for any future user-controllable cache/box path.
+    for path in [lower, upper, work] {
+        if path.to_string_lossy().contains(',') {
+            return Err(BoxError::BuildError(format!(
+                "overlay path contains a comma, which overlayfs options cannot express: {}",
+                path.display()
+            )));
+        }
+    }
+
     let opts = format!(
         "lowerdir={},upperdir={},workdir={}",
         lower.display(),
