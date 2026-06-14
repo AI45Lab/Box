@@ -236,10 +236,7 @@ impl VmManager {
             // cgroup `pids.max`; it reads this env in PID 1 before the container
             // fork.
             if let Some(pids_limit) = self.config.resource_limits.pids_limit {
-                env.push((
-                    "A3S_SEC_PIDS_LIMIT".to_string(),
-                    pids_limit.to_string(),
-                ));
+                env.push(("A3S_SEC_PIDS_LIMIT".to_string(), pids_limit.to_string()));
             }
 
             // Signal guest init to remount rootfs read-only after all setup

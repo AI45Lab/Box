@@ -180,9 +180,16 @@ pub fn spawn_isolated(
     match unsafe { fork() }.map_err(NamespaceError::ForkFailed)? {
         ForkResult::Child => {
             // Child process: create namespaces and exec
-            if let Err(e) =
-                child_process(config, command, args, env, workdir, user, main_stdio, cgroup_procs)
-            {
+            if let Err(e) = child_process(
+                config,
+                command,
+                args,
+                env,
+                workdir,
+                user,
+                main_stdio,
+                cgroup_procs,
+            ) {
                 tracing::error!("Child process failed: {}", e);
                 std::process::exit(1);
             }
