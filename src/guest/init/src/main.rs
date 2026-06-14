@@ -115,9 +115,19 @@ fn start_stdio_relays(out_r: i32, console_out: i32, err_r: i32, console_err: i32
                 let n = unsafe {
                     libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
                 };
-                // < 0: read error (treat as done). 0: EOF — the container closed
-                // its pipe write-end (it exited), so the relay is finished.
-                if n <= 0 {
+                if n < 0 {
+                    // EINTR: a signal (e.g. the SIGTERM handler, installed without
+                    // SA_RESTART) interrupted the blocking read — retry, don't
+                    // mistake it for EOF and truncate the container's final output.
+                    // Any other error means the pipe is gone, so stop.
+                    if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    break;
+                }
+                // EOF — the container closed its pipe write-end (it exited), so the
+                // relay is finished.
+                if n == 0 {
                     break;
                 }
                 let mut off = 0usize;
@@ -129,7 +139,15 @@ fn start_stdio_relays(out_r: i32, console_out: i32, err_r: i32, console_err: i32
                             n as usize - off,
                         )
                     };
-                    if w <= 0 {
+                    if w < 0 {
+                        // Same EINTR handling for the write side: retry the same
+                        // offset rather than dropping the rest of the chunk.
+                        if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                            continue;
+                        }
+                        break;
+                    }
+                    if w == 0 {
                         break;
                     }
                     off += w as usize;
