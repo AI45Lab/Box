@@ -83,8 +83,9 @@ impl tokio::io::AsyncWrite for HashingFileWriter {
 /// Stream a blob to `dest`, verifying its SHA-256 against `descriptor.digest`
 /// as it downloads. The blob is written to a `.partial` temp file and only
 /// renamed into place once the digest checks out, so a failed/corrupted pull
-/// never leaves a bad blob under its content-addressed name. Unknown digest
-/// algorithms are stored with a warning rather than silently trusted.
+/// never leaves a bad blob under its content-addressed name. A blob whose digest
+/// uses an unsupported algorithm (anything but sha256) is rejected rather than
+/// stored unverified.
 async fn stream_and_verify_blob(
     client: &Client,
     oci_ref: &Reference,
@@ -127,10 +128,19 @@ async fn stream_and_verify_blob(
             });
         }
         None => {
-            tracing::warn!(
-                digest = %descriptor.digest,
-                "Unrecognized digest algorithm; skipping {what} content verification"
-            );
+            // We can only verify sha256. Refuse to store a blob whose digest
+            // algorithm we cannot check rather than silently trust the registry's
+            // bytes — otherwise a malicious/MITM registry could serve arbitrary
+            // content under a sha512:/unknown digest and have it reach the rootfs.
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(BoxError::RegistryError {
+                registry: registry.to_string(),
+                message: format!(
+                    "{what} uses an unsupported digest algorithm ({}); refusing to store \
+                     unverifiable content (only sha256 is supported)",
+                    descriptor.digest
+                ),
+            });
         }
     }
 
