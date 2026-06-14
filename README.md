@@ -262,7 +262,7 @@ A3S Box has three network modes:
 
 | Mode | What it does | Current boundary |
 | --- | --- | --- |
-| TSI default | Guest socket operations are proxied through the host. Use this for simple outbound access. | No user-defined peer network. |
+| TSI default | Guest socket operations are proxied through the host. Use this for simple outbound access. | No user-defined peer network, and **no in-guest loopback** — a container cannot reach its own services over `localhost`/`127.0.0.1` (e.g. a `localhost` health check or `exec curl localhost` fails). Use a bridge network when you need working localhost. |
 | Bridge | Creates a real guest network interface for user-defined networks and peer discovery. | Linux uses `passt` with outbound NAT. macOS uses built-in `netproxy` for peer networking and published TCP ports; macOS bridge outbound NAT is unsupported. |
 | None | No network. | Useful for intentionally isolated workloads. |
 
