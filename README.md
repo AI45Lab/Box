@@ -1,14 +1,32 @@
 # A3S Box
 
 <p align="center">
-  <strong>Docker-like MicroVM runtime for OCI workloads</strong>
+  <strong>A kernel per workload — at container speed.</strong>
 </p>
 
 <p align="center">
-  <em>Run Linux OCI images inside libkrun MicroVMs, with a Docker-like CLI, local image store, volumes, TCP port publishing, opt-in TEE workflows, and a Kubernetes CRI server reachable by crictl and the kubelet (core pod lifecycle and exec).</em>
+  <em>A Docker-like runtime that runs each Linux OCI workload inside its own libkrun MicroVM. VM-grade isolation — a real kernel per box, with optional hardware TEE — brought to container-class startup and density by native Copy-on-Write snapshot-fork.</em>
 </p>
 
 ---
+
+## Why A3S Box
+
+**The tradeoff every runtime forces on you.** Containers are fast and dense, but they share the host kernel — one kernel bug or escape crosses every tenant on the box. Virtual machines isolate with their own kernel, but they are slow and heavy to start and to scale. You pick *speed* or *isolation*.
+
+**A3S Box collapses that tradeoff.** Every box is a real MicroVM with its own Linux kernel — yet native Copy-on-Write **snapshot-fork** clones a *booted* template instead of cold-booting each one, so a VM starts and scales like a container. Strong isolation stops being a thing you pay for in latency and footprint.
+
+Measured on a `/dev/kvm` host (not aspirational):
+
+| | A3S Box | Why it matters |
+| --- | --- | --- |
+| **Isolation** | A real Linux kernel per workload, optional AMD SEV-SNP confidential computing | A guest kernel bug stays in the guest — unlike a shared-kernel container escape |
+| **Cold start** | ~200 ms | Already VM-fast, before forking |
+| **Snapshot-fork** | ~110 ms per fork · 100 forks in **under ~1 s** (~8 ms amortized) · ~13 MB RSS each | VM density and startup at *container* scale |
+| **Warm pool** | a pre-booted box served in ~73 ms (~23× vs cold), CoW-filled | Sub-100 ms acquire for bursty/agent workloads |
+| **Developer surface** | `run` / `build` / `exec` / `logs` / `compose`, OCI images, Kubernetes CRI | No new mental model — your Docker workflow, unchanged |
+
+In one line: **the isolation of a VM, the startup and density of a container, the ergonomics of Docker.** That is the core of A3S Box. Everything below is an honest account of how far each surface is actually built.
 
 ## Current status
 
