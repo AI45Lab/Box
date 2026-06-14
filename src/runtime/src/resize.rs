@@ -77,13 +77,13 @@ impl ResourceUpdate {
 
         // cpu.weight: 1-10000 (maps from Docker's cpu-shares 2-262144)
         if let Some(shares) = self.limits.cpu_shares {
-            // Docker shares (2-262144) → cgroup v2 weight (1-10000)
-            // Formula: weight = (1 + ((shares - 2) * 9999) / 262142)
-            let weight = if shares <= 2 {
-                1
-            } else {
-                1 + ((shares.saturating_sub(2)) * 9999 / 262142).min(10000)
-            };
+            // Docker shares (2-262144) → cgroup v2 weight (1-10000), runc's
+            // mapping. Clamp shares into range FIRST (so the `* 9999` cannot
+            // overflow for absurd inputs near u64::MAX) and clamp the final
+            // result to [1, 10000] (the bare `1 + …` can reach 10001). Mirrors
+            // the guest `cgroup::shares_to_weight`.
+            let shares = shares.clamp(2, 262_144);
+            let weight = (1 + ((shares - 2) * 9999) / 262_142).clamp(1, 10_000);
             cmds.push(cgroup_write_cmd("cpu.weight", &weight.to_string()));
         }
 
@@ -107,13 +107,44 @@ impl ResourceUpdate {
             cmds.push(cgroup_write_cmd("pids.max", &pids.to_string()));
         }
 
-        // cpuset.cpus
+        // cpuset.cpus — only emit a known-good value. `validate_update` already
+        // rejects malformed cpusets, but guard here too since the value is
+        // interpolated into the resize shell command: a stray quote/`$`/`;`
+        // could otherwise break out of `echo '…'` and run arbitrary shell in the
+        // guest.
         if let Some(ref cpuset) = self.limits.cpuset_cpus {
-            cmds.push(cgroup_write_cmd("cpuset.cpus", cpuset));
+            if is_valid_cpuset(cpuset) {
+                cmds.push(cgroup_write_cmd("cpuset.cpus", cpuset));
+            } else {
+                tracing::warn!(cpuset = %cpuset, "Skipping malformed cpuset.cpus value");
+            }
         }
 
         cmds
     }
+}
+
+/// Validate a cgroup `cpuset.cpus` value: a comma-separated list of CPU indices
+/// and ranges, e.g. `0`, `0,2,4`, `0-3`, `0-1,4-7`. Only ASCII digits, `,` and
+/// `-` are allowed, so no shell metacharacter can survive — the kernel rejects
+/// anything else anyway. Surrounding whitespace per element is tolerated.
+fn is_valid_cpuset(cpuset: &str) -> bool {
+    let cpuset = cpuset.trim();
+    if cpuset.is_empty() {
+        return false;
+    }
+    cpuset.split(',').all(|element| {
+        let element = element.trim();
+        match element.split_once('-') {
+            Some((lo, hi)) => {
+                !lo.is_empty()
+                    && !hi.is_empty()
+                    && lo.bytes().all(|b| b.is_ascii_digit())
+                    && hi.bytes().all(|b| b.is_ascii_digit())
+            }
+            None => !element.is_empty() && element.bytes().all(|b| b.is_ascii_digit()),
+        }
+    })
 }
 
 /// Build a `sh` command that writes `value` to cgroup v2 control file `file` in
@@ -148,6 +179,16 @@ pub fn validate_update(update: &ResourceUpdate) -> Result<()> {
              memory ballooning. Stop and recreate the box with the desired memory size.",
             memory_mb
         )));
+    }
+    // Reject a malformed cpuset before it can be interpolated into the resize
+    // shell command (cgroup `cpuset.cpus` accepts only indices/ranges anyway).
+    if let Some(ref cpuset) = update.limits.cpuset_cpus {
+        if !is_valid_cpuset(cpuset) {
+            return Err(BoxError::ResizeError(format!(
+                "Invalid cpuset.cpus value {cpuset:?}: expected a comma-separated list of CPU \
+                 indices/ranges such as \"0-3\" or \"0,2,4\"."
+            )));
+        }
     }
     Ok(())
 }
@@ -330,6 +371,61 @@ mod tests {
         let cmds = update.build_cgroup_commands();
         assert!(cmds[0].contains("0,1,3"));
         assert!(cmds[0].contains("cpuset.cpus"));
+    }
+
+    #[test]
+    fn test_cpuset_valid_forms_accepted() {
+        for ok in ["0", "0,1,3", "0-3", "0-1,4-7", " 0 , 2 "] {
+            assert!(is_valid_cpuset(ok), "{ok:?} should be valid");
+        }
+    }
+
+    #[test]
+    fn test_cpuset_injection_rejected() {
+        // Shell-injection payloads and other malformed values must be rejected so
+        // they never reach `echo '…'` in the resize command.
+        for bad in [
+            "",
+            "0'$(id >>/tmp/pwned)",
+            "0; rm -rf /",
+            "0`whoami`",
+            "0\nmalicious",
+            "all",
+            "0-",
+            "-3",
+        ] {
+            assert!(!is_valid_cpuset(bad), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn test_validate_rejects_malformed_cpuset() {
+        let update = ResourceUpdate {
+            limits: ResourceLimits {
+                cpuset_cpus: Some("0'$(id)".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = validate_update(&update).unwrap_err();
+        assert!(err.to_string().contains("cpuset"));
+        // And the dangerous value never makes it into a shell command.
+        assert!(update.build_cgroup_commands().is_empty());
+    }
+
+    #[test]
+    fn test_cpu_weight_clamped_for_oversized_shares() {
+        // Absurd shares must not overflow the `* 9999` nor exceed cgroup's max
+        // weight of 10000.
+        let update = ResourceUpdate {
+            limits: ResourceLimits {
+                cpu_shares: Some(u64::MAX),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let cmds = update.build_cgroup_commands();
+        assert!(cmds[0].contains("'10000'"), "got {}", cmds[0]);
     }
 
     #[test]
