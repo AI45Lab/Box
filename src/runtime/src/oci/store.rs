@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use a3s_box_core::error::{BoxError, Result};
@@ -13,6 +14,9 @@ use a3s_box_core::{ImageStoreBackend, StoredImage};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
+
+/// Per-process counter for unique staging-dir names in `put`.
+static PUT_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Persistent index stored as JSON on disk.
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -130,11 +134,36 @@ impl ImageStore {
         let digest_hex = digest.strip_prefix("sha256:").unwrap_or(digest);
         let target_dir = self.store_dir.join("sha256").join(digest_hex);
 
-        // Copy source to target if not already present
+        // Copy source to target if not already present. Stage into a unique temp
+        // dir then atomically rename into place, so a concurrent put() for the
+        // same digest — or a copy that fails partway — can never leave a
+        // half-populated content-addressed dir that a later caller mistakes for a
+        // complete image (the bare check-then-copy raced on both counts).
         if !target_dir.exists() {
-            copy_dir_recursive(source_dir, &target_dir).map_err(|e| {
+            let seq = PUT_SEQ.fetch_add(1, Ordering::Relaxed);
+            let staging = self.store_dir.join("sha256").join(format!(
+                ".staging-{}-{}-{}",
+                digest_hex,
+                std::process::id(),
+                seq
+            ));
+            let _ = std::fs::remove_dir_all(&staging);
+            copy_dir_recursive(source_dir, &staging).map_err(|e| {
+                let _ = std::fs::remove_dir_all(&staging);
                 BoxError::OciImageError(format!("Failed to copy image to store: {}", e))
             })?;
+            if let Err(e) = std::fs::rename(&staging, &target_dir) {
+                let _ = std::fs::remove_dir_all(&staging);
+                // A concurrent put() may have populated target_dir first (rename
+                // onto a non-empty dir fails); that's fine — only propagate if the
+                // image still isn't there.
+                if !target_dir.exists() {
+                    return Err(BoxError::OciImageError(format!(
+                        "Failed to publish image to store: {}",
+                        e
+                    )));
+                }
+            }
         }
 
         let size_bytes = dir_size(&target_dir);

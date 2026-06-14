@@ -15,11 +15,15 @@
 //! NOT fail the build.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use a3s_box_core::dirs_home;
 use serde::{Deserialize, Serialize};
 
 use super::layer::{sha256_bytes, LayerInfo};
+
+/// Per-process counter for unique staging-file names in `store`.
+static STORE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Default cap on the total size of cached layer blobs (2 GiB). Override with
 /// `A3S_BOX_BUILDCACHE_MAX_BYTES`. When the cap is exceeded after a store, the
@@ -125,8 +129,27 @@ impl BuildCache {
     /// the `keys/<key>` record. Best-effort: I/O errors are ignored.
     pub(crate) fn store(&self, key: &str, layer: &LayerInfo, diff_id: &str) {
         let blob_path = self.dir.join("blobs").join(&layer.digest);
-        if !blob_path.exists() && std::fs::copy(&layer.path, &blob_path).is_err() {
-            return;
+        if !blob_path.exists() {
+            // Copy to a unique temp file then atomically rename into place, so a
+            // concurrent build (or a copy that fails partway) never publishes a
+            // half-written blob that a key record then points at. The blob is
+            // content-addressed, so a rename that overwrites a racing winner is
+            // harmless (identical bytes).
+            let seq = STORE_SEQ.fetch_add(1, Ordering::Relaxed);
+            let staging = self.dir.join("blobs").join(format!(
+                ".staging-{}-{}-{}",
+                layer.digest,
+                std::process::id(),
+                seq
+            ));
+            if std::fs::copy(&layer.path, &staging).is_err() {
+                let _ = std::fs::remove_file(&staging);
+                return;
+            }
+            if std::fs::rename(&staging, &blob_path).is_err() {
+                let _ = std::fs::remove_file(&staging);
+                return;
+            }
         }
 
         let record = KeyRecord {
