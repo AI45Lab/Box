@@ -618,6 +618,14 @@ pub async fn serve_attach(
                     Ok(None) | Err(_) => break,
                 }
             }
+            // The loop also exits on a frame-read error (or EOF) before a `fin`
+            // stdin frame; close stdin here so a stdin_once attach doesn't leak an
+            // open stdin on an abnormal client disconnect.
+            if stdin_once && !closed {
+                if let Some(input) = stdin.as_ref() {
+                    let _ = input.close_stdin().await;
+                }
+            }
         }
     };
 
