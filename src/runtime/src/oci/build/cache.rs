@@ -136,10 +136,12 @@ impl BuildCache {
             // content-addressed, so a rename that overwrites a racing winner is
             // harmless (identical bytes).
             let seq = STORE_SEQ.fetch_add(1, Ordering::Relaxed);
-            let staging = self
-                .dir
-                .join("blobs")
-                .join(format!(".staging-{}-{}-{}", layer.digest, std::process::id(), seq));
+            let staging = self.dir.join("blobs").join(format!(
+                ".staging-{}-{}-{}",
+                layer.digest,
+                std::process::id(),
+                seq
+            ));
             if std::fs::copy(&layer.path, &staging).is_err() {
                 let _ = std::fs::remove_file(&staging);
                 return;
