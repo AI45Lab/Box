@@ -247,7 +247,28 @@ impl ExecConfig {
         // (runtime/src/vm/spec.rs), so this default is only a defensive fallback.
         // Use /bin/sh — universal across distros — never /sbin/init, which does
         // not exist on Alpine and was the original cause of issue #3.
-        let executable = std::env::var("BOX_EXEC_EXEC").unwrap_or_else(|_| "/bin/sh".to_string());
+        // BOX_EXEC_* values are base64-encoded (URL-safe, no pad) by the runtime
+        // when BOX_EXEC_B64=1, so arbitrary bytes (quotes, spaces, `$`, …) survive
+        // libkrun's env serialization. Decode them back; fall back to the raw value
+        // on any decode error or when the marker is absent (older runtime).
+        use base64::Engine;
+        let b64 = std::env::var("BOX_EXEC_B64")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let decode = |s: String| -> String {
+            if !b64 {
+                return s;
+            }
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(s.as_bytes())
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .unwrap_or(s)
+        };
+
+        let executable = std::env::var("BOX_EXEC_EXEC")
+            .map(&decode)
+            .unwrap_or_else(|_| "/bin/sh".to_string());
 
         // Parse args from individual env vars (BOX_EXEC_ARGC + BOX_EXEC_ARG_0..N)
         let args: Vec<String> = match std::env::var("BOX_EXEC_ARGC")
@@ -255,23 +276,30 @@ impl ExecConfig {
             .and_then(|s| s.parse::<usize>().ok())
         {
             Some(argc) => (0..argc)
-                .filter_map(|i| std::env::var(format!("BOX_EXEC_ARG_{}", i)).ok())
+                .filter_map(|i| {
+                    std::env::var(format!("BOX_EXEC_ARG_{}", i))
+                        .ok()
+                        .map(&decode)
+                })
                 .collect(),
             None => vec![],
         };
 
-        let workdir = std::env::var("BOX_EXEC_WORKDIR").unwrap_or_else(|_| "/".to_string());
+        let workdir = std::env::var("BOX_EXEC_WORKDIR")
+            .map(&decode)
+            .unwrap_or_else(|_| "/".to_string());
 
         // Optional container user (image USER directive or CLI --user).
         let user = std::env::var("BOX_EXEC_USER")
             .ok()
+            .map(&decode)
             .filter(|u| !u.is_empty());
 
-        // Collect BOX_EXEC_ENV_* variables
+        // Collect BOX_EXEC_ENV_* variables (values decoded as above).
         let env: Vec<(String, String)> = std::env::vars()
             .filter_map(|(key, value)| {
                 key.strip_prefix("BOX_EXEC_ENV_")
-                    .map(|stripped| (stripped.to_string(), value))
+                    .map(|stripped| (stripped.to_string(), decode(value)))
             })
             .collect();
 

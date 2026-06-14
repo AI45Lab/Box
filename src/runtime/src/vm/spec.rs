@@ -134,14 +134,20 @@ impl VmManager {
             };
             a3s_box_core::env::merge_env_pairs(&mut container_env, &self.config.extra_env);
 
-            // Pass exec + args as individual env vars (avoids spaces being truncated
-            // by libkrun's env serialization).
+            // Pass exec + args as individual env vars, base64-encoded (URL-safe, no
+            // padding) so arbitrary bytes — spaces, quotes, `$`, `;` — survive
+            // libkrun's env serialization intact (a raw `"` in a value was being
+            // corrupted). `BOX_EXEC_B64=1` tells guest-init to decode them.
+            use base64::Engine;
+            let b64 =
+                |s: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(s.as_bytes());
             let mut env: Vec<(String, String)> = vec![
-                ("BOX_EXEC_EXEC".to_string(), exec),
+                ("BOX_EXEC_B64".to_string(), "1".to_string()),
+                ("BOX_EXEC_EXEC".to_string(), b64(&exec)),
                 ("BOX_EXEC_ARGC".to_string(), args.len().to_string()),
             ];
             for (i, arg) in args.iter().enumerate() {
-                env.push((format!("BOX_EXEC_ARG_{}", i), arg.clone()));
+                env.push((format!("BOX_EXEC_ARG_{}", i), b64(arg)));
             }
 
             // Prototype: deferred-main-spawn. If the host set BOX_DEFERRED_MAIN=1,
@@ -157,7 +163,7 @@ impl VmManager {
 
             // Pass the effective working directory to guest init so PID 1 and
             // the container entrypoint agree even when no OCI WORKDIR is set.
-            env.push(("BOX_EXEC_WORKDIR".to_string(), workdir.clone()));
+            env.push(("BOX_EXEC_WORKDIR".to_string(), b64(&workdir)));
 
             // Pass the container user (image USER / --user) to guest init, which
             // applies it (setgroups+setgid+setuid) to the MAIN process right
@@ -165,12 +171,15 @@ impl VmManager {
             // NOT go through the shim's libkrun set_uid, which would drop guest
             // PID 1 to the user and break init (mount/chroot need root).
             if let Some(user) = &user {
-                env.push(("BOX_EXEC_USER".to_string(), user.clone()));
+                env.push(("BOX_EXEC_USER".to_string(), b64(user)));
             }
 
-            // Pass container environment variables with BOX_EXEC_ENV_ prefix
+            // Pass container environment variables with BOX_EXEC_ENV_ prefix (values
+            // base64-encoded like the rest, so a value containing `"`/spaces/etc.
+            // reaches the container intact). The key stays raw — env names are
+            // restricted to a safe character set.
             for (key, value) in container_env {
-                env.push((format!("BOX_EXEC_ENV_{}", key), value));
+                env.push((format!("BOX_EXEC_ENV_{}", key), b64(&value)));
             }
 
             // Pass user volume mounts to guest init for mounting inside the VM.
@@ -747,6 +756,17 @@ mod tests {
     use tempfile::tempdir;
     use tempfile::TempDir;
 
+    /// Decode a base64 (URL-safe, no pad) `BOX_EXEC_*` value the way guest-init
+    /// does, so assertions can compare against the original raw value.
+    fn b64d(s: &str) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(s.as_bytes())
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .unwrap_or_else(|| s.to_string())
+    }
+
     fn test_oci_config(workdir: Option<&str>, user: Option<&str>) -> OciImageConfig {
         OciImageConfig {
             entrypoint: Some(vec!["/bin/app".to_string()]),
@@ -1065,12 +1085,12 @@ mod tests {
             .entrypoint
             .env
             .iter()
-            .any(|(key, value)| key == "BOX_EXEC_USER" && value == "1000:1000"));
+            .any(|(key, value)| key == "BOX_EXEC_USER" && b64d(value) == "1000:1000"));
         assert!(spec
             .entrypoint
             .env
             .iter()
-            .any(|(key, value)| key == "BOX_EXEC_WORKDIR" && value == "/override"));
+            .any(|(key, value)| key == "BOX_EXEC_WORKDIR" && b64d(value) == "/override"));
     }
 
     #[test]
@@ -1117,12 +1137,12 @@ mod tests {
             .entrypoint
             .env
             .iter()
-            .any(|(key, value)| key == "BOX_EXEC_USER" && value == "2000:2000"));
+            .any(|(key, value)| key == "BOX_EXEC_USER" && b64d(value) == "2000:2000"));
         assert!(spec
             .entrypoint
             .env
             .iter()
-            .any(|(key, value)| key == "BOX_EXEC_WORKDIR" && value == "/oci"));
+            .any(|(key, value)| key == "BOX_EXEC_WORKDIR" && b64d(value) == "/oci"));
     }
 
     #[test]
@@ -1138,7 +1158,7 @@ mod tests {
             .entrypoint
             .env
             .iter()
-            .any(|(key, value)| key == "BOX_EXEC_WORKDIR" && value == GUEST_WORKDIR));
+            .any(|(key, value)| key == "BOX_EXEC_WORKDIR" && b64d(value) == GUEST_WORKDIR));
     }
 
     #[test]
@@ -1182,17 +1202,17 @@ mod tests {
             .entrypoint
             .env
             .iter()
-            .any(|(key, value)| key == "BOX_EXEC_ENV_FOO" && value == "cli"));
+            .any(|(key, value)| key == "BOX_EXEC_ENV_FOO" && b64d(value) == "cli"));
         assert!(spec
             .entrypoint
             .env
             .iter()
-            .any(|(key, value)| key == "BOX_EXEC_ENV_BAR" && value == "image"));
+            .any(|(key, value)| key == "BOX_EXEC_ENV_BAR" && b64d(value) == "image"));
         assert!(spec
             .entrypoint
             .env
             .iter()
-            .any(|(key, value)| key == "BOX_EXEC_ENV_BAZ" && value == "cli"));
+            .any(|(key, value)| key == "BOX_EXEC_ENV_BAZ" && b64d(value) == "cli"));
         assert!(!spec
             .entrypoint
             .env
