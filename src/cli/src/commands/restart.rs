@@ -23,11 +23,11 @@ pub struct RestartArgs {
 }
 
 pub async fn execute(args: RestartArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let mut state = StateFile::load_default()?;
+    let state = StateFile::load_default()?;
     let mut errors: Vec<String> = Vec::new();
 
     for query in &args.boxes {
-        if let Err(e) = restart_one(&mut state, query, args.timeout).await {
+        if let Err(e) = restart_one(&state, query, args.timeout).await {
             errors.push(format!("{query}: {e}"));
         }
     }
@@ -40,7 +40,7 @@ pub async fn execute(args: RestartArgs) -> Result<(), Box<dyn std::error::Error>
 }
 
 async fn restart_one(
-    state: &mut StateFile,
+    state: &StateFile,
     query: &str,
     timeout: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -72,22 +72,34 @@ async fn restart_one(
         process::graceful_stop_via_guest(pid, &exec_socket_path, stop_signal, effective_timeout)
             .await;
 
-        // Update state to stopped
-        let record = resolve::resolve_mut(state, &box_id)?;
-        record.status = "stopped".to_string();
-        record.pid = None;
+        // Update state to stopped — atomically (load-fresh + mutate + save under
+        // the lock) so the post-await write cannot clobber a concurrent
+        // monitor/run/command writer with our pre-await snapshot.
         crate::cleanup::cleanup_external_socket_dir(&box_dir, &exec_socket_path);
-        state.save()?;
+        StateFile::modify(|s| {
+            if let Some(record) = s.find_by_id_mut(&box_id) {
+                record.status = "stopped".to_string();
+                record.pid = None;
+            }
+            Ok::<(), std::io::Error>(())
+        })?;
     }
 
-    // Phase 2: Start the box using shared boot logic
+    // Phase 2: Start the box using shared boot logic. The record's boot config
+    // (image, cmd, dirs) is immutable across the stop, so the in-memory handle is
+    // fine to boot from; only the post-boot status write must be atomic.
     let record = resolve::resolve(state, &box_id)?;
     let result = boot::boot_from_record(record).await?;
 
-    // Update record to running
-    let record = resolve::resolve_mut(state, &box_id)?;
-    boot::apply_boot_result(record, result, boot::RestartCountUpdate::Preserve);
-    state.save()?;
+    // Persist the boot result atomically; the closure re-resolves by id against
+    // fresh state so it never persists a stale snapshot (and Preserve keeps the
+    // freshly-loaded restart_count).
+    StateFile::modify(move |s| {
+        if let Some(record) = s.find_by_id_mut(&box_id) {
+            boot::apply_boot_result(record, result, boot::RestartCountUpdate::Preserve);
+        }
+        Ok::<(), std::io::Error>(())
+    })?;
 
     println!("{name}");
     Ok(())
