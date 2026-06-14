@@ -600,6 +600,10 @@ async fn handle_attach_stream(
     let mut input_buffer = vec![0u8; 16 * 1024];
     let (mut tcp_read, mut tcp_write) = tokio::io::split(stream);
 
+    // Track any I/O error so the stdin_once close-cleanup below runs on EVERY
+    // exit path (including an abnormal client disconnect / write error), not only
+    // the clean break — otherwise a stdin_once attach leaks an open stdin.
+    let mut loop_result: Result<(), Box<dyn std::error::Error + Send + Sync>> = Ok(());
     loop {
         tokio::select! {
             input = tcp_read.read(&mut input_buffer), if !stdin_closed => {
@@ -608,7 +612,10 @@ async fn handle_attach_stream(
                         stdin_closed = true;
                         if session.stdin_once {
                             if let Some(stdin) = stdin.as_ref() {
-                                stdin.close_stdin().await?;
+                                if let Err(e) = stdin.close_stdin().await {
+                                    loop_result = Err(e);
+                                    break;
+                                }
                             }
                         }
                         if !session.stdout && !session.stderr {
@@ -617,20 +624,32 @@ async fn handle_attach_stream(
                     }
                     Ok(n) => {
                         if let Some(stdin) = stdin.as_ref() {
-                            stdin.write_stdin(&input_buffer[..n]).await?;
+                            if let Err(e) = stdin.write_stdin(&input_buffer[..n]).await {
+                                loop_result = Err(e);
+                                break;
+                            }
                         }
                     }
-                    Err(e) => return Err(Box::new(e)),
+                    Err(e) => {
+                        loop_result = Err(Box::new(e));
+                        break;
+                    }
                 }
             }
             event = receiver.recv() => {
                 match event {
                     Ok(a3s_box_core::exec::ExecEvent::Chunk(chunk)) => match chunk.stream {
                         a3s_box_core::exec::StreamType::Stdout if session.stdout => {
-                            tcp_write.write_all(&chunk.data).await?;
+                            if let Err(e) = tcp_write.write_all(&chunk.data).await {
+                                loop_result = Err(Box::new(e));
+                                break;
+                            }
                         }
                         a3s_box_core::exec::StreamType::Stderr if session.stderr => {
-                            tcp_write.write_all(&chunk.data).await?;
+                            if let Err(e) = tcp_write.write_all(&chunk.data).await {
+                                loop_result = Err(Box::new(e));
+                                break;
+                            }
                         }
                         _ => {}
                     },
@@ -655,7 +674,7 @@ async fn handle_attach_stream(
         }
     }
 
-    Ok(())
+    loop_result
 }
 
 /// Handle port-forward streaming: TCP proxy to guest ports.
@@ -732,28 +751,37 @@ async fn handle_port_forward_stream(
 
     let tcp_to_guest = async {
         let mut buf = vec![0u8; 4096];
-        loop {
-            let n = tcp_read.read(&mut buf).await?;
+        let result = loop {
+            let n = match tcp_read.read(&mut buf).await {
+                Ok(n) => n,
+                Err(e) => break Err(e),
+            };
             if n == 0 {
-                write_port_forward_frame(
-                    &mut control_write,
-                    PORT_FORWARD_FRAME_CLOSE,
-                    PORT_FORWARD_STREAM_ID,
-                    &[],
-                )
-                .await?;
-                break;
+                break Ok::<(), std::io::Error>(());
             }
-
-            write_port_forward_frame(
+            if let Err(e) = write_port_forward_frame(
                 &mut control_write,
                 PORT_FORWARD_FRAME_DATA,
                 PORT_FORWARD_STREAM_ID,
                 &buf[..n],
             )
-            .await?;
-        }
-        Ok::<_, std::io::Error>(())
+            .await
+            {
+                break Err(e);
+            }
+        };
+        // Tell the guest the forward ended on EVERY exit path (clean client close
+        // OR a client-side read/write error), so it doesn't leak the guest TCP
+        // connection waiting for more data. Best-effort: a dead control channel
+        // makes this a no-op.
+        let _ = write_port_forward_frame(
+            &mut control_write,
+            PORT_FORWARD_FRAME_CLOSE,
+            PORT_FORWARD_STREAM_ID,
+            &[],
+        )
+        .await;
+        result
     };
 
     let guest_to_tcp = async {
