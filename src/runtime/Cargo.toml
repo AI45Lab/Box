@@ -21,7 +21,7 @@ operator = []
 build = []
 
 [dependencies]
-a3s-box-core = { version = "2.0.3", path = "../core" }
+a3s-box-core = { version = "2.1.0", path = "../core" }
 a3s-transport = { workspace = true }
 
 # Async runtime

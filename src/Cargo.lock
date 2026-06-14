@@ -164,7 +164,7 @@ dependencies = [
 
 [[package]]
 name = "a3s-box-sdk"
-version = "0.7.0"
+version = "2.1.0"
 dependencies = [
  "a3s-box-core",
  "a3s-box-runtime",
@@ -217,7 +217,7 @@ dependencies = [
 
 [[package]]
 name = "a3s-libkrun-sys"
-version = "0.1.5"
+version = "2.1.0"
 dependencies = [
  "libc",
  "num_cpus",
