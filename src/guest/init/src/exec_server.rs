@@ -1212,6 +1212,7 @@ fn execute_command_streaming(
         parse_sec_int(spec.env, "A3S_SEC_CPU_QUOTA="),
         parse_sec_int(spec.env, "A3S_SEC_CPU_PERIOD=").map(|value| value as u64),
         parse_sec_int(spec.env, "A3S_SEC_CPU_SHARES=").map(|value| value as u64),
+        parse_sec_int(spec.env, "A3S_SEC_PIDS_LIMIT=").map(|value| value as u64),
     );
     #[cfg(target_os = "linux")]
     let cgroup_procs = container_cgroup.as_ref().map(|cgroup| cgroup.procs_path());

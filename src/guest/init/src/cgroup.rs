@@ -23,10 +23,12 @@ use tracing::{debug, warn};
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 static CGROUP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Ensure cgroup v2 is mounted at `/sys/fs/cgroup` with the `memory` and `cpu`
-/// controllers delegated to child cgroups. Idempotent; returns `false` if
-/// cgroup v2 could not be made available (`memory` is required, `cpu`
-/// best-effort).
+/// Ensure cgroup v2 is mounted at `/sys/fs/cgroup` with the `memory`, `cpu`, and
+/// `pids` controllers delegated to child cgroups. Idempotent; returns `false`
+/// only if cgroup v2 cannot be mounted or exposes no controllers at all. Each
+/// individual limit (memory.max / cpu.max / pids.max) is best-effort in
+/// `ContainerCgroup::create`, so a missing controller degrades to "that limit
+/// is not enforced" rather than failing the launch.
 fn ensure_cgroup2_ready() -> bool {
     let controllers_path = format!("{CGROUP_ROOT}/cgroup.controllers");
     if std::fs::metadata(&controllers_path).is_err() {
@@ -55,11 +57,12 @@ fn ensure_cgroup2_ready() -> bool {
     let has = |ctrl: &str| available.split_whitespace().any(|c| c == ctrl);
 
     // Delegate controllers to child cgroups via the root's subtree_control (the
-    // root cgroup is exempt from the no-internal-processes rule). memory is
-    // required (limits + OOM accounting); cpu is best-effort (cpu.max throttle).
+    // root cgroup is exempt from the no-internal-processes rule). memory drives
+    // limits + OOM accounting, cpu the cpu.max throttle, pids the process-count
+    // cap (`--pids-limit`) — each best-effort.
     let subtree = format!("{CGROUP_ROOT}/cgroup.subtree_control");
     let current = std::fs::read_to_string(&subtree).unwrap_or_default();
-    for ctrl in ["memory", "cpu"] {
+    for ctrl in ["memory", "cpu", "pids"] {
         if has(ctrl) && !current.split_whitespace().any(|c| c == ctrl) {
             if let Err(error) = write_cgroup_file(&subtree, &format!("+{ctrl}")) {
                 warn!(error = %error, ctrl, "cgroup: failed to delegate controller");
@@ -67,8 +70,11 @@ fn ensure_cgroup2_ready() -> bool {
         }
     }
 
-    if !has("memory") {
-        warn!("cgroup: memory controller not available in cgroup.controllers");
+    // Usable as long as the unified hierarchy exposes at least one controller;
+    // the specific limit writes in `create` fail gracefully if their controller
+    // is absent.
+    if available.split_whitespace().next().is_none() {
+        warn!("cgroup: no v2 controllers available in cgroup.controllers");
         return false;
     }
     true
@@ -94,19 +100,22 @@ pub struct ContainerCgroup {
 
 impl ContainerCgroup {
     /// Create a per-container cgroup applying the given limits: `memory.max`
-    /// (bytes) and/or `cpu.max` (`cpu_quota` µs per `cpu_period` µs). Returns
-    /// `None` when no limit is requested or cgroup v2 is unavailable, in which
-    /// case the caller proceeds without enforcement.
+    /// (bytes), `cpu.max` (`cpu_quota` µs per `cpu_period` µs), and/or `pids.max`
+    /// (max process count, `--pids-limit`). Returns `None` when no limit is
+    /// requested or cgroup v2 is unavailable, in which case the caller proceeds
+    /// without enforcement.
     pub fn create(
         memory_max: Option<u64>,
         cpu_quota: Option<i64>,
         cpu_period: Option<u64>,
         cpu_shares: Option<u64>,
+        pids_max: Option<u64>,
     ) -> Option<Self> {
         let want_memory = memory_max.is_some_and(|m| m > 0);
         let want_cpu = cpu_quota.is_some_and(|q| q > 0);
         let want_weight = cpu_shares.is_some_and(|s| s > 0);
-        if (!want_memory && !want_cpu && !want_weight) || !ensure_cgroup2_ready() {
+        let want_pids = pids_max.is_some_and(|p| p > 0);
+        if (!want_memory && !want_cpu && !want_weight && !want_pids) || !ensure_cgroup2_ready() {
             return None;
         }
         let seq = CGROUP_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -145,11 +154,20 @@ impl ContainerCgroup {
                 warn!(error = %error, weight, "cgroup: failed to set cpu.weight");
             }
         }
+        if want_pids {
+            // cgroup v2 `pids.max` caps the number of processes/threads in the
+            // cgroup; a fork past the limit fails with EAGAIN.
+            let limit = pids_max.unwrap_or(0);
+            if let Err(error) = write_cgroup_file(&format!("{path}/pids.max"), &limit.to_string()) {
+                warn!(error = %error, limit, "cgroup: failed to set pids.max");
+            }
+        }
         debug!(
             path,
             ?memory_max,
             ?cpu_quota,
             ?cpu_shares,
+            ?pids_max,
             "cgroup: created container cgroup"
         );
         Some(Self { path })

@@ -157,6 +157,7 @@ impl NamespaceConfig {
 /// # Errors
 ///
 /// Returns error if fork, unshare, or exec fails.
+#[allow(clippy::too_many_arguments)] // syscall-shaped: command + args + env + workdir + user + stdio + cgroup
 pub fn spawn_isolated(
     config: &NamespaceConfig,
     command: &str,
@@ -165,6 +166,7 @@ pub fn spawn_isolated(
     workdir: &str,
     user: Option<&str>,
     main_stdio: Option<(RawFd, RawFd)>,
+    cgroup_procs: Option<&str>,
 ) -> Result<u32, NamespaceError> {
     tracing::info!(
         command = %command,
@@ -178,7 +180,16 @@ pub fn spawn_isolated(
     match unsafe { fork() }.map_err(NamespaceError::ForkFailed)? {
         ForkResult::Child => {
             // Child process: create namespaces and exec
-            if let Err(e) = child_process(config, command, args, env, workdir, user, main_stdio) {
+            if let Err(e) = child_process(
+                config,
+                command,
+                args,
+                env,
+                workdir,
+                user,
+                main_stdio,
+                cgroup_procs,
+            ) {
                 tracing::error!("Child process failed: {}", e);
                 std::process::exit(1);
             }
@@ -195,6 +206,7 @@ pub fn spawn_isolated(
 
 /// Child process logic: create namespaces and exec command.
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)] // mirrors spawn_isolated's syscall-shaped parameter list
 fn child_process(
     config: &NamespaceConfig,
     command: &str,
@@ -203,6 +215,7 @@ fn child_process(
     workdir: &str,
     user: Option<&str>,
     main_stdio: Option<(RawFd, RawFd)>,
+    cgroup_procs: Option<&str>,
 ) -> Result<(), NamespaceError> {
     // Create new namespaces
     let flags = config.to_clone_flags();
@@ -239,6 +252,24 @@ fn child_process(
                     }
                 }
             }
+        }
+    }
+
+    // Join the per-container cgroup (e.g. `pids.max` for `--pids-limit`) before
+    // exec, so this process — now the final container task, after any PID-ns
+    // fork above — and every worker it forks are bounded from birth. We move
+    // ourselves in by writing our own PID (resolved in our PID namespace) to the
+    // cgroup's `cgroup.procs`. Best-effort: a failure means no enforcement, not a
+    // failed launch. Plain file I/O is fine here — this is ordinary forked-child
+    // code (not a `pre_exec` hook), like the user/path resolution above.
+    if let Some(procs_path) = cgroup_procs {
+        let pid = std::process::id().to_string();
+        if let Err(e) = std::fs::write(procs_path, &pid) {
+            tracing::warn!(
+                error = %e,
+                procs_path,
+                "Failed to join container cgroup; resource limit not enforced"
+            );
         }
     }
 
@@ -1008,6 +1039,7 @@ pub(crate) fn syscall_name_to_number(name: &str) -> Option<u32> {
 
 /// Child process logic for non-Linux platforms (development stub).
 #[cfg(not(target_os = "linux"))]
+#[allow(clippy::too_many_arguments)] // mirrors spawn_isolated's syscall-shaped parameter list
 fn child_process(
     _config: &NamespaceConfig,
     command: &str,
@@ -1016,6 +1048,7 @@ fn child_process(
     workdir: &str,
     _user: Option<&str>,
     _main_stdio: Option<(RawFd, RawFd)>,
+    _cgroup_procs: Option<&str>,
 ) -> Result<(), NamespaceError> {
     // On non-Linux, just exec without namespace isolation or security
     tracing::warn!("Namespace isolation and security enforcement not available on this platform");

@@ -541,6 +541,30 @@ fn run_init() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "linux")]
     ensure_dev_std_symlinks();
 
+    // Per-container cgroup for run-path resource limits that have no VM-boundary
+    // equivalent — currently `pids.max` (`--pids-limit`). `--memory`/`--cpus` on
+    // `run` are enforced by sizing the microVM itself, so only the process-count
+    // cap needs an in-guest cgroup. Created here in PID 1 before the container
+    // fork; the child joins it from `child_process` before exec (so every worker
+    // it forks is bounded too), and it is removed when this binding drops at
+    // guest-init exit, by which point the container has been reaped. Best-effort:
+    // `create` returns `None` when no such limit is set or cgroup v2 is
+    // unavailable, leaving the normal boot path untouched.
+    #[cfg(target_os = "linux")]
+    let container_cgroup = a3s_box_guest_init::cgroup::ContainerCgroup::create(
+        None,
+        None,
+        None,
+        None,
+        std::env::var("A3S_SEC_PIDS_LIMIT")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok()),
+    );
+    #[cfg(target_os = "linux")]
+    let cgroup_procs = container_cgroup.as_ref().map(|cgroup| cgroup.procs_path());
+    #[cfg(not(target_os = "linux"))]
+    let cgroup_procs: Option<String> = None;
+
     let deferred_main = std::env::var("BOX_DEFERRED_MAIN")
         .map(|v| v == "1")
         .unwrap_or(false);
@@ -585,6 +609,7 @@ fn run_init() -> Result<(), Box<dyn std::error::Error>> {
             &exec_config.workdir,
             exec_config.user.as_deref(),
             main_stdio,
+            cgroup_procs.as_deref(),
         )?;
         info!("Container process started with PID {}", container_pid_raw);
 

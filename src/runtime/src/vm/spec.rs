@@ -230,6 +230,15 @@ impl VmManager {
             );
             env.extend(security_config.to_env_vars());
 
+            // Process-count cap (`--pids-limit`). Unlike `--memory`/`--cpus`
+            // (enforced by sizing the microVM itself), a pids cap has no
+            // VM-boundary equivalent, so guest-init enforces it via an in-guest
+            // cgroup `pids.max`; it reads this env in PID 1 before the container
+            // fork.
+            if let Some(pids_limit) = self.config.resource_limits.pids_limit {
+                env.push(("A3S_SEC_PIDS_LIMIT".to_string(), pids_limit.to_string()));
+            }
+
             // Signal guest init to remount rootfs read-only after all setup
             if self.config.read_only {
                 env.push(("BOX_READONLY".to_string(), "1".to_string()));
