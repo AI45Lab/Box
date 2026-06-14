@@ -83,8 +83,9 @@ impl tokio::io::AsyncWrite for HashingFileWriter {
 /// Stream a blob to `dest`, verifying its SHA-256 against `descriptor.digest`
 /// as it downloads. The blob is written to a `.partial` temp file and only
 /// renamed into place once the digest checks out, so a failed/corrupted pull
-/// never leaves a bad blob under its content-addressed name. Unknown digest
-/// algorithms are stored with a warning rather than silently trusted.
+/// never leaves a bad blob under its content-addressed name. A blob whose digest
+/// uses an unsupported algorithm (anything but sha256) is rejected rather than
+/// stored unverified.
 async fn stream_and_verify_blob(
     client: &Client,
     oci_ref: &Reference,
