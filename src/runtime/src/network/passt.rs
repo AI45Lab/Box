@@ -205,6 +205,7 @@ impl PasstManager {
             }
             if let Some(child) = self.child.as_mut() {
                 if let Ok(Some(status)) = child.try_wait() {
+                    // Early exit — try_wait reaped it, so nothing lingers.
                     return Err(BoxError::NetworkError(format!(
                         "passt exited early with {status} before creating its socket{}",
                         read_stderr(&stderr_path)
@@ -212,6 +213,16 @@ impl PasstManager {
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        // Timed out with passt still alive: kill the child we spawned so it does
+        // not linger holding the published port. `Drop` deliberately leaves a
+        // healthy passt running (detached use), and the pid-file fallback used by
+        // boot-failure cleanup can miss it if passt hasn't written the file yet —
+        // so reap it here directly via the handle we hold.
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
         }
 
         Err(BoxError::NetworkError(format!(
@@ -269,7 +280,10 @@ pub fn terminate_passt(socket_dir: &Path) {
     let pid_file = socket_dir.join("passt.pid");
     if let Ok(contents) = std::fs::read_to_string(&pid_file) {
         if let Ok(pid) = contents.trim().parse::<i32>() {
-            if pid > 1 {
+            // Verify the pid is still passt before signalling: the pid file is a
+            // stale snapshot, so if passt already exited and the kernel recycled
+            // its pid, a bare kill would SIGTERM an unrelated process.
+            if pid > 1 && pid_is_passt(pid) {
                 // SIGTERM; passt exits and is reaped by its (re)parent.
                 #[cfg(unix)]
                 unsafe {
@@ -281,6 +295,25 @@ pub fn terminate_passt(socket_dir: &Path) {
     }
     let _ = std::fs::remove_file(&pid_file);
     let _ = std::fs::remove_file(socket_dir.join("passt.sock"));
+}
+
+/// Best-effort check that `pid` is actually a passt process, to avoid SIGTERM-ing
+/// an unrelated process that recycled the pid after passt exited. Reads
+/// `/proc/<pid>/comm`; on any error (pid gone, no `/proc`) returns false so the
+/// stale pid is left alone — a genuinely-dead passt was already reaped by its
+/// reparent.
+#[cfg(target_os = "linux")]
+fn pid_is_passt(pid: i32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map(|comm| comm.trim() == "passt")
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pid_is_passt(_pid: i32) -> bool {
+    // No procfs to consult; passt is Linux-only, so this path is unreachable in
+    // practice — preserve the prior kill-by-pid-file behavior.
+    true
 }
 
 impl super::NetworkBackend for PasstManager {
