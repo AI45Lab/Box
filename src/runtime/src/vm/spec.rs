@@ -30,9 +30,16 @@ impl VmManager {
             read_only: false,
         }];
 
-        // Add user-specified volume mounts (-v host:guest or -v host:guest:ro)
+        // Add user-specified volume mounts (-v host:guest or -v host:guest:ro).
+        // Single-file binds are staged under this per-box dir (cleaned with the
+        // box) since virtio-fs can only share directories — see parse_volume_mount.
+        let filemounts_dir = self
+            .home_dir
+            .join("boxes")
+            .join(&self.box_id)
+            .join(".filemounts");
         for (i, vol) in self.config.volumes.iter().enumerate() {
-            let mount = Self::parse_volume_mount(vol, i)?;
+            let mount = Self::parse_volume_mount(vol, i, &filemounts_dir)?;
             fs_mounts.push(mount);
         }
 
@@ -512,7 +519,7 @@ impl VmManager {
     ///
     /// Handles Windows paths with drive letters (e.g. `C:\Users\Temp:/data:ro`) by
     /// using the colon-split parts array to reliably determine the host/guest boundary.
-    fn parse_volume_mount(volume: &str, index: usize) -> Result<FsMount> {
+    fn parse_volume_mount(volume: &str, index: usize, filemounts_dir: &Path) -> Result<FsMount> {
         let parts: Vec<&str> = volume.split(':').collect();
 
         // A valid volume must have at least 2 colon-separated parts (host:guest)
@@ -626,6 +633,18 @@ impl VmManager {
                 hint: None,
             })?;
 
+        // virtio-fs can only share a directory, so a single-file bind (host path
+        // is a file) is staged into a per-box directory and that directory is
+        // shared instead. The file is hard-linked in (so the bind stays live in
+        // both directions), falling back to a copy across filesystems. It is named
+        // with the guest path's basename — exactly what the guest looks for inside
+        // the share (see mount_user_volumes' `file` branch).
+        let host_path = if host_path.is_file() {
+            Self::stage_single_file_mount(&host_path, guest_path_str, index, filemounts_dir)?
+        } else {
+            host_path
+        };
+
         // Use a unique tag for each user volume
         let tag = format!("vol{}", index);
 
@@ -642,6 +661,53 @@ impl VmManager {
             host_path,
             read_only,
         })
+    }
+
+    /// Stage a single-file bind source into a per-box directory so virtio-fs (which
+    /// shares directories, not bare files) can expose it. Returns the directory to
+    /// share; it contains exactly one entry — the file under the guest path's
+    /// basename, which `mount_user_volumes` then binds onto the guest path. The
+    /// file is hard-linked to keep the bind live in both directions; across
+    /// filesystems it falls back to a copy (host-side writes then do not propagate).
+    fn stage_single_file_mount(
+        source: &Path,
+        guest_path: &str,
+        index: usize,
+        filemounts_dir: &Path,
+    ) -> Result<PathBuf> {
+        let basename = Path::new(guest_path).file_name().ok_or_else(|| {
+            BoxError::ConfigError(format!(
+                "Single-file bind guest path has no file name: {guest_path}"
+            ))
+        })?;
+        let stage_dir = filemounts_dir.join(index.to_string());
+        std::fs::create_dir_all(&stage_dir).map_err(|e| BoxError::BoxBootError {
+            message: format!(
+                "Failed to create file-mount staging dir {}: {}",
+                stage_dir.display(),
+                e
+            ),
+            hint: None,
+        })?;
+        let staged = stage_dir.join(basename);
+        let _ = std::fs::remove_file(&staged); // idempotent across restarts
+        if std::fs::hard_link(source, &staged).is_err() {
+            std::fs::copy(source, &staged).map_err(|e| BoxError::BoxBootError {
+                message: format!(
+                    "Failed to stage single-file mount {} -> {}: {}",
+                    source.display(),
+                    staged.display(),
+                    e
+                ),
+                hint: None,
+            })?;
+            tracing::warn!(
+                source = %source.display(),
+                "Single-file bind staged by copy (source on a different filesystem); \
+                 host-side writes will not propagate to the container"
+            );
+        }
+        Ok(stage_dir)
     }
 
     /// Create an anonymous volume via VolumeStore.
@@ -732,7 +798,7 @@ mod tests {
         let host_path = temp.path().to_str().unwrap();
         let volume = format!("{}:/data", host_path);
 
-        let mount = VmManager::parse_volume_mount(&volume, 0).unwrap();
+        let mount = VmManager::parse_volume_mount(&volume, 0, std::path::Path::new("/tmp")).unwrap();
         assert_eq!(mount.tag, "vol0");
         assert_eq!(mount.host_path, temp.path().canonicalize().unwrap());
         assert!(!mount.read_only);
@@ -744,7 +810,7 @@ mod tests {
         let host_path = temp.path().to_str().unwrap();
         let volume = format!("{}:/data:ro", host_path);
 
-        let mount = VmManager::parse_volume_mount(&volume, 1).unwrap();
+        let mount = VmManager::parse_volume_mount(&volume, 1, std::path::Path::new("/tmp")).unwrap();
         assert_eq!(mount.tag, "vol1");
         assert!(mount.read_only);
     }
@@ -755,9 +821,34 @@ mod tests {
         let host_path = temp.path().to_str().unwrap();
         let volume = format!("{}:/data:rw", host_path);
 
-        let mount = VmManager::parse_volume_mount(&volume, 2).unwrap();
+        let mount = VmManager::parse_volume_mount(&volume, 2, std::path::Path::new("/tmp")).unwrap();
         assert_eq!(mount.tag, "vol2");
         assert!(!mount.read_only);
+    }
+
+    #[test]
+    fn test_parse_volume_mount_single_file_is_staged_as_dir() {
+        let temp = TempDir::new().unwrap();
+        // A real source FILE (not a directory).
+        let src = temp.path().join("hostfile.txt");
+        std::fs::write(&src, b"DATA").unwrap();
+        let stage_base = temp.path().join("filemounts");
+        let volume = format!("{}:/etc/myconf", src.display());
+
+        let mount = VmManager::parse_volume_mount(&volume, 3, &stage_base).unwrap();
+
+        // virtio-fs shares directories, so host_path must be the staging DIR, not
+        // the bare file.
+        assert!(
+            mount.host_path.is_dir(),
+            "single-file bind must be staged into a directory, got {}",
+            mount.host_path.display()
+        );
+        // The staged dir holds the file under the GUEST basename — what the guest
+        // binds onto the guest path.
+        let staged = mount.host_path.join("myconf");
+        assert!(staged.exists(), "staged file under guest basename must exist");
+        assert_eq!(std::fs::read(&staged).unwrap(), b"DATA");
     }
 
     #[test]
@@ -766,7 +857,7 @@ mod tests {
         let host_path = temp.path().to_str().unwrap();
         let volume = format!("{}:/data:invalid", host_path);
 
-        let result = VmManager::parse_volume_mount(&volume, 0);
+        let result = VmManager::parse_volume_mount(&volume, 0, std::path::Path::new("/tmp"));
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -776,7 +867,7 @@ mod tests {
 
     #[test]
     fn test_parse_volume_mount_invalid_format() {
-        let result = VmManager::parse_volume_mount("invalid", 0);
+        let result = VmManager::parse_volume_mount("invalid", 0, std::path::Path::new("/tmp"));
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -791,7 +882,7 @@ mod tests {
         let volume = format!("{}:/data", host_path.display());
 
         assert!(!host_path.exists());
-        let mount = VmManager::parse_volume_mount(&volume, 0).unwrap();
+        let mount = VmManager::parse_volume_mount(&volume, 0, std::path::Path::new("/tmp")).unwrap();
         assert!(host_path.exists());
         assert_eq!(mount.host_path, host_path.canonicalize().unwrap());
     }
@@ -1195,7 +1286,7 @@ mod tests {
         // Path like /host/path:/guest/path:ro where guest path contains colon
         let volume = format!("{}:/data:/media/c:ro", host_path);
 
-        let result = VmManager::parse_volume_mount(&volume, 0);
+        let result = VmManager::parse_volume_mount(&volume, 0, std::path::Path::new("/tmp"));
         // Should handle this gracefully or error on the guest path with colon
         // The exact behavior depends on implementation
         assert!(result.is_err() || result.is_ok()); // Just verify it doesn't panic
