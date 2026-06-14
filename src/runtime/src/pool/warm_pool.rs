@@ -75,10 +75,12 @@ pub struct WarmPool {
     scaler: Option<Arc<Mutex<PoolScaler>>>,
     /// Prometheus metrics (optional).
     metrics: Option<crate::prom::RuntimeMetrics>,
-    /// Snapshot-fork template (built lazily on first fill when
+    /// Snapshot-fork template state (built lazily on first fill when
     /// `config.snapshot_fork`): the file-backed RAM image + state file every other
-    /// pool VM restores from. `None` until the first template is built.
-    template: Arc<Mutex<Option<PoolTemplate>>>,
+    /// pool VM restores from. Caches an `Unavailable` verdict so a build failure
+    /// (native VM snapshot unsupported on this build) is not re-attempted on every
+    /// fill — the pool cold-boots instead.
+    template: Arc<Mutex<TemplateState>>,
 }
 
 /// A built snapshot-fork template: the shared RAM image + state file that pool VMs
@@ -87,6 +89,17 @@ pub struct WarmPool {
 struct PoolTemplate {
     mem_file: String,
     state_file: String,
+}
+
+/// Cached state of the snapshot-fork template.
+enum TemplateState {
+    /// Not built yet — the first snapshot-fork fill attempts the build.
+    Unbuilt,
+    /// Built and ready; pool VMs restore from it.
+    Ready(PoolTemplate),
+    /// The build failed (native VM snapshot is unavailable on this build/platform).
+    /// Cached so it is not retried — `boot_or_restore` cold-boots instead.
+    Unavailable,
 }
 
 impl WarmPool {
@@ -142,7 +155,7 @@ impl WarmPool {
             shutdown_rx,
             scaler,
             metrics: None,
-            template: Arc::new(Mutex::new(None)),
+            template: Arc::new(Mutex::new(TemplateState::Unbuilt)),
         };
 
         // Initial fill
@@ -431,37 +444,87 @@ impl WarmPool {
         snapshot_fork: bool,
         box_config: &BoxConfig,
         event_emitter: &EventEmitter,
-        template: &Arc<Mutex<Option<PoolTemplate>>>,
+        template: &Arc<Mutex<TemplateState>>,
     ) -> Result<VmManager> {
         if snapshot_fork {
-            let tpl = Self::ensure_template(box_config, event_emitter, template).await?;
-            let mut cfg = box_config.clone();
-            cfg.snapshot_mem_file = Some(tpl.mem_file.clone());
-            cfg.restore_from = Some(tpl.state_file.clone());
-            cfg.snapshot_sock = None;
-            let mut vm = VmManager::new(cfg, event_emitter.clone());
-            vm.boot().await?;
-            Ok(vm)
-        } else {
-            let mut vm = VmManager::new(box_config.clone(), event_emitter.clone());
-            vm.boot().await?;
-            Ok(vm)
+            // Try the snapshot-fork template. If it can't be built (native VM
+            // snapshot unavailable — the verdict is cached so this is attempted at
+            // most once), fall back to a normal cold boot so the warm pool still
+            // fills rather than failing outright.
+            match Self::ensure_template(box_config, event_emitter, template).await {
+                Ok(tpl) => {
+                    let mut cfg = box_config.clone();
+                    cfg.snapshot_mem_file = Some(tpl.mem_file.clone());
+                    cfg.restore_from = Some(tpl.state_file.clone());
+                    cfg.snapshot_sock = None;
+                    let mut vm = VmManager::new(cfg, event_emitter.clone());
+                    vm.boot().await?;
+                    return Ok(vm);
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "snapshot-fork unavailable; cold-booting this pool VM");
+                }
+            }
         }
+        let mut vm = VmManager::new(box_config.clone(), event_emitter.clone());
+        vm.boot().await?;
+        Ok(vm)
     }
 
-    /// Build the snapshot-fork template once (lazily): cold-boot one VM with
-    /// file-backed RAM, snapshot it, tear down the source. Concurrent callers wait on
-    /// the lock and reuse the first-built template.
+    /// Get the snapshot-fork template, building it once lazily. Concurrent callers
+    /// wait on the lock and reuse the first result — a built template OR a cached
+    /// `Unavailable` verdict, so a failed build (native VM snapshot unsupported on
+    /// this build) is attempted at most once rather than re-tried (and re-timed-out)
+    /// on every pool fill. Returns `Err` when unavailable so `boot_or_restore` cold
+    /// boots instead.
     async fn ensure_template(
         box_config: &BoxConfig,
         event_emitter: &EventEmitter,
-        template: &Arc<Mutex<Option<PoolTemplate>>>,
+        template: &Arc<Mutex<TemplateState>>,
     ) -> Result<PoolTemplate> {
         let mut guard = template.lock().await;
-        if let Some(t) = guard.as_ref() {
-            return Ok(t.clone());
+        match &*guard {
+            TemplateState::Ready(t) => return Ok(t.clone()),
+            TemplateState::Unavailable => {
+                return Err(BoxError::PoolError(
+                    "snapshot-fork template unavailable (native VM snapshot unsupported)"
+                        .to_string(),
+                ));
+            }
+            TemplateState::Unbuilt => {}
         }
 
+        match Self::build_template(box_config, event_emitter).await {
+            Ok(tpl) => {
+                *guard = TemplateState::Ready(tpl.clone());
+                event_emitter.emit(BoxEvent::with_string(
+                    "pool.template.built",
+                    format!(
+                        "Snapshot-fork template built for image {}",
+                        box_config.image
+                    ),
+                ));
+                Ok(tpl)
+            }
+            Err(error) => {
+                // Cache the verdict and warn ONCE; the pool falls back to cold boot.
+                tracing::warn!(
+                    %error,
+                    "snapshot-fork template build failed; marking unavailable — \
+                     the warm pool will cold-boot instead"
+                );
+                *guard = TemplateState::Unavailable;
+                Err(error)
+            }
+        }
+    }
+
+    /// Cold-boot one source VM with file-backed RAM + a trigger socket, snapshot it,
+    /// and tear it down — leaving the RAM image + state file as the template.
+    async fn build_template(
+        box_config: &BoxConfig,
+        event_emitter: &EventEmitter,
+    ) -> Result<PoolTemplate> {
         let dir = a3s_box_core::dirs_home().join("pool").join(format!(
             "tpl-{:016x}",
             crate::vm::fnv1a_hash(&box_config.image)
@@ -485,18 +548,10 @@ impl WarmPool {
         Self::trigger_snapshot(&sock, &state_file).await?;
         let _ = src.destroy_with_timeout(2000).await;
 
-        let tpl = PoolTemplate {
+        Ok(PoolTemplate {
             mem_file: mem_file.to_string_lossy().into_owned(),
             state_file: state_file.to_string_lossy().into_owned(),
-        };
-        *guard = Some(tpl.clone());
-
-        event_emitter.emit(BoxEvent::with_string(
-            "pool.template.built",
-            format!("Snapshot-fork template built at {}", dir.display()),
-        ));
-
-        Ok(tpl)
+        })
     }
 
     /// Send a `snapshot <state>` request to libkrun's per-template trigger socket and
