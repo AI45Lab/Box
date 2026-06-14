@@ -16,8 +16,20 @@ impl VmManager {
     /// later are caught by `wait_for_exec_ready`'s `has_exited` checks, which gate
     /// the rest of boot anyway.
     pub(crate) async fn wait_for_vm_running(&self) -> Result<()> {
-        const MAX_WAIT_MS: u64 = 250;
-        const POLL_MS: u64 = 25;
+        // This is a crash-detection grace period, not a readiness wait: the VM
+        // process is alive the instant the shim is spawned, and we just watch for it
+        // exiting immediately. A snapshot-restored VM reaches its run loop in ~20ms
+        // (no cold boot), so a short grace catches an immediate restore failure while
+        // saving ~200ms on the fork fast-path; a cold boot keeps the longer grace.
+        #[cfg(unix)]
+        let max_wait_ms: u64 = if super::is_restore_mode(&self.config) {
+            40
+        } else {
+            250
+        };
+        #[cfg(not(unix))]
+        let max_wait_ms: u64 = 250;
+        const POLL_MS: u64 = 10;
 
         tracing::debug!("Confirming VM process started");
         let start = std::time::Instant::now();
@@ -32,7 +44,7 @@ impl VmManager {
                     });
                 }
             }
-            if start.elapsed().as_millis() >= MAX_WAIT_MS as u128 {
+            if start.elapsed().as_millis() >= max_wait_ms as u128 {
                 break;
             }
             tokio::time::sleep(tokio::time::Duration::from_millis(POLL_MS)).await;
@@ -117,5 +129,31 @@ impl VmManager {
 
             tokio::time::sleep(POLL_INTERVAL).await;
         }
+    }
+
+    /// Single best-effort exec-server probe for snapshot-restore boots.
+    ///
+    /// A restored guest is already past boot, so its exec server never re-signals
+    /// readiness the way a cold boot does — blocking on [`wait_for_exec_ready`]'s
+    /// cold-boot loop would stall registration for up to its safety cap. Instead try
+    /// exactly one connect + heartbeat to populate `exec_client` if the guest answers
+    /// promptly, and otherwise proceed immediately: exec/attach connect on demand.
+    #[cfg(unix)]
+    pub(crate) async fn probe_exec_ready_once(&mut self, exec_socket_path: &std::path::Path) {
+        use tokio::time::Duration;
+        const ATTEMPT_TIMEOUT: Duration = Duration::from_millis(500);
+
+        if let Ok(Ok(client)) =
+            tokio::time::timeout(ATTEMPT_TIMEOUT, ExecClient::connect(exec_socket_path)).await
+        {
+            if let Ok(Ok(true)) = tokio::time::timeout(ATTEMPT_TIMEOUT, client.heartbeat()).await {
+                tracing::debug!("restore: exec server heartbeat passed");
+                self.exec_client = Some(client);
+                return;
+            }
+        }
+        tracing::debug!(
+            "restore: exec server did not answer an immediate heartbeat; exec/attach will connect on demand"
+        );
     }
 }

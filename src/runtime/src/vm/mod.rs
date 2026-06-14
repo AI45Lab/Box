@@ -806,9 +806,16 @@ impl VmManager {
             if let Err(e) = async {
                 self.wait_for_vm_running().await?;
 
-                // 5b. Wait for exec server to become ready (Heartbeat health check)
+                // 5b. Become ready. A snapshot-restore boot resumes an already-booted
+                // guest whose exec server won't re-signal readiness, so the cold-boot
+                // wait would stall registration on its safety cap — do one best-effort
+                // probe instead. A normal boot waits for the Heartbeat health check.
                 #[cfg(unix)]
-                self.wait_for_exec_ready(&layout.exec_socket_path).await?;
+                if is_restore_mode(&self.config) {
+                    self.probe_exec_ready_once(&layout.exec_socket_path).await;
+                } else {
+                    self.wait_for_exec_ready(&layout.exec_socket_path).await?;
+                }
                 Ok::<(), BoxError>(())
             }
             .instrument(wait_span)
@@ -827,10 +834,13 @@ impl VmManager {
         // command is known at boot. The pool sets config.deferred_main to boot the
         // VM IDLE but drives spawn-main EXPLICITLY per request (the per-request
         // command isn't known at pre-warm), so a pool VM must NOT auto-trigger here.
+        // A restored guest's main is ALREADY running (captured in the snapshot), so
+        // it must never re-spawn — doing so would start a duplicate main.
         #[cfg(unix)]
-        if std::env::var("BOX_DEFERRED_MAIN")
-            .map(|v| v == "1")
-            .unwrap_or(false)
+        if !is_restore_mode(&self.config)
+            && std::env::var("BOX_DEFERRED_MAIN")
+                .map(|v| v == "1")
+                .unwrap_or(false)
         {
             if let Some(client) = self.exec_client.as_ref() {
                 match client.spawn_main(None).await {
@@ -1211,6 +1221,21 @@ impl VmManager {
 
         Ok(result)
     }
+}
+
+/// Whether this boot is a snapshot-fork restore (the guest is resumed already-booted
+/// rather than cold-booted). PER-VM: a pool / fork daemon sets `config.restore_from`
+/// so one process can restore different VMs; the single-VM `run` path uses the
+/// `KRUN_RESTORE_FROM` env. Either source means restore mode.
+#[cfg(unix)]
+fn is_restore_mode(config: &BoxConfig) -> bool {
+    config
+        .restore_from
+        .as_deref()
+        .is_some_and(|s| !s.is_empty())
+        || std::env::var("KRUN_RESTORE_FROM")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
 }
 
 /// Simple FNV-1a hash for generating short deterministic hashes from strings.

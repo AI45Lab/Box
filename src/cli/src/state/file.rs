@@ -41,6 +41,30 @@ impl StateFile {
         Self::load(&home.join("boxes.json"))
     }
 
+    /// Load the default state WITHOUT the reconcile sweep (PID-liveness checks +
+    /// cleanup over every record). The append hot path (box registration) only adds
+    /// a record, so reconciling every *other* box under the global lock is pure
+    /// overhead — and under a high-concurrency fork burst it makes registration
+    /// O(N²) serialized syscalls. Reconcile still runs on every `list`/status load
+    /// and in the monitor, so liveness/exit-code/restart handling is not lost.
+    fn load_default_raw() -> Result<Self, std::io::Error> {
+        let home = a3s_box_core::dirs_home();
+        let path = home.join("boxes.json");
+        if path.exists() {
+            let data = std::fs::read_to_string(&path)?;
+            let records: Vec<BoxRecord> = serde_json::from_str(&data).unwrap_or_default();
+            Ok(Self { path, records })
+        } else {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            Ok(Self {
+                path,
+                records: Vec::new(),
+            })
+        }
+    }
+
     /// Save state to disk atomically under the cross-process state lock.
     pub fn save(&self) -> Result<(), std::io::Error> {
         let _lock = super::lock::StateLock::acquire()?;
@@ -80,12 +104,14 @@ impl StateFile {
 
     /// Append a record atomically under the state lock (load fresh → push →
     /// save). Use this instead of `load_default()? + add()` so concurrent
-    /// appends/removals cannot lose records.
+    /// appends/removals cannot lose records. Loads WITHOUT the reconcile sweep —
+    /// appending a box must not pay an O(N) PID-liveness/cleanup pass over every
+    /// other box (the high-concurrency fork bottleneck).
     pub fn add_record(record: BoxRecord) -> Result<(), std::io::Error> {
-        Self::modify(|sf| {
-            sf.records.push(record);
-            Ok::<(), std::io::Error>(())
-        })
+        let _lock = super::lock::StateLock::acquire()?;
+        let mut sf = Self::load_default_raw()?;
+        sf.records.push(record);
+        sf.write_to_disk()
     }
 
     /// Remove a record by id atomically under the state lock. Returns whether a

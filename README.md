@@ -20,6 +20,7 @@ A3S Box is built toward production use, but it is not a full Docker, containerd,
 | OCI images | Pull, load, save, tag, inspect, history, remove, and local cache resolution are implemented. Push and cosign signing/verification paths exist and require registry access for end-to-end validation. |
 | Dockerfile build | Honest subset. `FROM`, metadata instructions, `COPY`/`ADD`, and shell-form `RUN` are implemented. `RUN` is isolated with Linux `chroot` and requires root-capable Linux; macOS fails by default unless explicitly unsafe host execution is enabled. |
 | Lifecycle and exec | `run`, `create`, `start`, `stop`, `restart`, `rm`, `wait`, foreground/detached runs, non-PTY exec, PTY exec, logs, stats, and inspect are implemented. |
+| Warm pool and snapshot-fork | A warm pool serves pre-booted sandboxes over a socket. Native snapshot-fork (Copy-on-Write microVM cloning) snapshots one booted template and restores many forks from it, each mapping the template RAM `MAP_PRIVATE`. Verified on `/dev/kvm`: ~4× faster than a cold boot per fork, 100 forks in under ~1 s (~8 ms amortized each). Requires `/dev/kvm`; opt in with `pool start --snapshot-fork` or the `KRUN_SNAPSHOT_*` / `KRUN_RESTORE_FROM` env. |
 | Networking | Default TSI networking, TCP `host:guest` publishing, user-defined bridge networks, network inspect/connect/disconnect/rm, and `/etc/hosts` peer discovery are implemented with documented platform boundaries. |
 | Compose | A useful local subset is implemented: image, command, entrypoint, env, env_file, ports, volumes, depends_on, networks, DNS, tmpfs, workdir, hostname, extra_hosts, labels, healthcheck, restart, CPU/memory, capabilities, and privileged mode. |
 | TEE | AMD SEV-SNP-oriented attestation, RA-TLS, sealing, and secret injection flows exist, plus simulation mode for development. Hardware-backed operation depends on SEV-SNP-capable hosts and libkrun support. TDX is not a productized path. |
@@ -48,7 +49,7 @@ The ignored `core_smoke` suite covers the core CLI path on a real MicroVM host:
 - TCP published ports with host loopback HTTP reachability;
 - bridge network endpoint allocation, peer `/etc/hosts`, connect/disconnect, and force removal cleanup;
 - named volumes, `cp`, `diff`, `export`, `commit`, `snapshot`, restart-policy monitor recovery, and Compose health/volume flow;
-- warm pool (`pool start`/`pool run`): pre-warmed sandboxes served over a socket, with backpressure and multi-image lazy pools; `--deferred` runs each command as the box's real main for full box semantics (real exit code + json-file console logs) with no cold boot.
+- warm pool (`pool start`/`pool run`): pre-warmed sandboxes served over a socket, with backpressure and multi-image lazy pools; `--deferred` runs each command as the box's real main for full box semantics (real exit code + json-file console logs) with no cold boot; `--snapshot-fork` fills the pool by Copy-on-Write restore from one booted template instead of cold booting each sandbox.
 
 The most recent local record in this branch: all 14 ignored `core_smoke` tests
 passed on macOS HVF with an offline Alpine OCI archive, and the ignored
@@ -96,11 +97,11 @@ a3s-box rm web
 
 ## Command surface
 
-A3S Box exposes 55 top-level commands. They are Docker-like, not Docker-identical.
+A3S Box exposes 56 top-level commands. They are Docker-like, not Docker-identical.
 
 | Category | Commands |
 | --- | --- |
-| Lifecycle | `run`, `create`, `start`, `stop`, `restart`, `rm`, `kill`, `pause`, `unpause`, `wait`, `rename` |
+| Lifecycle | `run`, `create`, `start`, `stop`, `restart`, `rm`, `kill`, `pause`, `unpause`, `wait`, `rename`, `prune` |
 | Execution | `exec`, `attach`, `top`, `shell` |
 | Images | `pull`, `push`, `build`, `images`, `rmi`, `tag`, `image-inspect`, `history`, `image-prune`, `save`, `load`, `commit` |
 | Filesystem | `cp`, `export`, `diff` |
@@ -193,7 +194,49 @@ a3s-box snapshot create app checkpoint-1
 a3s-box snapshot restore checkpoint-1 --name restored-app
 ```
 
-Snapshots are configuration/filesystem-oriented Box snapshots, not a live RAM checkpoint facility.
+The `snapshot` command produces configuration/filesystem-oriented Box snapshots, not a live RAM checkpoint. The live RAM Copy-on-Write facility is a separate, lower-level mechanism described in [Warm pool and snapshot-fork](#warm-pool-and-snapshot-fork).
+
+## Warm pool and snapshot-fork
+
+A **warm pool** keeps a set of sandboxes pre-booted and serves them over a Unix
+socket, so a request is answered by an already-running microVM instead of a cold
+boot. It supports backpressure, multi-image lazy pools, and a `--deferred` mode
+that runs each request as the box's real main process (real exit code +
+json-file console logs).
+
+```bash
+a3s-box pool start --image alpine:latest --size 8     # pre-warm 8 sandboxes
+a3s-box pool start --image alpine:latest --size 8 --snapshot-fork   # CoW fill
+a3s-box pool run alpine:latest -- echo hi             # served from the pool
+a3s-box pool status
+a3s-box pool stop
+```
+
+**Snapshot-fork** (`--snapshot-fork`, Linux `/dev/kvm` only) is native
+Copy-on-Write microVM cloning. The pool cold-boots one template sandbox,
+snapshots its file-backed guest RAM together with KVM vCPU and virtio device
+state, and then restores the rest of the pool from that snapshot. Each fork maps
+the template RAM `MAP_PRIVATE`, so it pays only for the pages it dirties. On a
+`/dev/kvm` host this is ~4× faster than a cold boot per fork, completes 100
+forks in under ~1 s (~8 ms amortized each, ~13 MB RSS per fork), and `exec`
+runs real commands over virtio-fs inside the restored guest. It is off by
+default.
+
+The same mechanism is available below the pool through environment variables:
+`KRUN_SNAPSHOT_MEM_FILE` and `KRUN_SNAPSHOT_SOCK` capture a snapshot from a
+booted template, and `KRUN_RESTORE_FROM` restores a fork from it. Per-VM
+`BoxConfig`/`InstanceSpec` fields (`snapshot_mem_file`, `snapshot_sock`,
+`restore_from`) take precedence over the env when set.
+
+## Pruning stopped boxes
+
+```bash
+a3s-box prune --force            # remove every created/stopped/dead box
+a3s-box container-prune --force  # alias
+```
+
+`prune` is the box-only counterpart to `system-prune` (which also removes images
+and networks). Running and paused boxes are never touched.
 
 ## Networking
 
@@ -365,6 +408,9 @@ matrix, and CRI smoke procedures.
 | `A3S_BOX_HOST_SMOKE_TIMEOUT_SECS` | Boot timeout override for ignored host smoke tests. |
 | `A3S_BOX_UNSAFE_HOST_RUN` | Opt into unsafe macOS host execution for Dockerfile `RUN` experiments. |
 | `A3S_BOX_BUILDCACHE_MAX_BYTES` | Cap on the total size of cached build layers at `~/.a3s/buildcache` (oldest evicted first). Default: 2 GiB. |
+| `KRUN_SNAPSHOT_MEM_FILE` | Path the booted template writes its file-backed guest RAM to when capturing a snapshot-fork template. |
+| `KRUN_SNAPSHOT_SOCK` | Control socket the template listens on for the `snapshot <path>` command (Linux `/dev/kvm` only). |
+| `KRUN_RESTORE_FROM` | Path to a snapshot the microVM restores from as a Copy-on-Write fork instead of cold booting. |
 | `RUST_LOG` | Rust tracing log level. |
 
 ## License

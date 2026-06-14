@@ -75,6 +75,18 @@ pub struct WarmPool {
     scaler: Option<Arc<Mutex<PoolScaler>>>,
     /// Prometheus metrics (optional).
     metrics: Option<crate::prom::RuntimeMetrics>,
+    /// Snapshot-fork template (built lazily on first fill when
+    /// `config.snapshot_fork`): the file-backed RAM image + state file every other
+    /// pool VM restores from. `None` until the first template is built.
+    template: Arc<Mutex<Option<PoolTemplate>>>,
+}
+
+/// A built snapshot-fork template: the shared RAM image + state file that pool VMs
+/// restore from (MAP_PRIVATE CoW of the RAM file).
+#[derive(Clone)]
+struct PoolTemplate {
+    mem_file: String,
+    state_file: String,
 }
 
 impl WarmPool {
@@ -130,6 +142,7 @@ impl WarmPool {
             shutdown_rx,
             scaler,
             metrics: None,
+            template: Arc::new(Mutex::new(None)),
         };
 
         // Initial fill
@@ -393,8 +406,13 @@ impl WarmPool {
 
     /// Boot a new VM using the pool's template config.
     async fn boot_new_vm(&self) -> Result<VmManager> {
-        let mut vm = VmManager::new(self.box_config.clone(), self.event_emitter.clone());
-        vm.boot().await?;
+        let vm = Self::boot_or_restore(
+            self.config.snapshot_fork,
+            &self.box_config,
+            &self.event_emitter,
+            &self.template,
+        )
+        .await?;
 
         let mut stats = self.stats.lock().await;
         stats.total_created += 1;
@@ -405,6 +423,133 @@ impl WarmPool {
         ));
 
         Ok(vm)
+    }
+
+    /// Fill one slot: restore from the snapshot-fork template when enabled, else cold
+    /// boot. Static so both `boot_new_vm` and the background replenish task use it.
+    async fn boot_or_restore(
+        snapshot_fork: bool,
+        box_config: &BoxConfig,
+        event_emitter: &EventEmitter,
+        template: &Arc<Mutex<Option<PoolTemplate>>>,
+    ) -> Result<VmManager> {
+        if snapshot_fork {
+            let tpl = Self::ensure_template(box_config, event_emitter, template).await?;
+            let mut cfg = box_config.clone();
+            cfg.snapshot_mem_file = Some(tpl.mem_file.clone());
+            cfg.restore_from = Some(tpl.state_file.clone());
+            cfg.snapshot_sock = None;
+            let mut vm = VmManager::new(cfg, event_emitter.clone());
+            vm.boot().await?;
+            Ok(vm)
+        } else {
+            let mut vm = VmManager::new(box_config.clone(), event_emitter.clone());
+            vm.boot().await?;
+            Ok(vm)
+        }
+    }
+
+    /// Build the snapshot-fork template once (lazily): cold-boot one VM with
+    /// file-backed RAM, snapshot it, tear down the source. Concurrent callers wait on
+    /// the lock and reuse the first-built template.
+    async fn ensure_template(
+        box_config: &BoxConfig,
+        event_emitter: &EventEmitter,
+        template: &Arc<Mutex<Option<PoolTemplate>>>,
+    ) -> Result<PoolTemplate> {
+        let mut guard = template.lock().await;
+        if let Some(t) = guard.as_ref() {
+            return Ok(t.clone());
+        }
+
+        let dir = a3s_box_core::dirs_home().join("pool").join(format!(
+            "tpl-{:016x}",
+            crate::vm::fnv1a_hash(&box_config.image)
+        ));
+        std::fs::create_dir_all(&dir).map_err(BoxError::IoError)?;
+        let mem_file = dir.join("template.ram");
+        let sock = dir.join("template.sock");
+        let state_file = dir.join("template.state");
+        let _ = std::fs::remove_file(&sock);
+
+        // Cold-boot the source as a snapshot TEMPLATE (file-backed RAM + trigger sock).
+        let mut cfg = box_config.clone();
+        cfg.snapshot_mem_file = Some(mem_file.to_string_lossy().into_owned());
+        cfg.snapshot_sock = Some(sock.to_string_lossy().into_owned());
+        cfg.restore_from = None;
+        let mut src = VmManager::new(cfg, event_emitter.clone());
+        src.boot().await?;
+
+        // Trigger the snapshot over libkrun's socket, then tear down the source (it is
+        // left paused by the snapshot; the RAM + state files are the template).
+        Self::trigger_snapshot(&sock, &state_file).await?;
+        let _ = src.destroy_with_timeout(2000).await;
+
+        let tpl = PoolTemplate {
+            mem_file: mem_file.to_string_lossy().into_owned(),
+            state_file: state_file.to_string_lossy().into_owned(),
+        };
+        *guard = Some(tpl.clone());
+
+        event_emitter.emit(BoxEvent::with_string(
+            "pool.template.built",
+            format!("Snapshot-fork template built at {}", dir.display()),
+        ));
+
+        Ok(tpl)
+    }
+
+    /// Send a `snapshot <state>` request to libkrun's per-template trigger socket and
+    /// wait for the `ok` reply (the socket appears once the template's vCPUs run).
+    ///
+    /// Snapshot-fork is a Linux/KVM (Unix) feature; on non-Unix hosts the trigger
+    /// socket does not exist, so this is unavailable (see the `not(unix)` stub).
+    #[cfg(unix)]
+    async fn trigger_snapshot(sock: &std::path::Path, state_file: &std::path::Path) -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // The socket is bound by libkrun after the guest starts; poll briefly.
+        let mut stream = None;
+        for _ in 0..200 {
+            match tokio::net::UnixStream::connect(sock).await {
+                Ok(s) => {
+                    stream = Some(s);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(25)).await,
+            }
+        }
+        let mut stream = stream.ok_or_else(|| {
+            BoxError::PoolError(format!("snapshot socket {} never appeared", sock.display()))
+        })?;
+        let cmd = format!("snapshot {}\n", state_file.display());
+        stream
+            .write_all(cmd.as_bytes())
+            .await
+            .map_err(BoxError::IoError)?;
+        let mut buf = [0u8; 64];
+        let n = stream.read(&mut buf).await.map_err(BoxError::IoError)?;
+        let reply = String::from_utf8_lossy(&buf[..n]);
+        if reply.trim() == "ok" {
+            Ok(())
+        } else {
+            Err(BoxError::PoolError(format!(
+                "snapshot trigger failed: {}",
+                reply.trim()
+            )))
+        }
+    }
+
+    /// Non-Unix stub: snapshot-fork relies on libkrun's Unix trigger socket and KVM
+    /// state save/restore, neither of which exist on Windows. `--snapshot-fork` is
+    /// Linux/KVM-only, so this path is never reached there in practice.
+    #[cfg(not(unix))]
+    async fn trigger_snapshot(
+        _sock: &std::path::Path,
+        _state_file: &std::path::Path,
+    ) -> Result<()> {
+        Err(BoxError::PoolError(
+            "snapshot-fork is only supported on Linux/KVM hosts".to_string(),
+        ))
     }
 
     /// Fill the pool to the minimum idle count.
@@ -473,6 +618,7 @@ impl WarmPool {
         let event_emitter = self.event_emitter.clone();
         let mut shutdown_rx = self.shutdown_rx.clone();
         let scaler = self.scaler.clone();
+        let template = Arc::clone(&self.template);
 
         tokio::spawn(async move {
             let check_interval = std::time::Duration::from_secs(
@@ -535,13 +681,25 @@ impl WarmPool {
                             let needed = effective_min_idle - current;
                             tracing::debug!(current, needed, min_idle = effective_min_idle, "Replenishing warm pool");
 
+                            // Fill the `needed` slots CONCURRENTLY rather than one
+                            // boot at a time — a snapshot-fork restore (or even a cold
+                            // boot) overlaps its readiness wait, so a batch fills in
+                            // roughly one boot's time instead of N×. For snapshot-fork
+                            // the first task builds the template under ensure_template's
+                            // lock; the rest wait then restore in parallel.
+                            let mut set = tokio::task::JoinSet::new();
                             for _ in 0..needed {
-                                let mut vm = VmManager::new(
-                                    box_config.clone(),
-                                    event_emitter.clone(),
-                                );
-                                match vm.boot().await {
-                                    Ok(()) => {
+                                let sf = config.snapshot_fork;
+                                let bc = box_config.clone();
+                                let ee = event_emitter.clone();
+                                let tpl = Arc::clone(&template);
+                                set.spawn(async move {
+                                    WarmPool::boot_or_restore(sf, &bc, &ee, &tpl).await
+                                });
+                            }
+                            while let Some(joined) = set.join_next().await {
+                                match joined {
+                                    Ok(Ok(vm)) => {
                                         let box_id = vm.box_id().to_string();
                                         let mut pool = idle.lock().await;
                                         pool.push(WarmVm {
@@ -551,18 +709,19 @@ impl WarmPool {
                                         let mut s = stats.lock().await;
                                         s.total_created += 1;
                                         s.idle_count = pool.len();
+                                        drop(s);
+                                        drop(pool);
 
                                         event_emitter.emit(BoxEvent::with_string(
                                             "pool.vm.created",
                                             format!("Replenished VM {}", box_id),
                                         ));
                                     }
+                                    Ok(Err(e)) => {
+                                        tracing::warn!(error = %e, "Failed to replenish warm pool");
+                                    }
                                     Err(e) => {
-                                        tracing::warn!(
-                                            error = %e,
-                                            "Failed to replenish warm pool"
-                                        );
-                                        break;
+                                        tracing::warn!(error = %e, "Replenish task join error");
                                     }
                                 }
                             }

@@ -4,6 +4,44 @@ All notable changes to A3S Box will be documented in this file.
 
 ## [Unreleased]
 
+## [2.1.0] — 2026-06-13
+
+### Added
+- **Native snapshot-fork (Copy-on-Write microVM cloning).** A booted template
+  microVM can be snapshotted and many forks restored from it, instead of cold
+  booting each one. The snapshot captures file-backed guest RAM plus KVM vCPU
+  and virtio device state; each fork maps the RAM file `MAP_PRIVATE` so it pays
+  only for the pages it dirties. Driven by `KRUN_SNAPSHOT_MEM_FILE` /
+  `KRUN_SNAPSHOT_SOCK` (capture) and `KRUN_RESTORE_FROM` (restore), or
+  per-VM via `BoxConfig`/`InstanceSpec`. Verified on `/dev/kvm`: a single fork
+  is ~4× faster than a cold boot (~450 ms → ~110 ms), 100 forks complete in
+  under ~1 s (~8 ms amortized per VM, ~13 MB RSS each), and `exec` runs real
+  commands over virtio-fs inside the restored guest.
+- **Warm pool snapshot-fork fill** (`pool start --snapshot-fork`): the pool
+  cold-boots one template, snapshots it, then restores the rest of the pool
+  from that snapshot. Combined with concurrent (JoinSet) fill this cuts
+  fill-to-8 from ~12.4 s to ~1.9 s. Off by default; opt in with the flag.
+- **`prune` command** (`a3s-box prune`, alias `container-prune`): removes every
+  created, stopped, and dead box in one call, mirroring `docker container
+  prune`. Running and paused boxes are never touched. Requires `--force`.
+- **Per-VM snapshot/restore config seam**: `BoxConfig` and `InstanceSpec` carry
+  `snapshot_mem_file`, `snapshot_sock`, and `restore_from`, so snapshot/restore
+  can be requested per box instead of only through process-global env vars
+  (per-VM config takes precedence over the env).
+
+### Fixed
+- **Concurrent box registration is now atomic.** `run` registered boxes by
+  loading the full state, mutating, and saving under lock; concurrent launches
+  could lose updates and the reconcile pass was O(N²). Registration is now an
+  atomic, reconcile-free append, and the later rollback paths un-register
+  correctly. Verified by launching 100 boxes concurrently with zero lost
+  records.
+- **`pool status` no longer errors when no pool daemon is running** — it exits
+  successfully and reports that nothing is running, matching Docker-style UX.
+- **Restore readiness is faster and OCI-free.** A restored fork skips the OCI
+  pull (the template's cached rootfs is reused) and uses a short crash-detection
+  grace (250 ms fixed → 40 ms) tuned for the restore path.
+
 ## [2.0.7] — 2026-06-06
 
 ### Added

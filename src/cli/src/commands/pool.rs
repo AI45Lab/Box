@@ -83,6 +83,11 @@ pub struct PoolStartArgs {
     #[arg(long)]
     pub ksm: bool,
 
+    /// Fill the pool by snapshot-fork: boot one template VM, snapshot it, then
+    /// restore every other slot (MAP_PRIVATE CoW) instead of cold-booting each.
+    #[arg(long)]
+    pub snapshot_fork: bool,
+
     /// Output as JSON
     #[arg(long)]
     pub json: bool,
@@ -282,6 +287,8 @@ struct PoolRegistry {
     deferred: bool,
     /// Mark pooled VM memory KSM-mergeable (host page dedup across same-image VMs).
     ksm: bool,
+    /// Fill the pool by snapshot-fork (one template, restore the rest).
+    snapshot_fork: bool,
 }
 
 impl PoolRegistry {
@@ -300,6 +307,7 @@ impl PoolRegistry {
             min_idle: size,
             max_size,
             idle_ttl_secs: self.ttl,
+            snapshot_fork: self.snapshot_fork,
             ..Default::default()
         };
         let box_config = BoxConfig {
@@ -379,6 +387,7 @@ async fn execute_start(args: PoolStartArgs) -> Result<(), Box<dyn std::error::Er
         ttl: args.ttl,
         deferred: args.deferred,
         ksm: args.ksm,
+        snapshot_fork: args.snapshot_fork,
     });
 
     // Pre-warm the default image, if one was given.
@@ -668,12 +677,19 @@ async fn execute_stop(_args: PoolStopArgs) -> Result<(), Box<dyn std::error::Err
 async fn execute_status(args: PoolStatusArgs) -> Result<(), Box<dyn std::error::Error>> {
     use tokio::net::UnixStream;
 
-    let mut stream = UnixStream::connect(&args.socket).await.map_err(|e| {
-        format!(
-            "Failed to connect to pool daemon at {} ({}). Is `a3s-box pool start` running?",
-            args.socket, e
-        )
-    })?;
+    // No daemon running is not an error for a status query — report "nothing" and
+    // succeed, like `ps` with no boxes. (Only a connected daemon that misbehaves is.)
+    let mut stream = match UnixStream::connect(&args.socket).await {
+        Ok(stream) => stream,
+        Err(_) => {
+            if args.json {
+                println!("[]");
+            } else {
+                println!("No pool daemon running (start one with `a3s-box pool start`).");
+            }
+            return Ok(());
+        }
+    };
 
     write_frame(&mut stream, &serde_json::to_vec(&Request::Status)?).await?;
     let resp: StatusResponse = serde_json::from_slice(&read_frame(&mut stream).await?)?;
@@ -918,6 +934,7 @@ mod tests {
             warm: vec![],
             deferred: false,
             ksm: false,
+            snapshot_fork: false,
             json: false,
         };
         let result = execute_start(args).await;
@@ -936,6 +953,7 @@ mod tests {
             warm: vec![],
             deferred: false,
             ksm: false,
+            snapshot_fork: false,
             json: false,
         };
         let result = execute_start(args).await;
@@ -954,15 +972,15 @@ mod tests {
 
     #[cfg(not(windows))]
     #[tokio::test]
-    async fn test_execute_status_no_daemon_errors() {
-        // With no daemon listening, status fails with a connect hint (not a panic).
+    async fn test_execute_status_no_daemon_succeeds_empty() {
+        // With no daemon listening, status reports "nothing running" and SUCCEEDS —
+        // a status query shouldn't fail just because no pool is up (like `ps`).
         let result = execute_status(PoolStatusArgs {
             socket: "/tmp/a3s-box-pool-does-not-exist.sock".to_string(),
             json: false,
         })
         .await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("pool daemon"));
+        assert!(result.is_ok());
     }
 
     #[test]

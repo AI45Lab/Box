@@ -100,6 +100,33 @@ impl VmManager {
         // Pull OCI image from registry and extract at rootfs root.
         // Extracting at root preserves absolute symlinks and dynamic linker paths.
         let reference = &self.config.image;
+
+        // Snapshot-fork fast path: a restored guest reuses the already-cached rootfs.
+        // Skip the registry pull/resolution — a network round-trip that costs ~100ms
+        // even on a cache hit — and the guest-init refresh (the snapshot already has
+        // it). Falls through to the normal pull on a cache miss (rare for a fork of a
+        // just-run template). The restored guest's main is already running, so no
+        // image config (entrypoint/env) is needed.
+        #[cfg(unix)]
+        if super::is_restore_mode(&self.config) {
+            let cache_key = RootfsCache::compute_key(reference, &[], &[], &[]);
+            if let Some(cached_path) = self.try_rootfs_cache_path(&cache_key)? {
+                let rootfs_path = self.rootfs_provider.prepare(&box_dir, &cached_path)?;
+                let tee_instance_config = self.generate_tee_config(&box_dir)?;
+                return Ok(BoxLayout {
+                    rootfs_path,
+                    exec_socket_path: socket_dir.join("exec.sock"),
+                    pty_socket_path: socket_dir.join("pty.sock"),
+                    attest_socket_path: socket_dir.join("attest.sock"),
+                    port_forward_socket_path: socket_dir.join("portfwd.sock"),
+                    workspace_path,
+                    console_output: Some(logs_dir.join("console.log")),
+                    oci_config: None,
+                    tee_instance_config,
+                });
+            }
+        }
+
         let images_dir = self.home_dir.join("images");
         let store = crate::oci::ImageStore::new(&images_dir, crate::DEFAULT_IMAGE_CACHE_SIZE)?;
         let mut puller = crate::oci::ImagePuller::new(

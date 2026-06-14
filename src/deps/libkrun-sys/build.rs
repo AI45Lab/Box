@@ -54,6 +54,8 @@ const LIB_DIR: &str = "lib";
 fn main() {
     // Rebuild if vendored sources change
     println!("cargo:rerun-if-changed=vendor/libkrun");
+    // Re-evaluate the system-vs-vendored decision when the toggle changes.
+    println!("cargo:rerun-if-env-changed=A3S_BUILD_LIBKRUN");
 
     // Check for stub mode (for CI linting without building)
     // Set A3S_DEPS_STUB=1 to skip building and emit stub link directives

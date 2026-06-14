@@ -117,6 +117,13 @@ pub struct PoolConfig {
     /// Autoscaling policy for dynamic min_idle adjustment
     #[serde(default)]
     pub scaling: ScalingPolicy,
+
+    /// Fill the pool by snapshot-fork instead of cold boot: boot ONE template VM
+    /// once, snapshot it, then replenish every other slot by restoring that snapshot
+    /// (MAP_PRIVATE CoW) — turning per-VM fill from a full cold boot (~1.7s) into a
+    /// restore (~tens of ms). All same-image pool VMs share one RAM image.
+    #[serde(default)]
+    pub snapshot_fork: bool,
 }
 
 /// Autoscaling policy for dynamic warm pool sizing.
@@ -199,6 +206,7 @@ impl Default for PoolConfig {
             max_size: 5,
             idle_ttl_secs: 300,
             scaling: ScalingPolicy::default(),
+            snapshot_fork: false,
         }
     }
 }
@@ -323,6 +331,23 @@ pub struct BoxConfig {
     #[serde(default)]
     pub ksm: bool,
 
+    /// Snapshot-fork (per-VM): file-backed guest RAM path for a snapshot TEMPLATE
+    /// (paired with `snapshot_sock`), or the RAM file to MAP_PRIVATE CoW-restore
+    /// from (paired with `restore_from`).
+    #[serde(default)]
+    pub snapshot_mem_file: Option<String>,
+
+    /// Snapshot-fork (per-VM): unix socket on which libkrun serves snapshot
+    /// requests for a template VM.
+    #[serde(default)]
+    pub snapshot_sock: Option<String>,
+
+    /// Snapshot-fork (per-VM): state file to RESTORE from — this VM resumes the
+    /// snapshotted template (CoW of `snapshot_mem_file`) instead of cold-booting.
+    /// The per-VM seam that lets one process (pool / fork daemon) fork many VMs.
+    #[serde(default)]
+    pub restore_from: Option<String>,
+
     /// Port mappings: "host_port:guest_port" (e.g., "8080:80")
     /// Maps host ports to guest ports via TSI (Transparent Socket Impersonation).
     #[serde(default)]
@@ -422,6 +447,9 @@ impl Default for BoxConfig {
             pool: PoolConfig::default(),
             deferred_main: false,
             ksm: false,
+            snapshot_mem_file: None,
+            snapshot_sock: None,
+            restore_from: None,
             port_map: vec![],
             dns: vec![],
             add_hosts: vec![],
