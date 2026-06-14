@@ -798,7 +798,8 @@ mod tests {
         let host_path = temp.path().to_str().unwrap();
         let volume = format!("{}:/data", host_path);
 
-        let mount = VmManager::parse_volume_mount(&volume, 0, std::path::Path::new("/tmp")).unwrap();
+        let mount =
+            VmManager::parse_volume_mount(&volume, 0, std::path::Path::new("/tmp")).unwrap();
         assert_eq!(mount.tag, "vol0");
         assert_eq!(mount.host_path, temp.path().canonicalize().unwrap());
         assert!(!mount.read_only);
@@ -810,7 +811,8 @@ mod tests {
         let host_path = temp.path().to_str().unwrap();
         let volume = format!("{}:/data:ro", host_path);
 
-        let mount = VmManager::parse_volume_mount(&volume, 1, std::path::Path::new("/tmp")).unwrap();
+        let mount =
+            VmManager::parse_volume_mount(&volume, 1, std::path::Path::new("/tmp")).unwrap();
         assert_eq!(mount.tag, "vol1");
         assert!(mount.read_only);
     }
@@ -821,7 +823,8 @@ mod tests {
         let host_path = temp.path().to_str().unwrap();
         let volume = format!("{}:/data:rw", host_path);
 
-        let mount = VmManager::parse_volume_mount(&volume, 2, std::path::Path::new("/tmp")).unwrap();
+        let mount =
+            VmManager::parse_volume_mount(&volume, 2, std::path::Path::new("/tmp")).unwrap();
         assert_eq!(mount.tag, "vol2");
         assert!(!mount.read_only);
     }
@@ -847,7 +850,10 @@ mod tests {
         // The staged dir holds the file under the GUEST basename — what the guest
         // binds onto the guest path.
         let staged = mount.host_path.join("myconf");
-        assert!(staged.exists(), "staged file under guest basename must exist");
+        assert!(
+            staged.exists(),
+            "staged file under guest basename must exist"
+        );
         assert_eq!(std::fs::read(&staged).unwrap(), b"DATA");
     }
 
@@ -882,7 +888,8 @@ mod tests {
         let volume = format!("{}:/data", host_path.display());
 
         assert!(!host_path.exists());
-        let mount = VmManager::parse_volume_mount(&volume, 0, std::path::Path::new("/tmp")).unwrap();
+        let mount =
+            VmManager::parse_volume_mount(&volume, 0, std::path::Path::new("/tmp")).unwrap();
         assert!(host_path.exists());
         assert_eq!(mount.host_path, host_path.canonicalize().unwrap());
     }
