@@ -18,6 +18,179 @@ use tracing::{error, info, warn};
 /// Global flag set by the SIGTERM handler to request graceful shutdown.
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+/// Relay threads forwarding the main process's stdout/stderr pipes to the console.
+/// Drained at container exit so the tail of the output reaches the console (and
+/// thus `logs` / the foreground terminal) before the VM halts.
+static STDIO_RELAYS: std::sync::OnceLock<std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>> =
+    std::sync::OnceLock::new();
+
+/// Interpose a re-openable pipe between the main container process's stdout/stderr
+/// and the virtio-console.
+///
+/// The container would otherwise inherit guest-init's virtio-console ports as fd
+/// 1/2, which are single-open: a process that re-opens `/proc/self/fd/{1,2}` or
+/// `/dev/stdout`/`/dev/stderr` (Apache httpd, nginx-to-stdout, and many real apps)
+/// gets `EBUSY`. We hand it pipe write-ends instead (installed onto fd 1/2 in the
+/// child by `spawn_isolated`) and relay the read-ends back to the console here, so
+/// re-opening works while `logs` and the split stdout/stderr streams are preserved.
+///
+/// File descriptors for the main-process stdio relay (set up before the fork,
+/// with the relay threads started only *after* the fork — see `start_stdio_relays`).
+#[cfg(target_os = "linux")]
+struct StdioRelayFds {
+    /// Pipe write-ends handed to the child as fd 1/2.
+    out_w: std::os::unix::io::RawFd,
+    err_w: std::os::unix::io::RawFd,
+    /// Pipe read-ends the relay threads drain.
+    out_r: std::os::unix::io::RawFd,
+    err_r: std::os::unix::io::RawFd,
+    /// Console targets (dups of guest-init fd 1/2) the relays write to.
+    console_out: std::os::unix::io::RawFd,
+    console_err: std::os::unix::io::RawFd,
+}
+
+/// Create the relay pipes + console dups (NO threads yet — threads must start after
+/// the container fork to stay fork-safe). Returns `None` (keep console fds, the
+/// pre-fix behavior) if any fd op fails.
+#[cfg(target_os = "linux")]
+fn setup_main_stdio_pipes() -> Option<StdioRelayFds> {
+    use std::os::unix::io::RawFd;
+
+    // Relay targets: dup guest-init's current stdout (fd 1 -> console.log) and
+    // stderr (fd 2 -> console.err.log) so the split-stream routing is preserved.
+    let console_out = unsafe { libc::dup(1) };
+    let console_err = unsafe { libc::dup(2) };
+    if console_out < 0 || console_err < 0 {
+        unsafe {
+            if console_out >= 0 {
+                libc::close(console_out);
+            }
+            if console_err >= 0 {
+                libc::close(console_err);
+            }
+        }
+        return None;
+    }
+
+    // O_CLOEXEC so the raw pipe fds don't leak into the exec'd container; the
+    // child's dup2 onto fd 1/2 clears CLOEXEC there so only those survive exec.
+    let mut out_fds = [0 as RawFd; 2];
+    let mut err_fds = [0 as RawFd; 2];
+    if unsafe { libc::pipe2(out_fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0
+        || unsafe { libc::pipe2(err_fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0
+    {
+        unsafe {
+            libc::close(console_out);
+            libc::close(console_err);
+        }
+        return None;
+    }
+    Some(StdioRelayFds {
+        out_w: out_fds[1],
+        err_w: err_fds[1],
+        out_r: out_fds[0],
+        err_r: err_fds[0],
+        console_out,
+        console_err,
+    })
+}
+
+/// Start the two relay threads (read pipe -> write console). Called *after* the
+/// container fork so guest-init is single-threaded across `fork()` (fork-safety:
+/// the codebase keeps the post-fork child free of locks held by other threads).
+/// Consumes the read-ends + console dups; the write-ends are closed by the caller.
+///
+/// NOTE: a hand-rolled `read`/`write` loop — NOT `std::io::copy`. On Linux,
+/// `io::copy` takes a `splice(2)` fast path for a pipe source, which on a
+/// pipe → virtio-console pair returns a spurious `Ok(0)` (premature EOF). That
+/// dropped the read-end immediately, so the container's first write hit a
+/// reader-less pipe and died with SIGPIPE. The explicit loop avoids splice.
+#[cfg(target_os = "linux")]
+fn start_stdio_relays(out_r: i32, console_out: i32, err_r: i32, console_err: i32) {
+    let mut handles = Vec::with_capacity(2);
+    for (read_fd, console_fd) in [(out_r, console_out), (err_r, console_err)] {
+        handles.push(std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = unsafe {
+                    libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                };
+                // < 0: read error (treat as done). 0: EOF — the container closed
+                // its pipe write-end (it exited), so the relay is finished.
+                if n <= 0 {
+                    break;
+                }
+                let mut off = 0usize;
+                while off < n as usize {
+                    let w = unsafe {
+                        libc::write(
+                            console_fd,
+                            buf.as_ptr().add(off) as *const libc::c_void,
+                            n as usize - off,
+                        )
+                    };
+                    if w <= 0 {
+                        break;
+                    }
+                    off += w as usize;
+                }
+            }
+            unsafe {
+                libc::close(read_fd);
+                libc::close(console_fd);
+            }
+        }));
+    }
+    if let Ok(mut g) = STDIO_RELAYS
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+    {
+        g.extend(handles);
+    }
+}
+
+/// Create the standard `/dev/std{in,out,err}` + `/dev/fd` symlinks into the
+/// process's own fds, the way container runtimes do.
+///
+/// The main container's `/dev` is a devtmpfs (real `null`/`urandom`/... nodes but
+/// no std* symlinks). Apps that log to `/dev/stdout` or `/dev/stderr` (official
+/// nginx, and many others) need these to resolve to their own stdio — which is
+/// re-openable now that the main process's stdout/stderr are pipes (see
+/// `setup_main_stdio_pipes`). Created once before the container fork so the
+/// container inherits them; best-effort and idempotent.
+#[cfg(target_os = "linux")]
+fn ensure_dev_std_symlinks() {
+    for (link, target) in [
+        ("/dev/stdin", "/proc/self/fd/0"),
+        ("/dev/stdout", "/proc/self/fd/1"),
+        ("/dev/stderr", "/proc/self/fd/2"),
+        ("/dev/fd", "/proc/self/fd"),
+    ] {
+        // symlink_metadata does not follow the link, so an existing symlink whose
+        // target is not yet resolvable still counts as present (idempotent).
+        if std::fs::symlink_metadata(link).is_ok() {
+            continue;
+        }
+        if let Err(e) = std::os::unix::fs::symlink(target, link) {
+            warn!("Failed to symlink {link} -> {target}: {e}");
+        }
+    }
+}
+
+/// Drain the stdout/stderr relay threads so the container's final output reaches
+/// the console before the VM halts. Idempotent; safe from any exit path.
+fn flush_stdio_relays() {
+    if let Some(lock) = STDIO_RELAYS.get() {
+        let handles: Vec<_> = lock
+            .lock()
+            .map(|mut g| std::mem::take(&mut *g))
+            .unwrap_or_default();
+        for h in handles {
+            let _ = h.join();
+        }
+    }
+}
+
 /// Container entrypoint configuration parsed from environment variables.
 struct ExecConfig {
     /// Container executable path
@@ -363,6 +536,11 @@ fn run_init() -> Result<(), Box<dyn std::error::Error>> {
     // pre-warmed/pooled sandbox). CONTAINER_PID stays the -1 sentinel; the exec
     // server + supervision loop start as usual, so host readiness still passes
     // (the heartbeat handshake has no container-pid dependency).
+    // Standard /dev/std{in,out,err} symlinks (-> the container's own fds), created
+    // before the container fork so it inherits them. Pairs with setup_main_stdio_pipes.
+    #[cfg(target_os = "linux")]
+    ensure_dev_std_symlinks();
+
     let deferred_main = std::env::var("BOX_DEFERRED_MAIN")
         .map(|v| v == "1")
         .unwrap_or(false);
@@ -388,6 +566,17 @@ fn run_init() -> Result<(), Box<dyn std::error::Error>> {
         );
         nix::unistd::Pid::from_raw(-1)
     } else {
+        // Hand the main process re-openable pipe write-ends as fd 1/2 (see
+        // setup_main_stdio_pipes) so it can re-open its own stdout/stderr by path.
+        #[cfg(target_os = "linux")]
+        let relay = setup_main_stdio_pipes();
+        #[cfg(not(target_os = "linux"))]
+        let relay: Option<()> = None;
+        #[cfg(target_os = "linux")]
+        let main_stdio = relay.as_ref().map(|r| (r.out_w, r.err_w));
+        #[cfg(not(target_os = "linux"))]
+        let main_stdio = None;
+
         let container_pid_raw = namespace::spawn_isolated(
             &namespace_config,
             &exec_config.executable,
@@ -395,8 +584,21 @@ fn run_init() -> Result<(), Box<dyn std::error::Error>> {
             &env_refs,
             &exec_config.workdir,
             exec_config.user.as_deref(),
+            main_stdio,
         )?;
         info!("Container process started with PID {}", container_pid_raw);
+
+        // Close our copies of the write-ends (the container is now the sole writer),
+        // then start the relay threads. Starting them AFTER the fork keeps guest-init
+        // single-threaded across the container `fork()` (fork-safety).
+        #[cfg(target_os = "linux")]
+        if let Some(r) = relay {
+            unsafe {
+                libc::close(r.out_w);
+                libc::close(r.err_w);
+            }
+            start_stdio_relays(r.out_r, r.console_out, r.err_r, r.console_err);
+        }
 
         // Make the main container PID available to the exec server so a host
         // graceful-stop request (signal-main control frame) can deliver the
@@ -442,6 +644,10 @@ fn run_init() -> Result<(), Box<dyn std::error::Error>> {
 
     // Step 9: Wait for agent process (reap zombies, handle SIGTERM)
     wait_for_children(container_pid)?;
+
+    // Drain the stdio relays on the graceful-shutdown / no-children return paths
+    // (the container-exit path flushes before its own process::exit).
+    flush_stdio_relays();
 
     Ok(())
 }
@@ -1086,6 +1292,9 @@ fn wait_for_children(container_pid: nix::unistd::Pid) -> Result<(), Box<dyn std:
                     info!("Container process {} exited with status {}", pid, code);
                 }
                 persist_exit_code(code);
+                // Flush the stdout/stderr relays so the container's last output
+                // reaches the console before this process::exit halts the VM.
+                flush_stdio_relays();
                 process::exit(code);
             } else if reaper::is_managed(pid.as_raw()) {
                 // Owned by an exec/PTY handler, which reaps it for the real status.

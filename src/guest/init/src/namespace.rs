@@ -7,6 +7,7 @@
 use nix::sched::{unshare, CloneFlags};
 
 use nix::unistd::{fork, ForkResult};
+use std::os::fd::RawFd;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
@@ -163,6 +164,7 @@ pub fn spawn_isolated(
     env: &[(&str, &str)],
     workdir: &str,
     user: Option<&str>,
+    main_stdio: Option<(RawFd, RawFd)>,
 ) -> Result<u32, NamespaceError> {
     tracing::info!(
         command = %command,
@@ -176,7 +178,7 @@ pub fn spawn_isolated(
     match unsafe { fork() }.map_err(NamespaceError::ForkFailed)? {
         ForkResult::Child => {
             // Child process: create namespaces and exec
-            if let Err(e) = child_process(config, command, args, env, workdir, user) {
+            if let Err(e) = child_process(config, command, args, env, workdir, user, main_stdio) {
                 tracing::error!("Child process failed: {}", e);
                 std::process::exit(1);
             }
@@ -200,6 +202,7 @@ fn child_process(
     env: &[(&str, &str)],
     workdir: &str,
     user: Option<&str>,
+    main_stdio: Option<(RawFd, RawFd)>,
 ) -> Result<(), NamespaceError> {
     // Create new namespaces
     let flags = config.to_clone_flags();
@@ -276,6 +279,21 @@ fn child_process(
 
     // Apply security restrictions + user before exec
     apply_security_before_exec(&mut cmd, process_user, supplemental_groups)?;
+
+    // Re-openable stdout/stderr: hand the main process pipe write-ends as fd 1/2 so
+    // a container that re-opens /proc/self/fd/{1,2} or /dev/stdout|stderr (Apache
+    // httpd, nginx-to-stdout, and many apps) succeeds. The virtio-console ports it
+    // would otherwise inherit are single-open and return EBUSY on a second open;
+    // a pipe is re-openable. guest-init relays the pipe read-ends back to the
+    // console, so `logs` and the split stdout/stderr streams are unaffected.
+    if let Some((out_w, err_w)) = main_stdio {
+        // SAFETY: out_w/err_w are pipe write-ends owned by this pre-exec child;
+        // dup2 onto fd 1/2 (the O_CLOEXEC originals close on exec).
+        unsafe {
+            libc::dup2(out_w, 1);
+            libc::dup2(err_w, 2);
+        }
+    }
 
     tracing::debug!("Executing command: {} {:?}", command, args);
 
@@ -997,6 +1015,7 @@ fn child_process(
     env: &[(&str, &str)],
     workdir: &str,
     _user: Option<&str>,
+    _main_stdio: Option<(RawFd, RawFd)>,
 ) -> Result<(), NamespaceError> {
     // On non-Linux, just exec without namespace isolation or security
     tracing::warn!("Namespace isolation and security enforcement not available on this platform");

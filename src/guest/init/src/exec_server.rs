@@ -1554,6 +1554,27 @@ fn ensure_container_dev_nodes(rootfs: &str) {
             );
         }
     }
+
+    // Standard /dev/std{in,out,err} + /dev/fd symlinks into the process's own fds.
+    // Apps that log to /dev/stdout or /dev/stderr (official nginx, and many others)
+    // then resolve to their own stdio — which is re-openable now that the main
+    // process's stdout/stderr are pipes (see setup_main_stdio_pipes in main.rs).
+    for (link, target) in [
+        ("stdin", "/proc/self/fd/0"),
+        ("stdout", "/proc/self/fd/1"),
+        ("stderr", "/proc/self/fd/2"),
+        ("fd", "/proc/self/fd"),
+    ] {
+        let path = format!("{dev}/{link}");
+        // symlink_metadata does not follow the link, so an existing symlink whose
+        // target is not yet resolvable still counts as present (idempotent).
+        if std::fs::symlink_metadata(&path).is_ok() {
+            continue;
+        }
+        if let Err(e) = std::os::unix::fs::symlink(target, &path) {
+            warn!("Failed to symlink /dev/{link} -> {target}: {e}");
+        }
+    }
 }
 
 /// Parse the container memory limit (bytes) from `A3S_SEC_MEM_LIMIT=<n>`.
