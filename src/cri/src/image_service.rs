@@ -225,6 +225,13 @@ impl ImageService for BoxImageService {
         let image_spec = req
             .image
             .ok_or_else(|| Status::invalid_argument("image spec required"))?;
+        if image_spec.image.trim().is_empty() {
+            // Reject an empty reference up front; otherwise it fails deep in
+            // reference parsing with a confusing error.
+            return Err(Status::invalid_argument(
+                "image reference must not be empty",
+            ));
+        }
 
         let digest = self.resolve_digest(&image_spec.image).await;
 
@@ -258,6 +265,13 @@ impl ImageService for BoxImageService {
         let image_spec = req
             .image
             .ok_or_else(|| Status::invalid_argument("image spec required"))?;
+        if image_spec.image.trim().is_empty() {
+            // Reject an empty reference up front; otherwise it fails deep in
+            // reference parsing with a confusing error.
+            return Err(Status::invalid_argument(
+                "image reference must not be empty",
+            ));
+        }
 
         // Honor kubelet's per-request credentials (imagePullSecrets). When the
         // request carries usable auth, pull with a one-off puller built from it;
@@ -298,6 +312,13 @@ impl ImageService for BoxImageService {
         let image_spec = req
             .image
             .ok_or_else(|| Status::invalid_argument("image spec required"))?;
+        if image_spec.image.trim().is_empty() {
+            // Reject an empty reference up front; otherwise it fails deep in
+            // reference parsing with a confusing error.
+            return Err(Status::invalid_argument(
+                "image reference must not be empty",
+            ));
+        }
 
         tracing::info!(image = %image_spec.image, "CRI RemoveImage");
 
