@@ -104,8 +104,7 @@ mod tests {
 
     #[test]
     fn test_unpause_rejects_stopped() {
-        let (_tmp, state) =
-            setup_state(vec![make_record("id-1", "stopped_box", "stopped", None)]);
+        let (_tmp, state) = setup_state(vec![make_record("id-1", "stopped_box", "stopped", None)]);
         let result = unpause_one(&state, "stopped_box");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Cannot unpause"));
@@ -113,8 +112,7 @@ mod tests {
 
     #[test]
     fn test_unpause_rejects_paused_without_pid() {
-        let (_tmp, state) =
-            setup_state(vec![make_record("id-1", "paused_box", "paused", None)]);
+        let (_tmp, state) = setup_state(vec![make_record("id-1", "paused_box", "paused", None)]);
 
         let result = unpause_one(&state, "paused_box");
 

@@ -91,8 +91,7 @@ mod tests {
 
     #[test]
     fn test_pause_rejects_non_running() {
-        let (_tmp, state) =
-            setup_state(vec![make_record("id-1", "stopped_box", "stopped", None)]);
+        let (_tmp, state) = setup_state(vec![make_record("id-1", "stopped_box", "stopped", None)]);
         let result = pause_one(&state, "stopped_box");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Cannot pause"));
@@ -100,8 +99,7 @@ mod tests {
 
     #[test]
     fn test_pause_rejects_created() {
-        let (_tmp, state) =
-            setup_state(vec![make_record("id-1", "created_box", "created", None)]);
+        let (_tmp, state) = setup_state(vec![make_record("id-1", "created_box", "created", None)]);
         let result = pause_one(&state, "created_box");
         assert!(result.is_err());
     }
@@ -121,8 +119,7 @@ mod tests {
 
     #[test]
     fn test_pause_rejects_running_without_pid() {
-        let (_tmp, state) =
-            setup_state(vec![make_record("id-1", "running_box", "running", None)]);
+        let (_tmp, state) = setup_state(vec![make_record("id-1", "running_box", "running", None)]);
 
         let result = pause_one(&state, "running_box");
 
