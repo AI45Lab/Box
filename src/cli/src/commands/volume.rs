@@ -237,14 +237,10 @@ pub fn resolve_named_volume(
     let volume_name = host_part;
     let store = VolumeStore::default_path()?;
 
-    // Auto-create volume if it doesn't exist (Docker behavior)
-    let config = match store.get(volume_name)? {
-        Some(config) => config,
-        None => {
-            let config = VolumeConfig::new(volume_name, "");
-            store.create(config)?
-        }
-    };
+    // Auto-create the volume if it doesn't exist (Docker behavior). Atomic
+    // under the store's cross-process lock, so two concurrent first-time
+    // `run -v name:/path` share one volume instead of racing to an error.
+    let config = store.get_or_create(VolumeConfig::new(volume_name, ""))?;
 
     // Replace the named volume with the host mount point path
     let mut resolved = config.mount_point.clone();
@@ -275,10 +271,9 @@ pub(crate) fn attach_volumes_with_store(
     box_id: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for name in volume_names {
-        if let Some(mut config) = store.get(name)? {
-            config.attach(box_id);
-            store.update(&config)?;
-        }
+        // modify() re-reads in_use_by under the lock, so concurrent attaches to
+        // the same volume accumulate instead of clobbering each other.
+        store.modify(name, |config| config.attach(box_id))?;
     }
     Ok(())
 }
@@ -290,10 +285,7 @@ pub fn detach_volumes(volume_names: &[String], box_id: &str) {
     }
     if let Ok(store) = VolumeStore::default_path() {
         for name in volume_names {
-            if let Ok(Some(mut config)) = store.get(name) {
-                config.detach(box_id);
-                store.update(&config).ok();
-            }
+            store.modify(name, |config| config.detach(box_id)).ok();
         }
     }
 }
