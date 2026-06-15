@@ -101,39 +101,63 @@ impl NetworkStore {
         Ok(networks.get(name).cloned())
     }
 
+    /// Run `f` against the full networks map under the **cross-process write
+    /// lock** (load-fresh → mutate → save). Use this to make a
+    /// get-modify-update sequence atomic — e.g. allocate-an-IP-then-connect —
+    /// so concurrent boots cannot assign duplicate IPs/MACs or silently lose
+    /// each other's endpoints. The map is saved only if `f` returns `Ok`.
+    ///
+    /// The lock is held across the whole load/mutate/save; `save` is itself
+    /// lock-free, so there is no re-entrant `flock` (which would self-deadlock).
+    pub fn with_write_lock<F, R, E>(&self, f: F) -> std::result::Result<R, E>
+    where
+        F: FnOnce(&mut HashMap<String, NetworkConfig>) -> std::result::Result<R, E>,
+        E: From<BoxError>,
+    {
+        let _lock = crate::file_lock::FileLock::acquire(&self.path).map_err(|e| {
+            E::from(BoxError::NetworkError(format!(
+                "failed to lock networks file {}: {e}",
+                self.path.display()
+            )))
+        })?;
+        let mut networks = self.load().map_err(E::from)?;
+        let r = f(&mut networks)?;
+        self.save(&networks).map_err(E::from)?;
+        Ok(r)
+    }
+
     /// Create a new network. Returns error if name already exists.
     pub fn create(&self, config: NetworkConfig) -> Result<()> {
-        let mut networks = self.load()?;
-
-        if networks.contains_key(&config.name) {
-            return Err(BoxError::NetworkError(format!(
-                "network '{}' already exists",
-                config.name
-            )));
-        }
-
-        networks.insert(config.name.clone(), config);
-        self.save(&networks)
+        self.with_write_lock(|networks| {
+            if networks.contains_key(&config.name) {
+                return Err(BoxError::NetworkError(format!(
+                    "network '{}' already exists",
+                    config.name
+                )));
+            }
+            networks.insert(config.name.clone(), config);
+            Ok(())
+        })
     }
 
     /// Remove a network by name. Returns the removed config or error if not found.
     pub fn remove(&self, name: &str) -> Result<NetworkConfig> {
-        let mut networks = self.load()?;
+        self.with_write_lock(|networks| {
+            let config = networks
+                .remove(name)
+                .ok_or_else(|| BoxError::NetworkError(format!("network '{}' not found", name)))?;
 
-        let config = networks
-            .remove(name)
-            .ok_or_else(|| BoxError::NetworkError(format!("network '{}' not found", name)))?;
-
-        if !config.endpoints.is_empty() {
-            return Err(BoxError::NetworkError(format!(
-                "network '{}' has {} connected endpoint(s); disconnect them first or use --force",
-                name,
-                config.endpoints.len()
-            )));
-        }
-
-        self.save(&networks)?;
-        Ok(config)
+            if !config.endpoints.is_empty() {
+                // Returning Err skips the save, so the in-memory removal is not
+                // persisted — the network stays intact.
+                return Err(BoxError::NetworkError(format!(
+                    "network '{}' has {} connected endpoint(s); disconnect them first or use --force",
+                    name,
+                    config.endpoints.len()
+                )));
+            }
+            Ok(config)
+        })
     }
 
     /// List all network names.
@@ -143,18 +167,22 @@ impl NetworkStore {
     }
 
     /// Update a network in-place (used for connect/disconnect).
+    ///
+    /// Prefer [`with_write_lock`](Self::with_write_lock) for a
+    /// get-modify-update sequence: `update` re-loads under the lock, but a
+    /// caller that read the network *before* calling `update` decided its
+    /// mutation on a possibly-stale snapshot.
     pub fn update(&self, config: &NetworkConfig) -> Result<()> {
-        let mut networks = self.load()?;
-
-        if !networks.contains_key(&config.name) {
-            return Err(BoxError::NetworkError(format!(
-                "network '{}' not found",
-                config.name
-            )));
-        }
-
-        networks.insert(config.name.clone(), config.clone());
-        self.save(&networks)
+        self.with_write_lock(|networks| {
+            if !networks.contains_key(&config.name) {
+                return Err(BoxError::NetworkError(format!(
+                    "network '{}' not found",
+                    config.name
+                )));
+            }
+            networks.insert(config.name.clone(), config.clone());
+            Ok(())
+        })
     }
 
     /// Get the store file path.
@@ -332,5 +360,50 @@ mod tests {
         store.create(net).unwrap();
 
         assert!(store.path().exists());
+    }
+
+    #[test]
+    fn concurrent_connects_allocate_distinct_ips() {
+        use std::collections::HashSet;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(NetworkStore::new(dir.path().join("networks.json")));
+        store
+            .create(NetworkConfig::new("dev", "10.88.0.0/24").unwrap())
+            .unwrap();
+
+        // Many threads connect concurrently. with_write_lock must serialize the
+        // load → allocate → save so every box gets a distinct IP and no endpoint
+        // is lost — the bug allocated duplicate IPs and dropped endpoints.
+        let handles: Vec<_> = (0..16)
+            .map(|i| {
+                let store = Arc::clone(&store);
+                std::thread::spawn(move || {
+                    store
+                        .with_write_lock(|nets| {
+                            nets.get_mut("dev")
+                                .unwrap()
+                                .connect(&format!("box-{i}"), &format!("name-{i}"))
+                                .map_err(BoxError::NetworkError)
+                        })
+                        .unwrap()
+                        .ip_address
+                })
+            })
+            .collect();
+
+        let ips: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let unique: HashSet<_> = ips.iter().collect();
+        assert_eq!(
+            unique.len(),
+            ips.len(),
+            "concurrent connects must allocate distinct IPs (got {ips:?})"
+        );
+        assert_eq!(
+            store.get("dev").unwrap().unwrap().endpoints.len(),
+            16,
+            "every concurrent endpoint must be persisted (no lost writes)"
+        );
     }
 }
