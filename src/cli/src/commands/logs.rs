@@ -134,10 +134,25 @@ async fn stream_logs(
             let mut line = String::new();
             match reader.read_line(&mut line) {
                 Ok(0) => {
-                    // If the file shrank below our offset it was truncated under
-                    // us (the shim bounds the raw console.log); re-read from the
-                    // start so `--follow` doesn't freeze at a stale offset.
-                    if let Ok(meta) = reader.get_ref().metadata() {
+                    // Follow-by-name (like `tail -F`): the writer either ROTATES
+                    // container.json (rename + new file → new inode) or TRUNCATES
+                    // the raw console.log in place. Handle both so `--follow`
+                    // never freezes on a stale fd after ~max-size of output.
+                    //
+                    // We only get here at EOF, so the old inode is already drained
+                    // up to the rotation point — re-opening loses no lines.
+                    let rotated = reader
+                        .get_ref()
+                        .metadata()
+                        .map(|open| file_rotated(&open, &log_path))
+                        .unwrap_or(false);
+                    if rotated {
+                        if let Ok(f) = std::fs::File::open(&log_path) {
+                            reader = BufReader::new(f);
+                            pos = 0;
+                        }
+                    } else if let Ok(meta) = reader.get_ref().metadata() {
+                        // Truncated in place (bounded console.log): re-read from start.
                         if pos > meta.len() {
                             pos = reader.seek(SeekFrom::Start(0)).unwrap_or(0);
                         }
@@ -176,6 +191,23 @@ async fn stream_logs(
     }
 
     Ok(())
+}
+
+/// True if the file currently at `path` has a different inode than `open_meta` —
+/// i.e. it was rotated (renamed away, a new one created) under our open fd. Lets
+/// `--follow` re-open the new file (`tail -F`) instead of stalling on the old
+/// inode after the writer rotates `container.json`.
+#[cfg(unix)]
+fn file_rotated(open_meta: &std::fs::Metadata, path: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path)
+        .map(|cur| open_meta.ino() != cur.ino())
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn file_rotated(_open_meta: &std::fs::Metadata, _path: &std::path::Path) -> bool {
+    false
 }
 
 fn resolve_log_source(record: &BoxRecord) -> Option<LogSource> {
@@ -343,6 +375,26 @@ fn extract_line_timestamp(line: &str) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn test_file_rotated_detects_inode_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("container.json");
+        std::fs::write(&path, b"old\n").unwrap();
+        let open = std::fs::File::open(&path).unwrap().metadata().unwrap();
+
+        // Same inode → not rotated.
+        assert!(!file_rotated(&open, &path));
+
+        // Rotate like the writer does: rename away, create a fresh file.
+        std::fs::rename(&path, dir.path().join("container.json.1")).unwrap();
+        std::fs::write(&path, b"new\n").unwrap();
+        assert!(file_rotated(&open, &path));
+
+        // Missing file → not rotated (no panic).
+        assert!(!file_rotated(&open, &dir.path().join("gone")));
+    }
 
     #[test]
     fn test_parse_duration_seconds() {
