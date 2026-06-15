@@ -671,25 +671,24 @@ async fn run_foreground(
     disconnect_network(&ctx.box_id, args.common.network.as_deref())?;
     crate::cleanup::cleanup_external_socket_dir(&ctx.box_dir, &ctx.exec_socket_path);
 
-    // Update state
-    let mut state = StateFile::load_default()?;
-    mark_record_stopped(
-        &mut state,
-        &ctx.box_id,
-        exit_code,
-        stop_reason.stopped_by_user(),
-    );
-
+    // Update state through the atomic primitives so a concurrent writer (the
+    // monitor, or another box's stop) is not clobbered by a stale load → mutate
+    // → full-vector save. Box registration already uses add_record for the same
+    // reason; this symmetric stop path had been missed.
+    let stopped_by_user = stop_reason.stopped_by_user();
     if args.rm {
         crate::cleanup::cleanup_anonymous_volumes(&ctx.anonymous_volumes);
-        state.remove(&ctx.box_id)?;
+        StateFile::remove_record(&ctx.box_id)?;
         let _ = std::fs::remove_dir_all(&ctx.box_dir);
         println!(
             "{}",
             foreground_completion_message(stop_reason, true, &ctx.name)
         );
     } else {
-        state.save()?;
+        StateFile::modify(|s| {
+            mark_record_stopped(s, &ctx.box_id, exit_code, stopped_by_user);
+            Ok::<(), std::io::Error>(())
+        })?;
         println!(
             "{}",
             foreground_completion_message(stop_reason, false, &ctx.name)
@@ -811,14 +810,17 @@ async fn cleanup_box(
     disconnect_network(&ctx.box_id, net_name)?;
     crate::cleanup::cleanup_external_socket_dir(&ctx.box_dir, &ctx.exec_socket_path);
 
-    let mut state = StateFile::load_default()?;
-    mark_record_stopped(&mut state, &ctx.box_id, exit_code, false);
+    // Atomic write under the state lock so a concurrent monitor/CLI write to
+    // another box is not clobbered by a stale full-vector save.
     if auto_remove {
         crate::cleanup::cleanup_anonymous_volumes(&ctx.anonymous_volumes);
-        state.remove(&ctx.box_id)?;
+        StateFile::remove_record(&ctx.box_id)?;
         let _ = std::fs::remove_dir_all(&ctx.box_dir);
     } else {
-        state.save()?;
+        StateFile::modify(|s| {
+            mark_record_stopped(s, &ctx.box_id, exit_code, false);
+            Ok::<(), std::io::Error>(())
+        })?;
     }
     Ok(())
 }
