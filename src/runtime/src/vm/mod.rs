@@ -923,11 +923,15 @@ impl VmManager {
         *state = BoxState::Stopped;
 
         // Stop the VM handler and capture its exit code before it's dropped.
+        // A stop failure must NOT skip the host-resource teardown below (network
+        // backend, overlay unmount, socket + box dirs) — those are already
+        // best-effort and would otherwise leak on every wedged stop. Capture the
+        // error and surface it after teardown instead of returning early.
+        let mut stop_error = None;
         if let Some(mut handler) = self.handler.write().await.take() {
             if let Err(e) = handler.stop(signal, timeout_ms) {
-                tracing::error!(box_id = %self.box_id, error = %e, "Failed to stop VM handler");
-                self.shim_exit_code = handler.exit_code();
-                return Err(e);
+                tracing::error!(box_id = %self.box_id, error = %e, "Failed to stop VM handler; continuing teardown");
+                stop_error = Some(e);
             }
             self.shim_exit_code = handler.exit_code();
         }
@@ -991,7 +995,12 @@ impl VmManager {
         // Emit stopped event
         self.event_emitter.emit(BoxEvent::empty("box.stopped"));
 
-        Ok(())
+        // Host teardown above is complete; surface a handler-stop failure now so
+        // the caller still learns the stop was imperfect.
+        match stop_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Transition to busy state.
@@ -1298,6 +1307,59 @@ mod tests {
         fn pid(&self) -> u32 {
             42
         }
+    }
+
+    /// A handler whose `stop` always fails — models a wedged VM that won't halt.
+    struct FailingHandler;
+
+    impl VmHandler for FailingHandler {
+        fn stop(&mut self, _signal: i32, _timeout_ms: u64) -> Result<()> {
+            Err(BoxError::StateError("simulated stop failure".to_string()))
+        }
+
+        fn metrics(&self) -> crate::vmm::VmMetrics {
+            crate::vmm::VmMetrics::default()
+        }
+
+        fn is_running(&self) -> bool {
+            true
+        }
+
+        fn pid(&self) -> u32 {
+            42
+        }
+    }
+
+    // Regression: a handler-stop failure must still run the host teardown
+    // (overlay unmount, socket + box dirs). Pre-fix, destroy_with_options
+    // returned early on the stop error and leaked the box directory on every
+    // wedged stop.
+    #[tokio::test]
+    async fn test_destroy_runs_host_teardown_even_when_handler_stop_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let box_id = "box-stopfail".to_string();
+        // persistent=false (the default) → the box dir is removed on destroy.
+        let mut vm =
+            VmManager::with_box_id(BoxConfig::default(), EventEmitter::new(16), box_id.clone());
+        vm.home_dir = tmp.path().to_path_buf();
+        *vm.handler.write().await = Some(Box::new(FailingHandler));
+
+        let box_dir = tmp.path().join("boxes").join(&box_id);
+        std::fs::create_dir_all(box_dir.join("logs")).unwrap();
+
+        let result = vm.destroy_with_options(default_stop_signal(), 100).await;
+
+        // The stop failure is still surfaced to the caller...
+        assert!(
+            result.is_err(),
+            "a handler-stop failure must still be reported"
+        );
+        // ...but the host teardown ran anyway: handler taken + box dir removed.
+        assert!(vm.handler.read().await.is_none());
+        assert!(
+            !box_dir.exists(),
+            "non-persistent box dir must be removed even when the stop failed"
+        );
     }
 
     #[tokio::test]

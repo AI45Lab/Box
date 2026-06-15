@@ -609,7 +609,7 @@ async fn run_tty(mut ctx: RunContext, args: &RunArgs) -> Result<(), Box<dyn std:
         args.rm,
         Some(exit_code),
     )
-    .await?;
+    .await;
 
     if exit_code != 0 {
         std::process::exit(exit_code);
@@ -683,43 +683,31 @@ async fn run_foreground(
 
     log_handle.abort();
 
-    // Destroy VM
+    // Best-effort teardown: a stop failure (wedged VM, transient store error)
+    // must not orphan the box's other resources, so every step runs regardless
+    // of whether an earlier one failed.
     if let Some(ref handle) = ctx.health_checker {
         handle.abort();
     }
-    ctx.vm
+    if let Err(error) = ctx
+        .vm
         .destroy_with_options(ctx.stop_signal, ctx.stop_timeout_ms)
-        .await?;
-    let exit_code = foreground_exit_code(stop_reason, ctx.vm.exit_code());
-
-    // Detach volumes and disconnect network
-    super::volume::detach_volumes(&ctx.volume_names, &ctx.box_id);
-    disconnect_network(&ctx.box_id, args.common.network.as_deref())?;
-    crate::cleanup::cleanup_external_socket_dir(&ctx.box_dir, &ctx.exec_socket_path);
-
-    // Update state through the atomic primitives so a concurrent writer (the
-    // monitor, or another box's stop) is not clobbered by a stale load → mutate
-    // → full-vector save. Box registration already uses add_record for the same
-    // reason; this symmetric stop path had been missed.
-    let stopped_by_user = stop_reason.stopped_by_user();
-    if args.rm {
-        crate::cleanup::cleanup_anonymous_volumes(&ctx.anonymous_volumes);
-        StateFile::remove_record(&ctx.box_id)?;
-        let _ = std::fs::remove_dir_all(&ctx.box_dir);
-        println!(
-            "{}",
-            foreground_completion_message(stop_reason, true, &ctx.name)
-        );
-    } else {
-        StateFile::modify(|s| {
-            mark_record_stopped(s, &ctx.box_id, exit_code, stopped_by_user);
-            Ok::<(), std::io::Error>(())
-        })?;
-        println!(
-            "{}",
-            foreground_completion_message(stop_reason, false, &ctx.name)
-        );
+        .await
+    {
+        tracing::warn!(box_id = %ctx.box_id, %error, "Failed to destroy VM on stop; continuing teardown");
     }
+    let exit_code = foreground_exit_code(stop_reason, ctx.vm.exit_code());
+    teardown_box_resources(
+        &ctx,
+        args.common.network.as_deref(),
+        args.rm,
+        exit_code,
+        stop_reason.stopped_by_user(),
+    );
+    println!(
+        "{}",
+        foreground_completion_message(stop_reason, args.rm, &ctx.name)
+    );
 
     if let Some(code) = exit_code {
         if code != 0 {
@@ -829,30 +817,53 @@ async fn cleanup_box(
     net_name: Option<&str>,
     auto_remove: bool,
     exit_code: Option<i32>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) {
     if let Some(ref handle) = ctx.health_checker {
         handle.abort();
     }
-    ctx.vm
+    if let Err(error) = ctx
+        .vm
         .destroy_with_options(ctx.stop_signal, ctx.stop_timeout_ms)
-        .await?;
+        .await
+    {
+        tracing::warn!(box_id = %ctx.box_id, %error, "Failed to destroy VM on stop; continuing teardown");
+    }
+    teardown_box_resources(ctx, net_name, auto_remove, exit_code, false);
+}
+
+/// Best-effort teardown of a box's host + state resources after its VM has been
+/// destroyed. Every step runs even if an earlier one failed, so a wedged VM or a
+/// transient store error never orphans the box's other resources — volume
+/// attachment, network IP, the `boxes.json` record, and the box directory.
+///
+/// State writes go through the atomic primitives (`remove_record`/`modify`) so a
+/// concurrent writer (the monitor, or another box's stop) is not clobbered by a
+/// stale load → mutate → full-vector save.
+fn teardown_box_resources(
+    ctx: &RunContext,
+    net_name: Option<&str>,
+    auto_remove: bool,
+    exit_code: Option<i32>,
+    stopped_by_user: bool,
+) {
     super::volume::detach_volumes(&ctx.volume_names, &ctx.box_id);
-    disconnect_network(&ctx.box_id, net_name)?;
+    if let Err(error) = disconnect_network(&ctx.box_id, net_name) {
+        tracing::warn!(box_id = %ctx.box_id, %error, "Failed to disconnect network during teardown");
+    }
     crate::cleanup::cleanup_external_socket_dir(&ctx.box_dir, &ctx.exec_socket_path);
 
-    // Atomic write under the state lock so a concurrent monitor/CLI write to
-    // another box is not clobbered by a stale full-vector save.
     if auto_remove {
         crate::cleanup::cleanup_anonymous_volumes(&ctx.anonymous_volumes);
-        StateFile::remove_record(&ctx.box_id)?;
+        if let Err(error) = StateFile::remove_record(&ctx.box_id) {
+            tracing::warn!(box_id = %ctx.box_id, %error, "Failed to remove box record during teardown");
+        }
         let _ = std::fs::remove_dir_all(&ctx.box_dir);
-    } else {
-        StateFile::modify(|s| {
-            mark_record_stopped(s, &ctx.box_id, exit_code, false);
-            Ok::<(), std::io::Error>(())
-        })?;
+    } else if let Err(error) = StateFile::modify(|s| {
+        mark_record_stopped(s, &ctx.box_id, exit_code, stopped_by_user);
+        Ok::<(), std::io::Error>(())
+    }) {
+        tracing::warn!(box_id = %ctx.box_id, %error, "Failed to mark box stopped during teardown");
     }
-    Ok(())
 }
 
 fn mark_record_stopped(
