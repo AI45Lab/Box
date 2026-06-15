@@ -32,6 +32,16 @@ pub struct MonitorArgs {
     /// Poll interval in seconds (default: 5)
     #[arg(long, default_value = "5")]
     pub interval: u64,
+
+    /// Install + enable the monitor as a supervised per-user service
+    /// (systemd `--user` on Linux, launchd LaunchAgent on macOS) and exit.
+    /// Without this, the monitor runs in the foreground.
+    #[arg(long, conflicts_with = "uninstall")]
+    pub install: bool,
+
+    /// Disable and remove the installed monitor service, then exit.
+    #[arg(long)]
+    pub uninstall: bool,
 }
 
 /// Per-box backoff state for restart attempts.
@@ -134,6 +144,13 @@ impl BackoffTracker {
 }
 
 pub async fn execute(args: MonitorArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if args.install {
+        return super::monitor_service::install(args.interval);
+    }
+    if args.uninstall {
+        return super::monitor_service::uninstall();
+    }
+
     let interval = Duration::from_secs(args.interval);
     let mut tracker = BackoffTracker::new();
 
