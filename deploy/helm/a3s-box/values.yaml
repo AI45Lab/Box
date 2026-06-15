@@ -1,5 +1,18 @@
 # A3S Box Helm Chart — values.yaml
 
+# IMPORTANT: no prebuilt CRI image is published yet. The repository below is a
+# placeholder — there is currently no automated build/push of
+# `a3s-box-cri` to a public registry, so a clean `helm install` will land in
+# `ImagePullBackOff`. Until an official image ships, build and push your own
+# from a node that can compile the runtime (it links libkrun), then point
+# `image.repository`/`image.tag` at it:
+#
+#   # on a build host with the repo + a libkrun toolchain:
+#   cargo build --release -p a3s-box-cri
+#   # package a3s-box-cri (+ the musl guest-init) into your own image and push,
+#   # then set image.repository/tag here.
+#
+# Track the image-publishing work before relying on the Helm path in production.
 image:
   repository: ghcr.io/a3s-lab/a3s-box-cri
   tag: latest

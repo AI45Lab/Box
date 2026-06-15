@@ -21,7 +21,7 @@ operator = []
 build = []
 
 [dependencies]
-a3s-box-core = { version = "2.1.0", path = "../core" }
+a3s-box-core = { version = "2.2.0", path = "../core" }
 a3s-transport = { workspace = true }
 
 # Async runtime
@@ -82,7 +82,7 @@ prometheus = { workspace = true }
 
 # macOS userspace network proxy (replaces gvproxy)
 [target.'cfg(target_os = "macos")'.dependencies]
-a3s-box-netproxy = { path = "../netproxy" }
+a3s-box-netproxy = { version = "2.2.0", path = "../netproxy" }
 
 [target.'cfg(unix)'.dependencies]
 # TEE attestation verification
