@@ -13,19 +13,22 @@ suite so regressions are visible and progress is measurable.
 
 | Field | Value |
 |-------|-------|
-| Date | 2026-06-02 |
+| Date | 2026-06-15 |
 | `critest` | v1.30.1 |
-| a3s-box | 2.0.6 |
+| a3s-box | 2.2.0 |
 | Host | Linux KVM node (`/dev/kvm`), Ubuntu 24.04 |
-| Result | **73 Passed · 9 Failed · 15 Skipped** (ran 82 of 97 specs) |
+| Result | **73 Passed · 7 Failed · 17 Skipped** (ran 80 of 97 specs, `--ginkgo.skip=portforward`) |
 
 Up from the original **21 Passed / 59 Failed** (2.0.4) and the **44 Passed**
 mid-point. With registry mirrors configured (so the e2e webserver/helper images
 resolve) plus per-container capabilities, image-defined users/groups, pod DNS,
 crash-recovery reaping, standard `/dev` nodes, routable pod IPs, **OOMKilled
-detection**, **MaskedPaths**, and an **SPDY port-forward bridge**, the suite now
-passes 73 of the 82 specs that run. Every one of the 9 remaining failures is
+detection**, **MaskedPaths**, and an **SPDY port-forward bridge**, the suite
+passes 73 of the 80 specs that run. Every one of the 7 remaining failures is
 architectural (microVM-per-pod) or environmental — none is a logic defect.
+Re-verified on `main` for the 2.2.0 release with **zero regression** from that
+release's CRI fixes (lifecycle/stats, streaming cleanup, empty-ref rejection,
+`rmi` short-tag resolution).
 
 How it was run:
 
@@ -79,9 +82,16 @@ critest --runtime-endpoint unix:///tmp/a3s-box.sock \
 
 ## Remaining gaps (9 failures — all architectural or environmental)
 
+The 2.2.0 run skips the 2 PortForward specs (see the port-forward note above), so
+its headline is **7 Failed**; the table below catalogues all 9 specs that do not
+pass on the full suite. Mount propagation is nondeterministic across ginkgo's
+randomized order — `rprivate` and `non-recursive readonly mounts` trade places
+between runs — but both share the one virtio-fs root cause and the count is
+unchanged.
+
 | Category | Failing specs | Root cause | Fixable here? |
 |----------|---------------|------------|---------------|
-| **Mount propagation** (3) | rprivate / rshared / rslave | bidirectional host↔container propagation needs a real shared mount configured at VM boot; containers are created post-boot and volumes are COPIED into the rootfs | ❌ architectural |
+| **Mount propagation / readonly** (3) | rshared / rslave / non-recursive readonly mounts | a directory volume is shared as a *single* virtio-fs mount of one host subtree; bidirectional host↔container propagation needs a real shared mount configured at VM boot, and a readonly mount necessarily covers the whole subtree (the test's nested host `tmpfs` is not a separate guest mount, so it cannot stay writable) | ❌ architectural |
 | **Host namespaces** (2) | HostNetwork=true, HostIpc=true | each pod is an isolated microVM with its own kernel + namespaces — there is no host network/IPC namespace to share; rejected fail-closed rather than silently mis-running | ❌ architectural |
 | **Per-container PID isolation** (1) | ContainerPID | all of a pod's containers share the single VM-wide PID namespace; a per-container PID namespace is not modeled | ❌ architectural |
 | **AppArmor enforce** (1) | should enforce a profile blocking writes | the guest kernel has no AppArmor LSM, and CRI passes only the profile *name* — critest loads the profile on the **host** kernel and deletes the source, so the guest has nothing to compile, and the host-compiled binary policy is ABI-tied to the host kernel. CRI's shared-host-kernel AppArmor model does not map onto a separate-kernel microVM | ❌ architectural |

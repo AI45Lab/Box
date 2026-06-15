@@ -4,6 +4,60 @@ All notable changes to A3S Box will be documented in this file.
 
 ## [Unreleased]
 
+## [2.2.0] — 2026-06-15
+
+A correctness and hardening release: 24 fixes across the CLI state machine,
+runtime resource limits, guest-init I/O, the OCI store, networking, the warm
+pool, and the CRI server. No breaking changes. CRI conformance re-verified with
+zero regression (see below).
+
+### Added
+
+- **Health-check TSI warning**: `run` now warns when a health check probes
+  `localhost` under TSI networking, where the probe cannot reach the guest.
+
+### Fixed
+
+- **CLI state machine** — route every status-update command (`stop`, `start`,
+  `kill`, `pause`, `unpause`, `rename`, `restart`) through the atomic
+  `StateFile` primitives, closing a load-modify-save TOCTOU that could clobber
+  concurrent box state; make box registration atomic in `compose` + `snapshot`
+  (orphan-VM race) and unmount the overlay before deleting the box directory in
+  `compose` cleanup.
+- **Resource limits** — enforce `--pids-limit` on the `run` path via an in-guest
+  cgroup `pids.max`; harden `resize` by rejecting shell-injectable cpuset strings
+  and clamping `cpu.weight` to its valid range.
+- **guest-init** — retry the stdio relay on `EINTR` so container output is never
+  truncated; fix a cgroup-mount TOCTOU, an stdio fd-leak, and a signal-64 edge;
+  make container `stdout`/`stderr` re-openable by path (`/dev/stdout`,
+  `/proc/self/fd/N`) so apps that reopen their logs (e.g. Apache httpd) start.
+- **exec** — base64-encode exec args/env so shell quotes survive libkrun's
+  environment passing.
+- **OCI store** — refuse to store blobs whose digest algorithm cannot be
+  verified; make store and build-cache writes atomic (stage + rename) so
+  concurrent pulls/builds cannot corrupt a layer.
+- **rootfs & networking** — overlay comma-guard + bounded unmount-retry in
+  provider cleanup; stage single-file bind mounts so directory-sharing virtio-fs
+  can serve them; kill passt on a boot-failure timeout, guard `terminate`
+  against PID reuse, and reap passt on boot failure so the published port is
+  released.
+- **Warm pool** — fall back to cold boot when snapshot-fork is unavailable,
+  instead of failing the pool fill.
+- **CRI** — maintain the `StopPodSandbox` state invariant and report stats
+  correctly for non-running containers; close stdin and send a port-forward
+  `CLOSE` frame on streaming error paths; reject empty image references in
+  pull/status/remove; resolve the image reference in `RemoveImage` so
+  `rmi <short-tag>` (e.g. `alpine:latest`) works; surface container log-file
+  open failures instead of swallowing them.
+
+### Verified
+
+- **CRI conformance: 73 Passed / 7 Failed / 17 Skipped** (`critest` v1.30.1, skip
+  portforward; 80 of 97 specs) on `main` — unchanged pass count, **zero
+  regression** from the fixes above. The 7 remaining failures are all
+  microVM-architectural (mount propagation, host namespaces, AppArmor-enforce,
+  non-recursive readonly mounts), not code defects.
+
 ## [2.1.0] — 2026-06-13
 
 ### Added
