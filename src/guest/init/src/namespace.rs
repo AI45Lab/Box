@@ -306,7 +306,7 @@ fn child_process(
     // names -> uid:gid via /etc/passwd, default the primary gid from passwd,
     // and gather image supplemental groups. Done here (pre-fork, allocating) so
     // the pre_exec hook only performs async-signal-safe syscalls.
-    let (process_user, supplemental_groups) = resolve_user_and_groups(user);
+    let (process_user, supplemental_groups) = resolve_user_and_groups(user)?;
 
     // Apply security restrictions + user before exec
     apply_security_before_exec(&mut cmd, process_user, supplemental_groups)?;
@@ -356,21 +356,28 @@ fn resolve_command_path(command: &str, env: &[(&str, &str)]) -> Option<PathBuf> 
 
 /// Resolve a container user string (`uid`, `uid:gid`, `root`, or a name) to a
 /// numeric [`ProcessUser`] plus its image supplementary groups, looking names up
-/// in the container rootfs (already pivoted to `/`). Returns `(None, [])` when no
-/// user is requested or the name cannot be resolved/parsed (the process then runs
-/// as root, the prior behaviour). Pure file reads — call pre-fork.
+/// in the container rootfs (already pivoted to `/`). Returns `Ok((None, []))` when
+/// NO user is requested (run as default). When a user IS requested but cannot be
+/// resolved/parsed it returns `Err` (fail CLOSED): silently running as root
+/// instead would be a privilege escalation. Pure file reads — call pre-fork.
 #[cfg(target_os = "linux")]
-fn resolve_user_and_groups(user: Option<&str>) -> (Option<crate::user::ProcessUser>, Vec<u32>) {
+fn resolve_user_and_groups(
+    user: Option<&str>,
+) -> Result<(Option<crate::user::ProcessUser>, Vec<u32>), NamespaceError> {
     let Some(user) = user.map(str::trim).filter(|u| !u.is_empty()) else {
-        return (None, Vec::new());
+        return Ok((None, Vec::new()));
     };
     // Names -> "uid:gid" via the container /etc/passwd; numeric/root pass through.
     let resolved = crate::user::resolve_named_user(user, "/").unwrap_or_else(|| user.to_string());
     let mut process_user = match crate::user::parse_process_user(Some(&resolved)) {
         Ok(Some(pu)) => pu,
         _ => {
-            tracing::warn!(user, "Could not resolve container user; running as root");
-            return (None, Vec::new());
+            // Fail closed: an explicit USER (image USER / --user) that cannot be
+            // resolved (e.g. no /etc/passwd entry) must abort the launch, not
+            // silently run as root. The exec path already fails closed here.
+            return Err(NamespaceError::SecurityFailed(format!(
+                "container user '{user}' could not be resolved (refusing to run as root)"
+            )));
         }
     };
     // Default the primary gid from the user's passwd entry (RunAsUser semantics).
@@ -378,7 +385,7 @@ fn resolve_user_and_groups(user: Option<&str>) -> (Option<crate::user::ProcessUs
         process_user.gid = crate::user::primary_gid_for_uid("/", process_user.uid);
     }
     let groups = crate::user::resolve_image_groups("/", process_user.uid, process_user.gid, user);
-    (Some(process_user), groups)
+    Ok((Some(process_user), groups))
 }
 
 /// Apply security restrictions (seccomp, no-new-privileges, capabilities) and
