@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 a3s-box-core = { path = "../core" }
-libkrun-sys = { version = "2.1.0", path = "../deps/libkrun-sys", package = "a3s-libkrun-sys" }
+libkrun-sys = { version = "2.2.0", path = "../deps/libkrun-sys", package = "a3s-libkrun-sys" }
 
 # CLI
 clap = { workspace = true }
