@@ -3,8 +3,10 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
     branches: [main]
+  workflow_dispatch: {}
 
 env:
   CARGO_TERM_COLOR: always
@@ -143,3 +145,60 @@ jobs:
           path: |
             src/target/x86_64-pc-windows-msvc/release/a3s-box.exe
             src/target/x86_64-pc-windows-msvc/release/a3s-box-shim.exe
+
+  # ── Real microVM integration gate (self-hosted, /dev/kvm) ───────
+  # The fmt/clippy/test/build jobs above all run in STUB mode
+  # (A3S_DEPS_STUB) and never boot a real microVM, so a runtime
+  # regression (boot, exec, virtio-fs, CRI lifecycle, snapshot-fork)
+  # cannot be caught by hosted CI — GitHub-hosted runners have no
+  # /dev/kvm. This job links REAL libkrun and runs the `#[ignore]`
+  # integration + crictl-smoke suites against a real microVM.
+  #
+  # ARMING THE GATE (one-time, operator — see docs/ci-kvm-runner.md):
+  #   1. Register a self-hosted runner that has /dev/kvm, with labels:
+  #        self-hosted, linux, kvm
+  #   2. Set repository variable  KVM_CI = true
+  #        (Settings -> Secrets and variables -> Actions -> Variables)
+  # Until both are done this job is SKIPPED (inert) and never blocks a PR.
+  integration-kvm:
+    name: Integration (real microVM, KVM)
+    needs: [fmt, clippy, test]
+    if: vars.KVM_CI == 'true'
+    runs-on: [self-hosted, linux, kvm]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Init submodules
+        run: git -c http.extraheader= submodule update --init --recursive
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Verify /dev/kvm is present
+        run: |
+          if [ ! -e /dev/kvm ]; then
+            echo "::error::/dev/kvm missing — this runner cannot boot microVMs"; exit 1
+          fi
+          echo "/dev/kvm present"
+      # Build REAL binaries: unset the stub so libkrun-sys compiles the
+      # vendored libkrun (build.rs gates on env::var("A3S_DEPS_STUB").is_ok(),
+      # so the var must be UNSET, not just emptied).
+      - name: Build real binaries + musl guest-init (no stub)
+        run: |
+          unset A3S_DEPS_STUB
+          cd src
+          cargo build --release -p a3s-box-guest-init --target x86_64-unknown-linux-musl
+          cargo build --release -p a3s-box-cli -p a3s-box-cri -p a3s-box-shim
+      - name: Core smoke — real boot + exec over virtio-fs
+        run: |
+          unset A3S_DEPS_STUB
+          cd src
+          cargo test --release -p a3s-box-cli --test core_smoke -- --ignored --nocapture --test-threads=1
+      - name: CRI crictl smoke — full pod/container lifecycle
+        env:
+          A3S_BOX_CRI_SMOKE: "1"
+          A3S_BOX_CRI_SMOKE_AGENT_IMAGE: ${{ vars.KVM_CI_AGENT_IMAGE || 'docker.m.daocloud.io/library/alpine:latest' }}
+          A3S_REGISTRY_MIRRORS: ${{ vars.KVM_CI_REGISTRY_MIRRORS }}
+        run: |
+          unset A3S_DEPS_STUB
+          cd src
+          cargo test --release -p a3s-box-cri --test crictl_smoke -- --ignored --nocapture --test-threads=1
