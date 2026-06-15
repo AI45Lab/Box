@@ -25,6 +25,15 @@ const EXEC_SIGNAL_MAIN_ACK: &[u8] = b"signal-main-ack";
 /// `EXEC_SPAWN_MAIN_ACK` in `guest/init/src/exec_server.rs`.
 const EXEC_SPAWN_MAIN_ACK: &[u8] = b"spawn-main-ack";
 
+/// Host-side slack added to a one-shot exec's in-guest `timeout_ns` before the
+/// host gives up reading the reply. The in-guest timeout cannot fire if the
+/// guest is wedged, so the host needs its own ceiling.
+const EXEC_HOST_SLACK_SECS: u64 = 10;
+/// Host-side deadline for a `signal-main` ACK. Signal delivery + the ACK are
+/// fast; a wedged guest that never replies must not block the caller's
+/// force-kill fallback.
+const SIGNAL_MAIN_ACK_TIMEOUT_SECS: u64 = 10;
+
 type ExecFrameReader = a3s_transport::FrameReader<tokio::io::ReadHalf<tokio::net::UnixStream>>;
 type ExecFrameWriter = a3s_transport::FrameWriter<tokio::io::WriteHalf<tokio::net::UnixStream>>;
 
@@ -88,12 +97,23 @@ impl ExecClient {
             .await
             .map_err(|e| BoxError::ExecError(format!("Exec request write failed: {}", e)))?;
 
-        // Read response frame
+        // Read response frame, bounded by a HOST-side deadline of the request's
+        // timeout plus slack. The request's timeout_ns is only enforced INSIDE
+        // the guest; a wedged guest (kernel hang, OOM thrash, frozen VM) can
+        // still complete the host connect handshake but never reply, which would
+        // block this read forever and stall every caller (health probes, the
+        // monitor poll loop, CLI exec).
         let (r, _w) = tokio::io::split(stream);
         let mut reader = a3s_transport::FrameReader::new(r);
-        let frame = reader
-            .read_frame()
+        let host_deadline = std::time::Duration::from_nanos(request.timeout_ns)
+            .saturating_add(std::time::Duration::from_secs(EXEC_HOST_SLACK_SECS));
+        let frame = tokio::time::timeout(host_deadline, reader.read_frame())
             .await
+            .map_err(|_| {
+                BoxError::ExecError(format!(
+                    "Exec response timed out after {host_deadline:?} (guest may be wedged)"
+                ))
+            })?
             .map_err(|e| BoxError::ExecError(format!("Exec response read failed: {}", e)))?
             .ok_or_else(|| {
                 BoxError::ExecError("Exec server closed without response".to_string())
@@ -267,10 +287,20 @@ impl ExecClient {
             return Ok(false);
         }
 
+        // Host-side deadline: a wedged guest can complete the connect handshake
+        // (listen backlog) but never write the ACK, which would hang this read
+        // forever — and stop/restart deliver the signal through here BEFORE their
+        // force-kill fallback, so the fallback would never run. On timeout report
+        // not-acknowledged so the caller force-kills.
         let (r, _w) = tokio::io::split(stream);
         let mut reader = a3s_transport::FrameReader::new(r);
-        match reader.read_frame().await {
-            Ok(Some(f))
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(SIGNAL_MAIN_ACK_TIMEOUT_SECS),
+            reader.read_frame(),
+        )
+        .await;
+        match read {
+            Ok(Ok(Some(f)))
                 if f.frame_type == a3s_transport::FrameType::Control
                     && f.payload == EXEC_SIGNAL_MAIN_ACK =>
             {
