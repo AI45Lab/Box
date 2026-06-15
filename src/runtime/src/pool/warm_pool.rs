@@ -91,14 +91,28 @@ struct PoolTemplate {
     state_file: String,
 }
 
+/// How many consecutive template-build failures are tolerated before the
+/// verdict becomes permanently `Unavailable`. A transient failure (host
+/// resource pressure, a source VM slow to bind its snapshot socket) presents
+/// identically to "snapshot unsupported by this libkrun build" ("snapshot
+/// socket never appeared"), so a bounded retry avoids permanently downgrading
+/// the whole pool to cold-boot on a one-off hiccup, while still giving up on a
+/// genuinely-unsupported host after a few attempts.
+const MAX_TEMPLATE_BUILD_FAILURES: u32 = 3;
+
 /// Cached state of the snapshot-fork template.
 enum TemplateState {
     /// Not built yet — the first snapshot-fork fill attempts the build.
     Unbuilt,
     /// Built and ready; pool VMs restore from it.
     Ready(PoolTemplate),
-    /// The build failed (native VM snapshot is unavailable on this build/platform).
-    /// Cached so it is not retried — `boot_or_restore` cold-boots instead.
+    /// The last build failed but is still retryable; carries the consecutive
+    /// failure count. A later fill retries until it reaches
+    /// `MAX_TEMPLATE_BUILD_FAILURES`, then it becomes `Unavailable`.
+    Failing(u32),
+    /// The build failed permanently (native VM snapshot unavailable on this
+    /// build/platform, or too many consecutive failures). Cached so it is not
+    /// retried — `boot_or_restore` cold-boots instead.
     Unavailable,
 }
 
@@ -483,7 +497,7 @@ impl WarmPool {
         template: &Arc<Mutex<TemplateState>>,
     ) -> Result<PoolTemplate> {
         let mut guard = template.lock().await;
-        match &*guard {
+        let prior_failures = match &*guard {
             TemplateState::Ready(t) => return Ok(t.clone()),
             TemplateState::Unavailable => {
                 return Err(BoxError::PoolError(
@@ -491,8 +505,10 @@ impl WarmPool {
                         .to_string(),
                 ));
             }
-            TemplateState::Unbuilt => {}
-        }
+            // Unbuilt or a still-retryable prior failure: (re)attempt the build.
+            TemplateState::Failing(n) => *n,
+            TemplateState::Unbuilt => 0,
+        };
 
         match Self::build_template(box_config, event_emitter).await {
             Ok(tpl) => {
@@ -507,13 +523,25 @@ impl WarmPool {
                 Ok(tpl)
             }
             Err(error) => {
-                // Cache the verdict and warn ONCE; the pool falls back to cold boot.
-                tracing::warn!(
-                    %error,
-                    "snapshot-fork template build failed; marking unavailable — \
-                     the warm pool will cold-boot instead"
-                );
-                *guard = TemplateState::Unavailable;
+                // Bounded retry: a transient failure presents identically to
+                // "snapshot unsupported", so only give up permanently after a few
+                // consecutive failures rather than downgrading the pool to
+                // cold-boot forever on a one-off hiccup.
+                let failures = prior_failures + 1;
+                if failures >= MAX_TEMPLATE_BUILD_FAILURES {
+                    tracing::warn!(
+                        %error, failures,
+                        "snapshot-fork template build failed repeatedly; marking \
+                         unavailable — the warm pool will cold-boot"
+                    );
+                    *guard = TemplateState::Unavailable;
+                } else {
+                    tracing::warn!(
+                        %error, failures,
+                        "snapshot-fork template build failed; will retry on a later fill"
+                    );
+                    *guard = TemplateState::Failing(failures);
+                }
                 Err(error)
             }
         }
