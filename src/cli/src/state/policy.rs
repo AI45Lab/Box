@@ -21,7 +21,9 @@ pub(crate) fn should_restart(record: &BoxRecord) -> bool {
     // Parse "on-failure:N" format
     if let Some(max_str) = policy.strip_prefix("on-failure:") {
         if let Ok(max) = max_str.parse::<u32>() {
-            return !record.stopped_by_user && record.restart_count < max;
+            return !record.stopped_by_user
+                && exited_on_failure(record)
+                && record.restart_count < max;
         }
         // Malformed "on-failure:..." — treat as no restart
         return false;
@@ -38,6 +40,11 @@ pub(crate) fn should_restart(record: &BoxRecord) -> bool {
         }
         "on-failure" => {
             if record.stopped_by_user {
+                return false;
+            }
+            // `on-failure` restarts ONLY on a non-zero exit (Docker semantics);
+            // a clean (code 0) exit must not be loop-restarted.
+            if !exited_on_failure(record) {
                 return false;
             }
             if record.max_restart_count > 0 {
@@ -59,6 +66,15 @@ pub(crate) fn should_restart(record: &BoxRecord) -> bool {
         }
         _ => false, // "no" or unknown
     }
+}
+
+/// Whether the box exited in a way that counts as a failure for `on-failure`.
+///
+/// A clean exit (`Some(0)`) is NOT a failure. A non-zero exit is. An unknown
+/// exit (`None` — e.g. the VM was lost before its exit marker was written) is
+/// treated as a failure so genuine crashes still restart.
+fn exited_on_failure(record: &BoxRecord) -> bool {
+    record.exit_code != Some(0)
 }
 
 /// Validate a restart policy string.

@@ -739,6 +739,43 @@ fn test_should_restart_on_failure_not_stopped_by_user() {
 }
 
 #[test]
+fn test_should_restart_on_failure_clean_exit_does_not_restart() {
+    // A box that exited 0 under `on-failure` must NOT be restarted (Docker
+    // semantics) — the bug was an infinite restart loop on clean exit.
+    let mut record = sample_record("id-1", "box1", "dead");
+    record.restart_policy = "on-failure".to_string();
+    record.stopped_by_user = false;
+    record.exit_code = Some(0);
+    assert!(!policy::should_restart(&record));
+
+    // A non-zero exit still restarts.
+    record.exit_code = Some(1);
+    assert!(policy::should_restart(&record));
+
+    // An unknown exit (VM lost before the marker) is treated as a failure.
+    record.exit_code = None;
+    assert!(policy::should_restart(&record));
+}
+
+#[test]
+fn test_should_restart_on_failure_n_respects_exit_code() {
+    let mut record = sample_record("id-1", "box1", "dead");
+    record.restart_policy = "on-failure:3".to_string();
+    record.stopped_by_user = false;
+    record.restart_count = 0;
+    record.exit_code = Some(0);
+    assert!(
+        !policy::should_restart(&record),
+        "clean exit must not restart"
+    );
+    record.exit_code = Some(2);
+    assert!(
+        policy::should_restart(&record),
+        "failure under the cap restarts"
+    );
+}
+
+#[test]
 fn test_should_restart_on_failure_stopped_by_user() {
     let mut record = sample_record("id-1", "box1", "dead");
     record.restart_policy = "on-failure".to_string();
