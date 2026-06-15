@@ -263,23 +263,41 @@ async fn poll_once(tracker: &mut BackoffTracker) -> Result<(), Box<dyn std::erro
         // Attempt restart
         match boot::boot_from_record(&record).await {
             Ok(result) => {
-                // Re-load fresh under the lock and apply only this box's
-                // restart fields, returning the new restart count for logging.
+                // Capture the shim pid before `result` is moved into the closure,
+                // so we can tear the VM down if the record vanished mid-boot.
+                let booted_pid = result.pid;
+                // Re-load fresh under the lock and apply only this box's restart
+                // fields. Returns the new restart count, or None if the record is
+                // gone — a concurrent `rm` removed the box while we were booting.
                 let new_count = StateFile::modify(|s| {
-                    let count = if let Some(rec) = s.find_by_id_mut(&box_id) {
+                    let count = s.find_by_id_mut(&box_id).map(|rec| {
                         boot::apply_boot_result(rec, result, boot::RestartCountUpdate::Increment);
                         rec.restart_count
-                    } else {
-                        0
-                    };
-                    Ok::<u32, std::io::Error>(count)
+                    });
+                    Ok::<Option<u32>, std::io::Error>(count)
                 })?;
                 tracker.record_attempt(&box_id);
-                println!(
-                    "monitor: box {name} ({short_id}) restarted (count: {new_count})",
-                    name = record.name,
-                    short_id = record.short_id,
-                );
+                match new_count {
+                    Some(new_count) => println!(
+                        "monitor: box {name} ({short_id}) restarted (count: {new_count})",
+                        name = record.name,
+                        short_id = record.short_id,
+                    ),
+                    None => {
+                        // The box was removed during the restart boot: the VM we
+                        // just started has no record tracking it. Tear it down so
+                        // it doesn't leak as an orphan shim + overlay mount.
+                        eprintln!(
+                            "monitor: box {name} ({short_id}) was removed during restart; tearing down the orphaned VM",
+                            name = record.name,
+                            short_id = record.short_id,
+                        );
+                        if let Some(pid) = booted_pid {
+                            crate::process::graceful_stop(pid, libc::SIGTERM, 5).await;
+                        }
+                        crate::cleanup::cleanup_removed_box(&record);
+                    }
+                }
             }
             Err(e) => {
                 tracker.record_attempt(&box_id);
