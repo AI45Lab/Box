@@ -290,13 +290,14 @@ fn verify_cert_chain(vcek_der: &[u8], ask_der: &[u8], ark_der: &[u8]) -> bool {
     use der::Decode;
     use x509_cert::Certificate;
 
-    // If any cert is empty, we can't verify the chain.
-    // The report may have been returned without certs (e.g., from cache).
+    // A missing cert means the chain cannot be verified — fail closed. There is
+    // no KDS-fetch fallback in this path, so an absent VCEK/ASK/ARK is NOT a
+    // "skip and trust"; it is an unverifiable chain. (Returning true for the
+    // all-empty case was a latent fail-open, masked only by the separate report
+    // signature check rejecting an empty VCEK.)
     if vcek_der.is_empty() || ask_der.is_empty() || ark_der.is_empty() {
-        tracing::warn!("Certificate chain incomplete, skipping chain verification");
-        // Return true if all are empty (certs not provided, will verify via KDS later)
-        // Return false if partially provided (inconsistent state)
-        return vcek_der.is_empty() && ask_der.is_empty() && ark_der.is_empty();
+        tracing::warn!("Certificate chain incomplete — cannot verify, rejecting");
+        return false;
     }
 
     // Parse all three certificates
@@ -684,9 +685,10 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_cert_chain_all_empty() {
-        // All empty = certs not provided, acceptable (will verify via KDS later)
-        assert!(verify_cert_chain(&[], &[], &[]));
+    fn test_verify_cert_chain_empty_fails_closed() {
+        // An empty chain is unverifiable, not "trusted by default" — fail closed
+        // (closes a latent fail-open where all-empty returned true).
+        assert!(!verify_cert_chain(&[], &[], &[]));
     }
 
     #[test]
