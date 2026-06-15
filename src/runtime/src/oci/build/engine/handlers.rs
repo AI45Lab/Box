@@ -860,7 +860,7 @@ fn download_url(url: &str) -> std::result::Result<Vec<u8>, String> {
                 .build()
                 .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
-            let response = client
+            let mut response = client
                 .get(url)
                 .send()
                 .await
@@ -870,11 +870,32 @@ fn download_url(url: &str) -> std::result::Result<Vec<u8>, String> {
                 return Err(format!("HTTP {} for {}", response.status(), url));
             }
 
-            response
-                .bytes()
+            // Cap the download so a hostile/huge URL cannot OOM the build host:
+            // `bytes()` buffers the WHOLE body with no limit. Reject an oversized
+            // advertised length early, then stream with a hard cap (the length
+            // header may be absent or lie).
+            const MAX_ADD_URL_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB
+            if let Some(len) = response.content_length() {
+                if len > MAX_ADD_URL_BYTES {
+                    return Err(format!(
+                        "ADD URL body too large: {len} bytes (max {MAX_ADD_URL_BYTES})"
+                    ));
+                }
+            }
+            let mut buf: Vec<u8> = Vec::new();
+            while let Some(chunk) = response
+                .chunk()
                 .await
-                .map(|b| b.to_vec())
-                .map_err(|e| format!("Failed to read response body: {}", e))
+                .map_err(|e| format!("Failed to read response body: {}", e))?
+            {
+                if buf.len() as u64 + chunk.len() as u64 > MAX_ADD_URL_BYTES {
+                    return Err(format!(
+                        "ADD URL body exceeds max {MAX_ADD_URL_BYTES} bytes"
+                    ));
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            Ok(buf)
         })
     })
 }

@@ -170,12 +170,48 @@ pub(super) fn assert_within(base: &Path, candidate: &Path) -> Result<()> {
 
 /// Expand `${VAR}` and `$VAR` references in a string using build args.
 pub(super) fn expand_args(s: &str, args: &HashMap<String, String>) -> String {
-    let mut result = s.to_string();
-    for (key, value) in args {
-        result = result.replace(&format!("${{{}}}", key), value);
-        result = result.replace(&format!("${}", key), value);
+    // Scan for $NAME / ${NAME} and expand each to the WHOLE identifier's value.
+    // A naive per-key string replace collides on prefixes (replacing `$VAR` also
+    // rewrites the `$VAR` inside `$VARLONG` / `$VARX`), and the result depends on
+    // HashMap iteration order. Here `$VAR` matches the longest [A-Za-z0-9_] run,
+    // so it never partially rewrites a longer name. An undefined name is left
+    // literal (the prior behavior — only defined keys were substituted).
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(s.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'$' && i + 1 < b.len() {
+            if b[i + 1] == b'{' {
+                if let Some(rel) = s[i + 2..].find('}') {
+                    let name = &s[i + 2..i + 2 + rel];
+                    match args.get(name) {
+                        Some(v) => out.extend_from_slice(v.as_bytes()),
+                        None => out.extend_from_slice(&b[i..i + 2 + rel + 1]),
+                    }
+                    i += 2 + rel + 1;
+                    continue;
+                }
+            } else {
+                let start = i + 1;
+                let mut j = start;
+                while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                    j += 1;
+                }
+                if j > start {
+                    let name = &s[start..j];
+                    match args.get(name) {
+                        Some(v) => out.extend_from_slice(v.as_bytes()),
+                        None => out.extend_from_slice(&b[i..j]),
+                    }
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        out.push(b[i]);
+        i += 1;
     }
-    result
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Compute the diff_id (SHA256 of uncompressed layer content).
@@ -374,6 +410,24 @@ pub(super) fn format_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_expand_args_no_prefix_collision() {
+        let mut args = HashMap::new();
+        args.insert("VAR".to_string(), "x".to_string());
+        args.insert("VARLONG".to_string(), "y".to_string());
+        // $VARLONG must expand to the longer key, not `$VAR` + "LONG".
+        assert_eq!(expand_args("$VARLONG", &args), "y");
+        assert_eq!(expand_args("${VARLONG}", &args), "y");
+        assert_eq!(expand_args("$VAR", &args), "x");
+        assert_eq!(expand_args("$VAR/$VARLONG", &args), "x/y");
+        assert_eq!(expand_args("a-${VAR}-b", &args), "a-x-b");
+        // $VARX (VARX undefined) must NOT become "x" + "X" — left literal.
+        assert_eq!(expand_args("$VARX", &args), "$VARX");
+        // Undefined names are left literal (prior behavior).
+        assert_eq!(expand_args("$UNSET", &args), "$UNSET");
+        assert_eq!(expand_args("${UNSET}", &args), "${UNSET}");
+    }
 
     #[test]
     fn test_reject_path_traversal() {
