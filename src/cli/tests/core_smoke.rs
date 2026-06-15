@@ -466,9 +466,16 @@ impl CoreSmoke {
 
     fn inspect_json(&self, name: &str) -> serde_json::Value {
         let stdout = self.ok(&["inspect", name]);
-        serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
             panic!("failed to parse inspect JSON for {name}: {e}\nstdout:\n{stdout}")
-        })
+        });
+        // `a3s-box inspect` returns a Docker-shaped array `[{...}]`. Every caller
+        // here wants the single object, so unwrap it (pass through if it is
+        // already an object, for robustness).
+        match parsed {
+            serde_json::Value::Array(mut items) if !items.is_empty() => items.remove(0),
+            other => other,
+        }
     }
 
     fn wait_for_named_status(&self, name: &str, expected: &str) -> serde_json::Value {
