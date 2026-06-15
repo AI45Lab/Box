@@ -8,7 +8,9 @@
 //! - `verifier`: Host-side report verification (signature + policy).
 //! - `policy`: Verification policy definitions.
 //! - `certs`: AMD KDS certificate fetching and caching.
+//! - `ark_roots`: Pinned genuine AMD ARK root keys (chain trust anchor).
 
+pub mod ark_roots;
 pub mod attestation;
 pub mod certs;
 pub mod extension;

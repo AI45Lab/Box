@@ -280,10 +280,12 @@ fn verify_p384_signature(
 ///
 /// Checks that:
 /// 1. Each certificate is a valid X.509 certificate
-/// 2. VCEK is signed by ASK (ECDSA-P384 signature verification)
-/// 3. ASK is signed by ARK (ECDSA-P384 signature verification)
-/// 4. ARK is self-signed (ECDSA-P384 signature verification)
-/// 5. Issuer/subject names match across the chain
+/// 2. Issuer/subject names match across the chain
+/// 3. VCEK is signed by ASK, ASK is signed by ARK, ARK is self-signed
+///    (each verified with the issuer key's own algorithm — RSASSA-PSS/SHA-384
+///    for AMD's RSA ARK/ASK, ECDSA-P384 for an EC issuer)
+/// 4. **The ARK is a pinned genuine AMD root** ([`super::ark_roots`]) — without
+///    this, a self-minted but internally-consistent chain would pass.
 fn verify_cert_chain(vcek_der: &[u8], ask_der: &[u8], ark_der: &[u8]) -> bool {
     use der::Decode;
     use x509_cert::Certificate;
@@ -362,19 +364,32 @@ fn verify_cert_chain(vcek_der: &[u8], ask_der: &[u8], ark_der: &[u8]) -> bool {
         return false;
     }
 
+    // Trust anchor: the chain must terminate at a GENUINE AMD ARK root, not a
+    // self-minted one. Internal self-consistency is necessary but NOT
+    // sufficient — without pinning, an attacker's own self-signed
+    // ARK → ASK → VCEK chain (signing a forged report) passes every check
+    // above. Pinning the ARK to AMD's published roots closes that fail-open.
+    if !super::ark_roots::is_trusted_ark(ark_der) {
+        tracing::warn!(
+            "ARK is not a pinned genuine AMD root key — rejecting (possible self-minted chain)"
+        );
+        return false;
+    }
+
     true
 }
 
-/// Verify that `cert` was signed by `issuer` using ECDSA-P384.
+/// Verify that `cert` was signed by `issuer`.
 ///
-/// Extracts the tbsCertificate DER bytes from `cert`, the signature from
-/// `cert.signature`, and the public key from `issuer`, then performs
-/// ECDSA-P384-SHA384 verification.
+/// The verification primitive is chosen by the **issuer's** public-key
+/// algorithm: AMD's ARK and ASK are RSA-4096 (RSASSA-PSS / SHA-384), while only
+/// the leaf VCEK is ECDSA-P384. A verifier that only knew ECDSA would silently
+/// reject every genuine AMD chain — and "validate" a synthetic all-ECDSA one,
+/// which is exactly the footgun that lets a self-minted chain look legitimate.
 fn verify_cert_signature(cert: &x509_cert::Certificate, issuer: &x509_cert::Certificate) -> bool {
     use der::Encode;
-    use p384::ecdsa::{signature::Verifier, DerSignature, VerifyingKey};
 
-    // Encode the tbsCertificate to DER (this is the signed data)
+    // Encode the tbsCertificate to DER (this is the signed data).
     let tbs_der = match cert.tbs_certificate.to_der() {
         Ok(d) => d,
         Err(e) => {
@@ -383,7 +398,7 @@ fn verify_cert_signature(cert: &x509_cert::Certificate, issuer: &x509_cert::Cert
         }
     };
 
-    // Extract the signature bytes from the certificate
+    // Extract the signature bytes from the certificate.
     let sig_bytes = match cert.signature.as_bytes() {
         Some(b) => b,
         None => {
@@ -392,22 +407,10 @@ fn verify_cert_signature(cert: &x509_cert::Certificate, issuer: &x509_cert::Cert
         }
     };
 
-    // Parse as DER-encoded ECDSA signature
-    let signature = match DerSignature::from_bytes(sig_bytes) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!("Failed to parse certificate ECDSA signature: {}", e);
-            return false;
-        }
-    };
-
-    // Extract the issuer's public key
-    let issuer_pub_key_bytes = match issuer
-        .tbs_certificate
-        .subject_public_key_info
-        .subject_public_key
-        .as_bytes()
-    {
+    // Extract the issuer's public key bytes (DER RSAPublicKey for RSA, or the
+    // SEC1 point for EC).
+    let issuer_spki = &issuer.tbs_certificate.subject_public_key_info;
+    let issuer_pub_key_bytes = match issuer_spki.subject_public_key.as_bytes() {
         Some(b) => b,
         None => {
             tracing::warn!("Failed to extract issuer public key bytes");
@@ -415,20 +418,48 @@ fn verify_cert_signature(cert: &x509_cert::Certificate, issuer: &x509_cert::Cert
         }
     };
 
-    let verifying_key = match VerifyingKey::from_sec1_bytes(issuer_pub_key_bytes) {
+    match issuer_spki.algorithm.oid.to_string().as_str() {
+        // rsaEncryption | rsassaPss → RSASSA-PSS with SHA-384 (AMD ARK/ASK).
+        "1.2.840.113549.1.1.1" | "1.2.840.113549.1.1.10" => {
+            verify_rsa_pss_sha384(&tbs_der, sig_bytes, issuer_pub_key_bytes)
+        }
+        // id-ecPublicKey → ECDSA-P384 (e.g. an EC-signed VCEK).
+        "1.2.840.10045.2.1" => verify_ecdsa_p384_cert(&tbs_der, sig_bytes, issuer_pub_key_bytes),
+        other => {
+            tracing::warn!("Unsupported issuer key algorithm OID: {other}");
+            false
+        }
+    }
+}
+
+/// Verify an RSASSA-PSS / SHA-384 signature (AMD ARK/ASK) over `message` using a
+/// DER `RSAPublicKey` (the SPKI subjectPublicKey contents for an RSA issuer).
+fn verify_rsa_pss_sha384(message: &[u8], signature: &[u8], rsa_pub_der: &[u8]) -> bool {
+    use ring::signature;
+    let key = signature::UnparsedPublicKey::new(&signature::RSA_PSS_2048_8192_SHA384, rsa_pub_der);
+    key.verify(message, signature).is_ok()
+}
+
+/// Verify an ECDSA-P384 certificate signature using a DER-encoded ECDSA
+/// signature and a SEC1-encoded EC public key.
+fn verify_ecdsa_p384_cert(message: &[u8], sig_der: &[u8], ec_pub_sec1: &[u8]) -> bool {
+    use p384::ecdsa::{signature::Verifier, DerSignature, VerifyingKey};
+
+    let signature = match DerSignature::from_bytes(sig_der) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("Failed to parse certificate ECDSA signature: {}", e);
+            return false;
+        }
+    };
+    let verifying_key = match VerifyingKey::from_sec1_bytes(ec_pub_sec1) {
         Ok(k) => k,
         Err(e) => {
             tracing::warn!("Failed to create P-384 verifying key from issuer: {}", e);
             return false;
         }
     };
-
-    // Verify the signature over the tbsCertificate DER bytes.
-    // X.509 uses SHA-384 hash internally for P-384 signatures.
-    match verifying_key.verify(&tbs_der, &signature) {
-        Ok(()) => true,
-        Err(_) => false,
-    }
+    verifying_key.verify(message, &signature).is_ok()
 }
 
 /// Check the attestation report against the verification policy.
@@ -721,9 +752,38 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_cert_chain_valid_signatures() {
+    fn test_verify_cert_chain_rejects_untrusted_synthetic_root() {
+        // The synthetic chain's signatures are all internally consistent (it is
+        // a genuine ECDSA chain), so it passes every signature/issuer check —
+        // but its ARK is self-minted, not a pinned AMD root, so it MUST be
+        // rejected. This is precisely the fail-open that pinning closes: an
+        // attacker who mints their own ARK → ASK → VCEK and signs a forged
+        // report can no longer pass verification.
         let (vcek, ask, ark) = make_test_cert_chain();
-        assert!(verify_cert_chain(&vcek, &ask, &ark));
+        assert!(
+            !crate::tee::ark_roots::is_trusted_ark(&ark),
+            "a self-minted ARK must not be trusted"
+        );
+        assert!(
+            !verify_cert_chain(&vcek, &ask, &ark),
+            "an internally-consistent but self-minted chain must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_genuine_amd_ark_self_signature_verifies_via_rsa_pss() {
+        use crate::tee::ark_roots::AMD_ARK_ROOTS;
+        use der::Decode;
+        // The real AMD ARKs are RSA-4096 / RSASSA-PSS-SHA384. This exercises the
+        // RSA path of verify_cert_signature against genuine AMD certificates
+        // (the ECDSA-only predecessor would have rejected all of them).
+        for ark_der in AMD_ARK_ROOTS {
+            let ark = x509_cert::Certificate::from_der(ark_der).unwrap();
+            assert!(
+                verify_cert_signature(&ark, &ark),
+                "a genuine AMD ARK self-signature must verify via RSASSA-PSS/SHA-384"
+            );
+        }
     }
 
     #[test]
