@@ -761,8 +761,21 @@ impl WarmPool {
                             }
                             while let Some(joined) = set.join_next().await {
                                 match joined {
-                                    Ok(Ok(vm)) => {
+                                    Ok(Ok(mut vm)) => {
                                         let box_id = vm.box_id().to_string();
+                                        // If shutdown landed while this batch was
+                                        // booting, drain_idle has already cleared
+                                        // `idle` and will not run again, so a VM
+                                        // pushed now leaks (no Drop reaper). Destroy
+                                        // it instead.
+                                        if *shutdown_rx.borrow() {
+                                            tracing::debug!(
+                                                box_id = %box_id,
+                                                "Pool shutting down mid-replenish; destroying freshly-booted VM"
+                                            );
+                                            let _ = vm.destroy_with_timeout(2000).await;
+                                            continue;
+                                        }
                                         let mut pool = idle.lock().await;
                                         pool.push(WarmVm {
                                             vm,
