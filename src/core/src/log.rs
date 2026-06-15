@@ -257,7 +257,15 @@ pub fn run_log_processor(
     stop: &AtomicBool,
 ) {
     match config.driver {
-        LogDriver::None => {}
+        // `none` produces no structured output, but libkrun still writes the raw
+        // console for the VM's lifetime — drain + bound it so a chatty box with
+        // logging disabled doesn't fill the disk (same hazard as the other
+        // drivers).
+        LogDriver::None => run_discard_processor(
+            console_log,
+            Some(console_cap(config.max_size(), config.max_file())),
+            stop,
+        ),
         LogDriver::JsonFile => run_json_file_processor(
             console_log,
             log_dir,
@@ -332,6 +340,20 @@ fn run_tagged_tail(
 /// max_file`) so the raw console never outgrows the queryable log it feeds.
 fn console_cap(max_size: u64, max_file: u32) -> u64 {
     max_size.saturating_mul(u64::from(max_file.max(1)))
+}
+
+/// Drain and bound the console for the `none` driver: tail both console files
+/// (advancing to clean line boundaries) and truncate when over `cap`, emitting
+/// nothing. Without this, `--log-driver none` would leave libkrun's raw
+/// `console.log`/`console.err.log` to grow without limit.
+fn run_discard_processor(console_log: &Path, cap: Option<u64>, stop: &AtomicBool) {
+    let err_log = stderr_console_path(console_log);
+    let discard = |_line: &str, _stream: &str| {};
+    let discard: &(dyn Fn(&str, &str) + Sync) = &discard;
+    std::thread::scope(|s| {
+        s.spawn(|| run_tagged_tail(console_log, "stdout", false, cap, stop, discard));
+        s.spawn(|| run_tagged_tail(&err_log, "stderr", false, cap, stop, discard));
+    });
 }
 
 fn run_json_file_processor(
@@ -723,6 +745,39 @@ mod tests {
             final_len <= cap + 6,
             "console.log unbounded: {final_len} bytes"
         );
+    }
+
+    #[test]
+    fn test_none_driver_still_bounds_console() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let console = dir.path().join("console.log");
+        std::fs::write(&console, b"l1\nl2\nl3\n").unwrap(); // 9 bytes
+        std::fs::write(dir.path().join("console.err.log"), b"").unwrap();
+
+        // none driver, tiny cap (max_size 4 * max_file 1).
+        let mut options = HashMap::new();
+        options.insert("max-size".to_string(), "4".to_string());
+        options.insert("max-file".to_string(), "1".to_string());
+        let config = LogConfig {
+            driver: LogDriver::None,
+            options,
+        };
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let (s2, c2, d2) = (stop.clone(), console.clone(), dir.path().to_path_buf());
+        let handle = std::thread::spawn(move || run_log_processor(&c2, &d2, &config, &s2));
+
+        std::thread::sleep(Duration::from_millis(300));
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        // The raw console was bounded even though `none` produces no output, and
+        // no container.json was written.
+        assert!(std::fs::metadata(&console).unwrap().len() <= 4);
+        assert!(!dir.path().join("container.json").exists());
     }
 
     #[test]
