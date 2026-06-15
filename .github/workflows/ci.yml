@@ -230,3 +230,17 @@ jobs:
           unset A3S_DEPS_STUB
           chmod +x bench/bench.sh
           bench/bench.sh leak
+      # Gate the cross-process advisory lock on boxes.json against REAL VMs:
+      # concurrent `run -d` processes must NOT lose each other's state writes.
+      # The unit tests only race in-process threads, so a broken/missing flock
+      # across separate a3s-box processes is invisible to them — this boots a
+      # fleet at once and asserts no lost update + intact JSON. Exits non-zero
+      # on a lost update, failing the gate.
+      - name: Race assertion — no lost update on boxes.json under concurrent run -d
+        env:
+          A3S_BOX: ${{ github.workspace }}/src/target/release/a3s-box
+          RACE: "8"
+        run: |
+          unset A3S_DEPS_STUB
+          chmod +x bench/bench.sh
+          bench/bench.sh race

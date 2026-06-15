@@ -8,13 +8,14 @@
 # place real microVMs boot).
 #
 # Usage:
-#   bench/bench.sh [all|cold|warm|fork|leak]   (default: all)
+#   bench/bench.sh [all|cold|warm|fork|leak|race]   (default: all)
 # Env:
 #   A3S_BOX   path to the a3s-box binary           (default: a3s-box on PATH)
 #   IMAGE     OCI image to benchmark                (default: alpine:latest)
 #   RUNS      samples per latency benchmark         (default: 20)
 #   POOL_SIZE warm-pool / fork fill size            (default: 16)
 #   CHURN     create/run/remove cycles for the leak test (default: 30)
+#   RACE      concurrent `run -d` processes for the cross-process race (default: 8)
 #
 # Exit code is non-zero if the leak assertion fails, so it is CI-gateable
 # (wire it into the self-hosted KVM job — see docs/ci-kvm-runner.md).
@@ -25,6 +26,7 @@ IMAGE="${IMAGE:-alpine:latest}"
 RUNS="${RUNS:-20}"
 POOL_SIZE="${POOL_SIZE:-16}"
 CHURN="${CHURN:-30}"
+RACE="${RACE:-8}"
 MODE="${1:-all}"
 
 now_ms() { date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))'; }
@@ -120,6 +122,61 @@ bench_leak() {
   return "$leak"
 }
 
+# Cross-process lost-update + JSON-integrity assertion.
+#
+# Every `a3s-box run -d` registers its box by load-modify-saving the SHARED
+# boxes.json. In production multiple CLIs (plus the monitor and CRI) do this
+# concurrently, so the write path is guarded by a cross-process advisory lock
+# (flock on boxes.json.lock). The unit tests only race in-process threads and
+# therefore CANNOT catch a broken or missing flock. This boots RACE real
+# microVMs at once and asserts that (a) boxes.json still parses afterward and
+# (b) every launch that reported success actually persisted — a clobbered
+# load-modify-save would silently drop entries (the classic lost update).
+bench_race() {
+  local N="$RACE"
+  local tag="race-$$"
+  echo "## Cross-process race ($N concurrent run -d -> boxes.json)"
+
+  # Baseline must load cleanly, so a failure below is attributable to the race.
+  if ! "$A3S_BOX" ps -a >/dev/null 2>&1; then
+    echo "  FAIL: boxes.json does not load before the race"; return 1
+  fi
+
+  local pids="" p
+  for i in $(seq 1 "$N"); do
+    "$A3S_BOX" run -d --name "$tag-$i" "$IMAGE" -- sleep 30 >/dev/null 2>&1 &
+    pids="$pids $!"
+  done
+  local ok=0
+  for p in $pids; do wait "$p" && ok=$(( ok + 1 )); done
+  echo "  launched: $ok/$N detached boxes reported success"
+
+  local rc=0
+  # The CLI re-reads boxes.json here; a torn write makes this fail or quarantine.
+  if ! "$A3S_BOX" ps -a >/dev/null 2>&1; then
+    echo "  FAIL: boxes.json is unreadable after the race (torn write)"
+    rc=1
+  else
+    local persisted
+    persisted=$("$A3S_BOX" ps -a --format '{{.Names}}' 2>/dev/null | grep -c "^$tag-")
+    echo "  persisted: $persisted entries named $tag-* (expected $ok)"
+    if [ "$persisted" -ne "$ok" ]; then
+      echo "  FAIL: lost update — $ok launches succeeded but only $persisted persisted"
+      rc=1
+    else
+      echo "  PASS: every successful launch persisted (no lost update, JSON intact)"
+    fi
+  fi
+
+  # Cleanup: remove every race box and verify none linger (the test must not leak).
+  for i in $(seq 1 "$N"); do "$A3S_BOX" rm -f "$tag-$i" >/dev/null 2>&1; done
+  sleep 2
+  local left
+  left=$("$A3S_BOX" ps -a --format '{{.Names}}' 2>/dev/null | grep -c "^$tag-")
+  [ "$left" -ne 0 ] && { echo "  FAIL: $left race box(es) survived cleanup"; rc=1; }
+  return "$rc"
+}
+
 require_kvm
 echo "# a3s-box benchmark — $(uname -sm), image=$IMAGE"
 rc=0
@@ -128,12 +185,14 @@ case "$MODE" in
   warm) bench_warm ;;
   fork) bench_fork ;;
   leak) bench_leak || rc=$? ;;
+  race) bench_race || rc=$? ;;
   all)
     bench_cold
     bench_warm
     bench_fork
     bench_leak || rc=$?
+    bench_race || rc=$?
     ;;
-  *) echo "unknown mode: $MODE (use all|cold|warm|fork|leak)"; exit 2 ;;
+  *) echo "unknown mode: $MODE (use all|cold|warm|fork|leak|race)"; exit 2 ;;
 esac
 exit "$rc"
