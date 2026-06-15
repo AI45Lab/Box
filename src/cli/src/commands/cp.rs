@@ -276,7 +276,13 @@ async fn copy_dir_from_box(
         cmd: vec![
             "sh".to_string(),
             "-c".to_string(),
-            format!("tar -cf - -C {} . | base64", shell_escape(box_path)),
+            // `set -o pipefail` so a `tar` failure (EACCES, missing file)
+            // propagates instead of being masked by base64's exit 0 — otherwise
+            // a truncated archive extracts and `cp` falsely reports success.
+            format!(
+                "set -o pipefail; tar -cf - -C {} . | base64",
+                shell_escape(box_path)
+            ),
         ],
         timeout_ns: DIR_TRANSFER_TIMEOUT_NS,
         env: vec![],
@@ -337,7 +343,7 @@ async fn copy_dir_to_box(
             "sh".to_string(),
             "-c".to_string(),
             format!(
-                "mkdir -p {} && echo '{}' | base64 -d | tar -xf - -C {}",
+                "set -o pipefail; mkdir -p {} && echo '{}' | base64 -d | tar -xf - -C {}",
                 shell_escape(box_path),
                 encoded,
                 shell_escape(box_path)
