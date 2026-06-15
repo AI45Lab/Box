@@ -557,6 +557,46 @@ fn test_reconcile_paused_without_pid_removes_external_socket_dir() {
 }
 
 #[test]
+fn test_concurrent_reconcile_load_tears_down_once_no_panic() {
+    // Regression for the unlocked reconcile-on-load races (#1 lost-update, #8
+    // double-teardown): many concurrent reconcile-on-load passes over the same
+    // dead auto-remove box must serialize on the state lock (flush_reconcile),
+    // tear it down exactly once, and never panic / double-free.
+    let tmp = TempDir::new().unwrap();
+    let path = test_state_path(&tmp);
+    let box_dir = tmp.path().join("concurrent-rm-box");
+    std::fs::create_dir_all(box_dir.join("sockets")).unwrap();
+
+    {
+        let mut sf = StateFile::load(&path).unwrap();
+        let mut record = sample_record("conc-rm-id", "conc_rm_box", "created");
+        record.status = "running".to_string();
+        record.pid = None; // dead
+        record.auto_remove = true;
+        record.box_dir = box_dir.clone();
+        record.exec_socket_path = box_dir.join("sockets").join("exec.sock");
+        sf.records.push(record);
+        sf.save().unwrap();
+    }
+
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let p = path.clone();
+            std::thread::spawn(move || {
+                let _ = StateFile::load(&p);
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let sf = StateFile::load(&path).unwrap();
+    assert!(sf.find_by_id("conc-rm-id").is_none());
+    assert!(!box_dir.exists());
+}
+
+#[test]
 fn test_reconcile_auto_removes_dead_running_box() {
     let tmp = TempDir::new().unwrap();
     let path = test_state_path(&tmp);
