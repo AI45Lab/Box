@@ -59,8 +59,8 @@ It then serves (plain HTTP, **off by default**, bind loopback — there is no au
 
 | Path | Response |
 |------|----------|
-| `GET /healthz` | `200 ok` — liveness probe |
-| `GET /metrics` | Prometheus text of box-state metrics |
+| `GET /healthz` | `200 ok` while the poll loop is alive; **`503`** if it has not completed a poll within the staleness threshold (`3 × interval`, min 30s) — so a hung supervision loop fails the probe instead of lying |
+| `GET /metrics` | Prometheus text of box-state + monitor-liveness metrics |
 
 Exported metrics (read fresh from state per scrape, no side effects):
 
@@ -69,6 +69,8 @@ a3s_box_total                         # boxes tracked
 a3s_box_state{status="running"|"paused"|"dead"|"created"|"other"}
 a3s_box_restarts_total                # sum of per-box restart counts
 a3s_box_health{status="healthy"|"unhealthy"}
+a3s_box_monitor_up                    # 1 if the poll loop polled within the threshold
+a3s_box_monitor_seconds_since_last_poll
 ```
 
 To run the metrics endpoint under the installed service, append the flag to the

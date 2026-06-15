@@ -105,9 +105,41 @@ fn parse_get_path(request: &str) -> Option<&str> {
     Some(target.split('?').next().unwrap_or(target))
 }
 
-/// Serve `/metrics` and `/healthz` on `addr` until the process exits. Each
-/// scrape reads a fresh **read-only** state snapshot (no reconcile side effects).
-pub async fn serve(addr: String) -> Result<(), Box<dyn std::error::Error>> {
+/// Current Unix time in seconds (0 on a pre-epoch clock).
+pub(super) fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Render the monitor's own liveness gauges from the shared last-poll clock.
+fn render_monitor_liveness(last_poll_secs: u64, stale_after_secs: u64) -> String {
+    let age = now_secs().saturating_sub(last_poll_secs);
+    let up = u8::from(age <= stale_after_secs);
+    format!(
+        "# HELP a3s_box_monitor_up 1 if the monitor poll loop completed a poll within the staleness threshold.\n\
+         # TYPE a3s_box_monitor_up gauge\n\
+         a3s_box_monitor_up {up}\n\
+         # HELP a3s_box_monitor_seconds_since_last_poll Seconds since the monitor last completed a poll iteration.\n\
+         # TYPE a3s_box_monitor_seconds_since_last_poll gauge\n\
+         a3s_box_monitor_seconds_since_last_poll {age}\n"
+    )
+}
+
+/// Serve `/metrics` and `/healthz` on `addr` until the process exits.
+///
+/// `last_poll` is the shared Unix-seconds timestamp the monitor's poll loop
+/// updates after every iteration; `/healthz` reports **503** (not a lying 200)
+/// if the loop has not polled within `stale_after_secs` — i.e. it actually
+/// reflects whether the supervision loop is alive, not just that the HTTP task
+/// is. Each `/metrics` scrape reads a fresh **read-only** state snapshot.
+pub async fn serve(
+    addr: String,
+    last_poll: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    stale_after_secs: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::sync::atomic::Ordering;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -122,6 +154,7 @@ pub async fn serve(addr: String) -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
         };
+        let last_poll = std::sync::Arc::clone(&last_poll);
         tokio::spawn(async move {
             // Read the request head (bounded — we only need the first line).
             let mut buf = [0u8; 2048];
@@ -131,11 +164,28 @@ pub async fn serve(addr: String) -> Result<(), Box<dyn std::error::Error>> {
             };
             let request = String::from_utf8_lossy(&buf[..n]);
             let response = match parse_get_path(&request) {
-                Some("/healthz") => http_response("200 OK", "text/plain", "ok\n"),
+                Some("/healthz") => {
+                    let age = now_secs().saturating_sub(last_poll.load(Ordering::Relaxed));
+                    if age <= stale_after_secs {
+                        http_response("200 OK", "text/plain", "ok\n")
+                    } else {
+                        http_response(
+                            "503 Service Unavailable",
+                            "text/plain",
+                            &format!(
+                                "stale: monitor poll loop has not run for {age}s (threshold {stale_after_secs}s)\n"
+                            ),
+                        )
+                    }
+                }
                 Some("/metrics") => {
-                    let body = StateFile::load_readonly()
+                    let mut body = StateFile::load_readonly()
                         .map(|s| render_box_metrics(s.records()))
                         .unwrap_or_else(|e| format!("# state load error: {e}\n"));
+                    body.push_str(&render_monitor_liveness(
+                        last_poll.load(Ordering::Relaxed),
+                        stale_after_secs,
+                    ));
                     http_response("200 OK", "text/plain; version=0.0.4", &body)
                 }
                 Some(_) => http_response("404 Not Found", "text/plain", "not found\n"),
@@ -208,5 +258,17 @@ mod tests {
         assert!(r.contains("Content-Length: 3"));
         assert!(r.contains("Connection: close"));
         assert!(r.ends_with("ok\n"));
+    }
+
+    #[test]
+    fn monitor_liveness_up_when_fresh_down_when_stale() {
+        let now = now_secs();
+        let fresh = render_monitor_liveness(now, 60);
+        assert!(fresh.contains("a3s_box_monitor_up 1"));
+        assert!(fresh.contains("a3s_box_monitor_seconds_since_last_poll 0"));
+
+        // A poll 1000s ago with a 60s threshold is stale → down.
+        let stale = render_monitor_liveness(now.saturating_sub(1000), 60);
+        assert!(stale.contains("a3s_box_monitor_up 0"));
     }
 }

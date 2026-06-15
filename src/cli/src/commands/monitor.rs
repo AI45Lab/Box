@@ -164,10 +164,19 @@ pub async fn execute(args: MonitorArgs) -> Result<(), Box<dyn std::error::Error>
         args.interval
     );
 
+    // Shared last-poll clock so the metrics endpoint's /healthz reflects whether
+    // the poll loop is actually alive (not just that the HTTP task is up).
+    let last_poll = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+        super::monitor_metrics::now_secs(),
+    ));
+
     // Optional metrics/health endpoint, served alongside the poll loop.
     if let Some(addr) = args.metrics_addr.clone() {
+        let last_poll = std::sync::Arc::clone(&last_poll);
+        // A poll is "stale" after 3 intervals, with a 30s floor for short intervals.
+        let stale_after = args.interval.saturating_mul(3).max(30);
         tokio::spawn(async move {
-            if let Err(e) = super::monitor_metrics::serve(addr).await {
+            if let Err(e) = super::monitor_metrics::serve(addr, last_poll, stale_after).await {
                 eprintln!("monitor metrics: failed to serve: {e}");
             }
         });
@@ -177,6 +186,12 @@ pub async fn execute(args: MonitorArgs) -> Result<(), Box<dyn std::error::Error>
         if let Err(e) = poll_once(&mut tracker).await {
             eprintln!("monitor: poll error: {e}");
         }
+        // Mark the loop alive (a hung poll_once stops updating this, so /healthz
+        // goes 503; a transient poll error keeps the loop alive and healthy).
+        last_poll.store(
+            super::monitor_metrics::now_secs(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         tokio::time::sleep(interval).await;
     }
 }
