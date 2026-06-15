@@ -125,6 +125,49 @@ pub(super) fn resolve_path(workdir: &str, path: &str) -> String {
     }
 }
 
+/// Reject a COPY/ADD path containing a `..` component. `Path::join` does not
+/// normalize, so a preserved `..` is resolved by the OS at access time and
+/// escapes the build context (source) or rootfs (destination) — Docker forbids
+/// this ("forbidden path outside the build context").
+pub(super) fn reject_path_traversal(path: &str) -> Result<()> {
+    if Path::new(path)
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(BoxError::BuildError(format!(
+            "COPY/ADD path '{path}' contains '..' (forbidden: it would escape the \
+             build context / rootfs)"
+        )));
+    }
+    Ok(())
+}
+
+/// Assert that `candidate` resolves *inside* `base`, following symlinks. Guards
+/// against a base-image (or prior-COPY) symlink whose target leaves the rootfs:
+/// canonicalize the deepest existing ancestor of `candidate` (it may not exist
+/// yet for a write) and verify it stays within the canonicalized `base`.
+pub(super) fn assert_within(base: &Path, candidate: &Path) -> Result<()> {
+    let base_real = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
+    let mut probe = candidate;
+    let existing = loop {
+        if probe.exists() {
+            break probe.canonicalize().unwrap_or_else(|_| probe.to_path_buf());
+        }
+        match probe.parent() {
+            Some(parent) => probe = parent,
+            None => break base_real.clone(),
+        }
+    };
+    if !existing.starts_with(&base_real) {
+        return Err(BoxError::BuildError(format!(
+            "COPY/ADD path '{}' escapes '{}' (forbidden)",
+            candidate.display(),
+            base.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Expand `${VAR}` and `$VAR` references in a string using build args.
 pub(super) fn expand_args(s: &str, args: &HashMap<String, String>) -> String {
     let mut result = s.to_string();
@@ -331,6 +374,38 @@ pub(super) fn format_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_reject_path_traversal() {
+        assert!(reject_path_traversal("../etc/passwd").is_err());
+        assert!(reject_path_traversal("a/../../b").is_err());
+        assert!(reject_path_traversal("..").is_err());
+        assert!(reject_path_traversal("/abs/ok").is_ok());
+        assert!(reject_path_traversal("rel/ok/path").is_ok());
+        assert!(reject_path_traversal(".").is_ok());
+    }
+
+    #[test]
+    fn test_assert_within_contains_and_rejects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        std::fs::create_dir_all(base.join("sub")).unwrap();
+        std::fs::write(base.join("sub/f"), "x").unwrap();
+
+        // Inside (existing) and a not-yet-existing path whose parent is inside.
+        assert!(assert_within(base, &base.join("sub/f")).is_ok());
+        assert!(assert_within(base, &base.join("new/not/yet")).is_ok());
+        // An absolute path outside the base is rejected.
+        assert!(assert_within(base, std::path::Path::new("/etc/passwd")).is_err());
+
+        // A symlink whose target escapes the base is rejected (symlink-follow).
+        #[cfg(unix)]
+        {
+            let link = base.join("escape");
+            std::os::unix::fs::symlink("/etc", &link).unwrap();
+            assert!(assert_within(base, &link.join("passwd")).is_err());
+        }
+    }
 
     // --- is_tar_archive tests ---
 

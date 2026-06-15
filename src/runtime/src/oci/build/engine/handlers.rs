@@ -11,7 +11,8 @@ use super::super::layer::{
     LayerInfo,
 };
 use super::utils::{
-    copy_dir_filtered, expand_args, extract_tar_to_dst, is_tar_archive, resolve_chown, resolve_path,
+    assert_within, copy_dir_filtered, expand_args, extract_tar_to_dst, is_tar_archive,
+    reject_path_traversal, resolve_chown, resolve_path,
 };
 use super::BuildState;
 
@@ -129,7 +130,11 @@ pub(super) fn handle_copy(
 
     // Resolve destination path
     let resolved_dst = resolve_path(workdir, dst);
+    reject_path_traversal(&resolved_dst)?;
     let dst_in_rootfs = rootfs_dir.join(resolved_dst.trim_start_matches('/'));
+    // The destination must not escape the rootfs via `..` or a base-image
+    // symlink whose target leaves it (a write would land on the host).
+    assert_within(rootfs_dir, &dst_in_rootfs)?;
 
     // Ensure destination directory exists
     if dst.ends_with('/') || src_patterns.len() > 1 {
@@ -153,6 +158,7 @@ pub(super) fn handle_copy(
         // absolute path: `Path::join` discards the base for an absolute arg, so
         // `rootfs.join("/run.sh")` would wrongly become "/run.sh". COPY --from
         // sources are conventionally absolute, so strip the leading slash.
+        reject_path_traversal(src)?;
         let rel = PathBuf::from(if src == "." {
             ""
         } else {
@@ -166,6 +172,9 @@ pub(super) fn handle_copy(
                 context_dir.display()
             )));
         }
+        // A source must resolve inside the build context (no `..`/symlink escape
+        // that would bake a host file outside the context into the image).
+        assert_within(context_dir, &src_path)?;
 
         // A single source excluded by .dockerignore is not in the build context.
         if let Some(ign) = ignore {
@@ -556,7 +565,10 @@ pub(super) fn handle_add(
     let src_patterns = &resolve_source_patterns(context_dir, src_patterns)?;
 
     let resolved_dst = resolve_path(workdir, dst);
+    reject_path_traversal(&resolved_dst)?;
     let dst_in_rootfs = rootfs_dir.join(resolved_dst.trim_start_matches('/'));
+    // The destination must not escape the rootfs via `..` or a base-image symlink.
+    assert_within(rootfs_dir, &dst_in_rootfs)?;
 
     // Ensure destination directory exists
     if dst.ends_with('/') || src_patterns.len() > 1 {
@@ -604,6 +616,7 @@ pub(super) fn handle_add(
 
         // See handle_copy: strip a leading slash so an absolute src resolves
         // within the context rather than discarding the base in `Path::join`.
+        reject_path_traversal(src)?;
         let rel = PathBuf::from(if src == "." {
             ""
         } else {
@@ -617,6 +630,8 @@ pub(super) fn handle_add(
                 context_dir.display()
             )));
         }
+        // A source must resolve inside the build context (no `..`/symlink escape).
+        assert_within(context_dir, &src_path)?;
 
         if let Some(ign) = ignore {
             if !rel.as_os_str().is_empty() && src_path.is_file() && ign.is_excluded(&rel) {
