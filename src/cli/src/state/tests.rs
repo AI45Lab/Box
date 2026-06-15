@@ -167,14 +167,35 @@ fn test_load_creates_parent_dir() {
 }
 
 #[test]
-fn test_load_corrupt_json_returns_empty() {
+fn test_load_corrupt_json_quarantines_instead_of_wiping() {
     let tmp = TempDir::new().unwrap();
     let path = test_state_path(&tmp);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(&path, "not valid json!!!").unwrap();
+    let corrupt = "not valid json!!!";
+    std::fs::write(&path, corrupt).unwrap();
 
     let sf = StateFile::load(&path).unwrap();
+    // Corruption yields an empty in-memory state (the CLI keeps working) ...
     assert!(sf.records().is_empty());
+
+    // ... but the corrupt data is NOT lost: it is quarantined to a timestamped
+    // sibling so a subsequent save cannot overwrite it with `[]`.
+    let dir = path.parent().unwrap();
+    let backups: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .contains("boxes.json.corrupt-")
+        })
+        .collect();
+    assert_eq!(backups.len(), 1, "expected exactly one quarantined backup");
+    assert_eq!(
+        std::fs::read_to_string(backups[0].path()).unwrap(),
+        corrupt,
+        "the quarantined backup must preserve the original corrupt bytes"
+    );
 }
 
 #[test]

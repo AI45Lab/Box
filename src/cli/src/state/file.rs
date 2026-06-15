@@ -16,7 +16,7 @@ impl StateFile {
     pub fn load(path: &Path) -> Result<Self, std::io::Error> {
         if path.exists() {
             let data = std::fs::read_to_string(path)?;
-            let records: Vec<BoxRecord> = serde_json::from_str(&data).unwrap_or_default();
+            let records = Self::parse_or_quarantine(path, &data);
             let mut sf = Self {
                 path: path.to_path_buf(),
                 records,
@@ -52,7 +52,7 @@ impl StateFile {
         let path = home.join("boxes.json");
         if path.exists() {
             let data = std::fs::read_to_string(&path)?;
-            let records: Vec<BoxRecord> = serde_json::from_str(&data).unwrap_or_default();
+            let records = Self::parse_or_quarantine(&path, &data);
             Ok(Self { path, records })
         } else {
             if let Some(parent) = path.parent() {
@@ -62,6 +62,51 @@ impl StateFile {
                 path,
                 records: Vec::new(),
             })
+        }
+    }
+
+    /// Parse box records from an existing state file's contents.
+    ///
+    /// On a parse failure the corrupt file is NOT silently discarded. Discarding
+    /// it would let the next `write_to_disk` overwrite `boxes.json` with `[]`,
+    /// orphaning every running VM/overlay with no error and no recoverable
+    /// record. Instead the corrupt file is quarantined to a timestamped sibling
+    /// (`boxes.json.corrupt-<unix-secs>`) and a loud warning is emitted, so the
+    /// data is preserved for recovery (`a3s-box reap`, or manual repair) while
+    /// the process starts from a clean empty state rather than crashing.
+    fn parse_or_quarantine(path: &Path, data: &str) -> Vec<BoxRecord> {
+        match serde_json::from_str::<Vec<BoxRecord>>(data) {
+            Ok(records) => records,
+            Err(err) => {
+                let preserved = Self::quarantine_corrupt_file(path)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "<backup failed>".to_string());
+                eprintln!(
+                    "a3s-box: WARNING: state file {} is corrupt ({err}); preserved a \
+                     copy at {preserved} and started from empty state. Running boxes are \
+                     no longer tracked — recover from the backup or run `a3s-box reap`.",
+                    path.display(),
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    /// Move a corrupt state file aside to a timestamped sibling so it is not
+    /// overwritten by the next save. Falls back to a copy if rename fails
+    /// (e.g. cross-device). Returns the backup path on success.
+    fn quarantine_corrupt_file(path: &Path) -> Option<PathBuf> {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let backup = path.with_extension(format!("json.corrupt-{secs}"));
+        if std::fs::rename(path, &backup).is_ok() {
+            return Some(backup);
+        }
+        match std::fs::copy(path, &backup) {
+            Ok(_) => Some(backup),
+            Err(_) => None,
         }
     }
 
