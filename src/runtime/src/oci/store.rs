@@ -178,31 +178,30 @@ impl ImageStore {
             path: target_dir,
         };
 
-        let mut index = self.index.write().await;
-
-        // Docker parity: if this reference already points at a DIFFERENT digest
-        // and that old digest is about to lose its last reference, keep the
-        // displaced image as a dangling entry (keyed by its digest) instead of
-        // dropping it. This makes a rebuilt/re-tagged image show up as
-        // `<none>` in `images`, be removable by `image prune`, and prevents
-        // silently orphaning its on-disk layout.
-        if let Some(old) = index.get(reference).cloned() {
-            if old.digest != digest {
-                let still_referenced = index
-                    .iter()
-                    .any(|(key, img)| key.as_str() != reference && img.digest == old.digest);
-                if !still_referenced && !index.contains_key(&old.digest) {
-                    let mut dangling = old.clone();
-                    dangling.reference = old.digest.clone();
-                    index.insert(old.digest.clone(), dangling);
+        self.with_index_lock(|index| {
+            // Docker parity: if this reference already points at a DIFFERENT
+            // digest and that old digest is about to lose its last reference,
+            // keep the displaced image as a dangling entry (keyed by its digest)
+            // instead of dropping it. This makes a rebuilt/re-tagged image show
+            // up as `<none>` in `images`, be removable by `image prune`, and
+            // prevents silently orphaning its on-disk layout.
+            if let Some(old) = index.get(reference).cloned() {
+                if old.digest != digest {
+                    let still_referenced = index
+                        .iter()
+                        .any(|(key, img)| key.as_str() != reference && img.digest == old.digest);
+                    if !still_referenced && !index.contains_key(&old.digest) {
+                        let mut dangling = old.clone();
+                        dangling.reference = old.digest.clone();
+                        index.insert(old.digest.clone(), dangling);
+                    }
                 }
             }
-        }
 
-        index.insert(reference.to_string(), stored.clone());
-        drop(index);
-
-        self.save_index_inner().await?;
+            index.insert(reference.to_string(), stored.clone());
+            Ok(())
+        })
+        .await?;
 
         Ok(stored)
     }
@@ -215,49 +214,46 @@ impl ImageStore {
     /// fall back to removing every reference that points at the matching
     /// digest.
     pub async fn remove(&self, image: &str) -> Result<()> {
-        let mut index = self.index.write().await;
+        self.with_index_lock(|index| {
+            // Resolve the reference keys to remove: the exact reference if it is
+            // a known key, otherwise every key sharing the requested digest.
+            let keys: Vec<String> = if index.contains_key(image) {
+                vec![image.to_string()]
+            } else {
+                index
+                    .values()
+                    .filter(|img| img.digest == image)
+                    .map(|img| img.reference.clone())
+                    .collect()
+            };
 
-        // Resolve the reference keys to remove: the exact reference if it is
-        // a known key, otherwise every key sharing the requested digest.
-        let keys: Vec<String> = if index.contains_key(image) {
-            vec![image.to_string()]
-        } else {
-            index
-                .values()
-                .filter(|img| img.digest == image)
-                .map(|img| img.reference.clone())
-                .collect()
-        };
-
-        if keys.is_empty() {
-            drop(index);
-            return Err(BoxError::OciImageError(format!(
-                "Image not found: {}",
-                image
-            )));
-        }
-
-        let removed: Vec<StoredImage> = keys.iter().filter_map(|k| index.remove(k)).collect();
-
-        // Delete each image's on-disk layout once no remaining reference
-        // points at the same digest. References sharing a digest share the
-        // same directory, so the `path.exists()` guard makes this idempotent.
-        for img in removed {
-            let digest_still_used = index.values().any(|other| other.digest == img.digest);
-            if !digest_still_used && img.path.exists() {
-                std::fs::remove_dir_all(&img.path).map_err(|e| {
-                    BoxError::OciImageError(format!(
-                        "Failed to remove image directory {}: {}",
-                        img.path.display(),
-                        e
-                    ))
-                })?;
+            if keys.is_empty() {
+                return Err(BoxError::OciImageError(format!(
+                    "Image not found: {}",
+                    image
+                )));
             }
-        }
 
-        drop(index);
-        self.save_index_inner().await?;
-        Ok(())
+            let removed: Vec<StoredImage> = keys.iter().filter_map(|k| index.remove(k)).collect();
+
+            // Delete each image's on-disk layout once no remaining reference
+            // points at the same digest. References sharing a digest share the
+            // same directory, so the `path.exists()` guard makes this idempotent.
+            for img in removed {
+                let digest_still_used = index.values().any(|other| other.digest == img.digest);
+                if !digest_still_used && img.path.exists() {
+                    std::fs::remove_dir_all(&img.path).map_err(|e| {
+                        BoxError::OciImageError(format!(
+                            "Failed to remove image directory {}: {}",
+                            img.path.display(),
+                            e
+                        ))
+                    })?;
+                }
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// List all stored images.
@@ -304,9 +300,17 @@ impl ImageStore {
 
     /// Load index from disk.
     fn load_index(&mut self) -> Result<()> {
+        // Construction-time load; reuse the shared disk reader.
+        self.index = Arc::new(RwLock::new(self.read_index_from_disk()?));
+        Ok(())
+    }
+
+    /// Read and parse `index.json` from disk into a fresh map (entries whose
+    /// content dir vanished are dropped). Does NOT touch `self.index`.
+    fn read_index_from_disk(&self) -> Result<HashMap<String, StoredImage>> {
         let index_path = self.store_dir.join("index.json");
         if !index_path.exists() {
-            return Ok(());
+            return Ok(HashMap::new());
         }
 
         let data = std::fs::read_to_string(&index_path).map_err(|e| {
@@ -323,15 +327,47 @@ impl ImageStore {
 
         let mut index = HashMap::new();
         for image in store_index.images {
-            // Only include images whose directories still exist
             if image.path.exists() {
                 index.insert(image.reference.clone(), image);
             }
         }
+        Ok(index)
+    }
 
-        // We need to set the inner value directly since we're in a sync context during construction
-        self.index = Arc::new(RwLock::new(index));
-        Ok(())
+    /// Apply `f` to the image index under the **cross-process write lock**:
+    /// reload `index.json` from disk (so this process observes other processes'
+    /// pulls/removes), let `f` mutate the map, then save. Without this, two
+    /// processes pulling concurrently each load their own snapshot and the
+    /// second `save` drops the first's entry (and leaks its content dir).
+    ///
+    /// The blocking `flock` is acquired off the runtime via `spawn_blocking`;
+    /// `save_index_inner` is lock-free, so there is no re-entrant `flock`.
+    async fn with_index_lock<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut HashMap<String, StoredImage>) -> Result<R>,
+    {
+        let index_path = self.store_dir.join("index.json");
+        let _lock = {
+            let p = index_path.clone();
+            tokio::task::spawn_blocking(move || crate::file_lock::FileLock::acquire(&p))
+                .await
+                .map_err(|e| BoxError::OciImageError(format!("index lock task failed: {e}")))?
+                .map_err(|e| {
+                    BoxError::OciImageError(format!(
+                        "failed to lock image index {}: {e}",
+                        index_path.display()
+                    ))
+                })?
+        };
+        // Sync the in-memory index with disk (pick up other processes' writes).
+        let fresh = self.read_index_from_disk()?;
+        let result = {
+            let mut idx = self.index.write().await;
+            *idx = fresh;
+            f(&mut idx)?
+        };
+        self.save_index_inner().await?;
+        Ok(result)
     }
 
     /// Save index to disk (async inner helper).
@@ -748,5 +784,40 @@ mod tests {
             assert!(image.is_some());
             assert_eq!(image.unwrap().digest, "sha256:persist");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_cross_instance_puts_persist_both() {
+        use std::collections::HashSet;
+        use std::sync::Arc;
+
+        let tmp = TempDir::new().unwrap();
+        let store_dir = tmp.path().join("store");
+        let source_dir = tmp.path().join("source");
+        create_test_oci_layout(&source_dir);
+
+        // Two ImageStore instances on the SAME dir simulate two processes, each
+        // with its own in-memory index. Concurrent puts of distinct images must
+        // BOTH persist — the lost-update bug dropped one. with_index_lock
+        // reloads under the cross-process lock, so neither overwrites the other.
+        let s1 = Arc::new(ImageStore::new(&store_dir, u64::MAX).unwrap());
+        let s2 = Arc::new(ImageStore::new(&store_dir, u64::MAX).unwrap());
+        let (src1, src2) = (source_dir.clone(), source_dir.clone());
+        let h1 = {
+            let s1 = Arc::clone(&s1);
+            tokio::spawn(async move { s1.put("img:a", "sha256:aaaa", &src1).await.unwrap() })
+        };
+        let h2 = {
+            let s2 = Arc::clone(&s2);
+            tokio::spawn(async move { s2.put("img:b", "sha256:bbbb", &src2).await.unwrap() })
+        };
+        h1.await.unwrap();
+        h2.await.unwrap();
+
+        // A fresh instance reads index.json from disk: both must be there.
+        let s3 = ImageStore::new(&store_dir, u64::MAX).unwrap();
+        let refs: HashSet<String> = s3.list().await.into_iter().map(|i| i.reference).collect();
+        assert!(refs.contains("img:a"), "img:a lost: {refs:?}");
+        assert!(refs.contains("img:b"), "img:b lost: {refs:?}");
     }
 }
