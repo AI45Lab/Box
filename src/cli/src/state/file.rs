@@ -111,10 +111,24 @@ impl StateFile {
     }
 
     /// Load the default state **read-only**: no reconcile sweep, no PID-liveness
-    /// cleanup, no write-back. For consumers that only need a snapshot of the
-    /// records (e.g. metrics scraping) and must not cause side effects.
+    /// cleanup, no write-back, and — unlike [`load_default_raw`] — **no
+    /// quarantine** of a corrupt file. For consumers that only need a snapshot
+    /// of the records (e.g. metrics scraping) and must not cause side effects.
+    ///
+    /// `load_default_raw` quarantines a corrupt `boxes.json` by renaming it,
+    /// which mutates the filesystem and bypasses the cross-process state lock —
+    /// wrong for a lock-free, per-scrape reader. Here a corrupt file simply
+    /// yields an empty snapshot; a real writer will quarantine it under the lock.
     pub(crate) fn load_readonly() -> Result<Self, std::io::Error> {
-        Self::load_default_raw()
+        let home = a3s_box_core::dirs_home();
+        let path = home.join("boxes.json");
+        let records = if path.exists() {
+            let data = std::fs::read_to_string(&path)?;
+            serde_json::from_str(&data).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        Ok(Self { path, records })
     }
 
     /// Save state to disk atomically under the cross-process state lock.
