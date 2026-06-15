@@ -61,9 +61,19 @@ pub fn launchd_plist(exe: &Path, interval: u64, log_path: &Path) -> String {
          </dict>\n\
          </plist>\n",
         label = LAUNCHD_LABEL,
-        exe = exe.display(),
-        log = log_path.display(),
+        exe = xml_escape(&exe.display().to_string()),
+        log = xml_escape(&log_path.display().to_string()),
     )
+}
+
+/// Escape XML element-content special characters. Without this, an exe or home
+/// path containing `&`, `<`, or `>` produces a malformed plist that `launchctl`
+/// rejects — silently leaving the monitor unsupervised.
+#[cfg(any(target_os = "macos", test))]
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Path the systemd user unit is written to.
@@ -235,5 +245,21 @@ mod tests {
         assert!(launchd_plist_path()
             .to_string_lossy()
             .contains("LaunchAgents/com.a3s-box.monitor.plist"));
+    }
+
+    #[test]
+    fn launchd_plist_escapes_xml_specials_in_paths() {
+        // A path with `&`/`<`/`>` (e.g. a quirky A3S_HOME) must not produce a
+        // malformed plist that launchctl rejects.
+        let plist = launchd_plist(
+            Path::new("/opt/a&b/<bin>/a3s-box"),
+            5,
+            Path::new("/home/a&b/.a3s/monitor.log"),
+        );
+        assert!(plist.contains("/opt/a&amp;b/&lt;bin&gt;/a3s-box"));
+        assert!(plist.contains("/home/a&amp;b/.a3s/monitor.log"));
+        // The raw, unescaped forms must NOT appear.
+        assert!(!plist.contains("a&b"));
+        assert!(!plist.contains("<bin>"));
     }
 }
