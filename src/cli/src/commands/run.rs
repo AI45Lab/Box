@@ -507,20 +507,46 @@ fn connect_network(
         return Ok(());
     };
     let net_store = a3s_box_runtime::NetworkStore::default_path()?;
-    let mut net_config = net_store
-        .get(net_name)?
-        .ok_or_else(|| format!("network '{}' not found", net_name))?;
-    super::network::validate_attachable_network(&net_config)
-        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-    let endpoint = net_config
-        .connect(box_id, name)
-        .map_err(|e| format!("Failed to connect to network: {e}"))?;
-    net_store.update(&net_config)?;
+    let endpoint = connect_box_to_network(&net_store, net_name, box_id, name)?;
     println!(
         "Connected to network {} (IP: {})",
         net_name, endpoint.ip_address
     );
     Ok(())
+}
+
+/// Allocate a network endpoint for a box atomically under the store's
+/// cross-process lock.
+///
+/// A plain `get → connect → update` reads the network outside the lock, so two
+/// concurrent `run --network` could allocate the same IP and drop one endpoint
+/// (#70 fixed the `network`/`start` paths but not this one). Split out from
+/// [`connect_network`] so the lost-update behavior is unit-testable with an
+/// explicit store — `NetworkStore::default_path` reads the process-global
+/// `A3S_HOME`, which cannot be raced safely across tests.
+fn connect_box_to_network(
+    net_store: &a3s_box_runtime::NetworkStore,
+    net_name: &str,
+    box_id: &str,
+    name: &str,
+) -> Result<a3s_box_core::network::NetworkEndpoint, Box<dyn std::error::Error>> {
+    net_store.with_write_lock(
+        |networks| -> Result<a3s_box_core::network::NetworkEndpoint, Box<dyn std::error::Error>> {
+            let net_config =
+                networks
+                    .get_mut(net_name)
+                    .ok_or_else(|| -> Box<dyn std::error::Error> {
+                        format!("network '{}' not found", net_name).into()
+                    })?;
+            super::network::validate_attachable_network(net_config)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            net_config
+                .connect(box_id, name)
+                .map_err(|e| -> Box<dyn std::error::Error> {
+                    format!("Failed to connect to network: {e}").into()
+                })
+        },
+    )
 }
 
 // ============================================================================
@@ -784,10 +810,14 @@ fn disconnect_network(
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(net_name) = net_name {
         let net_store = a3s_box_runtime::NetworkStore::default_path()?;
-        if let Some(mut net_config) = net_store.get(net_name)? {
-            net_config.disconnect(box_id).ok();
-            net_store.update(&net_config)?;
-        }
+        // Release the endpoint under the lock with a fresh read, so a
+        // concurrent connect to the same network is not clobbered.
+        net_store.with_write_lock(|networks| -> Result<(), Box<dyn std::error::Error>> {
+            if let Some(net_config) = networks.get_mut(net_name) {
+                net_config.disconnect(box_id).ok();
+            }
+            Ok(())
+        })?;
     }
     Ok(())
 }
@@ -842,6 +872,42 @@ fn mark_record_stopped(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Regression for the `run --network` lost-update race: connect_box_to_network
+    // must allocate a distinct IP per concurrent caller. A get → connect → update
+    // (the pre-fix code) would dup IPs and drop endpoints. The advisory lock is
+    // per-open-file-description, so separate FileLock::acquire calls serialize
+    // even across threads in one process — which exercises the fix in-process.
+    #[test]
+    fn concurrent_connect_box_to_network_allocates_distinct_ips() {
+        use a3s_box_core::network::NetworkConfig;
+        use a3s_box_runtime::NetworkStore;
+        use std::collections::HashSet;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(NetworkStore::new(dir.path().join("networks.json")));
+        store
+            .create(NetworkConfig::new("dev", "10.88.0.0/24").unwrap())
+            .unwrap();
+
+        let handles: Vec<_> = (0..16)
+            .map(|i| {
+                let store = Arc::clone(&store);
+                std::thread::spawn(move || {
+                    connect_box_to_network(&store, "dev", &format!("box-{i}"), &format!("name-{i}"))
+                        .unwrap()
+                        .ip_address
+                })
+            })
+            .collect();
+        let ips: HashSet<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(
+            ips.len(),
+            16,
+            "every concurrent connect must get a distinct IP (no lost update)"
+        );
+    }
 
     // --- build_resource_limits tests (using new struct layout) ---
 

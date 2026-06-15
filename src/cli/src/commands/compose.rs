@@ -379,67 +379,49 @@ async fn execute_up(
 
         // Connect to network before boot
         if let Some(net_name) = network_name.as_deref() {
-            let mut net_config = match net_store.get(net_name) {
-                Ok(Some(config)) => config,
-                Ok(None) => {
-                    return rollback_compose_up(
-                        &mut state,
-                        &started_services,
-                        &created_networks,
-                        format!("Compose network '{}' was not created", net_name),
-                    )
-                    .await;
-                }
-                Err(error) => {
-                    return rollback_compose_up(
-                        &mut state,
-                        &started_services,
-                        &created_networks,
-                        error,
-                    )
-                    .await;
-                }
-            };
-            if let Err(error) = super::network::validate_attachable_network(&net_config) {
-                return rollback_compose_up(
-                    &mut state,
-                    &started_services,
-                    &created_networks,
-                    error,
-                )
-                .await;
-            }
-            // Register the bare service name as a DNS alias so peers can reach
-            // this service as `svc` (Docker Compose behavior), not only as the
-            // `{project}-{svc}` box name.
-            let endpoint = match net_config.connect_with_aliases(
-                &box_id,
-                &box_name,
-                std::slice::from_ref(svc_name),
-            ) {
-                Ok(endpoint) => endpoint,
-                Err(error) => {
-                    return rollback_compose_up(
-                        &mut state,
-                        &started_services,
-                        &created_networks,
-                        format!(
-                            "Failed to connect service '{}' to network: {error}",
-                            svc_name
-                        ),
-                    )
-                    .await;
-                }
-            };
-            if let Err(error) = net_store.update(&net_config) {
-                return rollback_compose_up(
-                    &mut state,
-                    &started_services,
-                    &created_networks,
-                    error,
-                )
-                .await;
-            }
+            // Atomic load → validate → allocate-IP → save under the store's
+            // cross-process lock. A get → connect → update reads the network
+            // outside the lock, so a concurrent connect (another compose up, or
+            // a `run --network` to the same net) could dup the IP or drop this
+            // endpoint. Register the bare service name as a DNS alias so peers
+            // can reach this service as `svc` (Docker Compose behavior), not
+            // only as the `{project}-{svc}` box name.
+            let endpoint =
+                match net_store.with_write_lock(
+                    |networks| -> Result<
+                        a3s_box_core::network::NetworkEndpoint,
+                        Box<dyn std::error::Error>,
+                    > {
+                        let net_config = networks.get_mut(net_name).ok_or_else(
+                            || -> Box<dyn std::error::Error> {
+                                format!("Compose network '{}' was not created", net_name).into()
+                            },
+                        )?;
+                        super::network::validate_attachable_network(net_config)
+                            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                        net_config
+                            .connect_with_aliases(
+                                &box_id,
+                                &box_name,
+                                std::slice::from_ref(svc_name),
+                            )
+                            .map_err(|e| -> Box<dyn std::error::Error> {
+                                format!("Failed to connect service '{}' to network: {e}", svc_name)
+                                    .into()
+                            })
+                    },
+                ) {
+                    Ok(endpoint) => endpoint,
+                    Err(error) => {
+                        return rollback_compose_up(
+                            &mut state,
+                            &started_services,
+                            &created_networks,
+                            error,
+                        )
+                        .await;
+                    }
+                };
             print!(
                 "  [+] {} (image={}, ip={})",
                 svc_name, image, endpoint.ip_address

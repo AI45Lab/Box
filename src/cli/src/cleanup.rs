@@ -19,13 +19,20 @@ pub fn cleanup_box_resources(box_id: &str, volume_names: &[String], network_name
     // Detach named volumes
     super::commands::volume::detach_volumes(volume_names, box_id);
 
-    // Disconnect from network if connected
+    // Disconnect from network if connected. Release the endpoint under the
+    // store's cross-process lock with a fresh read, so a concurrent connect to
+    // the same network is not lost (a get → disconnect → update reads outside
+    // the lock and would clobber it).
     if let Some(net_name) = network_name {
         if let Ok(net_store) = a3s_box_runtime::NetworkStore::default_path() {
-            if let Ok(Some(mut net_config)) = net_store.get(net_name) {
-                net_config.disconnect(box_id).ok();
-                net_store.update(&net_config).ok();
-            }
+            let _ = net_store.with_write_lock(
+                |networks| -> Result<(), a3s_box_core::error::BoxError> {
+                    if let Some(net_config) = networks.get_mut(net_name) {
+                        net_config.disconnect(box_id).ok();
+                    }
+                    Ok(())
+                },
+            );
         }
     }
 }
