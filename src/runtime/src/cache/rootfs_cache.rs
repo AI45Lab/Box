@@ -122,24 +122,23 @@ impl RootfsCache {
         let rootfs_dir = self.cache_dir.join(key);
         let meta_path = self.cache_dir.join(format!("{}.meta.json", key));
 
-        // Remove existing entry if present
-        if rootfs_dir.exists() {
-            std::fs::remove_dir_all(&rootfs_dir).map_err(|e| {
-                BoxError::CacheError(format!(
-                    "Failed to remove existing rootfs cache entry {}: {}",
-                    rootfs_dir.display(),
-                    e
-                ))
-            })?;
+        // Already fully cached: nothing to do. `put` is only ever called on a
+        // cache MISS, so the only way an entry already exists here is a
+        // concurrent miss of the SAME image — identical content — which makes
+        // the skip correct and the two pulls idempotent.
+        if rootfs_dir.is_dir() && meta_path.is_file() {
+            return Ok(rootfs_dir);
         }
 
-        // Copy source rootfs to cache
-        super::layer_cache::copy_dir_recursive(source_rootfs, &rootfs_dir)?;
+        // Atomically publish (staging dir + rename) so two concurrent builds of
+        // the same image cannot corrupt the cache by removing/interleaving a
+        // half-copied directory (same bug as the layer cache, #85).
+        super::layer_cache::publish_dir_atomically(source_rootfs, &rootfs_dir, &self.cache_dir)?;
 
-        // Calculate size
+        // Calculate size (from whichever copy landed — they are identical).
         let size_bytes = super::layer_cache::dir_size(&rootfs_dir).unwrap_or(0);
 
-        // Write metadata
+        // Write metadata atomically (unique temp + rename).
         let now = chrono::Utc::now().timestamp();
         let meta = RootfsMeta {
             key: key.to_string(),
@@ -148,13 +147,10 @@ impl RootfsCache {
             cached_at: now,
             last_accessed: now,
         };
-        std::fs::write(&meta_path, serde_json::to_string_pretty(&meta)?).map_err(|e| {
-            BoxError::CacheError(format!(
-                "Failed to write rootfs metadata {}: {}",
-                meta_path.display(),
-                e
-            ))
-        })?;
+        super::layer_cache::write_meta_atomically(
+            &meta_path,
+            &serde_json::to_string_pretty(&meta)?,
+        )?;
 
         tracing::debug!(
             key = %key,
@@ -722,29 +718,61 @@ mod tests {
     }
 
     #[test]
-    fn test_rootfs_cache_put_overwrites_existing() {
+    fn test_rootfs_cache_put_same_key_is_idempotent() {
+        // `put` is only ever called on a cache miss, so an existing entry can
+        // only come from a concurrent miss of the SAME image (identical
+        // content). Re-putting must keep the first entry, not remove-and-recopy
+        // (which corrupts the cache when two builds of the same image race).
         let tmp = TempDir::new().unwrap();
         let cache = RootfsCache::new(tmp.path()).unwrap();
-        let key = "overwrite";
+        let key = "idempotent";
 
-        // Put first version
         let s1 = tmp.path().join("v1");
         create_test_rootfs(&s1, &[("v1.txt", "version 1")]);
-        cache.put(key, &s1, "first").unwrap();
+        let first = cache.put(key, &s1, "first").unwrap();
 
-        // Put second version
         let s2 = tmp.path().join("v2");
         create_test_rootfs(&s2, &[("v2.txt", "version 2")]);
-        let cached = cache.put(key, &s2, "second").unwrap();
+        let second = cache.put(key, &s2, "second").unwrap();
 
-        assert!(!cached.join("v1.txt").exists());
-        assert!(cached.join("v2.txt").is_file());
-
-        // Metadata should reflect second put
+        // Same path, first content + metadata preserved (idempotent, no overwrite).
+        assert_eq!(first, second);
+        assert!(second.join("v1.txt").is_file());
+        assert!(!second.join("v2.txt").exists());
         let meta_path = tmp.path().join(format!("{}.meta.json", key));
-        let content = std::fs::read_to_string(&meta_path).unwrap();
-        let meta: RootfsMeta = serde_json::from_str(&content).unwrap();
-        assert_eq!(meta.description, "second");
+        let meta: RootfsMeta =
+            serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+        assert_eq!(meta.description, "first");
+    }
+
+    #[test]
+    fn test_rootfs_cache_concurrent_put_same_key_no_corruption() {
+        use std::sync::Arc;
+
+        let tmp = TempDir::new().unwrap();
+        let cache = Arc::new(RootfsCache::new(tmp.path()).unwrap());
+        let key = "concurrent";
+        let files: &[(&str, &str)] = &[("a.txt", "alpha"), ("sub/b.txt", "beta")];
+
+        let handles: Vec<_> = (0..12)
+            .map(|i| {
+                let cache = Arc::clone(&cache);
+                let src = tmp.path().join(format!("src{i}"));
+                create_test_rootfs(&src, files);
+                std::thread::spawn(move || cache.put(key, &src, "race").unwrap())
+            })
+            .collect();
+        let paths: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        for p in &paths {
+            assert_eq!(p, &paths[0]);
+            assert_eq!(std::fs::read_to_string(p.join("a.txt")).unwrap(), "alpha");
+            assert_eq!(
+                std::fs::read_to_string(p.join("sub/b.txt")).unwrap(),
+                "beta"
+            );
+        }
+        assert!(cache.get(key).unwrap().is_some());
     }
 
     #[test]
