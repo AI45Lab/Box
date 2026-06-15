@@ -46,15 +46,16 @@ impl CredentialStore {
 
     /// Store credentials for a registry. Overwrites existing entry.
     pub fn store(&self, registry: &str, username: &str, password: &str) -> Result<()> {
-        let mut file = self.load()?;
-        file.registries.insert(
-            normalize_registry(registry),
-            CredentialEntry {
-                username: username.to_string(),
-                password: password.to_string(),
-            },
-        );
-        self.save(&file)
+        self.with_write_lock(|file| {
+            file.registries.insert(
+                normalize_registry(registry),
+                CredentialEntry {
+                    username: username.to_string(),
+                    password: password.to_string(),
+                },
+            );
+            Ok(())
+        })
     }
 
     /// Get credentials for a registry. Returns `(username, password)`.
@@ -68,15 +69,12 @@ impl CredentialStore {
 
     /// Remove credentials for a registry. Returns true if entry existed.
     pub fn remove(&self, registry: &str) -> Result<bool> {
-        let mut file = self.load()?;
-        let removed = file
-            .registries
-            .remove(&normalize_registry(registry))
-            .is_some();
-        if removed {
-            self.save(&file)?;
-        }
-        Ok(removed)
+        self.with_write_lock(|file| {
+            Ok(file
+                .registries
+                .remove(&normalize_registry(registry))
+                .is_some())
+        })
     }
 
     /// List all registries with stored credentials.
@@ -139,6 +137,31 @@ impl CredentialStore {
         })?;
         Ok(())
     }
+
+    /// Run `f` over the credential file under a cross-process advisory lock,
+    /// re-loading fresh inside the lock and saving the result.
+    ///
+    /// `store`/`remove` funnel through here so two concurrent `a3s-box login`
+    /// processes cannot lose each other's entry: the atomic tmp+rename in
+    /// `save` only prevents a torn read, and `save` even uses a fixed `.tmp`
+    /// name that concurrent writers would collide on. `save` stays lock-free —
+    /// the guard is held here across the whole load → mutate → save and is
+    /// non-reentrant.
+    fn with_write_lock<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut CredentialFile) -> Result<R>,
+    {
+        let _lock = crate::file_lock::FileLock::acquire(&self.path).map_err(|e| {
+            BoxError::ConfigError(format!(
+                "Failed to lock credential store {}: {e}",
+                self.path.display()
+            ))
+        })?;
+        let mut file = self.load()?;
+        let r = f(&mut file)?;
+        self.save(&file)?;
+        Ok(r)
+    }
 }
 
 /// Normalize registry names (e.g., "docker.io" and "index.docker.io" → "index.docker.io").
@@ -172,6 +195,39 @@ mod tests {
 
     fn test_store(dir: &TempDir) -> CredentialStore {
         CredentialStore::new(dir.path().join("credentials.json"))
+    }
+
+    // The advisory lock is per-open-file-description, so separate
+    // FileLock::acquire calls serialize even across threads in one process —
+    // which lets this exercise the lost-update fix in-process.
+    #[test]
+    fn concurrent_logins_to_distinct_registries_no_lost_update() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(test_store(&dir));
+
+        let n = 16;
+        let handles: Vec<_> = (0..n)
+            .map(|i| {
+                let store = Arc::clone(&store);
+                thread::spawn(move || {
+                    store
+                        .store(&format!("reg{i}.example.com"), "user", "pass")
+                        .unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(
+            store.list_registries().unwrap().len(),
+            n,
+            "every concurrent login must persist (no lost update)"
+        );
     }
 
     #[test]
