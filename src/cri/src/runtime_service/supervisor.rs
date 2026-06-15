@@ -33,7 +33,7 @@ impl SupervisedWorkload {
         }
     }
 
-    async fn cancel(&mut self) -> a3s_box_core::error::Result<()> {
+    pub(super) async fn cancel(&mut self) -> a3s_box_core::error::Result<()> {
         match self {
             Self::Exec(stream) => stream.cancel().await,
             Self::Pty(stream) => stream.cancel().await,

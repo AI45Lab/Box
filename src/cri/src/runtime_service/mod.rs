@@ -1349,7 +1349,7 @@ impl RuntimeService for BoxRuntimeService {
             (exec_socket, pty_socket)
         };
 
-        let (workload, stdin_handle) = if container.tty {
+        let (mut workload, stdin_handle) = if container.tty {
             let pty_socket_path = pty_socket_path.ok_or_else(|| {
                 Status::internal(format!(
                     "Sandbox {} PTY socket is not available",
@@ -1402,41 +1402,61 @@ impl RuntimeService for BoxRuntimeService {
             .mark_container_started_if_created(&container_id, now_ns)
             .await;
 
+        if !started {
+            // We already started the workload, but the container concurrently
+            // left the Created state (a racing Stop/Remove won the CAS). Stop the
+            // workload directly and return: spawning the exit supervisor here
+            // would ORPHAN a long-running workload (e.g. nginx) — its stop handle
+            // is never inserted into `workload_stops`, so StopContainer can't
+            // reach it, and it would run until it self-exits.
+            if let Err(error) = workload.cancel().await {
+                tracing::warn!(
+                    container_id = %container_id,
+                    sandbox_id = %container.sandbox_id,
+                    error = %error,
+                    "Failed to stop workload after losing the Created-state CAS"
+                );
+            }
+            return Err(Status::failed_precondition(format!(
+                "Container {} is no longer in the Created state",
+                container_id
+            )));
+        }
+
+        // started == true: register the control handles and spawn the supervisor.
         let (attach_tx, _) = broadcast::channel(128);
         let (stop_tx, stop_rx) = oneshot::channel();
         let log_reopen = Arc::new(Notify::new());
         let log_reopen_done = Arc::new(Notify::new());
-        if started {
-            self.attach_streams
+        self.attach_streams
+            .write()
+            .await
+            .insert(container_id.clone(), attach_tx.clone());
+        if let Some(stdin_handle) = stdin_handle {
+            self.workload_stdins
                 .write()
                 .await
-                .insert(container_id.clone(), attach_tx.clone());
-            if let Some(stdin_handle) = stdin_handle {
-                self.workload_stdins
-                    .write()
-                    .await
-                    .insert(container_id.clone(), stdin_handle);
-            }
-            self.workload_stops
-                .write()
-                .await
-                .insert(container_id.clone(), stop_tx);
-            self.log_reopens.write().await.insert(
-                container_id.clone(),
-                LogReopenHandle {
-                    request: log_reopen.clone(),
-                    done: log_reopen_done.clone(),
-                },
-            );
-            self.emit_container_event(
-                &container_id,
-                &container.sandbox_id,
-                ContainerEventType::ContainerStartedEvent,
-                now_ns,
-                "ContainerStarted",
-                format!("Container {} started", container.name),
-            );
+                .insert(container_id.clone(), stdin_handle);
         }
+        self.workload_stops
+            .write()
+            .await
+            .insert(container_id.clone(), stop_tx);
+        self.log_reopens.write().await.insert(
+            container_id.clone(),
+            LogReopenHandle {
+                request: log_reopen.clone(),
+                done: log_reopen_done.clone(),
+            },
+        );
+        self.emit_container_event(
+            &container_id,
+            &container.sandbox_id,
+            ContainerEventType::ContainerStartedEvent,
+            now_ns,
+            "ContainerStarted",
+            format!("Container {} started", container.name),
+        );
 
         // Open (create) the container log file now, before StartContainer
         // returns, so a caller that opens it immediately — e.g. critest's
@@ -1477,13 +1497,6 @@ impl RuntimeService for BoxRuntimeService {
             log_reopen_done,
             workload,
         });
-
-        if !started {
-            return Err(Status::failed_precondition(format!(
-                "Container {} is no longer in the Created state",
-                container_id
-            )));
-        }
 
         Ok(Response::new(StartContainerResponse {}))
     }
