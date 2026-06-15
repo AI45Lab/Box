@@ -59,6 +59,11 @@ fn reap_orphaned_box_in(home_dir: &Path, box_id: &str) {
         }
     }
 
+    // Remove the box's host cgroup (the shim creates `/sys/fs/cgroup/a3s-box/<id>`
+    // for host-side cgroup limits and can never remove it; an empty-dir rmdir
+    // clears it now that the shim is killed).
+    let _ = std::fs::remove_dir(format!("/sys/fs/cgroup/a3s-box/{box_id}"));
+
     if !killed.is_empty() {
         tracing::info!(box_id = %box_id, "Reaped orphaned sandbox microVM after CRI restart");
     }

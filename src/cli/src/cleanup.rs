@@ -46,6 +46,20 @@ pub fn cleanup_record_resources(record: &BoxRecord) {
     );
 }
 
+/// Remove the box's host cgroup `/sys/fs/cgroup/a3s-box/<id>`. The shim creates
+/// it for `--cpu-shares`/`--cpu-quota`/`--memory-reservation`/`--memory-swap`
+/// and — taking over the process via libkrun — can never remove it; an empty-dir
+/// `rmdir` on cgroupfs removes the cgroup once the shim PID is gone. Best-effort:
+/// absent (no host cgroup limits were set) or non-empty is fine.
+pub(crate) fn remove_host_cgroup(box_id: &str) {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::fs::remove_dir(format!("/sys/fs/cgroup/a3s-box/{box_id}"));
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = box_id;
+}
+
 /// Remove transient host resources for a stopped box while keeping its state.
 pub fn cleanup_stopped_box(record: &BoxRecord) {
     cleanup_record_resources(record);
@@ -53,6 +67,7 @@ pub fn cleanup_stopped_box(record: &BoxRecord) {
     // (and a later restart re-mounts cleanly instead of stacking).
     a3s_box_runtime::rootfs::unmount_box_overlay(&record.box_dir.join("merged"));
     cleanup_external_socket_dir(&record.box_dir, &record.exec_socket_path);
+    remove_host_cgroup(&record.id);
 }
 
 /// Remove anonymous volumes created from OCI `VOLUME` declarations.
@@ -99,6 +114,7 @@ pub fn cleanup_external_socket_dir(box_dir: &Path, exec_socket_path: &Path) {
 pub fn cleanup_removed_box(record: &BoxRecord) {
     cleanup_record_resources(record);
     cleanup_anonymous_volumes(&record.anonymous_volumes);
+    remove_host_cgroup(&record.id);
 
     if record.box_dir.exists() {
         // Release the overlayfs mount FIRST: otherwise remove_dir_all deletes

@@ -71,8 +71,32 @@ impl StateStore for JsonStateStore {
         }
 
         let bytes = std::fs::read(&self.path)?;
-        serde_json::from_slice(&bytes)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        match serde_json::from_slice(&bytes) {
+            Ok(state) => Ok(state),
+            Err(e) => {
+                // Quarantine the corrupt file to a timestamped sibling instead of
+                // letting the next save() silently overwrite (and destroy) it: its
+                // records name the previous run's sandboxes/containers and are
+                // needed to recover their leaked microVMs. Start from empty state.
+                let secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let backup = self.path.with_extension(format!("json.corrupt-{secs}"));
+                let preserved = match std::fs::rename(&self.path, &backup) {
+                    Ok(()) => backup.display().to_string(),
+                    Err(_) => std::fs::copy(&self.path, &backup)
+                        .map(|_| backup.display().to_string())
+                        .unwrap_or_else(|_| "<backup failed>".to_string()),
+                };
+                tracing::warn!(
+                    error = %e,
+                    preserved = %preserved,
+                    "CRI state.json is corrupt; quarantined it and started from empty state"
+                );
+                Ok(PersistedState::default())
+            }
+        }
     }
 }
 
@@ -105,6 +129,35 @@ mod tests {
     use super::*;
     use crate::container::{Container, ContainerState};
     use crate::sandbox::{PodSandbox, SandboxState};
+
+    #[test]
+    fn test_corrupt_state_is_quarantined_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(&path, b"not valid json!!!").unwrap();
+
+        let store = JsonStateStore::new(&path);
+        // Corruption yields an empty state (server keeps running)...
+        let state = store.load().unwrap();
+        assert!(state.sandboxes.is_empty() && state.containers.is_empty());
+
+        // ...and the corrupt bytes are preserved in a quarantine sibling, so the
+        // next save() does not silently destroy the previous run's records.
+        let backups: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains("state.json.corrupt-")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(backups[0].path()).unwrap(),
+            "not valid json!!!"
+        );
+    }
 
     fn sample_sandbox(id: &str) -> PodSandbox {
         PodSandbox {
