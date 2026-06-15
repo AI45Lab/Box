@@ -415,15 +415,22 @@ async fn execute_connect(args: ConnectArgs) -> Result<(), Box<dyn std::error::Er
         }
     }
 
-    let mut config = store
-        .get(&args.network)?
-        .ok_or_else(|| format!("network '{}' not found", args.network))?;
-
-    validate_attachable_network(&config)?;
-
-    let endpoint = ensure_endpoint(&mut config, &record.id, &record.name)
-        .map_err(|e| format!("Failed to connect: {e}"))?;
-    store.update(&config)?;
+    // Atomic load → validate → allocate-IP → save under the store's
+    // cross-process lock (concurrent connects can't dup IPs or lose endpoints).
+    let endpoint = store.with_write_lock(
+        |networks| -> Result<NetworkEndpoint, Box<dyn std::error::Error>> {
+            let config =
+                networks
+                    .get_mut(&args.network)
+                    .ok_or_else(|| -> Box<dyn std::error::Error> {
+                        format!("network '{}' not found", args.network).into()
+                    })?;
+            validate_attachable_network(config)?;
+            ensure_endpoint(config, &record.id, &record.name).map_err(
+                |e| -> Box<dyn std::error::Error> { format!("Failed to connect: {e}").into() },
+            )
+        },
+    )?;
 
     {
         let state_record = crate::resolve::resolve_mut(&mut state, &record.id)?;
@@ -457,22 +464,25 @@ async fn execute_disconnect(args: DisconnectArgs) -> Result<(), Box<dyn std::err
 
     let is_configured_network = configured_network.as_deref() == Some(args.network.as_str());
 
-    if let Some(mut config) = store.get(&args.network)? {
-        match config.disconnect(&record.id) {
-            Ok(_) => store.update(&config)?,
-            Err(error) if args.force || is_configured_network => {
-                tracing::debug!(
-                    box_id = %record.id,
-                    network = %args.network,
-                    error = %error,
-                    "Ignoring missing network endpoint during forced disconnect"
-                );
+    store.with_write_lock(|networks| -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(config) = networks.get_mut(&args.network) {
+            match config.disconnect(&record.id) {
+                Ok(_) => {} // persisted by with_write_lock
+                Err(error) if args.force || is_configured_network => {
+                    tracing::debug!(
+                        box_id = %record.id,
+                        network = %args.network,
+                        error = %error,
+                        "Ignoring missing network endpoint during forced disconnect"
+                    );
+                }
+                Err(error) => return Err(format!("Failed to disconnect: {error}").into()),
             }
-            Err(error) => return Err(format!("Failed to disconnect: {error}").into()),
+        } else if !args.force {
+            return Err(format!("network '{}' not found", args.network).into());
         }
-    } else if !args.force {
-        return Err(format!("network '{}' not found", args.network).into());
-    }
+        Ok(())
+    })?;
 
     if is_configured_network {
         let state_record = crate::resolve::resolve_mut(&mut state, &record.id)?;

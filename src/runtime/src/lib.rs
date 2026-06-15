@@ -16,6 +16,7 @@
 // -- Core modules (always compiled) --
 pub mod audit;
 pub mod cache;
+pub(crate) mod file_lock;
 pub mod fs;
 pub mod grpc;
 pub mod host_check;

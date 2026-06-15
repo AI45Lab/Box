@@ -158,21 +158,29 @@ fn ensure_network_connected_with_store(
     record: &BoxRecord,
     network_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut network = network_store
-        .get(network_name)?
-        .ok_or_else(|| format!("network '{}' not found", network_name))?;
-    crate::commands::network::validate_attachable_network(&network)
-        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-
-    if network.endpoints.contains_key(&record.id) {
-        return Ok(());
-    }
-
-    network
-        .connect(&record.id, &record.name)
-        .map_err(|error| format!("Failed to connect to network: {error}"))?;
-    network_store.update(&network)?;
-    Ok(())
+    // Atomic load → validate → idempotency → allocate-IP → save under the
+    // network store's cross-process lock, so concurrent boots attaching to the
+    // same bridge cannot allocate duplicate IPs/MACs or lose each other's
+    // endpoints (the get → connect → update sequence was previously unlocked).
+    network_store.with_write_lock(|networks| {
+        let network =
+            networks
+                .get_mut(network_name)
+                .ok_or_else(|| -> Box<dyn std::error::Error> {
+                    format!("network '{}' not found", network_name).into()
+                })?;
+        crate::commands::network::validate_attachable_network(network)
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        if network.endpoints.contains_key(&record.id) {
+            return Ok(());
+        }
+        network.connect(&record.id, &record.name).map_err(
+            |error| -> Box<dyn std::error::Error> {
+                format!("Failed to connect to network: {error}").into()
+            },
+        )?;
+        Ok(())
+    })
 }
 
 /// Reconstruct a `BoxConfig` from a persisted `BoxRecord` and boot the VM.
