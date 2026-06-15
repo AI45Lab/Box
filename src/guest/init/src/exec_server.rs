@@ -1147,7 +1147,15 @@ fn drain_exec_input_events(
                 outcome.cancel = true;
                 return outcome;
             }
-            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => return outcome,
+            Err(mpsc::TryRecvError::Empty) => return outcome,
+            // The host closed the exec connection without an explicit cancel
+            // (e.g. a3s-box-cri died, or a client disconnect the host didn't
+            // translate to a cancel). Treat it as a cancel so the command does
+            // not keep running orphaned in the guest.
+            Err(mpsc::TryRecvError::Disconnected) => {
+                outcome.cancel = true;
+                return outcome;
+            }
         }
     }
 }
@@ -1811,6 +1819,44 @@ fn truncate_output(mut data: Vec<u8>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_drain_exec_input_disconnected_requests_cancel() {
+        use std::sync::mpsc;
+        // A disconnected host input channel (a3s-box-cri died, or a client
+        // disconnect) must be treated as a cancel so the command is killed
+        // rather than left running orphaned.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let (tx, rx) = mpsc::channel::<ExecInputEvent>();
+        drop(tx); // host gone
+        let outcome = drain_exec_input_events(&mut child, Some(&rx));
+        assert!(
+            outcome.cancel,
+            "a disconnected host input channel must request cancel"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn test_drain_exec_input_empty_does_not_cancel() {
+        use std::sync::mpsc;
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let (_tx, rx) = mpsc::channel::<ExecInputEvent>(); // sender alive, no events
+        let outcome = drain_exec_input_events(&mut child, Some(&rx));
+        assert!(
+            !outcome.cancel,
+            "an idle (still-connected) input channel must not cancel"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 
     #[test]
     fn test_truncate_output_within_limit() {

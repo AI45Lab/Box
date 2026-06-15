@@ -361,9 +361,13 @@ pub async fn serve_exec(mut stream: TcpStream, session: &StreamingSession) -> Re
                     }
                     Ok(Some(_)) => {}
                     Ok(None) | Err(_) => {
-                        if !stdin_closed {
-                            let _ = input.close_stdin().await;
-                        }
+                        // Full client disconnect (e.g. the user Ctrl-C'd
+                        // `kubectl exec`): cancel the guest command so a
+                        // long-running exec doesn't keep running orphaned in the
+                        // guest. Closing stdin alone won't stop a command that
+                        // ignores stdin EOF, and the guest treats a bare
+                        // connection drop as "no more input", not "kill".
+                        let _ = input.cancel().await;
                         break;
                     }
                 }
