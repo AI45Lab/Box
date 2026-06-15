@@ -30,6 +30,7 @@ mod login;
 mod logout;
 mod logs;
 mod monitor;
+mod monitor_service;
 pub(crate) mod network;
 mod pause;
 mod pool;
