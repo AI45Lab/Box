@@ -11,6 +11,18 @@ pub struct StateFile {
     pub(super) records: Vec<BoxRecord>,
 }
 
+/// In-memory result of a reconcile pass: which records changed, and which dead
+/// boxes need host-resource teardown. The teardown + persistence run in
+/// [`StateFile::flush_reconcile`] under the state lock — never from the bare
+/// (possibly unlocked) read path.
+struct ReconcileOutcome {
+    changed: bool,
+    stopped: Vec<BoxRecord>,
+    removed: Vec<BoxRecord>,
+    #[allow(dead_code)]
+    restart_candidates: Vec<String>,
+}
+
 impl StateFile {
     /// Load state from disk. Creates an empty state if the file doesn't exist.
     pub fn load(path: &Path) -> Result<Self, std::io::Error> {
@@ -21,7 +33,15 @@ impl StateFile {
                 path: path.to_path_buf(),
                 records,
             };
-            sf.reconcile();
+            // Reconcile in memory so the caller sees accurate live/dead status.
+            let outcome = sf.reconcile();
+            // Persist the change + run teardown under the state lock. Writing /
+            // tearing-down directly from this (often unlocked) read path was a
+            // lost-update + double-teardown race; flush_reconcile re-loads fresh
+            // under the lock so a concurrent run/monitor write is never clobbered.
+            if outcome.changed {
+                let _ = Self::flush_reconcile(path);
+            }
             Ok(sf)
         } else {
             // Ensure parent directory exists
@@ -162,7 +182,11 @@ impl StateFile {
         E: From<std::io::Error>,
     {
         let _lock = super::lock::StateLock::acquire()?;
-        let mut sf = Self::load_default()?;
+        // Load WITHOUT the reconcile sweep: `modify` is a generic locked RMW for
+        // the caller's `f`, and reconcile now persists + tears down under its own
+        // lock (`flush_reconcile`) — running it here would deadlock (flock is not
+        // reentrant) once reconcile takes the lock.
+        let mut sf = Self::load_default_raw()?;
         let out = f(&mut sf)?;
         sf.write_to_disk()?;
         Ok(out)
@@ -257,11 +281,15 @@ impl StateFile {
         &self.records
     }
 
-    /// Reconcile: check PID liveness for active boxes, mark dead ones.
-    ///
-    /// Returns a list of box IDs that should be restarted based on their
-    /// restart policy. The caller is responsible for actually restarting them.
-    fn reconcile(&mut self) -> Vec<String> {
+    /// Reconcile IN MEMORY: check PID liveness for active boxes, mark dead ones,
+    /// capture their exit code, and drop auto-remove records. Returns the changed
+    /// flag and the dead boxes needing teardown, but performs NO disk write and
+    /// NO host-resource teardown itself. Both of those happen in
+    /// [`Self::flush_reconcile`] under the cross-process lock, because this runs
+    /// on every (often unlocked) `load()`; writing/tearing-down here was a
+    /// lost-update race (clobbering a concurrent `run`/monitor write) and a
+    /// double-teardown race (two reads cleaning up the same box).
+    fn reconcile(&mut self) -> ReconcileOutcome {
         let mut changed = false;
         let mut restart_candidates = Vec::new();
         let mut auto_remove_records = Vec::new();
@@ -308,26 +336,48 @@ impl StateFile {
             }
         }
 
-        for record in &stopped_resource_records {
-            crate::cleanup::cleanup_stopped_box(record);
-        }
-
         if !auto_remove_records.is_empty() {
-            for record in &auto_remove_records {
-                crate::cleanup::cleanup_removed_box(record);
-            }
             self.records
                 .retain(|record| !auto_remove_records.iter().any(|r| r.id == record.id));
             changed = true;
         }
 
-        if changed {
-            // reconcile runs inside `load`, which `modify` calls while holding
-            // the state lock; use the unlocked write to avoid re-locking.
-            let _ = self.write_to_disk();
+        ReconcileOutcome {
+            changed,
+            stopped: stopped_resource_records,
+            removed: auto_remove_records,
+            restart_candidates,
         }
+    }
 
-        restart_candidates
+    /// Persist the reconcile sweep (mark-dead, exit-code capture, auto-remove)
+    /// AND run the dead boxes' host-resource teardown for `path` — all under the
+    /// cross-process state lock. Re-loads fresh under the lock and re-reconciles,
+    /// so a concurrent writer is never clobbered and two readers cannot tear down
+    /// the same box twice (the second's fresh re-load sees the box already gone).
+    fn flush_reconcile(path: &Path) -> std::io::Result<()> {
+        let _lock = super::lock::StateLock::acquire()?;
+        let records = if path.exists() {
+            let data = std::fs::read_to_string(path)?;
+            Self::parse_or_quarantine(path, &data)
+        } else {
+            Vec::new()
+        };
+        let mut sf = Self {
+            path: path.to_path_buf(),
+            records,
+        };
+        let outcome = sf.reconcile();
+        if outcome.changed {
+            for record in &outcome.stopped {
+                crate::cleanup::cleanup_stopped_box(record);
+            }
+            for record in &outcome.removed {
+                crate::cleanup::cleanup_removed_box(record);
+            }
+            sf.write_to_disk()?;
+        }
+        Ok(())
     }
 
     /// Get box IDs that are pending restart (dead boxes with active restart policy).
