@@ -338,6 +338,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_mark_container_started_if_created_loses_cas_after_concurrent_stop() {
+        // Regression for the StartContainer orphan fix (#72): StartContainer
+        // starts the workload, then does this CAS. If a concurrent Stop/Remove
+        // flipped the container out of Created first, the CAS must LOSE — that
+        // is what lets StartContainer cancel the just-started workload instead
+        // of spawning an orphaned supervisor with no stop handle.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let store = PersistentCriStore::new(Arc::new(JsonStateStore::new(&path)));
+
+        store.add_sandbox(sample_sandbox("sb1")).await;
+        let mut container = sample_container("c1", "sb1");
+        container.state = ContainerState::Created;
+        store.add_container(container).await;
+
+        // Concurrent Stop wins the race and moves it out of Created.
+        store.mark_container_exited("c1", 1_000_000_000, 0).await;
+
+        let won = store
+            .mark_container_started_if_created("c1", 2_000_000_000)
+            .await;
+        assert!(!won, "CAS must fail once the container has left Created");
+
+        let c = store.containers.get("c1").await.unwrap();
+        assert_ne!(c.state, ContainerState::Created);
+        assert_ne!(
+            c.state,
+            ContainerState::Running,
+            "a lost CAS must NOT flip the container to Running"
+        );
+
+        // An unknown container also loses the CAS.
+        assert!(
+            !store
+                .mark_container_started_if_created("does-not-exist", 3_000_000_000)
+                .await
+        );
+    }
+
+    #[tokio::test]
     async fn test_mark_container_exited_if_running_persists() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
