@@ -7,11 +7,41 @@
 
 use super::*;
 
+/// Decode `/proc/.../mountinfo`'s octal escapes (`\040` space, `\011` tab,
+/// `\012` newline, `\134` backslash — any `\ooo`) back to the real path bytes.
+///
+/// The kernel escapes those bytes in mount-point fields. A CRI bind whose
+/// container_path contains a space (Kubernetes allows it) appears as
+/// `.../my\040dir`; handing that literal to `umount` fails (no such path), the
+/// bind survives, and the subsequent `remove_dir_all` over the rootfs deletes
+/// the host source THROUGH the live bind — node-side data loss. Decoding makes
+/// the unmount target match the kernel's actual mount point.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn unescape_mountinfo(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\'
+            && i + 3 < b.len()
+            && (b'0'..=b'7').contains(&b[i + 1])
+            && (b'0'..=b'7').contains(&b[i + 2])
+            && (b'0'..=b'7').contains(&b[i + 3])
+        {
+            out.push(((b[i + 1] - b'0') << 6) | ((b[i + 2] - b'0') << 3) | (b[i + 3] - b'0'));
+            i += 4;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Mount points at or under `root`, parsed from `/proc/self/mountinfo` content
-/// (space-separated; field index 4 is the mount point). Returned deepest-first
-/// so a parent unmount does not `EBUSY` on a child. Pure (string in/out) for
-/// testing; managed CRI rootfs paths contain no whitespace, so mountinfo's
-/// octal escaping needs no decoding here.
+/// (space-separated; field index 4 is the mount point, with octal escapes
+/// decoded). Returned deepest-first so a parent unmount does not `EBUSY` on a
+/// child. Pure (string in/out) for testing.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn submounts_under(mountinfo: &str, root: &str) -> Vec<String> {
     let root = root.trim_end_matches('/');
@@ -19,8 +49,8 @@ fn submounts_under(mountinfo: &str, root: &str) -> Vec<String> {
     let mut mps: Vec<String> = mountinfo
         .lines()
         .filter_map(|line| line.split(' ').nth(4))
-        .filter(|mp| *mp == root || mp.starts_with(&with_slash))
-        .map(|mp| mp.to_string())
+        .map(unescape_mountinfo)
+        .filter(|mp| mp.as_str() == root || mp.starts_with(with_slash.as_str()))
         .collect();
     mps.sort_by_key(|p| std::cmp::Reverse(p.matches('/').count()));
     mps.dedup();
@@ -476,7 +506,7 @@ impl BoxRuntimeService {
 
 #[cfg(test)]
 mod cleanup_tests {
-    use super::submounts_under;
+    use super::{submounts_under, unescape_mountinfo};
 
     #[test]
     fn test_submounts_under_filters_and_orders_deepest_first() {
@@ -511,5 +541,34 @@ mod cleanup_tests {
             submounts_under(mountinfo, "/root/x"),
             vec!["/root/x".to_string()]
         );
+    }
+
+    #[test]
+    fn test_unescape_mountinfo_decodes_octal() {
+        assert_eq!(unescape_mountinfo("/data/my\\040dir"), "/data/my dir");
+        assert_eq!(unescape_mountinfo("/a\\011b"), "/a\tb"); // tab
+        assert_eq!(unescape_mountinfo("/a\\134b"), "/a\\b"); // backslash
+        assert_eq!(unescape_mountinfo("/plain/path"), "/plain/path");
+        // A trailing backslash that is not a full \ooo escape is left as-is.
+        assert_eq!(unescape_mountinfo("/a\\b"), "/a\\b");
+    }
+
+    #[test]
+    fn test_submounts_under_decodes_whitespace_mount_point() {
+        // A CRI bind whose container_path has a space: the kernel writes the
+        // mount point escaped (`\040`). The unmount target MUST be the decoded
+        // real path, or umount fails and remove_dir_all destroys the host source.
+        let mountinfo = "\
+1 2 0:1 / /root/rootfs/data/my\\040dir rw - ext4 d rw
+1 2 0:1 / /root/rootfs/plain rw - ext4 d rw
+";
+        let got = submounts_under(mountinfo, "/root/rootfs");
+        assert!(
+            got.contains(&"/root/rootfs/data/my dir".to_string()),
+            "decoded space path must be present (got {got:?})"
+        );
+        assert!(got.contains(&"/root/rootfs/plain".to_string()));
+        // The escaped literal must NOT be returned (umount can't resolve it).
+        assert!(!got.iter().any(|p| p.contains("\\040")));
     }
 }
