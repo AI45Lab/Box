@@ -530,6 +530,21 @@ impl WarmPool {
             crate::vm::fnv1a_hash(&box_config.image)
         ));
         std::fs::create_dir_all(&dir).map_err(BoxError::IoError)?;
+
+        // Cross-process lock on the per-image template dir. The dir is keyed only
+        // by the image hash, so two processes building the same image's template
+        // would write the same template.ram/template.state concurrently and
+        // corrupt them. Held (via a Send File handle) across the boot+snapshot
+        // awaits below; acquired off-runtime so a contended flock doesn't block a
+        // worker thread.
+        let lock_target = dir.clone();
+        let _lock = tokio::task::spawn_blocking(move || {
+            crate::file_lock::FileLock::acquire(&lock_target)
+        })
+        .await
+        .map_err(|e| BoxError::PoolError(format!("Template lock task failed: {e}")))?
+        .map_err(|e| BoxError::PoolError(format!("Failed to lock template dir: {e}")))?;
+
         let mem_file = dir.join("template.ram");
         let sock = dir.join("template.sock");
         let state_file = dir.join("template.state");
