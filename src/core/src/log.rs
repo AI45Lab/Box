@@ -155,9 +155,34 @@ fn parse_size(s: &str) -> std::result::Result<u64, String> {
 // long as the VM, so it is the correct, daemonless home (like containerd-shim).
 // ===========================================================================
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Truncate `path` to empty if it has grown past `cap` bytes; returns whether it
+/// truncated.
+///
+/// libkrun appends the guest console to the raw `console.log`/`console.err.log`
+/// for the VM's entire lifetime, so a chatty long-running box grows them without
+/// limit — only the rotated `container.json` was ever bounded. The tail loop
+/// calls this at a clean line boundary (every line so far is already durable in
+/// `container.json`), so truncation never drops queryable log data. libkrun
+/// holds the file `O_APPEND`, so its next write resumes at offset 0 — no hole.
+fn console_truncate_if_over(path: &Path, cap: u64) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if meta.len() <= cap {
+        return false;
+    }
+    match std::fs::OpenOptions::new().write(true).open(path) {
+        Ok(f) if f.set_len(0).is_ok() => {
+            tracing::debug!(path = %path.display(), cap, "console log exceeded cap; truncated");
+            true
+        }
+        _ => false,
+    }
+}
 
 /// Path to the structured JSON log file inside a box's log dir.
 pub fn json_log_path(log_dir: &Path) -> PathBuf {
@@ -180,9 +205,10 @@ pub fn is_runtime_console_noise(line: &str) -> bool {
 /// VM has exited and `console.log` is fully drained — flushing any final partial
 /// line as the last value before the subsequent `None`.
 fn tail_next_line(
-    reader: &mut impl BufRead,
+    reader: &mut (impl BufRead + Seek),
     buf: &mut String,
     stop: &AtomicBool,
+    on_eof: Option<&dyn Fn() -> bool>,
 ) -> Option<String> {
     loop {
         match reader.read_line(buf) {
@@ -195,6 +221,16 @@ fn tail_next_line(
                     }
                     let line = std::mem::take(buf);
                     return Some(line.trim_end_matches(['\n', '\r']).to_string());
+                }
+                // Caught up at a clean line boundary (no partial line buffered):
+                // let the caller bound the file's growth. If it truncated, seek
+                // back to the start so reads don't sit forever past a stale EOF.
+                if buf.is_empty() {
+                    if let Some(on_eof) = on_eof {
+                        if on_eof() {
+                            let _ = reader.seek(std::io::SeekFrom::Start(0));
+                        }
+                    }
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 continue;
@@ -234,6 +270,7 @@ pub fn run_log_processor(
             config.syslog_address(),
             config.syslog_facility(),
             config.tag().unwrap_or("a3s-box"),
+            Some(console_cap(config.max_size(), config.max_file())),
             stop,
         ),
     }
@@ -268,6 +305,7 @@ fn run_tagged_tail(
     file: &Path,
     stream: &str,
     filter_noise: bool,
+    bound: Option<u64>,
     stop: &AtomicBool,
     emit: &(dyn Fn(&str, &str) + Sync),
 ) {
@@ -277,12 +315,23 @@ fn run_tagged_tail(
     };
     let mut reader = BufReader::new(f);
     let mut buf = String::new();
-    while let Some(line) = tail_next_line(&mut reader, &mut buf, stop) {
+    // Bound the raw console file's growth at clean line boundaries (see
+    // console_truncate_if_over). None = unbounded (used by tests).
+    let truncate = bound.map(|cap| move || console_truncate_if_over(file, cap));
+    let on_eof: Option<&dyn Fn() -> bool> = truncate.as_ref().map(|t| t as &dyn Fn() -> bool);
+    while let Some(line) = tail_next_line(&mut reader, &mut buf, stop, on_eof) {
         if filter_noise && is_runtime_console_noise(&line) {
             continue;
         }
         emit(&line, stream);
     }
+}
+
+/// The raw `console.log`/`console.err.log` byte budget before the tail loop
+/// truncates it. Tied to the rotated `container.json` budget (`max_size *
+/// max_file`) so the raw console never outgrows the queryable log it feeds.
+fn console_cap(max_size: u64, max_file: u32) -> u64 {
+    max_size.saturating_mul(u64::from(max_file.max(1)))
 }
 
 fn run_json_file_processor(
@@ -315,11 +364,12 @@ fn run_json_file_processor(
     };
     let emit: &(dyn Fn(&str, &str) + Sync) = &emit;
 
+    let cap = Some(console_cap(max_size, max_file));
     std::thread::scope(|s| {
-        s.spawn(|| run_tagged_tail(console_log, "stdout", true, stop, emit));
+        s.spawn(|| run_tagged_tail(console_log, "stdout", true, cap, stop, emit));
         // libkrun's `init.krun:` preamble can land on EITHER stream, so filter
         // the noise on stderr too.
-        s.spawn(|| run_tagged_tail(&err_log, "stderr", true, stop, emit));
+        s.spawn(|| run_tagged_tail(&err_log, "stderr", true, cap, stop, emit));
     });
 }
 
@@ -329,6 +379,7 @@ fn run_syslog_processor(
     address: &str,
     _facility: &str,
     tag: &str,
+    cap: Option<u64>,
     stop: &AtomicBool,
 ) {
     use std::net::UdpSocket;
@@ -355,8 +406,8 @@ fn run_syslog_processor(
             };
             let emit: &(dyn Fn(&str, &str) + Sync) = &emit;
             std::thread::scope(|s| {
-                s.spawn(|| run_tagged_tail(console_log, "stdout", true, stop, emit));
-                s.spawn(|| run_tagged_tail(&err_log, "stderr", true, stop, emit));
+                s.spawn(|| run_tagged_tail(console_log, "stdout", true, cap, stop, emit));
+                s.spawn(|| run_tagged_tail(&err_log, "stderr", true, cap, stop, emit));
             });
         }
         "tcp" => {
@@ -377,8 +428,8 @@ fn run_syslog_processor(
             };
             let emit: &(dyn Fn(&str, &str) + Sync) = &emit;
             std::thread::scope(|sc| {
-                sc.spawn(|| run_tagged_tail(console_log, "stdout", true, stop, emit));
-                sc.spawn(|| run_tagged_tail(&err_log, "stderr", true, stop, emit));
+                sc.spawn(|| run_tagged_tail(console_log, "stdout", true, cap, stop, emit));
+                sc.spawn(|| run_tagged_tail(&err_log, "stderr", true, cap, stop, emit));
             });
         }
         _ => {}
@@ -584,14 +635,14 @@ mod tests {
         let mut buf = String::new();
         let stop = AtomicBool::new(true);
         assert_eq!(
-            tail_next_line(&mut reader, &mut buf, &stop),
+            tail_next_line(&mut reader, &mut buf, &stop, None),
             Some("alpha".to_string())
         );
         assert_eq!(
-            tail_next_line(&mut reader, &mut buf, &stop),
+            tail_next_line(&mut reader, &mut buf, &stop, None),
             Some("beta".to_string())
         );
-        assert_eq!(tail_next_line(&mut reader, &mut buf, &stop), None);
+        assert_eq!(tail_next_line(&mut reader, &mut buf, &stop, None), None);
         assert!(buf.is_empty());
     }
 
@@ -604,10 +655,74 @@ mod tests {
         let mut buf = String::new();
         let stop = AtomicBool::new(true);
         assert_eq!(
-            tail_next_line(&mut reader, &mut buf, &stop),
+            tail_next_line(&mut reader, &mut buf, &stop, None),
             Some("only-partial".to_string())
         );
-        assert_eq!(tail_next_line(&mut reader, &mut buf, &stop), None);
+        assert_eq!(tail_next_line(&mut reader, &mut buf, &stop, None), None);
+    }
+
+    #[test]
+    fn test_console_truncate_if_over_only_when_over_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.log");
+        std::fs::write(&path, b"hello").unwrap(); // 5 bytes
+
+        assert!(!console_truncate_if_over(&path, 10)); // under cap → untouched
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 5);
+
+        assert!(console_truncate_if_over(&path, 4)); // over cap → truncated
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+
+        // Missing file: false, no panic.
+        assert!(!console_truncate_if_over(&dir.path().join("nope"), 0));
+    }
+
+    #[test]
+    fn test_run_tagged_tail_truncates_over_cap_and_keeps_emitting() {
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("console.log");
+        // Pre-fill past a tiny cap with three complete lines.
+        std::fs::write(&path, b"l1\nl2\nl3\n").unwrap();
+        let cap = 4u64;
+
+        let collected = Arc::new(Mutex::new(Vec::<String>::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (c2, s2, p2) = (collected.clone(), stop.clone(), path.clone());
+        let handle = std::thread::spawn(move || {
+            let emit = move |line: &str, _stream: &str| c2.lock().unwrap().push(line.to_string());
+            let emit: &(dyn Fn(&str, &str) + Sync) = &emit;
+            run_tagged_tail(&p2, "stdout", false, Some(cap), &s2, emit);
+        });
+
+        // Let the tail drain l1..l3, hit EOF, and truncate (9 bytes > cap 4).
+        std::thread::sleep(Duration::from_millis(300));
+        // libkrun-style O_APPEND write after the truncation.
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(b"l4\nl5\n").unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        let got = collected.lock().unwrap().clone();
+        // No data lost across the truncation: pre- and post-truncation lines both emit.
+        for line in ["l1", "l3", "l4", "l5"] {
+            assert!(got.contains(&line.to_string()), "missing {line} in {got:?}");
+        }
+        // And the raw file stayed bounded (truncated, not left at full history).
+        let final_len = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            final_len <= cap + 6,
+            "console.log unbounded: {final_len} bytes"
+        );
     }
 
     #[test]

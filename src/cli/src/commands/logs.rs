@@ -128,15 +128,24 @@ async fn stream_logs(
     if args.follow {
         let file = std::fs::File::open(&log_path)?;
         let mut reader = BufReader::new(file);
-        reader.seek(SeekFrom::End(0))?;
+        let mut pos = reader.seek(SeekFrom::End(0))?;
 
         loop {
             let mut line = String::new();
             match reader.read_line(&mut line) {
                 Ok(0) => {
+                    // If the file shrank below our offset it was truncated under
+                    // us (the shim bounds the raw console.log); re-read from the
+                    // start so `--follow` doesn't freeze at a stale offset.
+                    if let Ok(meta) = reader.get_ref().metadata() {
+                        if pos > meta.len() {
+                            pos = reader.seek(SeekFrom::Start(0)).unwrap_or(0);
+                        }
+                    }
                     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                 }
-                Ok(_) => {
+                Ok(n) => {
+                    pos += n as u64;
                     let trimmed = line.trim_end();
                     if use_json {
                         print_json_line(

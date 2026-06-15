@@ -255,7 +255,7 @@ pub(crate) async fn tail_file(path: &std::path::Path) {
 /// foreground `run`/`attach` shows stdout and stderr like Docker.
 pub(crate) async fn tail_file_stream(path: &std::path::Path, to_stderr: bool) {
     use std::io::Write as _;
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
     // Wait for file to exist
     loop {
@@ -271,12 +271,24 @@ pub(crate) async fn tail_file_stream(path: &std::path::Path, to_stderr: bool) {
     };
 
     let mut buf = vec![0u8; 4096];
+    let mut pos: u64 = 0;
     loop {
         match file.read(&mut buf).await {
             Ok(0) => {
+                // Detect truncation/rotation: if our read offset is past the
+                // file's current end, the shim bounded the raw console under us
+                // (see core::log::console_truncate_if_over). Re-read from the
+                // start so we keep streaming instead of freezing forever at a
+                // stale offset.
+                if let Ok(meta) = file.metadata().await {
+                    if pos > meta.len() {
+                        pos = file.seek(std::io::SeekFrom::Start(0)).await.unwrap_or(0);
+                    }
+                }
                 tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
             }
             Ok(n) => {
+                pos += n as u64;
                 let text = String::from_utf8_lossy(&buf[..n]);
                 if to_stderr {
                     let mut err = std::io::stderr();
