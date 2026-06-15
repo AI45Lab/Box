@@ -219,3 +219,14 @@ jobs:
           unset A3S_DEPS_STUB
           cd src
           cargo test --release -p a3s-box-cri --test crictl_smoke -- --ignored --nocapture --test-threads=1
+      # Gate leak-freeness under churn against REAL VMs: create/run/remove cycles
+      # must return orphan shims / overlay mounts / box dirs to baseline. Exits
+      # non-zero on a leak, so a resource-leak regression fails the gate.
+      - name: Leak assertion — no orphan shims/mounts/box-dirs after churn
+        env:
+          A3S_BOX: ${{ github.workspace }}/src/target/release/a3s-box
+          CHURN: "20"
+        run: |
+          unset A3S_DEPS_STUB
+          chmod +x bench/bench.sh
+          bench/bench.sh leak
