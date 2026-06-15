@@ -545,8 +545,15 @@ impl WarmPool {
 
         // Trigger the snapshot over libkrun's socket, then tear down the source (it is
         // left paused by the snapshot; the RAM + state files are the template).
-        Self::trigger_snapshot(&sock, &state_file).await?;
+        //
+        // Destroy the source UNCONDITIONALLY: `trigger_snapshot` fails on any
+        // libkrun without snapshot support (the common case), and `?`-ing out
+        // here would leak the fully-booted source VM (shim process, overlay
+        // mount, box dir, sockets) — neither VmManager nor ShimHandler reaps on
+        // drop. Capture the result, tear down, then propagate.
+        let snapshot = Self::trigger_snapshot(&sock, &state_file).await;
         let _ = src.destroy_with_timeout(2000).await;
+        snapshot?;
 
         Ok(PoolTemplate {
             mem_file: mem_file.to_string_lossy().into_owned(),
