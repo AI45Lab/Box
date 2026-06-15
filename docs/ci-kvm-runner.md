@@ -54,6 +54,14 @@ microVM gate after the cheap `fmt`/`clippy`/`test` jobs pass.
 4. `crictl_smoke` (`A3S_BOX_CRI_SMOKE=1`) — the full CRI pod/container lifecycle
    (`RunPodSandbox → CreateContainer → StartContainer → exec → Stop → Remove`)
    driven by real `crictl`.
+5. **Leak assertion** (`bench/bench.sh leak`) — runs `CHURN` create/run/remove
+   cycles and asserts orphan shims, overlay mounts, and box dirs all return to
+   baseline. A resource-leak regression fails the gate.
+6. **Race assertion** (`bench/bench.sh race`) — boots `RACE` detached boxes
+   concurrently and asserts `boxes.json` still parses and every successful
+   launch persisted. This is the only check that exercises the cross-process
+   advisory lock (`flock` on `boxes.json.lock`) across separate processes — the
+   unit tests only race in-process threads. A lost update fails the gate.
 
 For the deeper `critest` conformance suite (73/7/17) and the snapshot-fork /
 warm-pool benchmarks, see [`cri-conformance.md`](./cri-conformance.md) and the
