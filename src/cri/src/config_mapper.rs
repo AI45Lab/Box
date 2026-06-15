@@ -122,10 +122,14 @@ fn resolve_agent_image(
 
 /// Parse resource configuration from annotations.
 fn parse_resources(annotations: &HashMap<String, String>) -> ResourceConfig {
+    // Clamp to the VM spec's valid vCPU range. Downstream the count narrows to a
+    // u8, so an out-of-range annotation (e.g. 256) would wrap to 0 vCPUs and
+    // silently fail to boot; clamp to 1..=255 instead.
     let vcpus = annotations
         .get(ANN_VCPUS)
         .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(2);
+        .unwrap_or(2)
+        .clamp(1, 255);
 
     let memory_mb = annotations
         .get(ANN_MEMORY_MB)

@@ -48,7 +48,15 @@ impl StateStore for JsonStateStore {
             std::fs::create_dir_all(parent)?;
         }
 
-        let tmp = self.path.with_extension("tmp");
+        // Per-call unique temp name (pid + monotonic counter): a fixed `.tmp`
+        // was shared by concurrent persist() calls, so two snapshots could
+        // clobber each other's temp file and produce a torn/lost state.json.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = self
+            .path
+            .with_extension(format!("tmp.{}.{seq}", std::process::id()));
         let json = serde_json::to_vec_pretty(state)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 

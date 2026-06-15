@@ -58,16 +58,30 @@ impl SnapshotStore {
             )));
         }
 
-        std::fs::create_dir_all(&snap_dir).map_err(|e| {
+        // Build the whole snapshot in a staging dir, then atomically rename it to
+        // `<id>/` only after metadata.json is written. A crash mid-save then
+        // leaves at most a `<id>.staging-*` dir (GC-able), never a partial
+        // `<id>/` that get/list ignore (they key on metadata.json) yet that
+        // blocks re-create and never prunes.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static STAGE_SEQ: AtomicU64 = AtomicU64::new(0);
+        let staging = self.base_dir.join(format!(
+            ".staging-{}-{}-{}",
+            metadata.id,
+            std::process::id(),
+            STAGE_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&staging);
+        std::fs::create_dir_all(&staging).map_err(|e| {
             BoxError::CacheError(format!(
-                "Failed to create snapshot directory {}: {}",
-                snap_dir.display(),
+                "Failed to create snapshot staging directory {}: {}",
+                staging.display(),
                 e
             ))
         })?;
 
         // Copy rootfs if source exists
-        let rootfs_dest = snap_dir.join("rootfs");
+        let rootfs_dest = staging.join("rootfs");
         if rootfs_source.exists() {
             copy_dir_recursive(rootfs_source, &rootfs_dest)?;
         } else {
@@ -77,10 +91,10 @@ impl SnapshotStore {
         }
 
         // Calculate size
-        metadata.size_bytes = dir_size(&snap_dir);
+        metadata.size_bytes = dir_size(&staging);
 
-        // Write metadata
-        let meta_path = snap_dir.join("metadata.json");
+        // Write metadata into the staging dir.
+        let meta_path = staging.join("metadata.json");
         let json = serde_json::to_string_pretty(&metadata).map_err(|e| {
             BoxError::SerializationError(format!("Failed to serialize snapshot metadata: {}", e))
         })?;
@@ -88,6 +102,17 @@ impl SnapshotStore {
             BoxError::CacheError(format!(
                 "Failed to write snapshot metadata {}: {}",
                 meta_path.display(),
+                e
+            ))
+        })?;
+
+        // Atomic publish: the snapshot becomes visible (with its metadata) in one
+        // step, or not at all.
+        std::fs::rename(&staging, &snap_dir).map_err(|e| {
+            let _ = std::fs::remove_dir_all(&staging);
+            BoxError::CacheError(format!(
+                "Failed to publish snapshot {}: {}",
+                snap_dir.display(),
                 e
             ))
         })?;

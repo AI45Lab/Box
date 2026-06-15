@@ -311,8 +311,13 @@ impl Ipam {
         let broadcast_u32 = u32::from(self.broadcast());
         let gateway_u32 = u32::from(self.gateway);
 
-        // Start from network + 2 (skip network and gateway)
-        let mut candidate = net_u32 + 2;
+        // Start from network + 2 (skip network and gateway). Checked arithmetic:
+        // a subnet near the top of the u32 range must report exhaustion, not
+        // overflow-panic (debug) or wrap to a garbage IP (release).
+        let mut candidate = match net_u32.checked_add(2) {
+            Some(c) => c,
+            None => return Err("no available IP addresses in subnet".to_string()),
+        };
         while candidate < broadcast_u32 {
             if candidate != gateway_u32 {
                 let ip = Ipv4Addr::from(candidate);
@@ -320,7 +325,10 @@ impl Ipam {
                     return Ok(ip);
                 }
             }
-            candidate += 1;
+            candidate = match candidate.checked_add(1) {
+                Some(c) => c,
+                None => break,
+            };
         }
 
         Err("no available IP addresses in subnet".to_string())
@@ -679,6 +687,17 @@ mod tests {
 
         let result = ipam.allocate(&[ip1]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_ipam_allocate_top_of_range_no_overflow() {
+        // A subnet at the very top of the u32 range must report exhaustion via
+        // checked arithmetic, not overflow-panic (debug) or a wrapped garbage IP.
+        let ipam = Ipam::new("255.255.255.252/30").unwrap();
+        // net=...252, gateway=...253, host=...254, broadcast=...255 -> 1 usable.
+        let ip1 = ipam.allocate(&[]).unwrap();
+        assert_eq!(ip1, Ipv4Addr::new(255, 255, 255, 254));
+        assert!(ipam.allocate(&[ip1]).is_err());
     }
 
     #[test]
