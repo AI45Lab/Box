@@ -55,7 +55,13 @@ pub(super) fn container_user_from_linux_config(
     let security_context = linux.and_then(|linux| linux.security_context.as_ref())?;
 
     if !security_context.run_as_username.is_empty() {
-        return Some(security_context.run_as_username.clone());
+        // Preserve an explicitly-requested run_as_group for the named-user path
+        // too (the guest resolves `name:gid`), otherwise the requested gid is
+        // silently dropped and the process falls back to the passwd primary gid.
+        return Some(match security_context.run_as_group.as_ref() {
+            Some(group) => format!("{}:{}", security_context.run_as_username, group.value),
+            None => security_context.run_as_username.clone(),
+        });
     }
 
     let user = security_context.run_as_user.as_ref()?.value;
@@ -441,6 +447,36 @@ mod tests {
     use super::*;
     use crate::cri_api::namespace_option::NamespaceMode;
     use crate::cri_api::NamespaceOption;
+
+    #[test]
+    fn test_container_user_named_preserves_run_as_group() {
+        use crate::cri_api::{Int64Value, LinuxContainerConfig, LinuxContainerSecurityContext};
+        let with_group = LinuxContainerConfig {
+            security_context: Some(LinuxContainerSecurityContext {
+                run_as_username: "appuser".to_string(),
+                run_as_group: Some(Int64Value { value: 2000 }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // The explicitly-requested gid must not be dropped for the named-user path.
+        assert_eq!(
+            container_user_from_linux_config(Some(&with_group)),
+            Some("appuser:2000".to_string())
+        );
+
+        let no_group = LinuxContainerConfig {
+            security_context: Some(LinuxContainerSecurityContext {
+                run_as_username: "appuser".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            container_user_from_linux_config(Some(&no_group)),
+            Some("appuser".to_string())
+        );
+    }
 
     #[test]
     fn test_container_exit_reason_oom_killed_overrides_code() {

@@ -96,8 +96,10 @@ fn bind_mount_source(source: &Path, target: &Path, readonly: bool) -> Result<(),
         )));
     }
     if readonly {
-        // A read-only bind needs a second remount; non-fatal if it fails (the
-        // mount is live, just writable).
+        // A read-only bind needs a second remount. Fail CLOSED if it fails: a
+        // volume the pod marked readOnly (a secret/configMap, or a readOnly
+        // hostPath) must never be silently exposed writable. Tear down the
+        // read-write bind we just made and surface the error.
         let ro = std::process::Command::new("mount")
             .arg("-o")
             .arg("remount,bind,ro")
@@ -106,7 +108,15 @@ fn bind_mount_source(source: &Path, target: &Path, readonly: bool) -> Result<(),
             .map(|s| s.success())
             .unwrap_or(false);
         if !ro {
-            tracing::warn!(target = %target.display(), "Failed to remount CRI mount read-only");
+            let _ = std::process::Command::new("umount")
+                .arg("-l")
+                .arg(target)
+                .status();
+            return Err(Status::internal(format!(
+                "Failed to remount CRI mount {} read-only (refusing to expose a \
+                 readOnly volume as writable)",
+                target.display()
+            )));
         }
     }
     Ok(())

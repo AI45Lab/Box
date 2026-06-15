@@ -267,7 +267,12 @@ impl VmManager {
             #[cfg(target_os = "windows")]
             env.push(("KRUN_INIT_PID1".to_string(), "1".to_string()));
 
-            tracing::debug!(env = ?env, "Using guest init as PID 1");
+            // Log only the count, never the values: `env` carries one
+            // BOX_EXEC_ENV_<KEY>=base64(value) entry per container env var, which
+            // on the CRI path includes Kubernetes secret-sourced values
+            // (secretKeyRef / envFrom). The no-guest-init branch already logs a
+            // count for the same reason.
+            tracing::debug!(env_count = env.len(), "Using guest init as PID 1");
 
             Entrypoint {
                 executable: guest_init_exec.to_string(),
