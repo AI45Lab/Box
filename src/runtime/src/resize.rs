@@ -153,11 +153,14 @@ fn is_valid_cpuset(cpuset: &str) -> bool {
 /// The resize exec runs in the guest root cgroup and this exec channel carries
 /// no container id, so the command resolves the slice at runtime: when there is
 /// exactly one `box-*` slice (every CLI box and single-container pod) it writes
-/// there; otherwise it falls back to the root cgroup — a harmless no-op — rather
-/// than mis-targeting a sibling container in a multi-container pod.
+/// there. Otherwise it FAILS (exit 1) — it must never fall back to writing the
+/// bare root cgroup, which either errors (e.g. root has no `cpu.max`) or applies
+/// the limit to the whole root hierarchy instead of the container, while the CLI
+/// still reported success. A non-zero exit surfaces as a visible warning at the
+/// call site (container_update) instead of a silent mis-apply.
 fn cgroup_write_cmd(file: &str, value: &str) -> String {
     format!(
-        "d=\"\"; n=0; for x in /sys/fs/cgroup/box-*/; do [ -d \"$x\" ] && {{ d=\"$x\"; n=$((n+1)); }}; done; [ \"$n\" = 1 ] || d=\"/sys/fs/cgroup/\"; echo '{value}' > \"${{d}}{file}\""
+        "d=\"\"; n=0; for x in /sys/fs/cgroup/box-*/; do [ -d \"$x\" ] && {{ d=\"$x\"; n=$((n+1)); }}; done; [ \"$n\" = 1 ] || {{ echo \"a3s-resize: cannot resolve a unique per-container cgroup ($n box-* slices) to set {file}\" >&2; exit 1; }}; echo '{value}' > \"${{d}}{file}\""
     )
 }
 
@@ -458,6 +461,32 @@ mod tests {
         assert!(cmds[0].contains("/sys/fs/cgroup/box-*"), "got {}", cmds[0]);
         assert!(cmds[0].contains("pids.max"));
         assert!(cmds[0].contains("'50'"));
+    }
+
+    #[test]
+    fn test_cgroup_command_fails_instead_of_writing_root() {
+        // When the per-container slice can't be uniquely resolved the command
+        // must exit non-zero (surfacing a warning at the call site), NOT fall
+        // back to writing the bare root cgroup, which mis-applies the limit to
+        // the whole hierarchy while the CLI reports success.
+        let update = ResourceUpdate {
+            limits: ResourceLimits {
+                cpu_quota: Some(50_000),
+                cpu_period: Some(100_000),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let cmds = update.build_cgroup_commands();
+        assert_eq!(cmds.len(), 1);
+        assert!(cmds[0].contains("exit 1"), "must fail loudly: {}", cmds[0]);
+        // The dangerous root-cgroup fallback must be gone: no assignment that
+        // points the write target `d` at the bare root.
+        assert!(
+            !cmds[0].contains("d=\"/sys/fs/cgroup/\""),
+            "must not fall back to the root cgroup: {}",
+            cmds[0]
+        );
     }
 
     #[test]
