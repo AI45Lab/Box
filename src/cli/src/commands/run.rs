@@ -349,7 +349,7 @@ async fn setup_and_boot(args: &RunArgs) -> Result<RunContext, Box<dyn std::error
     let stop_timeout_ms = args
         .common
         .stop_timeout
-        .map(|secs| secs * 1000)
+        .map(|secs| secs.saturating_mul(1000)) // absurd --stop-timeout must not overflow ms
         .unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT_MS);
     let anonymous_volumes = vm.anonymous_volumes().to_vec();
     // Register atomically (load-fresh-under-lock → push → write). A stale

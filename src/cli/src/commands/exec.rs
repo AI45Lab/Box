@@ -118,7 +118,10 @@ pub async fn execute(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
     let timeout_ns = if args.timeout == 0 {
         DEFAULT_EXEC_TIMEOUT_NS
     } else {
-        args.timeout * 1_000_000_000
+        // saturating: an absurd --timeout (seconds) would otherwise overflow u64
+        // nanoseconds (panic in debug, wrap to a tiny timeout in release). Cap at
+        // u64::MAX ns instead — effectively unbounded, which is the intent.
+        args.timeout.saturating_mul(1_000_000_000)
     };
 
     // Read stdin if interactive mode
