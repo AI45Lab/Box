@@ -147,10 +147,25 @@ impl VersionStore {
     }
 }
 
+/// Bind a context and version into the string used for sealing.
+///
+/// The underlying `sealed::seal` uses its `context` argument as BOTH the HKDF
+/// key-derivation `info` and the AES-GCM additional-authenticated-data. By
+/// folding the version into that string we make the version part of the key
+/// and the AAD: any tampering with the stored `version` field (e.g. forging an
+/// old blob to a newer version to defeat `check_version`) yields a different
+/// key/AAD and makes unseal fail authentication. The NUL separator cannot
+/// appear in a normal context string, so `(context, version)` maps to a unique,
+/// unambiguous binding.
+fn versioned_seal_context(context: &str, version: u64) -> String {
+    format!("{context}\0v{version}")
+}
+
 /// Seal data with version-based rollback protection.
 ///
-/// Advances the version counter for the context, then seals the data
-/// with the version embedded in the blob.
+/// Advances the version counter for the context, then seals the data with the
+/// version cryptographically bound into the sealing context (see
+/// [`versioned_seal_context`]).
 pub fn seal_versioned(
     report: &[u8],
     plaintext: &[u8],
@@ -159,11 +174,14 @@ pub fn seal_versioned(
     version_store: &mut VersionStore,
 ) -> Result<VersionedSealedData> {
     let version = version_store.advance(context)?;
-    let sealed = super::sealed::seal(report, plaintext, context, policy)?;
+    let bound_context = versioned_seal_context(context, version);
+    let sealed = super::sealed::seal(report, plaintext, &bound_context, policy)?;
 
     Ok(VersionedSealedData {
         version,
-        context: sealed.context,
+        // Store the ORIGINAL context for version tracking / rollback checks; the
+        // version is bound into the sealing context separately.
+        context: context.to_string(),
         policy: sealed.policy,
         blob: sealed.blob,
     })
@@ -181,10 +199,13 @@ pub fn unseal_versioned(
     // Check for rollback
     version_store.check_version(&versioned.context, versioned.version)?;
 
-    // Reconstruct SealedData for the underlying unseal
+    // Reconstruct SealedData for the underlying unseal. The version is bound
+    // into the sealing context, so a forged `version` field (one that slips past
+    // check_version) produces a mismatched key/AAD and unseal fails to
+    // authenticate.
     let sealed = super::sealed::SealedData {
         policy: versioned.policy,
-        context: versioned.context.clone(),
+        context: versioned_seal_context(&versioned.context, versioned.version),
         blob: versioned.blob.clone(),
     };
 
@@ -377,6 +398,40 @@ mod tests {
         let result = unseal_versioned(&report, &old, &mut store);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Rollback"));
+    }
+
+    #[test]
+    fn test_unseal_versioned_forged_version_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = test_version_store(&tmp);
+        let report = make_test_report();
+
+        // Seal at version 1 (store advances to 1).
+        let mut sealed = seal_versioned(
+            &report,
+            b"secret-v1",
+            "ctx",
+            SealingPolicy::default(),
+            &mut store,
+        )
+        .unwrap();
+        assert_eq!(sealed.version, 1);
+
+        // Forge the plaintext version field to a value that still passes the
+        // rollback check (>= stored). Without cryptographic binding this would
+        // let a stale blob masquerade as a newer version; because the version is
+        // bound into the sealing context (key + AAD), unseal must fail to
+        // authenticate instead of returning the rolled-back plaintext.
+        sealed.version = 2;
+        assert!(store.check_version("ctx", sealed.version).is_ok());
+
+        let result = unseal_versioned(&report, &sealed, &mut store);
+        assert!(result.is_err(), "forged version must not unseal");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("Unseal failed") || msg.contains("mismatch") || msg.contains("corrupted"),
+            "expected an authentication failure, got: {msg}"
+        );
     }
 
     #[test]
