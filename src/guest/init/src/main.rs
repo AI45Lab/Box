@@ -643,6 +643,12 @@ fn run_init() -> Result<(), Box<dyn std::error::Error>> {
             },
             exec_config.user.clone(),
         );
+        // Stash the cgroup's procs path too, so the deferred main joins the
+        // per-container cgroup when spawned (the non-deferred branch below
+        // passes it to spawn_isolated). Without this a warm/IDLE-boot box runs
+        // its main outside the cgroup and pids.max / cpu.max are unenforced.
+        #[cfg(target_os = "linux")]
+        exec_server::set_deferred_cgroup_procs(cgroup_procs.clone());
         nix::unistd::Pid::from_raw(-1)
     } else {
         // Hand the main process re-openable pipe write-ends as fd 1/2 (see
