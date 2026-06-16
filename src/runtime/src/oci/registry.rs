@@ -25,6 +25,29 @@ fn registry_protocol_from_env() -> ClientProtocol {
     }
 }
 
+/// Validate a registry-supplied content digest and return its hex body.
+///
+/// `oci-distribution` returns the `Docker-Content-Digest` header verbatim with
+/// no validation, so a malicious/compromised registry (or a MITM when
+/// `A3S_REGISTRY_PROTOCOL=http`) can return e.g. `sha256:../../../../etc/cron.d/x`.
+/// That value is used to build on-disk paths (the manifest/blob write, the pull
+/// temp dir, the store key); without this check the `..` components make it a
+/// path-traversal arbitrary-file write/delete primitive that runs in the default
+/// config (signature policy is Skip). Require the canonical
+/// `sha256:<64 lowercase hex>` form and reject anything else.
+pub(crate) fn validated_digest_hex(digest: &str) -> Result<&str> {
+    digest
+        .strip_prefix("sha256:")
+        .filter(|hex| {
+            hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+        .ok_or_else(|| {
+            BoxError::OciImageError(format!(
+                "registry returned a malformed content digest (expected sha256:<64 hex>): {digest:?}"
+            ))
+        })
+}
+
 /// An `AsyncWrite` that streams bytes straight to a file while computing their
 /// SHA-256, so a pulled blob is hashed and written in bounded chunks instead of
 /// being fully buffered in memory.
@@ -352,11 +375,12 @@ impl RegistryPuller {
             });
         }
 
-        // Write manifest blob
+        // Write manifest blob. Validate the registry-returned digest first: it is
+        // the Docker-Content-Digest header verbatim, and feeding `sha256:../../x`
+        // into blobs_dir.join() would write the (attacker-shaped) manifest JSON to
+        // an arbitrary host path outside the store.
         let manifest_json = serde_json::to_vec(&image_manifest)?;
-        let manifest_digest_hex = manifest_digest
-            .strip_prefix("sha256:")
-            .unwrap_or(&manifest_digest);
+        let manifest_digest_hex = validated_digest_hex(&manifest_digest)?;
         std::fs::write(blobs_dir.join(manifest_digest_hex), &manifest_json).map_err(|e| {
             BoxError::RegistryError {
                 registry: reference.registry.clone(),
@@ -710,6 +734,43 @@ mod tests {
         let auth = RegistryAuth::anonymous();
         assert!(auth.username.is_none());
         assert!(auth.password.is_none());
+    }
+
+    #[test]
+    fn validated_digest_hex_rejects_path_traversal_and_non_hex() {
+        // A real digest passes and yields the bare hex (used as a path component).
+        let good = format!("sha256:{}", "a".repeat(64));
+        assert_eq!(validated_digest_hex(&good).unwrap(), "a".repeat(64));
+        assert_eq!(
+            validated_digest_hex(
+                "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            )
+            .unwrap(),
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        );
+
+        // SECURITY: every path-traversal / malformed digest a malicious registry
+        // could return MUST be rejected before it reaches blobs_dir.join().
+        for evil in [
+            "sha256:../../../../etc/cron.d/x",
+            "sha256:..",
+            "sha256:../x",
+            "sha256:abc/../def",
+            "sha256:/etc/passwd",
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde/", // 63 + slash
+            &format!("sha256:{}", "A".repeat(64)), // uppercase not allowed (non-canonical)
+            &format!("sha256:{}", "g".repeat(64)), // non-hex
+            &format!("sha256:{}", "a".repeat(63)), // too short
+            &format!("sha256:{}", "a".repeat(65)), // too long
+            "sha512:0000000000000000000000000000000000000000000000000000000000000000",
+            "../../../etc/passwd",
+            "",
+        ] {
+            assert!(
+                validated_digest_hex(evil).is_err(),
+                "must reject malicious/malformed digest: {evil:?}"
+            );
+        }
     }
 
     #[test]

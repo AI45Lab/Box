@@ -216,8 +216,13 @@ impl ImagePuller {
         // keeps its canonical reference (full_ref) for storage and identity.
         let fetch = self.mirror_reference(reference);
 
-        // Get the manifest digest for storage key
+        // Get the manifest digest for storage key. The registry returns it
+        // verbatim (the Docker-Content-Digest header), so validate it before it is
+        // used to build any on-disk path below (the temp dir that gets
+        // remove_dir_all'd, the store key) — a `sha256:../../x` value would
+        // otherwise be a path-traversal arbitrary-dir-delete / store-escape.
         let digest = self.puller.pull_manifest_digest(&fetch).await?;
+        super::registry::validated_digest_hex(&digest)?;
 
         // Check if we already have this digest (different tag, same content)
         if let Some(stored) = self.store.get_by_digest(&digest).await {
