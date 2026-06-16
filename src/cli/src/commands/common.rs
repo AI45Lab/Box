@@ -370,6 +370,34 @@ pub(crate) fn validate_runtime_options(common: &CommonBoxArgs) -> Result<(), Str
         return Err("--gpus is not implemented; GPU passthrough is not available".to_string());
     }
 
+    // CPUs must fit the microVM sizing contract: `vcpus as u8` (spec.rs) turned 0
+    // into a non-bootable VM and >= 256 into a wrapped/truncated count.
+    if common.cpus == 0 {
+        return Err("--cpus must be at least 1".to_string());
+    }
+    if common.cpus > 255 {
+        return Err(format!("--cpus {} exceeds the maximum of 255", common.cpus));
+    }
+
+    // OOM controls are accepted for Docker-CLI compatibility but not enforced by
+    // the libkrun backend; warn instead of silently misleading an operator who
+    // relies on them, and validate the documented oom_score_adj range.
+    if common.oom_kill_disable {
+        eprintln!(
+            "a3s-box: warning: --oom-kill-disable is accepted but not enforced by the libkrun backend"
+        );
+    }
+    if let Some(adj) = common.oom_score_adj {
+        if !(-1000..=1000).contains(&adj) {
+            return Err(format!(
+                "--oom-score-adj {adj} is out of range (-1000 to 1000)"
+            ));
+        }
+        eprintln!(
+            "a3s-box: warning: --oom-score-adj is accepted but not enforced by the libkrun backend"
+        );
+    }
+
     normalize_user_option(common.user.as_deref())?;
     validate_workdir_option(common.workdir.as_deref())?;
     normalize_port_maps(&common.publish)?;
@@ -498,7 +526,12 @@ pub(crate) fn parse_memory_bytes(s: &str) -> Result<u64, String> {
     let num: u64 = num_str
         .parse()
         .map_err(|_| format!("invalid number: {num_str}"))?;
-    Ok(num * multiplier)
+    // checked_mul: an absurd value (e.g. `20000000000g`) overflows u64 and would
+    // wrap to a small/more-restrictive limit in release (panic in debug). The
+    // sibling parsers (output.rs parse_size_bytes/parse_memory) were already
+    // hardened; this one was missed.
+    num.checked_mul(multiplier)
+        .ok_or_else(|| format!("size value too large: {s}"))
 }
 
 /// Build ResourceLimits from common box args.
@@ -514,7 +547,14 @@ pub(crate) fn build_resource_limits(
     let memory_swap = match &args.memory_swap {
         Some(s) if s == "-1" => Some(-1i64),
         Some(s) => {
-            Some(parse_memory_bytes(s).map_err(|e| format!("Invalid --memory-swap: {e}"))? as i64)
+            let bytes = parse_memory_bytes(s).map_err(|e| format!("Invalid --memory-swap: {e}"))?;
+            // Reject before the lossy `as i64` cast: a value > i64::MAX would wrap
+            // negative, and resize.rs maps swap < 0 to memory.swap.max=max
+            // (unlimited) — so a fat-fingered huge value silently became unlimited.
+            if bytes > i64::MAX as u64 {
+                return Err(format!("--memory-swap value too large: {s}").into());
+            }
+            Some(bytes as i64)
         }
         None => None,
     };
@@ -594,6 +634,37 @@ mod tests {
     fn test_parse_memory_bytes_raw_number() {
         assert_eq!(parse_memory_bytes("1073741824").unwrap(), 1073741824);
         assert_eq!(parse_memory_bytes("512").unwrap(), 512);
+    }
+
+    #[test]
+    fn test_parse_memory_bytes_rejects_overflow() {
+        // The unchecked multiply wrapped (release) / panicked (debug) on an
+        // absurd value; it must now be a clean error.
+        assert!(parse_memory_bytes("20000000000g").is_err());
+        assert!(parse_memory_bytes("18446744073709551615k").is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_and_excessive_cpus() {
+        let mut args = default_common_args();
+        args.cpus = 2;
+        assert!(validate_runtime_options(&args).is_ok());
+        args.cpus = 0;
+        assert!(validate_runtime_options(&args)
+            .unwrap_err()
+            .contains("cpus"));
+        args.cpus = 256;
+        assert!(validate_runtime_options(&args).unwrap_err().contains("255"));
+    }
+
+    #[test]
+    fn test_validate_rejects_out_of_range_oom_score_adj() {
+        let mut args = default_common_args();
+        args.oom_score_adj = Some(2000);
+        let err = validate_runtime_options(&args).unwrap_err();
+        assert!(err.contains("oom-score-adj"), "got: {err}");
+        args.oom_score_adj = Some(-500);
+        assert!(validate_runtime_options(&args).is_ok());
     }
 
     #[test]

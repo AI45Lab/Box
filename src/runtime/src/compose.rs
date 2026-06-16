@@ -477,7 +477,24 @@ fn parse_compose_memory(s: &str) -> Result<u32> {
         .parse()
         .map_err(|_| BoxError::ConfigError(format!("Invalid memory value: {}", s)))?;
 
-    Ok((num * multiplier as f64) as u32)
+    // Reject the values the lossy `as u32` cast silently mangled: a negative
+    // (`-5g` saturated to 0 MiB → handed to libkrun) and an absurdly large value
+    // (`99999999g` saturated to u32::MAX MiB). Fractional values like 1.5g stay
+    // valid (Docker-compatible). round() avoids truncating e.g. 1.9m to 1.
+    if !num.is_finite() || num < 0.0 {
+        return Err(BoxError::ConfigError(format!(
+            "Invalid memory value: {}",
+            s
+        )));
+    }
+    let mib = num * multiplier as f64;
+    if mib > u32::MAX as f64 {
+        return Err(BoxError::ConfigError(format!(
+            "memory value too large: {}",
+            s
+        )));
+    }
+    Ok(mib.round() as u32)
 }
 
 fn resolve_compose_path(base_dir: &Path, path: &str) -> PathBuf {
@@ -846,6 +863,16 @@ services:
         assert_eq!(parse_compose_memory("512m").unwrap(), 512);
         assert_eq!(parse_compose_memory("512M").unwrap(), 512);
         assert_eq!(parse_compose_memory("512mb").unwrap(), 512);
+    }
+
+    #[test]
+    fn test_parse_compose_memory_rejects_negative_and_overflow() {
+        // The lossy `as u32` cast saturated these silently: `-5g` → 0 MiB,
+        // `99999999g` → u32::MAX MiB. Both must now be errors.
+        assert!(parse_compose_memory("-5g").is_err());
+        assert!(parse_compose_memory("99999999g").is_err());
+        // Valid fractional input is still accepted (Docker-compatible).
+        assert_eq!(parse_compose_memory("1.5g").unwrap(), 1536);
     }
 
     #[test]

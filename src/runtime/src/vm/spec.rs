@@ -395,9 +395,19 @@ impl VmManager {
             ));
         }
 
+        // Fail closed instead of truncating: `vcpus as u8` turned 256 into 0
+        // (a 0-vCPU microVM fails to boot) and 260 into 4, silently violating the
+        // requested sizing. The CLI validates the range up front; this guards the
+        // compose/CRI paths too.
+        let vcpus = u8::try_from(self.config.resources.vcpus).map_err(|_| {
+            BoxError::ConfigError(format!(
+                "vcpus {} exceeds the maximum of 255",
+                self.config.resources.vcpus
+            ))
+        })?;
         Ok(InstanceSpec {
             box_id: self.box_id.clone(),
-            vcpus: self.config.resources.vcpus as u8,
+            vcpus,
             memory_mib: self.config.resources.memory_mb,
             rootfs_path: layout.rootfs_path.clone(),
             exec_socket_path: layout.exec_socket_path.clone(),
