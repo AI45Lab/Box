@@ -109,18 +109,32 @@ impl ContainerCgroup {
     /// (max process count, `--pids-limit`). Returns `None` when no limit is
     /// requested or cgroup v2 is unavailable, in which case the caller proceeds
     /// without enforcement.
+    #[allow(clippy::too_many_arguments)]
     pub fn create(
         memory_max: Option<u64>,
+        memory_low: Option<u64>,
+        memory_swap_max: Option<i64>,
         cpu_quota: Option<i64>,
         cpu_period: Option<u64>,
         cpu_shares: Option<u64>,
         pids_max: Option<u64>,
     ) -> Option<Self> {
         let want_memory = memory_max.is_some_and(|m| m > 0);
+        let want_memory_low = memory_low.is_some_and(|m| m > 0);
+        // memory.swap.max accepts a byte value or -1 (unlimited); any explicit
+        // value means the limit was requested.
+        let want_memory_swap = memory_swap_max.is_some();
         let want_cpu = cpu_quota.is_some_and(|q| q > 0);
         let want_weight = cpu_shares.is_some_and(|s| s > 0);
         let want_pids = pids_max.is_some_and(|p| p > 0);
-        if (!want_memory && !want_cpu && !want_weight && !want_pids) || !ensure_cgroup2_ready() {
+        if (!want_memory
+            && !want_memory_low
+            && !want_memory_swap
+            && !want_cpu
+            && !want_weight
+            && !want_pids)
+            || !ensure_cgroup2_ready()
+        {
             return None;
         }
         let seq = CGROUP_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -140,6 +154,27 @@ impl ContainerCgroup {
             // Kill the whole cgroup on OOM so the container's main process dies
             // even if the over-allocating process was a child (best-effort).
             let _ = write_cgroup_file(&format!("{path}/memory.oom.group"), "1");
+        }
+        if want_memory_low {
+            // memory.low = best-effort soft reservation (--memory-reservation):
+            // the kernel reclaims from this cgroup only after unprotected memory
+            // is exhausted. Non-fatal so other limits still apply.
+            let low = memory_low.unwrap_or(0);
+            if let Err(error) = write_cgroup_file(&format!("{path}/memory.low"), &low.to_string()) {
+                warn!(error = %error, low, "cgroup: failed to set memory.low");
+            }
+        }
+        if want_memory_swap {
+            // memory.swap.max (--memory-swap): a byte cap, or "max" for -1
+            // (unlimited swap). Non-fatal.
+            let value = match memory_swap_max {
+                Some(v) if v < 0 => "max".to_string(),
+                Some(v) => v.to_string(),
+                None => "max".to_string(),
+            };
+            if let Err(error) = write_cgroup_file(&format!("{path}/memory.swap.max"), &value) {
+                warn!(error = %error, value, "cgroup: failed to set memory.swap.max");
+            }
         }
         if want_cpu {
             // cgroup v2 `cpu.max` = "<quota_us> <period_us>"; CRI defaults the

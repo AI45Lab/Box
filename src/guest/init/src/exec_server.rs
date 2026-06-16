@@ -1243,6 +1243,8 @@ fn execute_command_streaming(
     #[cfg(target_os = "linux")]
     let container_cgroup = crate::cgroup::ContainerCgroup::create(
         parse_sec_mem_limit(spec.env),
+        parse_sec_int(spec.env, "A3S_SEC_MEM_LOW=").map(|value| value as u64),
+        parse_sec_int(spec.env, "A3S_SEC_MEM_SWAP="),
         parse_sec_int(spec.env, "A3S_SEC_CPU_QUOTA="),
         parse_sec_int(spec.env, "A3S_SEC_CPU_PERIOD=").map(|value| value as u64),
         parse_sec_int(spec.env, "A3S_SEC_CPU_SHARES=").map(|value| value as u64),

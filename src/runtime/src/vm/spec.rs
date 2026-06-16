@@ -278,6 +278,20 @@ impl VmManager {
                 }
             }
 
+            // Memory soft-reservation (--memory-reservation → memory.low) and
+            // swap cap (--memory-swap → memory.swap.max). Like the CPU caps these
+            // are enforced by the in-guest per-container cgroup (the broken
+            // host-side path was removed); the hard --memory limit stays
+            // VM-sized, so no A3S_SEC_MEM_LIMIT is emitted here.
+            if let Some(reservation) = self.config.resource_limits.memory_reservation {
+                if reservation > 0 {
+                    env.push(("A3S_SEC_MEM_LOW".to_string(), reservation.to_string()));
+                }
+            }
+            if let Some(swap) = self.config.resource_limits.memory_swap {
+                env.push(("A3S_SEC_MEM_SWAP".to_string(), swap.to_string()));
+            }
+
             // Signal guest init to remount rootfs read-only after all setup
             if self.config.read_only {
                 env.push(("BOX_READONLY".to_string(), "1".to_string()));
@@ -869,6 +883,26 @@ mod tests {
         assert_eq!(env_value(&spec, "A3S_SEC_CPU_PERIOD"), Some("100000"));
         assert_eq!(env_value(&spec, "A3S_SEC_CPU_SHARES"), Some("512"));
         assert_eq!(env_value(&spec, "A3S_SEC_PIDS_LIMIT"), Some("100"));
+    }
+
+    #[test]
+    fn test_run_path_plumbs_memory_reservation_and_swap_to_guest() {
+        // --memory-reservation (memory.low) and --memory-swap (memory.swap.max)
+        // must reach guest-init as A3S_SEC_MEM_LOW / A3S_SEC_MEM_SWAP so the
+        // in-guest cgroup enforces them (the broken host path was removed).
+        let temp = tempdir().unwrap();
+        let mut config = BoxConfig::default();
+        config.resource_limits.memory_reservation = Some(256 * 1024 * 1024);
+        config.resource_limits.memory_swap = Some(-1);
+
+        let mut vm = test_vm_manager(config);
+        let layout = test_layout(temp.path(), Some(test_oci_config(None, None)), true);
+        let spec = vm.build_instance_spec(&layout).unwrap();
+
+        assert_eq!(env_value(&spec, "A3S_SEC_MEM_LOW"), Some("268435456"));
+        assert_eq!(env_value(&spec, "A3S_SEC_MEM_SWAP"), Some("-1"));
+        // The hard --memory limit is VM-sized, not an in-guest memory.max.
+        assert_eq!(env_value(&spec, "A3S_SEC_MEM_LIMIT"), None);
     }
 
     #[test]
