@@ -30,6 +30,20 @@ impl SnapshotStore {
                 e
             ))
         })?;
+        // Sweep leftover `.staging-*` dirs from a prior crashed/aborted save
+        // (mirrors ImageStore::new). `save` builds the whole snapshot in
+        // `.staging-<id>-<pid>-<seq>` and only renames it into `<id>/` after
+        // metadata.json; a SIGKILL/OOM/power-loss mid-copy leaves a full
+        // rootfs-sized staging dir that list/count/prune never see (they key on
+        // metadata.json) and that embeds the dead writer's pid+seq, so no later
+        // process can match it — it would leak permanently without this sweep.
+        if let Ok(entries) = std::fs::read_dir(base_dir) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().starts_with(".staging-") {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+            }
+        }
         Ok(Self {
             base_dir: base_dir.to_path_buf(),
         })
@@ -651,5 +665,29 @@ mod tests {
             std::fs::read_to_string(dst.join("sub/b.txt")).unwrap(),
             "world"
         );
+    }
+
+    #[test]
+    fn new_sweeps_leftover_staging_dirs() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("snapshots");
+        std::fs::create_dir_all(&base).unwrap();
+
+        // A full rootfs-sized staging dir leaked by a crashed save...
+        let leaked = base.join(".staging-snap1-12345-0");
+        std::fs::create_dir_all(leaked.join("rootfs")).unwrap();
+        std::fs::write(leaked.join("rootfs").join("big"), vec![0u8; 4096]).unwrap();
+        // ...alongside a real snapshot (keyed by metadata.json).
+        let real = base.join("snap1");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("metadata.json"), "{}").unwrap();
+
+        let _store = SnapshotStore::new(&base).unwrap();
+
+        assert!(
+            !leaked.exists(),
+            "leaked .staging-* dir must be swept on open"
+        );
+        assert!(real.exists(), "a real snapshot dir must be preserved");
     }
 }
