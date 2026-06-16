@@ -381,24 +381,66 @@ async fn run_due_health_checks(state: &StateFile) -> Result<(), Box<dyn std::err
         return Ok(());
     }
 
-    for (box_id, exec_socket_path, health_check) in probes {
-        let healthy = health::run_probe(
-            &exec_socket_path,
-            &health_check.cmd,
-            health::probe_timeout_ns(&health_check),
-        )
-        .await;
-        // Re-load fresh under the lock and apply only this box's health fields,
-        // so concurrent CLI/health-checker writes are preserved.
+    // Run the due probes concurrently with bounded fan-out (see probe_all): the
+    // old serial loop made one wedged-but-connectable guest stall every other
+    // box's health check AND every restart this cycle, since each probe is
+    // host-bounded to its timeout + slack. State writes stay serialized below.
+    let results = probe_all(probes).await;
+
+    // Apply each result under the state lock (writes stay serialized; only the
+    // slow network probes were parallelized). Re-load fresh per box so a
+    // concurrent CLI/health-checker write is preserved.
+    for (box_id, healthy, checked_at) in results {
         StateFile::modify(|s| {
             if let Some(record) = s.find_by_id_mut(&box_id) {
-                health::apply_probe_result(record, healthy, chrono::Utc::now());
+                health::apply_probe_result(record, healthy, checked_at);
             }
             Ok::<(), std::io::Error>(())
         })?;
     }
 
     Ok(())
+}
+
+/// Health-check probe input: (box id, exec socket path, health check).
+#[cfg(not(windows))]
+type ProbeJob = (String, std::path::PathBuf, crate::state::HealthCheck);
+
+/// Run the given probes concurrently with bounded fan-out, returning
+/// `(box_id, healthy, checked_at)` for each. Production wrapper over
+/// [`probe_all_with`] using the real exec probe.
+#[cfg(not(windows))]
+async fn probe_all(probes: Vec<ProbeJob>) -> Vec<(String, bool, chrono::DateTime<chrono::Utc>)> {
+    probe_all_with(probes, |sock, cmd, timeout_ns| async move {
+        health::run_probe(&sock, &cmd, timeout_ns).await
+    })
+    .await
+}
+
+/// Bounded-concurrency fan-out over health probes. The probe function is
+/// injected so the concurrency is unit-testable without a live guest.
+#[cfg(not(windows))]
+async fn probe_all_with<F, Fut>(
+    probes: Vec<ProbeJob>,
+    probe: F,
+) -> Vec<(String, bool, chrono::DateTime<chrono::Utc>)>
+where
+    F: Fn(std::path::PathBuf, Vec<String>, u64) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    use futures::stream::StreamExt;
+    // Cap on in-flight probes so a large fleet can't open an unbounded number of
+    // exec connections at once.
+    const MAX_CONCURRENT_PROBES: usize = 16;
+    futures::stream::iter(probes)
+        .map(|(box_id, exec_socket_path, health_check)| {
+            let timeout_ns = health::probe_timeout_ns(&health_check);
+            let fut = probe(exec_socket_path, health_check.cmd, timeout_ns);
+            async move { (box_id, fut.await, chrono::Utc::now()) }
+        })
+        .buffer_unordered(MAX_CONCURRENT_PROBES)
+        .collect()
+        .await
 }
 
 #[cfg(windows)]
@@ -546,5 +588,66 @@ mod tests {
 
         assert!(line.contains("box box (id1)"));
         assert!(line.contains("4s remaining"));
+    }
+
+    // The per-cycle health probes must run concurrently (bounded), not serially:
+    // a serial loop made one slow/wedged guest stall every other box's check and
+    // every restart that cycle. With a fake 200ms probe, 8 boxes complete in
+    // ~200ms (concurrent) instead of ~1.6s (serial), and genuinely overlap.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn probe_all_runs_probes_concurrently() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let n = 8usize;
+        let probes: Vec<ProbeJob> = (0..n)
+            .map(|i| {
+                (
+                    format!("box-{i}"),
+                    std::path::PathBuf::from("/nonexistent"),
+                    crate::state::HealthCheck {
+                        cmd: vec!["true".to_string()],
+                        interval_secs: 0,
+                        timeout_secs: 5,
+                        retries: 3,
+                        start_period_secs: 0,
+                    },
+                )
+            })
+            .collect();
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+
+        let start = Instant::now();
+        let results = probe_all_with(probes, |_sock, _cmd, _timeout_ns| {
+            let in_flight = Arc::clone(&in_flight);
+            let max_in_flight = Arc::clone(&max_in_flight);
+            async move {
+                let cur = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                max_in_flight.fetch_max(cur, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                false
+            }
+        })
+        .await;
+        let elapsed = start.elapsed();
+
+        // Every probe produced a result — none dropped by the fan-out.
+        assert_eq!(results.len(), n);
+        assert!(results.iter().all(|(_, healthy, _)| !*healthy));
+        // Serial would be n × 200ms = 1.6s; concurrent (cap 16 ≥ 8) ≈ 200ms.
+        assert!(
+            elapsed < Duration::from_millis(900),
+            "probes did not run concurrently: {elapsed:?}"
+        );
+        assert!(
+            max_in_flight.load(Ordering::SeqCst) >= 2,
+            "expected overlapping probes, max in-flight was {}",
+            max_in_flight.load(Ordering::SeqCst)
+        );
     }
 }

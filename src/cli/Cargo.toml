@@ -20,6 +20,7 @@ a3s-transport = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }
+futures = { workspace = true }
 
 # CLI
 clap = { workspace = true }
