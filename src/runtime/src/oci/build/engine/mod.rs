@@ -318,8 +318,24 @@ pub async fn build(config: BuildConfig, store: Arc<ImageStore>) -> Result<BuildR
                     other => instruction_to_string(other),
                 };
                 let input_hash = match instruction {
-                    Instruction::Copy { src, from, .. } if from.is_none() => {
+                    Instruction::Copy { src, from: None, .. } => {
                         hash_context_sources(&config.context_dir, src)
+                    }
+                    Instruction::Copy {
+                        src,
+                        from: Some(from_ref),
+                        ..
+                    } => {
+                        // COPY --from=<stage>: key on the ACTUAL source files'
+                        // content in the (already-built) source stage's rootfs.
+                        // Without this the output stage's chain key never depends
+                        // on what the source stage produced, so a changed builder
+                        // binary is served STALE from the on-disk build cache.
+                        // External-image sources resolve to Err here and fall to
+                        // None (the image ref is already in `repr`).
+                        resolve_stage_rootfs(from_ref, &completed_stages)
+                            .ok()
+                            .and_then(|rootfs| hash_context_sources(rootfs, src))
                     }
                     Instruction::Add { src, .. } => hash_context_sources(&config.context_dir, src),
                     _ => None,
