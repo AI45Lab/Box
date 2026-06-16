@@ -605,12 +605,23 @@ fn run_init() -> Result<(), Box<dyn std::error::Error>> {
     // guest-init exit, by which point the container has been reaped. Best-effort:
     // `create` returns `None` when no such limit is set or cgroup v2 is
     // unavailable, leaving the normal boot path untouched.
+    // Build the per-container cgroup from the runtime's A3S_SEC_* control vars.
+    // memory_max stays None on the boot path: `--memory` is enforced by sizing
+    // the microVM RAM, not an in-guest cgroup (so the runtime emits no
+    // A3S_SEC_MEM_LIMIT here). The CPU/pids caps DO have to be applied in-guest
+    // and are mirrored from the same env vars the CRI exec path consumes.
     #[cfg(target_os = "linux")]
     let container_cgroup = a3s_box_guest_init::cgroup::ContainerCgroup::create(
         None,
-        None,
-        None,
-        None,
+        std::env::var("A3S_SEC_CPU_QUOTA")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok()),
+        std::env::var("A3S_SEC_CPU_PERIOD")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok()),
+        std::env::var("A3S_SEC_CPU_SHARES")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok()),
         std::env::var("A3S_SEC_PIDS_LIMIT")
             .ok()
             .and_then(|value| value.parse::<u64>().ok()),
