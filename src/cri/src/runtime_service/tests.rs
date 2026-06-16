@@ -1955,7 +1955,7 @@ fn test_parse_localhost_seccomp_deny_allow_default() {
         r#"{"defaultAction":"SCMP_ACT_ALLOW","syscalls":[{"names":["chmod","fchmodat"],"action":"SCMP_ACT_ERRNO"}]}"#,
     )
     .unwrap();
-    let deny = super::parse_localhost_seccomp_deny(path.to_str().unwrap()).unwrap();
+    let deny = super::parse_localhost_seccomp_deny(path.to_str().unwrap(), dir.path()).unwrap();
     assert_eq!(deny, vec!["chmod".to_string(), "fchmodat".to_string()]);
 }
 
@@ -1966,7 +1966,7 @@ fn test_parse_localhost_seccomp_deny_rejects_deny_by_default() {
     std::fs::write(&path, r#"{"defaultAction":"SCMP_ACT_ERRNO","syscalls":[]}"#).unwrap();
     // Deny-by-default profiles need a full allow-list; not supported -> Err so
     // the caller falls back to RuntimeDefault rather than running unconfined.
-    assert!(super::parse_localhost_seccomp_deny(path.to_str().unwrap()).is_err());
+    assert!(super::parse_localhost_seccomp_deny(path.to_str().unwrap(), dir.path()).is_err());
 }
 
 #[tokio::test]

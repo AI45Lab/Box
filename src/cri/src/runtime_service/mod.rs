@@ -210,6 +210,48 @@ struct OciSeccompSyscall {
     action: String,
 }
 
+/// The node's seccomp profile root — kubelet default, override with
+/// `A3S_BOX_SECCOMP_PROFILE_ROOT`.
+fn seccomp_profile_root() -> PathBuf {
+    std::env::var("A3S_BOX_SECCOMP_PROFILE_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/var/lib/kubelet/seccomp"))
+}
+
+/// Confine a CRI `localhostProfile` path to the seccomp profile `root` and reject
+/// `..` traversal.
+///
+/// `localhost_ref` comes from a pod's
+/// `securityContext.seccompProfile.localhostProfile` (attacker-settable through
+/// the CRI) and is read off the host disk — without confinement it is an
+/// arbitrary host-file open primitive. Mirrors kubelet/containerd semantics:
+/// profiles live under the configured seccomp root. A relative ref resolves under
+/// the root; an absolute ref must lie within it. `root` is injected so the check
+/// is testable without process-global env state.
+fn confined_seccomp_path(localhost_ref: &str, root: &std::path::Path) -> Result<PathBuf, String> {
+    let r = std::path::Path::new(localhost_ref);
+    if r.components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(format!(
+            "seccomp profile path contains '..': {localhost_ref}"
+        ));
+    }
+    let candidate = if r.is_absolute() {
+        r.to_path_buf()
+    } else {
+        root.join(r)
+    };
+    if !candidate.starts_with(root) {
+        return Err(format!(
+            "seccomp profile {} is outside the seccomp root {}",
+            candidate.display(),
+            root.display()
+        ));
+    }
+    Ok(candidate)
+}
+
 /// Parse a CRI localhost seccomp profile file and return the syscall names it
 /// blocks with `SCMP_ACT_ERRNO`/`SCMP_ACT_KILL*`.
 ///
@@ -218,9 +260,13 @@ struct OciSeccompSyscall {
 /// profile (which would need a full allow-list compiled to BPF) is not yet
 /// supported; returns an error so the caller can fall back rather than silently
 /// run unconfined.
-fn parse_localhost_seccomp_deny(localhost_ref: &str) -> Result<Vec<String>, String> {
-    let raw = std::fs::read_to_string(localhost_ref)
-        .map_err(|e| format!("read seccomp profile {localhost_ref}: {e}"))?;
+fn parse_localhost_seccomp_deny(
+    localhost_ref: &str,
+    root: &std::path::Path,
+) -> Result<Vec<String>, String> {
+    let path = confined_seccomp_path(localhost_ref, root)?;
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| format!("read seccomp profile {}: {e}", path.display()))?;
     let profile: OciSeccompProfile =
         serde_json::from_str(&raw).map_err(|e| format!("parse seccomp profile: {e}"))?;
     if !matches!(
@@ -247,6 +293,38 @@ fn parse_localhost_seccomp_deny(localhost_ref: &str) -> Result<Vec<String>, Stri
         .flat_map(|s| s.names)
         .collect();
     Ok(deny)
+}
+
+#[cfg(test)]
+mod seccomp_confine_tests {
+    use super::confined_seccomp_path;
+    use std::path::Path;
+
+    #[test]
+    fn confines_localhost_profile_to_root_and_rejects_traversal() {
+        let root = Path::new("/var/lib/kubelet/seccomp");
+        // In-root relative/absolute refs are allowed (the check is lexical, so
+        // the files need not exist).
+        assert!(confined_seccomp_path("audit.json", root).is_ok());
+        assert!(confined_seccomp_path("profiles/audit.json", root).is_ok());
+        assert!(confined_seccomp_path("/var/lib/kubelet/seccomp/audit.json", root).is_ok());
+
+        // SECURITY: a malicious localhostProfile must not open arbitrary host
+        // files — traversal, out-of-root absolute paths, and prefix-confusion
+        // are all rejected (caller then falls back to RuntimeDefault).
+        for evil in [
+            "../../../../etc/passwd",
+            "sub/../../escape",
+            "/etc/passwd",
+            "/etc/shadow",
+            "/var/lib/kubelet/seccomp-evil/x",
+        ] {
+            assert!(
+                confined_seccomp_path(evil, root).is_err(),
+                "must reject malicious seccomp path: {evil}"
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1151,7 +1229,10 @@ impl RuntimeService for BoxRuntimeService {
                         // Read + parse the localhost profile (allow-default +
                         // ERRNO deny list) and pass the blocked syscalls to the
                         // guest, which compiles them into a BPF filter.
-                        match parse_localhost_seccomp_deny(&profile.localhost_ref) {
+                        match parse_localhost_seccomp_deny(
+                            &profile.localhost_ref,
+                            &seccomp_profile_root(),
+                        ) {
                             Ok(deny) => {
                                 env.push(("A3S_SEC_SECCOMP_LOCALHOST".to_string(), deny.join(",")));
                             }
