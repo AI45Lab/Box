@@ -29,6 +29,7 @@ pub mod build;
 pub mod credentials;
 mod image;
 mod layers;
+mod limited_reader;
 mod pull;
 pub mod reference;
 pub mod registry;

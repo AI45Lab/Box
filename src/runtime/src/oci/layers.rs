@@ -24,6 +24,19 @@ use tar::Archive;
 /// - Extraction fails
 /// - Target directory cannot be created
 pub fn extract_layer(layer_path: &Path, target_dir: &Path) -> Result<()> {
+    // Bound total decompressed output so a compression-bomb layer (a few MB that
+    // expands to hundreds of GB of zeros) cannot fill the host disk during pull.
+    // Generous default; tune with A3S_BOX_MAX_LAYER_BYTES.
+    let max_layer_bytes =
+        super::limited_reader::cap_from_env("A3S_BOX_MAX_LAYER_BYTES", 16 * 1024 * 1024 * 1024);
+    extract_layer_with_cap(layer_path, target_dir, max_layer_bytes)
+}
+
+fn extract_layer_with_cap(
+    layer_path: &Path,
+    target_dir: &Path,
+    max_layer_bytes: u64,
+) -> Result<()> {
     // Validate layer exists
     if !layer_path.exists() {
         return Err(BoxError::OciImageError(format!(
@@ -81,6 +94,8 @@ pub fn extract_layer(layer_path: &Path, target_dir: &Path) -> Result<()> {
         // Uncompressed tar (some registries / `--compression none`).
         Box::new(file)
     };
+
+    let decoder = super::limited_reader::LimitedReader::new(decoder, max_layer_bytes);
 
     // Extract the tar archive, applying OCI whiteout semantics so files deleted
     // in an upper layer do not reappear from lower layers:
@@ -151,10 +166,15 @@ pub fn extract_layer(layer_path: &Path, target_dir: &Path) -> Result<()> {
         }
 
         entry.unpack_in(target_dir).map_err(|e| {
+            // Surface the underlying cause (e.g. the LimitedReader's size-cap
+            // error) — tar's wrapper Display alone would just say "failed to
+            // unpack <path>" and hide a decompression-bomb abort from the operator.
+            let cause = std::error::Error::source(&e)
+                .map(|src| format!("{e}: {src}"))
+                .unwrap_or_else(|| e.to_string());
             BoxError::OciImageError(format!(
-                "Failed to extract layer to {}: {}",
+                "Failed to extract layer to {}: {cause}",
                 target_dir.display(),
-                e
             ))
         })?;
     }
@@ -340,6 +360,43 @@ mod tests {
         assert!(!target.join("d/old2.txt").exists());
         assert!(target.join("d/new.txt").exists());
         assert!(!target.join("d/.wh..wh..opq").exists());
+    }
+
+    #[test]
+    fn extract_layer_rejects_decompression_bomb_past_cap() {
+        let temp_dir = TempDir::new().unwrap();
+        let layer = temp_dir.path().join("bomb.tar.gz");
+        let target = temp_dir.path().join("out");
+        // 64 KiB of zeros — compresses to almost nothing but exceeds a small cap,
+        // standing in for a real layer that expands to hundreds of GB.
+        let big = vec![0u8; 64 * 1024];
+        create_test_layer(&layer, &[("big", &big)]);
+
+        // A 4 KiB cap must abort the extraction...
+        let result = extract_layer_with_cap(&layer, &target, 4 * 1024);
+        assert!(
+            result.is_err(),
+            "the cap must abort an oversized (bomb) layer, got: {result:?}"
+        );
+        // ...BEFORE the full 64 KiB member is written to disk.
+        let written = std::fs::metadata(target.join("big"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert!(
+            written < 64 * 1024,
+            "cap must bound bytes written before aborting; wrote {written}"
+        );
+    }
+
+    #[test]
+    fn extract_layer_with_generous_cap_extracts_normally() {
+        let temp_dir = TempDir::new().unwrap();
+        let layer = temp_dir.path().join("ok.tar.gz");
+        let target = temp_dir.path().join("out");
+        create_test_layer(&layer, &[("file.txt", b"hello")]);
+        // A generous cap must not regress a normal small layer.
+        extract_layer_with_cap(&layer, &target, 16 * 1024 * 1024).unwrap();
+        assert!(target.join("file.txt").exists());
     }
 
     // Helper function to create a test tar.gz layer

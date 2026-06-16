@@ -22,6 +22,7 @@ pub(super) fn is_tar_archive(name: &str) -> bool {
 
 /// Extract a tar archive to a destination directory.
 pub(super) fn extract_tar_to_dst(archive_path: &Path, dst: &Path) -> Result<()> {
+    use crate::oci::limited_reader::LimitedReader;
     use flate2::read::GzDecoder;
     use std::io::BufReader;
 
@@ -43,8 +44,17 @@ pub(super) fn extract_tar_to_dst(archive_path: &Path, dst: &Path) -> Result<()> 
 
     let name = archive_path.to_str().unwrap_or("").to_lowercase();
 
+    // Bound decompressed output so a compression-bomb archive (`ADD app.tar.gz`)
+    // cannot fill the build host's disk. Mirrors the MAX_ADD_URL_BYTES cap on the
+    // ADD-URL path (which the local-archive path previously lacked); tune with
+    // A3S_BOX_MAX_BUILD_EXTRACT_BYTES.
+    let max_bytes = crate::oci::limited_reader::cap_from_env(
+        "A3S_BOX_MAX_BUILD_EXTRACT_BYTES",
+        4 * 1024 * 1024 * 1024,
+    );
+
     if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
-        let decoder = GzDecoder::new(BufReader::new(file));
+        let decoder = LimitedReader::new(GzDecoder::new(BufReader::new(file)), max_bytes);
         let mut archive = tar::Archive::new(decoder);
         archive.unpack(dst).map_err(|e| {
             BoxError::BuildError(format!(
@@ -64,7 +74,7 @@ pub(super) fn extract_tar_to_dst(archive_path: &Path, dst: &Path) -> Result<()> 
         {
             use bzip2::read::BzDecoder;
 
-            let decoder = BzDecoder::new(BufReader::new(file));
+            let decoder = LimitedReader::new(BzDecoder::new(BufReader::new(file)), max_bytes);
             let mut archive = tar::Archive::new(decoder);
             archive.unpack(dst).map_err(|e| {
                 BoxError::BuildError(format!(
@@ -85,7 +95,7 @@ pub(super) fn extract_tar_to_dst(archive_path: &Path, dst: &Path) -> Result<()> 
         {
             use xz2::read::XzDecoder;
 
-            let decoder = XzDecoder::new(BufReader::new(file));
+            let decoder = LimitedReader::new(XzDecoder::new(BufReader::new(file)), max_bytes);
             let mut archive = tar::Archive::new(decoder);
             archive.unpack(dst).map_err(|e| {
                 BoxError::BuildError(format!(
@@ -96,7 +106,7 @@ pub(super) fn extract_tar_to_dst(archive_path: &Path, dst: &Path) -> Result<()> 
             })?;
         }
     } else if name.ends_with(".tar") {
-        let mut archive = tar::Archive::new(BufReader::new(file));
+        let mut archive = tar::Archive::new(LimitedReader::new(BufReader::new(file), max_bytes));
         archive.unpack(dst).map_err(|e| {
             BoxError::BuildError(format!(
                 "Failed to extract tar {}: {}",
