@@ -600,6 +600,72 @@ async fn spawn_multi_exec_stream_server(
     })
 }
 
+/// Exec-stream server that counts how many exec (Data) requests it receives
+/// across all connections. Used to prove StartContainer spawns a workload at
+/// most once even under a concurrent double-start race. Loops forever (never
+/// breaks) and handles each connection in its own task, so connection ordering
+/// between racing callers does not matter; heartbeats (readiness probes) are
+/// answered but not counted.
+async fn spawn_counting_exec_server(
+    exec_request_count: Arc<std::sync::atomic::AtomicUsize>,
+) -> Option<TestExecServer> {
+    let tmp = tempdir_for_unix_socket("a3s-cri-count-exec-test");
+    let socket_path = tmp.path().join("exec.sock");
+    let listener = bind_test_exec_listener(&socket_path)?;
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let exec_request_count = exec_request_count.clone();
+            tokio::spawn(async move {
+                let (r, w) = tokio::io::split(stream);
+                let mut reader = a3s_transport::FrameReader::new(r);
+                let mut writer = a3s_transport::FrameWriter::new(w);
+
+                match reader.read_frame().await.unwrap() {
+                    None => {}
+                    Some(frame) if frame.frame_type == a3s_transport::FrameType::Heartbeat => {
+                        let heartbeat = a3s_transport::Frame::heartbeat();
+                        let encoded = heartbeat.encode().unwrap();
+                        writer.into_inner().write_all(&encoded).await.unwrap();
+                    }
+                    Some(frame) if frame.frame_type == a3s_transport::FrameType::Data => {
+                        let _request: a3s_box_core::exec::ExecRequest =
+                            serde_json::from_slice(&frame.payload).unwrap();
+                        exec_request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+                        let chunk = a3s_box_core::exec::ExecChunk {
+                            stream: a3s_box_core::exec::StreamType::Stdout,
+                            data: b"booted\n".to_vec(),
+                        };
+                        writer
+                            .write_data(&serde_json::to_vec(&chunk).unwrap())
+                            .await
+                            .unwrap();
+
+                        sleep(Duration::from_millis(200)).await;
+
+                        let exit = a3s_box_core::exec::ExecExit {
+                            exit_code: 0,
+                            oom_killed: false,
+                        };
+                        writer
+                            .write_control(&serde_json::to_vec(&exit).unwrap())
+                            .await
+                            .unwrap();
+                    }
+                    Some(frame) => panic!("unexpected frame type: {:?}", frame.frame_type),
+                }
+            });
+        }
+    });
+
+    Some(TestExecServer {
+        _tmp: tmp,
+        socket_path,
+    })
+}
+
 async fn spawn_pty_stream_server_with_assert<F>(
     stdout: &'static [u8],
     exit_code: i32,
@@ -2405,6 +2471,83 @@ async fn test_start_container_transitions_running_then_exited() {
     let log = tokio::fs::read_to_string(&log_path).await.unwrap();
     assert!(log.contains(" stdout F booted\n"));
     assert!(log.contains(" stderr F warn\n"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_concurrent_start_container_spawns_workload_at_most_once() {
+    // Two StartContainer calls race on the same Created container. The early
+    // state check at the top of start_container reads a snapshot (non-atomic),
+    // so both racing callers can pass it. The atomic Created->Running CAS must
+    // claim the transition BEFORE the workload spawn, so the loser returns
+    // failed_precondition WITHOUT spawning a second guest workload. This is the
+    // regression guard for the double-spawn race: if the CAS is moved back after
+    // the spawn, both callers spawn and the exec server counts two requests.
+    let svc = Arc::new(make_test_service());
+    svc.store.sandboxes.add(test_sandbox("sb-1")).await;
+
+    let log_dir = tempfile::tempdir().unwrap();
+    let mut container = test_container("c-1", "sb-1");
+    container.command = vec!["/bin/test-app".to_string()];
+    container.log_path = log_dir
+        .path()
+        .join("container.log")
+        .to_string_lossy()
+        .to_string();
+    svc.store.containers.add(container).await;
+
+    let exec_request_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let Some(exec_server) = spawn_counting_exec_server(exec_request_count.clone()).await else {
+        return;
+    };
+    let vm = attach_ready_test_vm("sb-1", &exec_server.socket_path).await;
+    svc.vm_managers.write().await.insert("sb-1".to_string(), vm);
+
+    let svc_a = svc.clone();
+    let svc_b = svc.clone();
+    let call_a = tokio::spawn(async move {
+        svc_a
+            .start_container(Request::new(StartContainerRequest {
+                container_id: "c-1".to_string(),
+            }))
+            .await
+    });
+    let call_b = tokio::spawn(async move {
+        svc_b
+            .start_container(Request::new(StartContainerRequest {
+                container_id: "c-1".to_string(),
+            }))
+            .await
+    });
+    let (res_a, res_b) = tokio::join!(call_a, call_b);
+    let res_a = res_a.unwrap();
+    let res_b = res_b.unwrap();
+
+    // Exactly one call wins the Created->Running transition; the loser is
+    // rejected with failed_precondition.
+    assert!(
+        res_a.is_ok() ^ res_b.is_ok(),
+        "exactly one StartContainer must succeed (a_ok={}, b_ok={})",
+        res_a.is_ok(),
+        res_b.is_ok(),
+    );
+    let loser_err = res_a.err().or(res_b.err()).unwrap();
+    assert_eq!(
+        loser_err.code(),
+        tonic::Code::FailedPrecondition,
+        "loser must be rejected with failed_precondition, got: {loser_err:?}"
+    );
+
+    // The decisive assertion: the workload must have been spawned exactly once.
+    // Both start_container futures have completed, so in a regressed (spawn-
+    // before-CAS) build the loser's exec request would already have been written
+    // to the server; give it a brief, bounded window to process any such frame,
+    // then assert the count is exactly one.
+    sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        exec_request_count.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "workload must be spawned exactly once across the concurrent double-start"
+    );
 }
 
 #[tokio::test]

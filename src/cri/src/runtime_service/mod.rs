@@ -1368,81 +1368,92 @@ impl RuntimeService for BoxRuntimeService {
             (exec_socket, pty_socket)
         };
 
-        let (mut workload, stdin_handle) = if container.tty {
-            let pty_socket_path = pty_socket_path.ok_or_else(|| {
-                Status::internal(format!(
-                    "Sandbox {} PTY socket is not available",
-                    container.sandbox_id
-                ))
-            })?;
-            let pty_client = a3s_box_runtime::PtyClient::connect(&pty_socket_path)
-                .await
-                .map_err(|e| {
-                    Status::internal(format!("Failed to connect to sandbox PTY server: {}", e))
-                })?;
-            let pty_request = a3s_box_core::pty::PtyRequest {
-                cmd: exec_request.cmd.clone(),
-                env: exec_request.env.clone(),
-                working_dir: exec_request.working_dir.clone(),
-                rootfs: exec_request.rootfs.clone(),
-                user: exec_request.user.clone(),
-                cols: 80,
-                rows: 24,
-            };
-            let stream = pty_client.start_stream(&pty_request).await.map_err(|e| {
-                Status::internal(format!("Failed to start TTY container workload: {}", e))
-            })?;
-            let stdin_handle = if container.stdin {
-                Some(StreamingInput::Pty(stream.input()))
-            } else {
-                None
-            };
-            (SupervisedWorkload::Pty(stream), stdin_handle)
-        } else {
-            let exec_client = a3s_box_runtime::ExecClient::connect(&exec_socket_path)
-                .await
-                .map_err(|e| {
-                    Status::internal(format!("Failed to connect to sandbox exec server: {}", e))
-                })?;
-            let stream = exec_client.exec_stream(&exec_request).await.map_err(|e| {
-                Status::internal(format!("Failed to start container workload: {}", e))
-            })?;
-            let stdin_handle = if container.stdin {
-                Some(StreamingInput::Exec(stream.input()))
-            } else {
-                None
-            };
-            (SupervisedWorkload::Exec(stream), stdin_handle)
-        };
-
+        // Win the Created->Running transition BEFORE spawning the workload, so
+        // two concurrent StartContainer calls for the same container cannot both
+        // spawn a guest workload (the loser's CAS fails and it never spawns).
         let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        let started = self
+        if !self
             .store
             .mark_container_started_if_created(&container_id, now_ns)
-            .await;
-
-        if !started {
-            // We already started the workload, but the container concurrently
-            // left the Created state (a racing Stop/Remove won the CAS). Stop the
-            // workload directly and return: spawning the exit supervisor here
-            // would ORPHAN a long-running workload (e.g. nginx) — its stop handle
-            // is never inserted into `workload_stops`, so StopContainer can't
-            // reach it, and it would run until it self-exits.
-            if let Err(error) = workload.cancel().await {
-                tracing::warn!(
-                    container_id = %container_id,
-                    sandbox_id = %container.sandbox_id,
-                    error = %error,
-                    "Failed to stop workload after losing the Created-state CAS"
-                );
-            }
+            .await
+        {
             return Err(Status::failed_precondition(format!(
                 "Container {} is no longer in the Created state",
                 container_id
             )));
         }
 
-        // started == true: register the control handles and spawn the supervisor.
+        // Spawn the workload; on any failure revert Running->Exited so the
+        // container is not left a phantom Running with no backing process.
+        let spawn_result: std::result::Result<
+            (SupervisedWorkload, Option<StreamingInput>),
+            Status,
+        > = async {
+            let workload_and_stdin = if container.tty {
+                let pty_socket_path = pty_socket_path.ok_or_else(|| {
+                    Status::internal(format!(
+                        "Sandbox {} PTY socket is not available",
+                        container.sandbox_id
+                    ))
+                })?;
+                let pty_client = a3s_box_runtime::PtyClient::connect(&pty_socket_path)
+                    .await
+                    .map_err(|e| {
+                        Status::internal(format!("Failed to connect to sandbox PTY server: {}", e))
+                    })?;
+                let pty_request = a3s_box_core::pty::PtyRequest {
+                    cmd: exec_request.cmd.clone(),
+                    env: exec_request.env.clone(),
+                    working_dir: exec_request.working_dir.clone(),
+                    rootfs: exec_request.rootfs.clone(),
+                    user: exec_request.user.clone(),
+                    cols: 80,
+                    rows: 24,
+                };
+                let stream = pty_client.start_stream(&pty_request).await.map_err(|e| {
+                    Status::internal(format!("Failed to start TTY container workload: {}", e))
+                })?;
+                let stdin_handle = if container.stdin {
+                    Some(StreamingInput::Pty(stream.input()))
+                } else {
+                    None
+                };
+                (SupervisedWorkload::Pty(stream), stdin_handle)
+            } else {
+                let exec_client = a3s_box_runtime::ExecClient::connect(&exec_socket_path)
+                    .await
+                    .map_err(|e| {
+                        Status::internal(format!("Failed to connect to sandbox exec server: {}", e))
+                    })?;
+                let stream = exec_client.exec_stream(&exec_request).await.map_err(|e| {
+                    Status::internal(format!("Failed to start container workload: {}", e))
+                })?;
+                let stdin_handle = if container.stdin {
+                    Some(StreamingInput::Exec(stream.input()))
+                } else {
+                    None
+                };
+                (SupervisedWorkload::Exec(stream), stdin_handle)
+            };
+            Ok(workload_and_stdin)
+        }
+        .await;
+
+        let (workload, stdin_handle) = match spawn_result {
+            Ok(workload_and_stdin) => workload_and_stdin,
+            Err(error) => {
+                // The workload never started; revert Running->Exited so the
+                // container is not left a phantom Running with no backing
+                // process (a retry can then start it cleanly).
+                self.store
+                    .mark_container_exited(&container_id, now_ns, 255)
+                    .await;
+                return Err(error);
+            }
+        };
+
+        // We hold the Created->Running transition: register the control handles
+        // and spawn the supervisor.
         let (attach_tx, _) = broadcast::channel(128);
         let (stop_tx, stop_rx) = oneshot::channel();
         let log_reopen = Arc::new(Notify::new());
