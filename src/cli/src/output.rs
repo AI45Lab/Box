@@ -108,7 +108,10 @@ pub fn parse_size_bytes(s: &str) -> Result<u64, String> {
         .parse()
         .map_err(|_| format!("invalid size value: {s}"))?;
 
-    Ok(num * multiplier)
+    // checked_mul: a huge value like `16777216t` would otherwise overflow u64
+    // (panic in debug, wrap to a bogus small size in release).
+    num.checked_mul(multiplier)
+        .ok_or_else(|| format!("size value too large: {s}"))
 }
 
 /// Parse a Docker/Go-style duration string into whole seconds.
@@ -204,7 +207,10 @@ pub fn parse_memory(s: &str) -> Result<u32, String> {
         .parse()
         .map_err(|_| format!("invalid memory value: {s}"))?;
 
-    Ok(num * multiplier)
+    // checked_mul: e.g. `4194304g` overflows u32 MB (panic in debug, wrap in
+    // release) — fail with a clear message instead.
+    num.checked_mul(multiplier)
+        .ok_or_else(|| format!("memory value too large: {s}"))
 }
 
 #[cfg(test)]
@@ -334,6 +340,16 @@ mod tests {
         assert_eq!(parse_memory("0").unwrap(), 0);
     }
 
+    #[test]
+    fn test_parse_memory_overflow_is_error_not_panic() {
+        // 4194304 * 1024 (g) == 2^32, overflowing u32. Must return an error,
+        // not panic (debug) or wrap to a bogus small value (release).
+        assert!(parse_memory("4194304g").is_err());
+        assert!(parse_memory("5000000g").is_err());
+        // A large-but-valid value still parses.
+        assert_eq!(parse_memory("4194303g").unwrap(), 4194303 * 1024);
+    }
+
     // --- parse_size_bytes tests ---
 
     #[test]
@@ -342,6 +358,21 @@ mod tests {
         assert_eq!(parse_size_bytes("1024").unwrap(), 1024);
         assert_eq!(parse_size_bytes("100b").unwrap(), 100);
         assert_eq!(parse_size_bytes("100B").unwrap(), 100);
+    }
+
+    #[test]
+    fn test_parse_size_bytes_overflow_is_error_not_panic() {
+        // 16777216 * 2^40 (t) == 2^64, overflowing u64. Must return an error,
+        // not panic (debug) or wrap to a bogus small size (release). This guards
+        // every byte-sized CLI flag (--memory-swap etc.) against adversarial or
+        // fat-fingered input.
+        assert!(parse_size_bytes("16777216t").is_err());
+        assert!(parse_size_bytes("99999999999999999999t").is_err());
+        // A large-but-valid value still parses.
+        assert_eq!(
+            parse_size_bytes("8t").unwrap(),
+            8 * 1024 * 1024 * 1024 * 1024
+        );
     }
 
     #[test]
