@@ -210,9 +210,12 @@ a3s-box export app -o rootfs.tar
 a3s-box commit app -t app:snapshot
 a3s-box snapshot create app checkpoint-1
 a3s-box snapshot restore checkpoint-1 --name restored-app
+a3s-box snapshot prune --keep 5          # bound disk: keep the 5 newest
 ```
 
 The `snapshot` command produces configuration/filesystem-oriented Box snapshots, not a live RAM checkpoint. The live RAM Copy-on-Write facility is a separate, lower-level mechanism described in [Warm pool and snapshot-fork](#warm-pool-and-snapshot-fork).
+
+Each snapshot deep-copies the box rootfs, so a scheduled snapshot workflow can fill the disk. `snapshot prune --keep N` / `--max-bytes B` evicts the oldest beyond a cap; set `A3S_BOX_MAX_SNAPSHOTS` / `A3S_BOX_MAX_SNAPSHOT_BYTES` to auto-prune on every `snapshot create` (unset = unbounded).
 
 ## Warm pool and snapshot-fork
 
@@ -225,10 +228,13 @@ json-file console logs).
 ```bash
 a3s-box pool start --image alpine:latest --size 8     # pre-warm 8 sandboxes
 a3s-box pool start --image alpine:latest --size 8 --snapshot-fork   # CoW fill
+a3s-box pool start --image alpine:latest --metrics-addr 127.0.0.1:9101   # + Prometheus /metrics
 a3s-box pool run alpine:latest -- echo hi             # served from the pool
 a3s-box pool status
 a3s-box pool stop
 ```
+
+`pool start --metrics-addr` serves a Prometheus `/metrics` endpoint with warm-pool hit/miss, VM-boot, and cache metrics for the long-running daemon (alongside `monitor --metrics-addr`'s box-state metrics + `/healthz`).
 
 **Snapshot-fork** (`--snapshot-fork`, Linux `/dev/kvm` only) is native
 Copy-on-Write microVM cloning. The pool cold-boots one template sandbox,
