@@ -318,9 +318,9 @@ pub async fn build(config: BuildConfig, store: Arc<ImageStore>) -> Result<BuildR
                     other => instruction_to_string(other),
                 };
                 let input_hash = match instruction {
-                    Instruction::Copy { src, from: None, .. } => {
-                        hash_context_sources(&config.context_dir, src)
-                    }
+                    Instruction::Copy {
+                        src, from: None, ..
+                    } => hash_context_sources(&config.context_dir, src),
                     Instruction::Copy {
                         src,
                         from: Some(from_ref),
