@@ -89,6 +89,12 @@ pub async fn execute(args: PullArgs) -> Result<(), Box<dyn std::error::Error>> {
         }));
     }
     let image = puller.pull(&args.image).await?;
+    crate::audit::record(
+        a3s_box_core::audit::AuditAction::ImagePull,
+        a3s_box_core::audit::AuditOutcome::Success,
+        &args.image,
+        &format!("pulled image {}", args.image),
+    );
 
     if args.quiet {
         println!("{}", image.root_dir().display());

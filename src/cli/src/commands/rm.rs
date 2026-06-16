@@ -71,6 +71,12 @@ fn rm_one(
     // in-memory handle consistent without a second persisting write.
     StateFile::remove_record(&box_id)?;
     state.forget(&box_id);
+    crate::audit::record(
+        a3s_box_core::audit::AuditAction::BoxDestroy,
+        a3s_box_core::audit::AuditOutcome::Success,
+        &box_id,
+        &format!("removed box {name}"),
+    );
     println!("{name}");
 
     Ok(())

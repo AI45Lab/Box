@@ -151,6 +151,15 @@ pub async fn execute(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let output = client.exec_command(&request).await?;
+    // Record that an exec happened (best-effort) before the exit-code branch
+    // below may std::process::exit. The container command's own exit code is
+    // separate from whether the exec was delivered.
+    crate::audit::record(
+        a3s_box_core::audit::AuditAction::ExecCommand,
+        a3s_box_core::audit::AuditOutcome::Success,
+        &record.id,
+        &format!("exec command in box {}", record.name),
+    );
 
     if !output.stdout.is_empty() {
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -203,6 +212,14 @@ async fn execute_pty(
         rows,
     };
     client.send_request(&request).await?;
+    // Record the interactive (pty) exec once the request is delivered — opening
+    // a shell in a box is a key forensic event.
+    crate::audit::record(
+        a3s_box_core::audit::AuditAction::ExecCommand,
+        a3s_box_core::audit::AuditOutcome::Success,
+        &record.id,
+        &format!("exec (pty) in box {}", record.name),
+    );
 
     // Split the PTY client stream for concurrent read/write
     let (read_half, write_half) = client.into_split();

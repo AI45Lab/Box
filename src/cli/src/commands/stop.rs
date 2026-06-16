@@ -102,6 +102,12 @@ async fn stop_one(
         }
         Ok::<(), std::io::Error>(())
     })?;
+    crate::audit::record(
+        a3s_box_core::audit::AuditAction::BoxStop,
+        a3s_box_core::audit::AuditOutcome::Success,
+        &box_id,
+        &format!("stopped box {name}"),
+    );
     println!("{name}");
 
     Ok(())

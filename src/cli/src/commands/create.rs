@@ -185,6 +185,12 @@ pub async fn execute(args: CreateArgs) -> Result<(), Box<dyn std::error::Error>>
         return Err(error);
     }
 
+    crate::audit::record(
+        a3s_box_core::audit::AuditAction::BoxCreate,
+        a3s_box_core::audit::AuditOutcome::Success,
+        &box_id,
+        &format!("created box {name}"),
+    );
     println!("{box_id}");
     Ok(())
 }

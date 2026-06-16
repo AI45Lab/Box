@@ -1,5 +1,6 @@
 //! A3S Box CLI - Docker-like MicroVM runtime.
 
+pub mod audit;
 pub mod boot;
 pub mod cleanup;
 pub mod commands;
