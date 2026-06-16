@@ -96,6 +96,24 @@ struct DeferredMainSpec {
 #[cfg(target_os = "linux")]
 static DEFERRED_MAIN: std::sync::Mutex<Option<DeferredMainSpec>> = std::sync::Mutex::new(None);
 
+/// The per-container cgroup's `cgroup.procs` path, stashed at boot when the box
+/// boots IDLE (deferred-main). The deferred main is spawned later by
+/// [`spawn_deferred_main`], which must write its PID here to join the cgroup —
+/// otherwise it runs OUTSIDE the cgroup and `pids.max` / `cpu.max` are
+/// unenforced (the boot-spawn path passes this to `spawn_isolated`).
+#[cfg(target_os = "linux")]
+static DEFERRED_CGROUP_PROCS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Stash the per-container cgroup's `cgroup.procs` path so a later deferred-main
+/// spawn joins the cgroup, matching the boot-spawn path. `None` (no limit set /
+/// no cgroup) leaves the deferred main uncgrouped, as before.
+#[cfg(target_os = "linux")]
+pub fn set_deferred_cgroup_procs(procs_path: Option<String>) {
+    *DEFERRED_CGROUP_PROCS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = procs_path;
+}
+
 /// Stash the container command for a deferred (IDLE) boot. The command already
 /// reached the guest via BOX_EXEC_*, so the host only sends a bare spawn-main
 /// trigger post-readiness; the guest runs the stashed command as its main.
@@ -163,6 +181,14 @@ fn spawn_deferred_main(frame: Option<DeferredMainSpec>) -> Result<i32, String> {
     // via async-signal-safe pre_exec — already safe to spawn from this multi-threaded
     // PID 1), then override stdio to INHERIT so the main's stdout/stderr reach PID
     // 1's console fds (→ json-file logs), unlike an exec's piped stdio.
+    // Join the per-container cgroup stashed at boot so the deferred main is
+    // subject to the same pids.max / cpu.max as a boot-spawned main. Without
+    // this the warm/IDLE-boot main runs outside the cgroup and the limits are
+    // silently inert.
+    let cgroup_procs = DEFERRED_CGROUP_PROCS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     let (mut command, _timeout) = build_command(
         ExecCommandSpec {
             cmd: &cmd_vec,
@@ -174,7 +200,7 @@ fn spawn_deferred_main(frame: Option<DeferredMainSpec>) -> Result<i32, String> {
             stdin_streaming: false,
             user: user.as_deref(),
         },
-        None,
+        cgroup_procs.as_deref(),
     )
     .map_err(|out| String::from_utf8_lossy(&out.stderr).into_owned())?;
     command
