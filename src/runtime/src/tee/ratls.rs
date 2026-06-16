@@ -279,6 +279,9 @@ pub fn create_client_config(
 struct RaTlsVerifier {
     policy: AttestationPolicy,
     allow_simulated: bool,
+    /// Signature-verification algorithms from the installed crypto provider,
+    /// used to actually verify the TLS CertificateVerify (proof-of-possession).
+    signature_algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
 }
 
 impl RaTlsVerifier {
@@ -286,6 +289,8 @@ impl RaTlsVerifier {
         Self {
             policy,
             allow_simulated,
+            signature_algorithms: rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms,
         }
     }
 }
@@ -356,21 +361,25 @@ impl rustls::client::danger::ServerCertVerifier for RaTlsVerifier {
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        // We trust the TLS signature if the attestation report is valid
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        // Verify the handshake signature against the presented certificate's
+        // public key. This is the TLS CertificateVerify (proof-of-possession):
+        // it proves the peer actually holds the private key for the attested
+        // certificate, so a captured/replayed RA-TLS cert (whose key the
+        // attacker does not have) is rejected.
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.signature_algorithms)
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.signature_algorithms)
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
@@ -554,6 +563,109 @@ mod tests {
         };
 
         (cert_der, report)
+    }
+
+    /// Drive a full in-memory TLS handshake between a client using the RA-TLS
+    /// verifier and the given server config. Returns the client-side result so
+    /// signature/attestation rejections are observable.
+    fn drive_ratls_handshake(
+        server_config: rustls::ServerConfig,
+    ) -> std::result::Result<(), rustls::Error> {
+        use rustls::pki_types::ServerName;
+        use std::sync::Arc;
+
+        let client_config =
+            create_client_config(AttestationPolicy::default(), true).expect("build client config");
+
+        let server_name = ServerName::try_from("localhost").unwrap();
+        let mut client =
+            rustls::ClientConnection::new(Arc::new(client_config), server_name).unwrap();
+        let mut server = rustls::ServerConnection::new(Arc::new(server_config)).unwrap();
+
+        // Pump bytes between the two connections until both finish handshaking
+        // or one rejects. The client's verify_server_cert / verify_tls13_signature
+        // errors surface from client.process_new_packets().
+        for _ in 0..40 {
+            while client.wants_write() {
+                let mut buf = Vec::new();
+                client.write_tls(&mut buf).unwrap();
+                let mut rd = &buf[..];
+                server.read_tls(&mut rd).unwrap();
+                server.process_new_packets().map_err(|e| {
+                    rustls::Error::General(format!("server rejected handshake: {e}"))
+                })?;
+            }
+            while server.wants_write() {
+                let mut buf = Vec::new();
+                server.write_tls(&mut buf).unwrap();
+                let mut rd = &buf[..];
+                client.read_tls(&mut rd).unwrap();
+                client.process_new_packets()?;
+            }
+            if !client.is_handshaking() && !server.is_handshaking() {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    /// Build a server config that presents `cert_der` but signs the
+    /// CertificateVerify with `signing_key_der`. A custom resolver is used
+    /// because `with_single_cert` rejects an inconsistent cert/key pair — but a
+    /// real attacker is not bound by that check.
+    fn impostor_server_config(cert_der: Vec<u8>, signing_key_der: Vec<u8>) -> rustls::ServerConfig {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+        use rustls::sign::CertifiedKey;
+        use std::sync::Arc;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key_der));
+        let signer = rustls::crypto::ring::sign::any_ecdsa_type(&key).expect("ecdsa signing key");
+        let certified = CertifiedKey::new(vec![CertificateDer::from(cert_der)], signer);
+
+        #[derive(Debug)]
+        struct FixedResolver(Arc<CertifiedKey>);
+        impl rustls::server::ResolvesServerCert for FixedResolver {
+            fn resolve(&self, _hello: rustls::server::ClientHello) -> Option<Arc<CertifiedKey>> {
+                Some(self.0.clone())
+            }
+        }
+
+        rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(FixedResolver(Arc::new(certified))))
+    }
+
+    #[test]
+    fn test_ratls_handshake_accepts_matching_key() {
+        // A genuine peer presents its bound cert and signs the CertificateVerify
+        // with the matching private key — proof-of-possession holds, so the
+        // handshake (attestation + signature) must complete.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (cert_der, key_der, _report) = make_bound_ratls_cert();
+        let server_config = create_server_config(&cert_der, &key_der).expect("server config");
+        assert!(
+            drive_ratls_handshake(server_config).is_ok(),
+            "a handshake with a matching cert/key must succeed"
+        );
+    }
+
+    #[test]
+    fn test_ratls_handshake_rejects_mismatched_key_proof_of_possession() {
+        // Replay attack: the server presents a legitimate bound cert (valid SNP
+        // report, valid pubkey binding) but signs the CertificateVerify with a
+        // DIFFERENT key it controls — it does not hold the attested cert's key.
+        // The TLS CertificateVerify check must reject this. The pre-fix verifier
+        // returned assertion() unconditionally and would accept the impostor.
+        let (cert_der, _key_der, _report) = make_bound_ratls_cert();
+        let (_other_cert, other_key_der, _) = make_bound_ratls_cert();
+        let server_config = impostor_server_config(cert_der, other_key_der);
+        let result = drive_ratls_handshake(server_config);
+        assert!(
+            result.is_err(),
+            "a handshake where the peer cannot prove possession of the cert key must fail"
+        );
     }
 
     #[test]
