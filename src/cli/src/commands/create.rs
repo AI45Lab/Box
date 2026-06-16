@@ -69,6 +69,13 @@ pub async fn execute(args: CreateArgs) -> Result<(), Box<dyn std::error::Error>>
     let home = a3s_box_core::dirs_home();
     let box_dir = home.join("boxes").join(&box_id);
 
+    // Arm cleanup for the pre-registration section: create_dir_all and volume
+    // resolution below can fail with `?` after the box dir already exists, and
+    // until the box is registered it's invisible to `prune`/`rm`. The guard
+    // removes the orphaned dir on any early return; it is disarmed right before
+    // the add_record block, after which cleanup_partial_box_record takes over.
+    let mut dir_guard = crate::cleanup::BoxDirGuard::new(box_dir.clone());
+
     // Create box directory structure
     std::fs::create_dir_all(box_dir.join("sockets"))?;
     std::fs::create_dir_all(box_dir.join("logs"))?;
@@ -157,6 +164,11 @@ pub async fn execute(args: CreateArgs) -> Result<(), Box<dyn std::error::Error>>
     };
 
     let record_for_cleanup = record.clone();
+    // Past the fallible pre-registration section: hand box-dir ownership to the
+    // record-level cleanup below (cleanup_partial_box_record), which also clears
+    // state + attached resources.
+    dir_guard.disarm();
+
     // Atomic append under the state lock so concurrent `create`/`run` cannot
     // lose records (load_default()+add() is a lost-update race).
     if let Err(error) = StateFile::add_record(record) {

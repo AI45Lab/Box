@@ -155,6 +155,12 @@ async fn execute_restore(args: SnapshotRestoreArgs) -> Result<(), Box<dyn std::e
     let socket_dir = box_dir.join("sockets");
     let logs_dir = box_dir.join("logs");
 
+    // Arm cleanup: every step below (create dirs, copy rootfs, register) can
+    // fail with `?`. Until the box is in the state file it is invisible to
+    // `prune`/`rm`, so a half-created box dir would leak on disk forever. The
+    // guard removes it on any early return and is disarmed once registered.
+    let mut dir_guard = crate::cleanup::BoxDirGuard::new(box_dir.clone());
+
     std::fs::create_dir_all(&socket_dir)?;
     std::fs::create_dir_all(&logs_dir)?;
 
@@ -229,6 +235,7 @@ async fn execute_restore(args: SnapshotRestoreArgs) -> Result<(), Box<dyn std::e
     // Atomic append under the state lock so a concurrent writer (run/monitor/
     // compose/health) cannot clobber this registration with a stale snapshot.
     StateFile::add_record(record)?;
+    dir_guard.disarm(); // registered — the box dir is now owned by the record
 
     println!("{}", box_id);
     Ok(())

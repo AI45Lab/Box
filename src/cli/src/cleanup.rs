@@ -154,10 +154,69 @@ pub fn cleanup_partial_box_record(record: &BoxRecord, state: Option<&mut StateFi
     }
 }
 
+/// Removes a box directory tree on drop unless [`disarm`](Self::disarm)ed.
+///
+/// `create`/`snapshot restore` materialize the box dir (sockets/, logs/,
+/// rootfs/) BEFORE the box is registered in the state file. If any step in
+/// between fails with `?`, an unregistered box dir is left behind — invisible to
+/// `prune`/`rm` (which only see boxes in state) and leaking on disk. Arm this
+/// guard before the first fallible filesystem step and `disarm()` it the moment
+/// the box is registered; any early return in between cleans the dir up.
+pub(crate) struct BoxDirGuard {
+    path: std::path::PathBuf,
+    armed: bool,
+}
+
+impl BoxDirGuard {
+    pub(crate) fn new(path: std::path::PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for BoxDirGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_helpers::fixtures::make_record;
+
+    #[test]
+    fn test_box_dir_guard_removes_on_drop_unless_disarmed() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Armed (create/restore failed before registration) → box dir removed.
+        let orphaned = tmp.path().join("boxes").join("failed-box");
+        std::fs::create_dir_all(orphaned.join("rootfs")).unwrap();
+        {
+            let _guard = BoxDirGuard::new(orphaned.clone());
+        }
+        assert!(
+            !orphaned.exists(),
+            "an armed guard must remove the orphaned box dir on drop"
+        );
+
+        // Disarmed (box registered in state) → dir kept.
+        let registered = tmp.path().join("boxes").join("good-box");
+        std::fs::create_dir_all(registered.join("rootfs")).unwrap();
+        {
+            let mut guard = BoxDirGuard::new(registered.clone());
+            guard.disarm();
+        }
+        assert!(
+            registered.exists(),
+            "a disarmed guard must keep the registered box dir"
+        );
+    }
 
     #[test]
     fn test_cleanup_partial_box_record_removes_state_and_box_dir() {
