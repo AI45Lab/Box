@@ -92,8 +92,9 @@ impl StateFile {
     /// orphaning every running VM/overlay with no error and no recoverable
     /// record. Instead the corrupt file is quarantined to a timestamped sibling
     /// (`boxes.json.corrupt-<unix-secs>`) and a loud warning is emitted, so the
-    /// data is preserved for recovery (`a3s-box reap`, or manual repair) while
-    /// the process starts from a clean empty state rather than crashing.
+    /// data is preserved for recovery (restore it, then `a3s-box ps` re-reconciles;
+    /// otherwise repair manually) while the process starts from a clean empty
+    /// state rather than crashing.
     fn parse_or_quarantine(path: &Path, data: &str) -> Vec<BoxRecord> {
         match serde_json::from_str::<Vec<BoxRecord>>(data) {
             Ok(records) => records,

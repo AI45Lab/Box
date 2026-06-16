@@ -363,9 +363,15 @@ impl ImageStore {
             }
         }
         if skipped > 0 {
+            // Preserve the original (with the un-deserializable entries) before the
+            // next save rewrites index.json with only the survivors — otherwise the
+            // skipped records are erased with no backup, unlike the whole-file path.
+            let preserved = crate::store_io::quarantine_copy(&index_path)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<backup failed>".to_string());
             tracing::warn!(
-                "{skipped} image index entr{} skipped as unreadable; affected images \
-                 will be re-pulled on demand",
+                "{skipped} image index entr{} skipped as unreadable; preserved a copy at \
+                 {preserved}; affected images will be re-pulled on demand",
                 if skipped == 1 { "y" } else { "ies" },
             );
         }

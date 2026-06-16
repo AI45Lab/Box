@@ -15,6 +15,7 @@ dependencies = [
  "comfy-table",
  "dirs",
  "flate2",
+ "futures",
  "hex",
  "libc",
  "oci-spec",

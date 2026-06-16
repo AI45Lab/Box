@@ -534,6 +534,26 @@ pub(crate) fn parse_memory_bytes(s: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("size value too large: {s}"))
 }
 
+/// Parse a `--memory-swap` value into the cgroup `i64` representation, failing
+/// closed on overflow.
+///
+/// `-1` is Docker's sentinel for "unlimited" and maps to `-1`. Any other value
+/// is a byte size that MUST fit in `i64`: a value > `i64::MAX` would wrap
+/// negative on the `as i64` cast, and `resize.rs` maps `swap < 0` to
+/// `memory.swap.max=max` (unlimited) — so a fat-fingered huge value would
+/// silently become *unlimited* swap. Reject it instead. Shared by the
+/// run/create path and `a3s-box update` so the two cannot diverge.
+pub(crate) fn parse_memory_swap(s: &str) -> Result<i64, String> {
+    if s == "-1" {
+        return Ok(-1);
+    }
+    let bytes = parse_memory_bytes(s).map_err(|e| format!("Invalid --memory-swap: {e}"))?;
+    if bytes > i64::MAX as u64 {
+        return Err(format!("--memory-swap value too large: {s}"));
+    }
+    Ok(bytes as i64)
+}
+
 /// Build ResourceLimits from common box args.
 pub(crate) fn build_resource_limits(
     args: &CommonBoxArgs,
@@ -545,17 +565,7 @@ pub(crate) fn build_resource_limits(
         None => None,
     };
     let memory_swap = match &args.memory_swap {
-        Some(s) if s == "-1" => Some(-1i64),
-        Some(s) => {
-            let bytes = parse_memory_bytes(s).map_err(|e| format!("Invalid --memory-swap: {e}"))?;
-            // Reject before the lossy `as i64` cast: a value > i64::MAX would wrap
-            // negative, and resize.rs maps swap < 0 to memory.swap.max=max
-            // (unlimited) — so a fat-fingered huge value silently became unlimited.
-            if bytes > i64::MAX as u64 {
-                return Err(format!("--memory-swap value too large: {s}").into());
-            }
-            Some(bytes as i64)
-        }
+        Some(s) => Some(parse_memory_swap(s)?),
         None => None,
     };
 
@@ -642,6 +652,22 @@ mod tests {
         // absurd value; it must now be a clean error.
         assert!(parse_memory_bytes("20000000000g").is_err());
         assert!(parse_memory_bytes("18446744073709551615k").is_err());
+    }
+
+    #[test]
+    fn test_parse_memory_swap_sentinel_value_and_overflow() {
+        // -1 is Docker's "unlimited" sentinel and must survive verbatim.
+        assert_eq!(parse_memory_swap("-1").unwrap(), -1);
+        // A normal size parses to its byte count.
+        assert_eq!(parse_memory_swap("512m").unwrap(), 512 * 1024 * 1024);
+        // Fail closed: a value > i64::MAX must be rejected, NOT wrap negative
+        // (which resize.rs would map to memory.swap.max=max → silently unlimited).
+        // i64::MAX = 9223372036854775807; this is just above it.
+        let huge = "9300000000000000000";
+        let err = parse_memory_swap(huge).unwrap_err();
+        assert!(err.contains("too large"), "got: {err}");
+        // And the same guard via a suffixed overflow.
+        assert!(parse_memory_swap("9000000000g").is_err());
     }
 
     #[test]

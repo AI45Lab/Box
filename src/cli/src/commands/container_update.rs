@@ -102,12 +102,9 @@ pub async fn execute(args: ContainerUpdateArgs) -> Result<(), Box<dyn std::error
     }
 
     if let Some(ref swap) = args.memory_swap {
-        let val = if swap == "-1" {
-            -1i64
-        } else {
-            common::parse_memory_bytes(swap).map_err(|e| format!("Invalid --memory-swap: {e}"))?
-                as i64
-        };
+        // Same fail-closed parse as the run/create path so `update --memory-swap`
+        // can't silently grant unlimited swap on an overflowing value.
+        let val = common::parse_memory_swap(swap)?;
         update.limits.memory_swap = Some(val);
         record.resource_limits.memory_swap = Some(val);
         updated.push(format!("memory-swap={swap}"));
