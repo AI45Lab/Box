@@ -182,6 +182,14 @@ pub async fn execute(args: MonitorArgs) -> Result<(), Box<dyn std::error::Error>
         });
     }
 
+    // Exit promptly on SIGTERM/SIGINT, but only AFTER a complete poll_once: the
+    // boot→persist step inside poll_once leaves a freshly-booted microVM tracked
+    // only once StateFile::modify records its pid, so interrupting it mid-flight
+    // would orphan the VM (reparented to init) while its record stays dead/pid=None,
+    // and the next start would boot a SECOND VM. The CRI server installs the same
+    // handler; the monitor was the inconsistent outlier (no handler → a stop
+    // mid-poll orphaned the in-flight boot).
+    let mut shutdown = std::pin::pin!(monitor_shutdown_signal());
     loop {
         if let Err(e) = poll_once(&mut tracker).await {
             eprintln!("monitor: poll error: {e}");
@@ -192,8 +200,42 @@ pub async fn execute(args: MonitorArgs) -> Result<(), Box<dyn std::error::Error>
             super::monitor_metrics::now_secs(),
             std::sync::atomic::Ordering::Relaxed,
         );
-        tokio::time::sleep(interval).await;
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = &mut shutdown => {
+                println!("a3s-box monitor: received shutdown signal, exiting after completing the poll cycle");
+                break;
+            }
+        }
     }
+    Ok(())
+}
+
+/// Resolve when the monitor receives SIGTERM/SIGINT (Ctrl-C on non-unix). Mirrors
+/// the CRI server's `shutdown_signal` so the always-on supervisor daemon shuts
+/// down gracefully instead of being terminated at an arbitrary suspension point.
+#[cfg(unix)]
+async fn monitor_shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    match (
+        signal(SignalKind::terminate()),
+        signal(SignalKind::interrupt()),
+    ) {
+        (Ok(mut sigterm), Ok(mut sigint)) => {
+            tokio::select! {
+                _ = sigterm.recv() => {}
+                _ = sigint.recv() => {}
+            }
+        }
+        // Could not install handlers — never resolve, so the loop keeps polling
+        // (matches the previous always-on behaviour rather than exiting early).
+        _ => std::future::pending::<()>().await,
+    }
+}
+
+#[cfg(not(unix))]
+async fn monitor_shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 /// Single poll iteration: load state, find dead boxes, restart eligible ones.
