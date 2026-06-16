@@ -11,6 +11,7 @@ pub mod env;
 pub mod error;
 pub mod event;
 pub mod exec;
+pub mod fs_atomic;
 pub mod log;
 pub mod network;
 pub mod operator;

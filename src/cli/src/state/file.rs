@@ -163,9 +163,10 @@ impl StateFile {
     fn write_to_disk(&self) -> Result<(), std::io::Error> {
         let data = serde_json::to_string_pretty(&self.records).map_err(std::io::Error::other)?;
         let tmp_path = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp_path, &data)?;
-        std::fs::rename(&tmp_path, &self.path)?;
-        Ok(())
+        // Durable atomic write (fsync tmp before rename + fsync parent dir): a
+        // hard crash must not leave a truncated boxes.json that then parses-fail
+        // and quarantines the WHOLE box inventory, orphaning every running VM.
+        a3s_box_core::fs_atomic::write_durable(&tmp_path, &self.path, data.as_bytes())
     }
 
     /// Atomically apply `f` to the on-disk state under the exclusive
