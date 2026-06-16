@@ -297,96 +297,6 @@ fn parse_cpuset_spec(spec: &str) -> std::result::Result<Vec<usize>, String> {
     Ok(cpus)
 }
 
-/// Apply cgroup v2 resource limits (Linux only, best-effort).
-///
-/// Creates a cgroup under /sys/fs/cgroup/a3s-box/<box_id>/ and writes
-/// the appropriate control files. Moves the current process into the cgroup.
-#[cfg(target_os = "linux")]
-fn apply_cgroup_limits(spec: &InstanceSpec) {
-    let limits = &spec.resource_limits;
-    let has_cgroup_limits = limits.cpu_shares.is_some()
-        || limits.cpu_quota.is_some()
-        || limits.memory_reservation.is_some()
-        || limits.memory_swap.is_some();
-
-    if !has_cgroup_limits {
-        return;
-    }
-
-    let cgroup_path = format!("/sys/fs/cgroup/a3s-box/{}", spec.box_id);
-
-    // Create cgroup directory
-    if std::fs::create_dir_all(&cgroup_path).is_err() {
-        tracing::debug!(
-            path = cgroup_path,
-            "Cannot create cgroup directory (requires root or cgroup delegation)"
-        );
-        return;
-    }
-
-    // cpu.weight (from --cpu-shares)
-    // Docker shares range: 2-262144, cgroup v2 weight range: 1-10000
-    // Conversion: weight = 1 + ((shares - 2) * 9999) / 262142
-    if let Some(shares) = limits.cpu_shares {
-        let weight = 1 + ((shares.clamp(2, 262144) - 2) * 9999) / 262142;
-        if let Err(e) = std::fs::write(format!("{}/cpu.weight", cgroup_path), weight.to_string()) {
-            tracing::debug!(error = %e, "Failed to set cpu.weight");
-        } else {
-            tracing::info!(shares, weight, "Applied CPU shares");
-        }
-    }
-
-    // cpu.max (from --cpu-quota / --cpu-period)
-    if let Some(quota) = limits.cpu_quota {
-        let period = limits.cpu_period.unwrap_or(100_000);
-        let quota_str = if quota < 0 {
-            "max".to_string()
-        } else {
-            quota.to_string()
-        };
-        let value = format!("{} {}", quota_str, period);
-        if let Err(e) = std::fs::write(format!("{}/cpu.max", cgroup_path), &value) {
-            tracing::debug!(error = %e, "Failed to set cpu.max");
-        } else {
-            tracing::info!(cpu_max = value, "Applied CPU quota");
-        }
-    }
-
-    // memory.low (from --memory-reservation)
-    if let Some(reservation) = limits.memory_reservation {
-        if let Err(e) = std::fs::write(
-            format!("{}/memory.low", cgroup_path),
-            reservation.to_string(),
-        ) {
-            tracing::debug!(error = %e, "Failed to set memory.low");
-        } else {
-            tracing::info!(bytes = reservation, "Applied memory reservation");
-        }
-    }
-
-    // memory.swap.max (from --memory-swap)
-    if let Some(swap) = limits.memory_swap {
-        let value = if swap < 0 {
-            "max".to_string()
-        } else {
-            swap.to_string()
-        };
-        if let Err(e) = std::fs::write(format!("{}/memory.swap.max", cgroup_path), &value) {
-            tracing::debug!(error = %e, "Failed to set memory.swap.max");
-        } else {
-            tracing::info!(memory_swap = value, "Applied memory swap limit");
-        }
-    }
-
-    // Move current process into the cgroup
-    let pid = std::process::id();
-    if let Err(e) = std::fs::write(format!("{}/cgroup.procs", cgroup_path), pid.to_string()) {
-        tracing::debug!(error = %e, "Failed to move process into cgroup");
-    } else {
-        tracing::info!(cgroup = cgroup_path, "Moved shim process into cgroup");
-    }
-}
-
 #[cfg(not(target_os = "windows"))]
 fn tsi_port_map_for_spec(spec: &InstanceSpec) -> Vec<String> {
     if native_bridge_port_forwarding_handles_spec(spec) {
@@ -868,9 +778,16 @@ unsafe fn configure_and_start_vm(spec: &InstanceSpec) -> Result<()> {
         }
     }
 
-    // Apply cgroup v2 resource limits (Linux only, best-effort)
-    #[cfg(target_os = "linux")]
-    apply_cgroup_limits(spec);
+    // CPU/memory cgroup limits (--cpu-shares/--cpu-quota/--memory-reservation/
+    // --memory-swap) are NOT applied to the host VM process: they are enforced
+    // INSIDE the guest by guest-init's per-container cgroup (the workload runs in
+    // the microVM, so the in-guest cgroup is what bounds it — real-VM measured
+    // cpu.max actively throttling a 0.5-core cap). The old host-side
+    // apply_cgroup_limits created /sys/fs/cgroup/a3s-box/<id> and wrote
+    // cpu.weight/cpu.max/memory.* there, but the controllers were never delegated
+    // to that subtree (writes ENOENT'd, swallowed) so it never enforced anything —
+    // it only leaked an empty host cgroup. Removed. (cpuset above stays: CPU
+    // pinning of the VM threads has no in-guest equivalent.)
 
     // Spawn the log processor on a dedicated thread for the box's lifetime. The
     // shim owns console.log and lives exactly as long as the VM, so this is the
