@@ -27,6 +27,7 @@ pub mod prom;
 pub mod resize;
 pub mod rootfs;
 pub mod snapshot;
+mod store_io;
 #[cfg(unix)]
 pub mod tee;
 #[cfg(feature = "vm")]
