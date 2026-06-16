@@ -291,6 +291,7 @@ async fn setup_and_boot(args: &RunArgs) -> Result<RunContext, Box<dyn std::error
         image: args.common.image.clone(),
         status: "running".to_string(),
         pid,
+        pid_start_time: pid.and_then(crate::process::pid_start_time),
         cpus: args.common.cpus,
         memory_mb,
         volumes: resolved_volumes,

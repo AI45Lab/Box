@@ -240,8 +240,12 @@ async fn poll_once(tracker: &mut BackoffTracker) -> Result<(), Box<dyn std::erro
         // If unhealthy, kill the process first before restarting
         if is_unhealthy {
             println!("{}", restart_log_line(&record, RestartReason::Unhealthy));
+            // Only signal a PID we can confirm is still this box's shim — a
+            // reused PID after a crash/reboot must never be SIGTERM'd.
             if let Some(pid) = record.pid {
-                crate::process::graceful_stop(pid, libc::SIGTERM, 10).await;
+                if crate::process::is_process_alive_with_identity(pid, record.pid_start_time) {
+                    crate::process::graceful_stop(pid, libc::SIGTERM, 10).await;
+                }
             }
             tracker.mark_dead(&box_id);
             // Mark as dead so boot_from_record works; re-load fresh under the

@@ -46,7 +46,9 @@ enum WaitPollAction {
 fn wait_poll_action(record: &BoxRecord) -> WaitPollAction {
     match record.status.as_str() {
         "running" | "paused" => match record.pid {
-            Some(pid) if process::is_process_alive(pid) => WaitPollAction::Sleep,
+            Some(pid) if process::is_process_alive_with_identity(pid, record.pid_start_time) => {
+                WaitPollAction::Sleep
+            }
             _ => WaitPollAction::Finish(wait_exit_code(record)),
         },
         "created" => WaitPollAction::Sleep,

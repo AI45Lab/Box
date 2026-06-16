@@ -181,6 +181,7 @@ async fn execute_restore(args: SnapshotRestoreArgs) -> Result<(), Box<dyn std::e
         image: meta.image.clone(),
         status: "created".to_string(),
         pid: None,
+        pid_start_time: None,
         cpus: meta.vcpus,
         memory_mb: meta.memory_mb,
         volumes: meta.volumes.clone(),

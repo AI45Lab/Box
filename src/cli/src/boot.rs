@@ -90,6 +90,9 @@ pub fn apply_boot_result(
 ) {
     record.status = "running".to_string();
     record.pid = result.pid;
+    // Capture the shim's start-time identity alongside its PID so a later reused
+    // PID (after a crash/reboot) is not mistaken for this process.
+    record.pid_start_time = result.pid.and_then(crate::process::pid_start_time);
     if let Some(exec_socket_path) = result.exec_socket_path {
         record.exec_socket_path = exec_socket_path;
     }
@@ -331,6 +334,7 @@ mod tests {
             image: "alpine:latest".to_string(),
             status: "stopped".to_string(),
             pid: None,
+            pid_start_time: None,
             cpus: 4,
             memory_mb: 2048,
             volumes: vec!["/host:/guest".to_string()],

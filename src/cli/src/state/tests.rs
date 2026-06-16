@@ -21,6 +21,7 @@ fn sample_record(id: &str, name: &str, status: &str) -> BoxRecord {
         } else {
             None
         },
+        pid_start_time: None,
         cpus: 2,
         memory_mb: 512,
         volumes: vec![],

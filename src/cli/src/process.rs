@@ -60,6 +60,46 @@ pub fn is_process_exited(pid: u32) -> bool {
     !is_process_alive(pid)
 }
 
+/// Read a process's start time (field 22 of `/proc/<pid>/stat`, in clock ticks
+/// since boot) as a stable identity token. After a crash or reboot the kernel
+/// can reassign the old shim PID to an unrelated process; the start time lets us
+/// tell the original process apart from a reused PID. `None` when it cannot be
+/// determined (non-Linux, or the process is already gone).
+#[cfg(target_os = "linux")]
+pub fn pid_start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Format: "<pid> (<comm>) <state> ...". comm may contain spaces/parens, so
+    // scan past the final ')': the tokens after it begin at field 3 (state), so
+    // field 22 (starttime) is the 20th of those (index 19).
+    let after = &stat[stat.rfind(')')? + 1..];
+    after
+        .split_whitespace()
+        .nth(19)
+        .and_then(|s| s.parse::<u64>().ok())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn pid_start_time(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// Liveness with PID-identity verification: the process is alive only if it
+/// exists AND — when an identity token was recorded — its current start time
+/// still matches. After a reboot or PID reuse the start time differs, so a stale
+/// record is treated as dead and no signal is ever delivered to an unrelated
+/// process. A `None` expected token (records persisted before this field
+/// existed) falls back to the bare liveness check, so an in-place upgrade never
+/// mis-marks a still-running box.
+pub fn is_process_alive_with_identity(pid: u32, expected_start: Option<u64>) -> bool {
+    if !is_process_alive(pid) {
+        return false;
+    }
+    match expected_start {
+        Some(expected) => pid_start_time(pid) == Some(expected),
+        None => true,
+    }
+}
+
 #[cfg(windows)]
 pub fn is_process_alive(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::STILL_ACTIVE;
@@ -264,5 +304,22 @@ mod tests {
         assert_eq!(StopOutcome::AlreadyExited.inferred_exit_code(15), None);
         assert_eq!(StopOutcome::GracefulExit.inferred_exit_code(15), Some(143));
         assert_eq!(StopOutcome::ForceKilled.inferred_exit_code(15), Some(137));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_pid_identity_distinguishes_reused_pid() {
+        let me = std::process::id();
+        let token = pid_start_time(me);
+        assert!(token.is_some(), "live process must have a start-time token");
+        // Same process, correct token => alive.
+        assert!(is_process_alive_with_identity(me, token));
+        // Live PID but a token that does not match => a reused PID => NOT alive,
+        // so no signal is ever delivered to the impostor process.
+        assert!(!is_process_alive_with_identity(me, Some(u64::MAX)));
+        // Legacy record with no token => falls back to bare liveness => alive.
+        assert!(is_process_alive_with_identity(me, None));
+        // A dead PID is never alive regardless of token.
+        assert!(!is_process_alive_with_identity(99999, None));
     }
 }

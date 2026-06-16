@@ -17,6 +17,7 @@ pub mod fixtures {
             image: "alpine:latest".to_string(),
             status: status.to_string(),
             pid,
+            pid_start_time: None,
             cpus: 2,
             memory_mb: 512,
             volumes: vec![],
