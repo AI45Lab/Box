@@ -231,9 +231,58 @@ async fn execute_create(args: CreateArgs) -> Result<(), Box<dyn std::error::Erro
         config.labels.insert(key.to_string(), value.to_string());
     }
 
+    // Reject a subnet that overlaps an existing network's pool. Each network's
+    // IPAM only considers its own endpoints, so two networks sharing an address
+    // range (e.g. the default 10.89.0.0/24 created twice) hand different boxes
+    // the SAME IP + derived MAC — ambiguous routes and host-side passt
+    // port-forward conflicts. Docker rejects this at create time; the compose
+    // path already derives distinct per-index subnets to avoid it.
+    for existing in store.list()? {
+        if subnets_overlap(&config.subnet, &existing.subnet) {
+            return Err(format!(
+                "subnet {} overlaps with existing network '{}' ({})",
+                config.subnet, existing.name, existing.subnet
+            )
+            .into());
+        }
+    }
+
     store.create(config)?;
     println!("{}", args.name);
     Ok(())
+}
+
+/// Parse an IPv4 CIDR like `10.89.0.0/24` into `(network_address, prefix_len)`
+/// with the host bits masked off. Returns `None` if it cannot be parsed.
+fn parse_cidr(cidr: &str) -> Option<(u32, u8)> {
+    let (addr, prefix) = cidr.split_once('/')?;
+    let ip: std::net::Ipv4Addr = addr.trim().parse().ok()?;
+    let prefix: u8 = prefix.trim().parse().ok()?;
+    if prefix > 32 {
+        return None;
+    }
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    Some((u32::from(ip) & mask, prefix))
+}
+
+/// Whether two IPv4 subnets overlap (one contains the other's network address).
+/// Unparseable inputs are treated as non-overlapping — `NetworkConfig::new`
+/// already validates the format, so this only guards the overlap relationship.
+fn subnets_overlap(a: &str, b: &str) -> bool {
+    let (Some((net_a, pa)), Some((net_b, pb))) = (parse_cidr(a), parse_cidr(b)) else {
+        return false;
+    };
+    let shorter = pa.min(pb);
+    let mask = if shorter == 0 {
+        0
+    } else {
+        u32::MAX << (32 - shorter)
+    };
+    (net_a & mask) == (net_b & mask)
 }
 
 pub(crate) fn validate_attachable_network(config: &NetworkConfig) -> Result<(), String> {
@@ -878,5 +927,19 @@ mod tests {
     fn test_invalid_label_format() {
         let label = "no-equals-sign";
         assert!(label.split_once('=').is_none());
+    }
+
+    #[test]
+    fn test_subnets_overlap() {
+        // Identical, contained, and containing ranges overlap.
+        assert!(subnets_overlap("10.89.0.0/24", "10.89.0.0/24"));
+        assert!(subnets_overlap("10.89.0.0/24", "10.89.0.128/25"));
+        assert!(subnets_overlap("10.0.0.0/8", "10.89.0.0/24"));
+        assert!(subnets_overlap("0.0.0.0/0", "10.89.0.0/24"));
+        // Adjacent / disjoint ranges do not overlap.
+        assert!(!subnets_overlap("10.89.0.0/24", "10.89.1.0/24"));
+        assert!(!subnets_overlap("10.89.0.0/24", "192.168.0.0/24"));
+        // Host bits are masked, so a host address resolves to its network.
+        assert!(subnets_overlap("10.89.0.5/24", "10.89.0.200/24"));
     }
 }
