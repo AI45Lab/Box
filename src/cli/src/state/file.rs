@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use super::BoxRecord;
-use crate::state::policy::{is_process_alive, should_restart};
+use crate::state::policy::{is_record_pid_live, should_restart};
 
 /// Persistent state file backed by JSON.
 pub struct StateFile {
@@ -300,7 +300,7 @@ impl StateFile {
                 continue;
             }
 
-            let has_live_pid = record.pid.is_some_and(is_process_alive);
+            let has_live_pid = is_record_pid_live(record);
             if !has_live_pid {
                 // guest-init writes the container exit code into the overlay
                 // rootfs (`/.a3s_exit_code`) on exit; it surfaces on the host at

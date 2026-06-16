@@ -2,9 +2,14 @@
 
 use super::BoxRecord;
 
-/// Check if a process is alive.
-pub(super) fn is_process_alive(pid: u32) -> bool {
-    crate::process::is_process_alive(pid)
+/// Record-level liveness with PID-identity verification: live only if the
+/// recorded PID exists AND its start-time identity still matches (when one was
+/// recorded). Prevents a reused PID after a crash/reboot from keeping a dead box
+/// "running". See [`crate::process::is_process_alive_with_identity`].
+pub(crate) fn is_record_pid_live(record: &BoxRecord) -> bool {
+    record.pid.is_some_and(|pid| {
+        crate::process::is_process_alive_with_identity(pid, record.pid_start_time)
+    })
 }
 
 /// Determine if a box should be automatically restarted based on its restart policy.

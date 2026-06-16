@@ -505,6 +505,7 @@ async fn execute_up(
             image,
             status: "running".to_string(),
             pid,
+            pid_start_time: pid.and_then(crate::process::pid_start_time),
             cpus: svc.and_then(|s| s.cpus).unwrap_or(2),
             memory_mb: svc
                 .and_then(|s| s.mem_limit.as_ref())

@@ -6,7 +6,7 @@ use crate::state::BoxRecord;
 /// Require a record to point at a currently live host process.
 pub fn require_live_pid(record: &BoxRecord, action: &str) -> Result<u32, String> {
     match record.pid {
-        Some(pid) if process::is_process_alive(pid) => Ok(pid),
+        Some(pid) if process::is_process_alive_with_identity(pid, record.pid_start_time) => Ok(pid),
         Some(pid) => Err(format!(
             "Cannot {action} box {} because its recorded PID {pid} is not running. The box state may be stale; run `a3s-box ps` to reconcile state, then `a3s-box restart {}` if it should still be running.",
             record.name, record.name
@@ -79,5 +79,30 @@ mod tests {
         let record = make_record("id", "box", "running", Some(std::process::id()));
 
         assert!(resume_paused_for_termination(&record, std::process::id(), "stop").is_ok());
+    }
+
+    // A live PID whose recorded start-time identity does NOT match (a reused PID
+    // after a crash/reboot) must be rejected so stop/kill/pause never signals an
+    // unrelated host process. Without the identity check this returns Ok(pid).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_require_live_pid_rejects_reused_pid_via_identity_mismatch() {
+        let mut record = make_record("id", "box", "running", Some(std::process::id()));
+        record.pid_start_time = Some(u64::MAX);
+
+        let error = require_live_pid(&record, "stop").unwrap_err();
+        assert!(error.contains("is not running"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_require_live_pid_accepts_matching_identity() {
+        let mut record = make_record("id", "box", "running", Some(std::process::id()));
+        record.pid_start_time = crate::process::pid_start_time(std::process::id());
+
+        assert_eq!(
+            require_live_pid(&record, "stop").unwrap(),
+            std::process::id()
+        );
     }
 }

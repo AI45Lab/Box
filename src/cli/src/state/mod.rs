@@ -33,6 +33,12 @@ pub struct BoxRecord {
     pub status: String,
     /// Shim process PID (set when running)
     pub pid: Option<u32>,
+    /// Start-time identity token (`/proc/<pid>/stat` field 22) captured when
+    /// `pid` was recorded, so a reused PID after a crash/reboot is not mistaken
+    /// for the original shim. `None` for records written before this field
+    /// existed (they fall back to a bare liveness check).
+    #[serde(default)]
+    pub pid_start_time: Option<u64>,
     /// Number of vCPUs
     pub cpus: u32,
     /// Memory in MB

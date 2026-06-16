@@ -52,9 +52,13 @@ fn rm_one(
         }
 
         // Force-kill the active box. A missing PID is treated as stale state;
-        // --force still removes metadata and resources below.
+        // --force still removes metadata and resources below. Only signal a PID
+        // whose start-time identity still matches, so a reused PID after a
+        // crash/reboot is never killed.
         if let Some(pid) = record.pid {
-            crate::process::terminate_process(pid);
+            if crate::process::is_process_alive_with_identity(pid, record.pid_start_time) {
+                crate::process::terminate_process(pid);
+            }
         }
     }
 
