@@ -4,7 +4,7 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 pub enum BoxError {
     /// VM failed to start
-    #[error("VM boot failed: {message}")]
+    #[error("VM boot failed: {message}{}", .hint.as_ref().map(|h| format!(" (hint: {h})")).unwrap_or_default())]
     BoxBootError {
         message: String,
         hint: Option<String>,
@@ -108,7 +108,13 @@ mod tests {
             message: "Failed to start VM".to_string(),
             hint: Some("Check virtualization support".to_string()),
         };
-        assert_eq!(error.to_string(), "VM boot failed: Failed to start VM");
+        // The actionable hint is rendered (matching the CRI path) so an operator
+        // who hits a boot failure on the CLI gets the remediation, not just the
+        // diagnosis.
+        assert_eq!(
+            error.to_string(),
+            "VM boot failed: Failed to start VM (hint: Check virtualization support)"
+        );
     }
 
     #[test]

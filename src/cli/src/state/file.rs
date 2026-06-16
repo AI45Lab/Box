@@ -104,7 +104,9 @@ impl StateFile {
                 eprintln!(
                     "a3s-box: WARNING: state file {} is corrupt ({err}); preserved a \
                      copy at {preserved} and started from empty state. Running boxes are \
-                     no longer tracked — recover from the backup or run `a3s-box reap`.",
+                     no longer tracked — their records are in the preserved copy; repair \
+                     and restore it, then `a3s-box ps` re-reconciles. Otherwise remove any \
+                     leaked VMs/overlays manually.",
                     path.display(),
                 );
                 Vec::new()
@@ -137,14 +139,22 @@ impl StateFile {
     ///
     /// `load_default_raw` quarantines a corrupt `boxes.json` by renaming it,
     /// which mutates the filesystem and bypasses the cross-process state lock —
-    /// wrong for a lock-free, per-scrape reader. Here a corrupt file simply
-    /// yields an empty snapshot; a real writer will quarantine it under the lock.
+    /// wrong for a lock-free, per-scrape reader. Here a corrupt file is surfaced
+    /// as an `Err` (no quarantine — a real writer does that under the lock) so the
+    /// caller can distinguish it from an empty/absent file: swallowing the parse
+    /// error to an empty snapshot made `/metrics` report a falsely-healthy
+    /// all-zeros result for a truncated state file instead of an error.
     pub(crate) fn load_readonly() -> Result<Self, std::io::Error> {
         let home = a3s_box_core::dirs_home();
-        let path = home.join("boxes.json");
+        Self::load_readonly_from(home.join("boxes.json"))
+    }
+
+    /// Inner [`load_readonly`] over an explicit path (testable).
+    pub(crate) fn load_readonly_from(path: PathBuf) -> Result<Self, std::io::Error> {
         let records = if path.exists() {
             let data = std::fs::read_to_string(&path)?;
-            serde_json::from_str(&data).unwrap_or_default()
+            serde_json::from_str(&data)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
         } else {
             Vec::new()
         };

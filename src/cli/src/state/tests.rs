@@ -199,6 +199,23 @@ fn test_load_corrupt_json_quarantines_instead_of_wiping() {
 }
 
 #[test]
+fn test_load_readonly_surfaces_corrupt_file_as_error() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("boxes.json");
+    std::fs::write(&path, "not valid json!!!").unwrap();
+    // A present-but-corrupt file must surface as an Err so the /metrics scrape
+    // reports a load error instead of a falsely-healthy all-zeros snapshot.
+    assert!(StateFile::load_readonly_from(path).is_err());
+}
+
+#[test]
+fn test_load_readonly_missing_file_is_empty_ok() {
+    let tmp = TempDir::new().unwrap();
+    let sf = StateFile::load_readonly_from(tmp.path().join("absent.json")).unwrap();
+    assert!(sf.records().is_empty());
+}
+
+#[test]
 fn test_add_and_find() {
     let tmp = TempDir::new().unwrap();
     let mut sf = StateFile::load(&test_state_path(&tmp)).unwrap();
