@@ -88,6 +88,11 @@ pub struct PoolStartArgs {
     #[arg(long)]
     pub snapshot_fork: bool,
 
+    /// Serve Prometheus metrics (warm-pool hit/miss, VM boot, cache) on this
+    /// address (e.g. `127.0.0.1:9101`). Off when unset. Bind loopback — no auth.
+    #[arg(long)]
+    pub metrics_addr: Option<String>,
+
     /// Output as JSON
     #[arg(long)]
     pub json: bool,
@@ -289,6 +294,10 @@ struct PoolRegistry {
     ksm: bool,
     /// Fill the pool by snapshot-fork (one template, restore the rest).
     snapshot_fork: bool,
+    /// Optional Prometheus metrics shared across every pool this registry
+    /// creates, so warm_pool hit/miss + vm_boot/cache numbers are scrapeable
+    /// from the long-lived daemon (the one process where they matter most).
+    metrics: Option<a3s_box_runtime::RuntimeMetrics>,
 }
 
 impl PoolRegistry {
@@ -320,11 +329,16 @@ impl PoolRegistry {
             ksm: self.ksm,
             ..Default::default()
         };
-        let pool = std::sync::Arc::new(
-            WarmPool::start(pool_config, box_config, EventEmitter::new(256))
-                .await
-                .map_err(|e| e.to_string())?,
-        );
+        let mut pool = WarmPool::start(pool_config, box_config, EventEmitter::new(256))
+            .await
+            .map_err(|e| e.to_string())?;
+        // Record this pool's hit/miss/boot/cache metrics into the shared registry
+        // (set before Arc-wrapping — set_metrics needs &mut). All pools share one
+        // RuntimeMetrics registry, so the daemon's /metrics endpoint aggregates them.
+        if let Some(metrics) = &self.metrics {
+            pool.set_metrics(metrics.clone());
+        }
+        let pool = std::sync::Arc::new(pool);
         let entry = PoolEntry {
             pool,
             sem: std::sync::Arc::new(tokio::sync::Semaphore::new(max_size)),
@@ -379,6 +393,16 @@ async fn execute_start(args: PoolStartArgs) -> Result<(), Box<dyn std::error::Er
         return Err(format!("--size ({}) cannot exceed --max ({})", args.size, args.max).into());
     }
 
+    // Optional Prometheus metrics for the long-lived daemon. One shared registry
+    // is handed to every pool (set_metrics) and to the /metrics server; cloning a
+    // RuntimeMetrics shares the underlying registry, so the server scrapes what the
+    // pools record (warm_pool hit/miss, vm_boot, cache).
+    let metrics = if args.metrics_addr.is_some() {
+        a3s_box_runtime::RuntimeMetrics::try_new().ok()
+    } else {
+        None
+    };
+
     let registry = std::sync::Arc::new(PoolRegistry {
         pools: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         default_image: args.image.clone(),
@@ -388,7 +412,13 @@ async fn execute_start(args: PoolStartArgs) -> Result<(), Box<dyn std::error::Er
         deferred: args.deferred,
         ksm: args.ksm,
         snapshot_fork: args.snapshot_fork,
+        metrics: metrics.clone(),
     });
+
+    // Serve /metrics alongside the pool socket, if requested.
+    if let (Some(addr), Some(metrics)) = (args.metrics_addr.clone(), metrics) {
+        tokio::spawn(serve_pool_metrics(addr, metrics));
+    }
 
     // Pre-warm the default image, if one was given.
     let default_stats = if let Some(ref image) = args.image {
@@ -437,6 +467,49 @@ async fn execute_start(args: PoolStartArgs) -> Result<(), Box<dyn std::error::Er
         println!("Done.");
     }
     Ok(())
+}
+
+/// Serve a Prometheus `/metrics` endpoint exposing the pool daemon's runtime
+/// metrics (warm_pool hit/miss, vm_boot, cache). Minimal raw-HTTP server,
+/// mirroring the monitor's metrics endpoint.
+async fn serve_pool_metrics(addr: String, metrics: a3s_box_runtime::RuntimeMetrics) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = match TcpListener::bind(&addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("pool metrics: failed to bind {addr}: {e}");
+            return;
+        }
+    };
+    println!("  metrics:  http://{addr}/metrics");
+
+    loop {
+        let Ok((mut sock, _)) = listener.accept().await else {
+            continue;
+        };
+        let metrics = metrics.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            let n = match sock.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => n,
+            };
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let path = req.split_whitespace().nth(1).unwrap_or("");
+            let (status, body) = if path.starts_with("/metrics") {
+                ("200 OK", metrics.encode())
+            } else {
+                ("404 Not Found", String::new())
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(response.as_bytes()).await;
+        });
+    }
 }
 
 /// Accept `pool run` connections until Ctrl-C, serving each request concurrently
