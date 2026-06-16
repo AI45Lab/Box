@@ -60,9 +60,10 @@ impl StateStore for JsonStateStore {
         let json = serde_json::to_vec_pretty(state)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-        std::fs::write(&tmp, &json)?;
-        std::fs::rename(&tmp, &self.path)?;
-        Ok(())
+        // Durable atomic write: fsync the tmp file before the rename + fsync the
+        // parent dir, so a hard crash can't leave a truncated state.json that
+        // fails to parse on recovery and orphans every sandbox/container.
+        a3s_box_core::fs_atomic::write_durable(&tmp, &self.path, &json)
     }
 
     fn load(&self) -> std::io::Result<PersistedState> {
