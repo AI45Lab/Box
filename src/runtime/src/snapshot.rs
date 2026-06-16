@@ -166,10 +166,24 @@ impl SnapshotStore {
             })?;
             let meta_path = entry.path().join("metadata.json");
             if meta_path.exists() {
-                if let Ok(data) = std::fs::read_to_string(&meta_path) {
-                    if let Ok(meta) = serde_json::from_str::<SnapshotMetadata>(&data) {
-                        snapshots.push(meta);
-                    }
+                match std::fs::read_to_string(&meta_path) {
+                    Ok(data) => match serde_json::from_str::<SnapshotMetadata>(&data) {
+                        Ok(meta) => snapshots.push(meta),
+                        // Don't silently skip: a metadata file that won't parse
+                        // makes the snapshot invisible to count/total_size/prune
+                        // while its rootfs keeps consuming disk. Surface it so it
+                        // can be diagnosed and cleaned up.
+                        Err(e) => tracing::warn!(
+                            path = %meta_path.display(),
+                            error = %e,
+                            "Skipping snapshot with unparseable metadata.json (orphaned on disk)"
+                        ),
+                    },
+                    Err(e) => tracing::warn!(
+                        path = %meta_path.display(),
+                        error = %e,
+                        "Skipping snapshot with unreadable metadata.json"
+                    ),
                 }
             }
         }

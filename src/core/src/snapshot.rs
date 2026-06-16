@@ -49,12 +49,22 @@ pub struct SnapshotMetadata {
     #[serde(default)]
     pub rootfs_cache_key: Option<String>,
     /// Size of the snapshot on disk in bytes
+    #[serde(default)]
     pub size_bytes: u64,
     /// Creation timestamp
+    #[serde(default = "epoch")]
     pub created_at: DateTime<Utc>,
     /// User-provided description
     #[serde(default)]
     pub description: String,
+}
+
+/// Default `created_at` for metadata written by an older/partial build that
+/// omitted the field. Without a default a single missing field would make
+/// serde reject the whole record, dropping the snapshot from `list()`/`prune()`
+/// (invisible, un-prunable, leaking disk) — see SnapshotStore::list.
+fn epoch() -> DateTime<Utc> {
+    DateTime::<Utc>::UNIX_EPOCH
 }
 
 impl SnapshotMetadata {
@@ -166,6 +176,31 @@ mod tests {
         .with_resources(4, 2048);
         assert_eq!(meta.vcpus, 4);
         assert_eq!(meta.memory_mb, 2048);
+    }
+
+    #[test]
+    fn test_snapshot_metadata_tolerates_missing_size_and_created_at() {
+        // Metadata written by an older/partial build (or lightly corrupted) that
+        // omits size_bytes/created_at must still deserialize, so the snapshot
+        // stays visible to list()/count()/prune() instead of being silently
+        // dropped and leaking disk. Only the truly-required identity fields are
+        // present here.
+        let json = r#"{
+            "id": "snap-old",
+            "name": "old",
+            "source_box_id": "box-1",
+            "image": "alpine:latest",
+            "vcpus": 2,
+            "memory_mb": 512,
+            "volumes": [],
+            "env": {},
+            "cmd": []
+        }"#;
+        let parsed: SnapshotMetadata =
+            serde_json::from_str(json).expect("must tolerate missing size_bytes/created_at");
+        assert_eq!(parsed.id, "snap-old");
+        assert_eq!(parsed.size_bytes, 0);
+        assert_eq!(parsed.created_at, DateTime::<Utc>::UNIX_EPOCH);
     }
 
     #[test]
