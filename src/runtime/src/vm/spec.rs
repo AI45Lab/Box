@@ -255,6 +255,29 @@ impl VmManager {
                 env.push(("A3S_SEC_PIDS_LIMIT".to_string(), pids_limit.to_string()));
             }
 
+            // CPU cgroup limits (`--cpu-quota`/`--cpu-period`/`--cpu-shares`).
+            // Like the pids cap these have no VM-boundary equivalent, so the
+            // guest enforces them with a per-container cgroup v2 cpu.max /
+            // cpu.weight. The CRI path already plumbs the identical A3S_SEC_CPU_*
+            // vars (runtime_service mod.rs) and the guest consumes them in
+            // exec_server; mirror it here so a `run --cpu-quota ...` is actually
+            // capped instead of silently dropped. A quota of 0/-1 is unlimited.
+            if let Some(cpu_quota) = self.config.resource_limits.cpu_quota {
+                if cpu_quota > 0 {
+                    env.push(("A3S_SEC_CPU_QUOTA".to_string(), cpu_quota.to_string()));
+                    if let Some(cpu_period) = self.config.resource_limits.cpu_period {
+                        if cpu_period > 0 {
+                            env.push(("A3S_SEC_CPU_PERIOD".to_string(), cpu_period.to_string()));
+                        }
+                    }
+                }
+            }
+            if let Some(cpu_shares) = self.config.resource_limits.cpu_shares {
+                if cpu_shares > 0 {
+                    env.push(("A3S_SEC_CPU_SHARES".to_string(), cpu_shares.to_string()));
+                }
+            }
+
             // Signal guest init to remount rootfs read-only after all setup
             if self.config.read_only {
                 env.push(("BOX_READONLY".to_string(), "1".to_string()));
@@ -815,6 +838,60 @@ mod tests {
 
     fn test_vm_manager(config: BoxConfig) -> VmManager {
         VmManager::with_box_id(config, EventEmitter::new(16), "test-box".to_string())
+    }
+
+    fn env_value<'a>(spec: &'a InstanceSpec, key: &str) -> Option<&'a str> {
+        spec.entrypoint
+            .env
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn test_run_path_plumbs_cpu_cgroup_limits_to_guest() {
+        // The `run` boot path must hand the CPU cgroup limits to guest-init as
+        // A3S_SEC_CPU_* (the same vars the CRI path emits and the guest consumes),
+        // so `run --cpu-quota/--cpu-shares` is actually enforced in-guest instead
+        // of silently dropped.
+        let temp = tempdir().unwrap();
+        let mut config = BoxConfig::default();
+        config.resource_limits.cpu_quota = Some(50_000);
+        config.resource_limits.cpu_period = Some(100_000);
+        config.resource_limits.cpu_shares = Some(512);
+        config.resource_limits.pids_limit = Some(100);
+
+        let mut vm = test_vm_manager(config);
+        let layout = test_layout(temp.path(), Some(test_oci_config(None, None)), true);
+        let spec = vm.build_instance_spec(&layout).unwrap();
+
+        assert_eq!(env_value(&spec, "A3S_SEC_CPU_QUOTA"), Some("50000"));
+        assert_eq!(env_value(&spec, "A3S_SEC_CPU_PERIOD"), Some("100000"));
+        assert_eq!(env_value(&spec, "A3S_SEC_CPU_SHARES"), Some("512"));
+        assert_eq!(env_value(&spec, "A3S_SEC_PIDS_LIMIT"), Some("100"));
+    }
+
+    #[test]
+    fn test_run_path_omits_cpu_limits_when_unset_or_unlimited() {
+        // No limits set, plus an explicit unlimited quota (-1): nothing should be
+        // emitted, so the guest leaves cpu.max at "max".
+        let temp = tempdir().unwrap();
+        let mut config = BoxConfig::default();
+        config.resource_limits.cpu_quota = Some(-1);
+        config.resource_limits.cpu_period = Some(100_000);
+
+        let mut vm = test_vm_manager(config);
+        let layout = test_layout(temp.path(), Some(test_oci_config(None, None)), true);
+        let spec = vm.build_instance_spec(&layout).unwrap();
+
+        assert!(
+            !spec
+                .entrypoint
+                .env
+                .iter()
+                .any(|(k, _)| k.starts_with("A3S_SEC_CPU_")),
+            "no A3S_SEC_CPU_* must be emitted for an unset/unlimited quota"
+        );
     }
 
     #[test]
