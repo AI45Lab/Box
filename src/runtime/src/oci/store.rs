@@ -321,15 +321,53 @@ impl ImageStore {
             ))
         })?;
 
-        let store_index: StoreIndex = serde_json::from_str(&data).map_err(|e| {
-            BoxError::OciImageError(format!("Failed to parse image store index: {}", e))
-        })?;
+        // Parse resiliently so a corrupt/old-schema index never bricks the whole
+        // catalog or blocks CRI/CLI startup. First read the `{ images: [...] }`
+        // envelope leniently (entries as raw values); if even that fails the file
+        // is unusable, so quarantine it and start from an empty catalog that
+        // re-pulls repopulate. Then deserialize each entry independently, skipping
+        // (not failing on) any one corrupt/incompatible record.
+        #[derive(serde::Deserialize)]
+        struct RawIndex {
+            #[serde(default)]
+            images: Vec<serde_json::Value>,
+        }
+
+        let raw: RawIndex = match serde_json::from_str(&data) {
+            Ok(raw) => raw,
+            Err(err) => {
+                let preserved = crate::store_io::quarantine_label(&index_path);
+                tracing::warn!(
+                    "image store index {} is corrupt ({err}); preserved a copy at \
+                     {preserved} and started from an empty catalog (re-pulled images \
+                     will repopulate it)",
+                    index_path.display(),
+                );
+                return Ok(HashMap::new());
+            }
+        };
 
         let mut index = HashMap::new();
-        for image in store_index.images {
-            if image.path.exists() {
-                index.insert(image.reference.clone(), image);
+        let mut skipped = 0usize;
+        for value in raw.images {
+            match serde_json::from_value::<StoredImage>(value) {
+                Ok(image) => {
+                    if image.path.exists() {
+                        index.insert(image.reference.clone(), image);
+                    }
+                }
+                Err(err) => {
+                    skipped += 1;
+                    tracing::warn!("skipping unreadable image index entry ({err})");
+                }
             }
+        }
+        if skipped > 0 {
+            tracing::warn!(
+                "{skipped} image index entr{} skipped as unreadable; affected images \
+                 will be re-pulled on demand",
+                if skipped == 1 { "y" } else { "ies" },
+            );
         }
         Ok(index)
     }
@@ -819,5 +857,36 @@ mod tests {
         let refs: HashSet<String> = s3.list().await.into_iter().map(|i| i.reference).collect();
         assert!(refs.contains("img:a"), "img:a lost: {refs:?}");
         assert!(refs.contains("img:b"), "img:b lost: {refs:?}");
+    }
+
+    #[tokio::test]
+    async fn corrupt_index_is_quarantined_not_fatal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().join("images");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        std::fs::write(store_dir.join("index.json"), "{ not valid json").unwrap();
+
+        // Construction must SUCCEED (start from an empty catalog) rather than
+        // erroring and blocking CRI/CLI startup on a corrupt/old-schema index.
+        let store = ImageStore::new(&store_dir, u64::MAX)
+            .expect("corrupt index.json must not brick the image store");
+        assert!(
+            store.list().await.is_empty(),
+            "store must start from an empty catalog after quarantine"
+        );
+
+        // The corrupt index is preserved as a timestamped sibling, not lost.
+        let quarantined = std::fs::read_dir(&store_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains("index.json.corrupt-")
+            });
+        assert!(
+            quarantined,
+            "corrupt index.json must be quarantined to a sibling"
+        );
     }
 }

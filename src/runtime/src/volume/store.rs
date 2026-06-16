@@ -53,9 +53,21 @@ impl VolumeStore {
             ))
         })?;
 
-        let file: VolumesFile = serde_json::from_str(&data).map_err(|e| {
-            BoxError::SerializationError(format!("failed to parse volumes file: {}", e))
-        })?;
+        // A corrupt/old-schema volumes file must not brick the runtime: quarantine
+        // it and start from an empty set (create repopulates) rather than failing
+        // every volume operation. Mirrors the boxes.json hardening.
+        let file: VolumesFile = match serde_json::from_str(&data) {
+            Ok(f) => f,
+            Err(e) => {
+                let preserved = crate::store_io::quarantine_label(&self.path);
+                tracing::warn!(
+                    "volumes file {} is corrupt ({e}); preserved a copy at {preserved} \
+                     and started from an empty volume set",
+                    self.path.display(),
+                );
+                return Ok(HashMap::new());
+            }
+        };
 
         Ok(file.volumes)
     }
@@ -598,5 +610,25 @@ mod tests {
             n,
             "every concurrent create must persist (no lost update)"
         );
+    }
+
+    #[test]
+    fn corrupt_volumes_file_is_quarantined_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("volumes.json");
+        std::fs::write(&path, "{ not valid json").unwrap();
+        let store = VolumeStore::new(path.clone(), dir.path().join("volumes"));
+
+        // load() must succeed (empty) instead of erroring every volume op.
+        assert!(store.load().unwrap().is_empty());
+        let quarantined = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains("volumes.json.corrupt-")
+            });
+        assert!(quarantined, "corrupt volumes.json must be quarantined");
     }
 }

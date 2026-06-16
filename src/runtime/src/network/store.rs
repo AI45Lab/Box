@@ -47,8 +47,21 @@ impl NetworkStore {
             ))
         })?;
 
-        let file: NetworksFile = serde_json::from_str(&data)
-            .map_err(|e| BoxError::NetworkError(format!("failed to parse networks file: {}", e)))?;
+        // A corrupt/old-schema networks file must not brick the runtime: quarantine
+        // it and start from an empty set (create repopulates) rather than failing
+        // every network operation. Mirrors the boxes.json hardening.
+        let file: NetworksFile = match serde_json::from_str(&data) {
+            Ok(f) => f,
+            Err(e) => {
+                let preserved = crate::store_io::quarantine_label(&self.path);
+                tracing::warn!(
+                    "networks file {} is corrupt ({e}); preserved a copy at {preserved} \
+                     and started from an empty network set",
+                    self.path.display(),
+                );
+                return Ok(HashMap::new());
+            }
+        };
 
         Ok(file.networks)
     }
@@ -405,5 +418,26 @@ mod tests {
             16,
             "every concurrent endpoint must be persisted (no lost writes)"
         );
+    }
+
+    #[test]
+    fn corrupt_networks_file_is_quarantined_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("networks.json");
+        std::fs::write(&path, "{ not valid json").unwrap();
+        let store = NetworkStore::new(path.clone());
+
+        // load() must succeed (empty) instead of erroring every network op.
+        assert!(store.load().unwrap().is_empty());
+        // The corrupt file is preserved as a timestamped sibling, not lost.
+        let quarantined = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains("networks.json.corrupt-")
+            });
+        assert!(quarantined, "corrupt networks.json must be quarantined");
     }
 }
