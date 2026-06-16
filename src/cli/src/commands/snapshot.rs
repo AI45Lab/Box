@@ -24,6 +24,8 @@ pub enum SnapshotAction {
     Rm(SnapshotRmArgs),
     /// Display detailed snapshot information
     Inspect(SnapshotInspectArgs),
+    /// Evict old snapshots to bound disk usage
+    Prune(SnapshotPruneArgs),
 }
 
 /// Arguments for `snapshot create`.
@@ -71,6 +73,18 @@ pub struct SnapshotInspectArgs {
     pub id: String,
 }
 
+/// Arguments for `snapshot prune`.
+#[derive(Parser)]
+pub struct SnapshotPruneArgs {
+    /// Keep at most this many newest snapshots (0 = no count limit)
+    #[arg(long, default_value = "0")]
+    pub keep: usize,
+    /// Evict oldest snapshots until the total size is under this many bytes
+    /// (0 = no size limit)
+    #[arg(long = "max-bytes", default_value = "0")]
+    pub max_bytes: u64,
+}
+
 /// Execute a snapshot command.
 pub async fn execute(args: SnapshotArgs) -> Result<(), Box<dyn std::error::Error>> {
     match args.action {
@@ -79,7 +93,33 @@ pub async fn execute(args: SnapshotArgs) -> Result<(), Box<dyn std::error::Error
         SnapshotAction::Ls(a) => execute_ls(a).await,
         SnapshotAction::Rm(a) => execute_rm(a).await,
         SnapshotAction::Inspect(a) => execute_inspect(a).await,
+        SnapshotAction::Prune(a) => execute_prune(a).await,
     }
+}
+
+/// Prune snapshots to bound disk usage. Explicit operator action (no surprise
+/// auto-deletion): wires the `SnapshotStore::prune` primitive — which was
+/// implemented and unit-tested but had no caller, so `max_snapshots`/
+/// `max_total_bytes` were inert and scheduled/per-CI snapshots grew the host
+/// disk unbounded with only manual `snapshot rm` as recourse.
+async fn execute_prune(args: SnapshotPruneArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use a3s_box_runtime::SnapshotStore;
+
+    if args.keep == 0 && args.max_bytes == 0 {
+        return Err("specify --keep <N> and/or --max-bytes <BYTES> to prune".into());
+    }
+
+    let store = SnapshotStore::default_path()?;
+    let removed = store.prune(args.keep, args.max_bytes)?;
+    if removed.is_empty() {
+        println!("Nothing to prune");
+    } else {
+        for id in &removed {
+            println!("{id}");
+        }
+        println!("Pruned {} snapshot(s)", removed.len());
+    }
+    Ok(())
 }
 
 /// Create a snapshot from a box.
