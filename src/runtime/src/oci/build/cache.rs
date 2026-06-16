@@ -200,6 +200,32 @@ impl BuildCache {
                 total = total.saturating_sub(len);
             }
         }
+
+        // Blobs were just evicted — drop key records that now point at nothing,
+        // so the keys/ dir doesn't accumulate dangling pointers without bound.
+        self.prune_orphan_keys();
+    }
+
+    /// Remove key records whose referenced blob no longer exists. Each key is a
+    /// small JSON record, but a long-lived build host edits-and-rebuilds many
+    /// chain keys and `prune_to` only evicts blobs, so without this the keys/
+    /// directory grows unbounded (and leaves dangling pointers after eviction).
+    /// Best-effort; a missing keys/ dir is a no-op.
+    fn prune_orphan_keys(&self) {
+        let Ok(read_dir) = std::fs::read_dir(self.dir.join("keys")) else {
+            return;
+        };
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            let keep = std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<KeyRecord>(&bytes).ok())
+                .is_some_and(|record| self.dir.join("blobs").join(&record.digest).exists());
+            if !keep {
+                // Blob evicted, or an unparseable/truncated key record: cruft.
+                let _ = std::fs::remove_file(&path);
+            }
+        }
     }
 }
 
@@ -330,6 +356,33 @@ mod tests {
         assert_eq!(hit.size, 19);
         assert!(hit.blob_path.exists());
         assert_eq!(fs::read(&hit.blob_path).unwrap(), b"fake layer contents");
+    }
+
+    #[test]
+    fn prune_evicts_orphan_key_records() {
+        let tmp = TempDir::new().unwrap();
+        let cache_dir = tmp.path().join("buildcache");
+        let cache = open_at(&cache_dir);
+
+        let layer_path = tmp.path().join("layer.tar.gz");
+        fs::write(&layer_path, vec![0u8; 4096]).unwrap();
+        let layer = LayerInfo {
+            path: layer_path,
+            digest: "cafef00d".to_string(),
+            size: 4096,
+        };
+        let key = BuildCache::chain("", "RUN make", None);
+        cache.store(&key, &layer, "diff");
+
+        let blob = cache_dir.join("blobs").join("cafef00d");
+        let key_file = cache_dir.join("keys").join(&key);
+        assert!(blob.exists() && key_file.exists());
+
+        // Force the cache under the blob size: evicts the blob AND prunes its
+        // now-dangling key record (previously the key file leaked forever).
+        cache.prune_to(0);
+        assert!(!blob.exists(), "blob should be evicted");
+        assert!(!key_file.exists(), "orphaned key record should be pruned");
     }
 
     #[test]
