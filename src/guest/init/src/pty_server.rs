@@ -270,20 +270,26 @@ fn handle_pty_connection(fd: std::os::fd::OwnedFd) -> Result<(), Box<dyn std::er
         .as_ref()
         .and_then(|cgroup| std::ffi::CString::new(cgroup.procs_path()).ok());
 
-    // Apply CRI MaskedPaths / ReadonlyPaths / readOnlyRootFilesystem to the
-    // container rootfs before the fork — the child shares this mount namespace
-    // and chroots into it. The exec path does this; the PTY path skipped it, so a
-    // tty container's securityContext path restrictions went unenforced.
-    // Best-effort, mirroring the exec path: a masked path that doesn't exist is
-    // simply skipped.
+    // Set up the container rootfs before the fork — the child shares this mount
+    // namespace and chroots into it. The exec path does all of this per spawn;
+    // the PTY path did NONE of it, so a tty container was missing /proc + /dev and
+    // its securityContext path restrictions went unenforced. Mirror the exec path
+    // exactly (same critest-validated functions), in the same order.
     #[cfg(target_os = "linux")]
     if let Some(ref rootfs) = request.rootfs {
+        // /proc + /sys, then the standard /dev nodes — many workloads read
+        // /proc/self/* or /dev/urandom and won't start without them. Idempotent.
+        crate::exec_server::ensure_container_pseudo_filesystems(rootfs);
+        crate::exec_server::ensure_container_dev_nodes(rootfs);
+        // CRI MaskedPaths / ReadonlyPaths (best-effort; a path that doesn't exist
+        // is skipped) — these need /proc + /sys mounted above.
         let masked = crate::exec_server::parse_sec_path_list(&request.env, "A3S_SEC_MASKED_PATHS=");
         let readonly =
             crate::exec_server::parse_sec_path_list(&request.env, "A3S_SEC_READONLY_PATHS=");
         if !masked.is_empty() || !readonly.is_empty() {
             crate::exec_server::apply_container_path_restrictions(rootfs, &masked, &readonly);
         }
+        // readOnlyRootFilesystem — last, after /proc, /sys and inner mounts are up.
         if request
             .env
             .iter()

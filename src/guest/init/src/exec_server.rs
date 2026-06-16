@@ -1518,7 +1518,7 @@ fn configure_child_process(
 /// existing mount (detected by a differing `st_dev`) is left untouched, and any
 /// failure is logged without aborting the exec.
 #[cfg(target_os = "linux")]
-fn ensure_container_pseudo_filesystems(rootfs: &str) {
+pub(crate) fn ensure_container_pseudo_filesystems(rootfs: &str) {
     use nix::mount::{mount, MsFlags};
     use std::os::unix::fs::MetadataExt;
 
@@ -1559,7 +1559,7 @@ fn ensure_container_pseudo_filesystems(rootfs: &str) {
 /// still holds `CAP_MKNOD` (before the privilege drop and chroot). Best-effort
 /// and idempotent: an existing node is left as-is.
 #[cfg(target_os = "linux")]
-fn ensure_container_dev_nodes(rootfs: &str) {
+pub(crate) fn ensure_container_dev_nodes(rootfs: &str) {
     let dev = format!("{rootfs}/dev");
     if let Err(e) = std::fs::create_dir_all(&dev) {
         warn!("Failed to create container /dev {dev}: {e}");
