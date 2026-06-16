@@ -164,6 +164,75 @@ fn handle_pty_connection(fd: std::os::fd::OwnedFd) -> Result<(), Box<dyn std::er
 
     info!(cmd = ?request.cmd, "PTY session starting");
 
+    // Parse the A3S_SEC_* confinement controls from the request env (same keys
+    // and KEY=VALUE format the exec path consumes) and build the seccomp filter
+    // BEFORE the fork — building a filter allocates, and the post-fork child must
+    // stay async-signal-safe. The TTY workload previously applied NONE of these,
+    // running with full capabilities, no seccomp and no_new_privs unset despite
+    // the pod's securityContext (#11). The same async-signal-safe namespace::
+    // primitives the exec path uses are applied in the child below.
+    let sec_supplemental_groups: Vec<u32> = request
+        .env
+        .iter()
+        .find_map(|entry| entry.strip_prefix("A3S_SEC_SUPPLEMENTAL_GROUPS="))
+        .map(|csv| {
+            csv.split(',')
+                .filter_map(|gid| gid.trim().parse::<u32>().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    let sec_cap_drop: Vec<String> = request
+        .env
+        .iter()
+        .find_map(|entry| entry.strip_prefix("A3S_SEC_CAP_DROP="))
+        .map(|csv| {
+            csv.split(',')
+                .map(|name| name.trim().to_string())
+                .filter(|name| !name.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let sec_cap_keep: Option<Vec<String>> = request
+        .env
+        .iter()
+        .find_map(|entry| entry.strip_prefix("A3S_SEC_CAP_KEEP="))
+        .map(|csv| {
+            csv.split(',')
+                .map(|name| name.trim().to_string())
+                .filter(|name| !name.is_empty())
+                .collect()
+        });
+    let sec_no_new_privs = request
+        .env
+        .iter()
+        .any(|entry| entry == "A3S_SEC_NO_NEW_PRIVS=1");
+    #[cfg(target_os = "linux")]
+    let seccomp_filter: Option<Vec<libc::sock_filter>> = {
+        let localhost: Vec<u32> = request
+            .env
+            .iter()
+            .find_map(|entry| entry.strip_prefix("A3S_SEC_SECCOMP_LOCALHOST="))
+            .map(|csv| {
+                csv.split(',')
+                    .filter_map(|name| crate::namespace::syscall_name_to_number(name.trim()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let apply_default = request
+            .env
+            .iter()
+            .any(|entry| entry == "A3S_SEC_SECCOMP=default");
+        if !localhost.is_empty() {
+            Some(crate::namespace::build_seccomp_errno_filter(&localhost))
+        } else if apply_default {
+            Some(crate::namespace::build_default_bpf_filter())
+        } else {
+            None
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let _ = (&sec_cap_drop, &sec_cap_keep, sec_no_new_privs);
+
     // Step 2: Allocate PTY
     let pty = openpty(None, None)?;
     let master_fd = pty.master;
@@ -219,10 +288,60 @@ fn handle_pty_connection(fd: std::os::fd::OwnedFd) -> Result<(), Box<dyn std::er
                 let _ = std::env::set_current_dir(dir);
             }
 
+            // Confinement, part 1 (while still root, BEFORE the uid switch):
+            // supplemental groups need CAP_SETGID and capset needs CAP_SETPCAP,
+            // both cleared once user.apply() drops to a non-root uid. The default
+            // keep-set retains CAP_SETUID/CAP_SETGID so user.apply still works.
+            if !sec_supplemental_groups.is_empty() {
+                let ret = unsafe {
+                    libc::setgroups(
+                        sec_supplemental_groups.len() as _,
+                        sec_supplemental_groups.as_ptr() as *const libc::gid_t,
+                    )
+                };
+                if ret != 0 {
+                    eprintln!("Failed to set PTY supplemental groups");
+                    std::process::exit(127);
+                }
+            }
+            #[cfg(target_os = "linux")]
+            {
+                if let Some(ref keep) = sec_cap_keep {
+                    if let Err(error) = crate::namespace::restrict_capabilities_to_keep(keep) {
+                        eprintln!("Failed to restrict PTY capabilities: {}", error);
+                        std::process::exit(127);
+                    }
+                } else if !sec_cap_drop.is_empty() {
+                    if let Err(error) = crate::namespace::drop_capabilities(&sec_cap_drop) {
+                        eprintln!("Failed to drop PTY capabilities: {}", error);
+                        std::process::exit(127);
+                    }
+                }
+            }
+
             if let Some(user) = process_user {
                 if let Err(error) = user.apply() {
                     eprintln!("Failed to apply PTY user: {}", error);
                     std::process::exit(127);
+                }
+            }
+
+            // Confinement, part 2 (AFTER the uid switch): no_new_privs before
+            // seccomp so a later execve cannot regain privileges, then install
+            // the prebuilt seccomp filter last so it is active across execvp.
+            #[cfg(target_os = "linux")]
+            {
+                if sec_no_new_privs {
+                    if let Err(error) = crate::namespace::set_no_new_privs() {
+                        eprintln!("Failed to set PTY no_new_privs: {}", error);
+                        std::process::exit(127);
+                    }
+                }
+                if let Some(ref filter) = seccomp_filter {
+                    if let Err(error) = crate::namespace::install_seccomp_filter(filter) {
+                        eprintln!("Failed to install PTY seccomp filter: {}", error);
+                        std::process::exit(127);
+                    }
                 }
             }
 
