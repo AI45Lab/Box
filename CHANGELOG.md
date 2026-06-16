@@ -4,6 +4,60 @@ All notable changes to A3S Box will be documented in this file.
 
 ## [Unreleased]
 
+## [2.3.0] — 2026-06-16
+
+A security and hardening release closing a 35-finding adversarial audit (plus
+new finds): both criticals and every security / data-loss / DoS / resource-leak
+/ hang finding is fixed. The headline isolation and resource-enforcement fixes
+were validated on real microVMs (measured CPU throttling, in-guest cgroup
+limits, and TTY confinement), not just CI. No breaking API changes; behavior
+changes are noted below (resource limits and TTY security controls that were
+silently ignored are now actually enforced).
+
+### Security
+
+- **TTY containers were unconfined** — a CRI `tty: true` workload ran through the
+  PTY path, which applied **none** of the pod's securityContext: full
+  capabilities, no seccomp filter, `no_new_privs` unset, no cgroup, and no
+  masked/readonly path restrictions. The PTY path now performs the **same**
+  confinement + container setup as the exec path (seccomp, capability drop/keep,
+  no_new_privs, supplemental groups, per-container cgroup, `/proc`+`/dev`, and
+  MaskedPaths/ReadonlyPaths/readOnlyRootFilesystem). Real-VM verified.
+- **TEE/attestation** — RA-TLS now verifies the TLS CertificateVerify signature
+  (proof-of-possession), defeating captured-certificate replay; sealed-storage
+  rollback protection binds the version into the AEAD so a forged version fails
+  authentication; an empty SNP certificate chain fails closed; container env
+  secrets are no longer written to debug logs.
+- **OCI build** — COPY/ADD source and destination paths are contained against
+  traversal escapes; ADD-from-URL is bounded.
+
+### Fixed
+
+- **Resource limits (cgroup) now actually enforced** — `--cpu-quota`/`--cpu-period`/
+  `--cpu-shares`, `--pids-limit`, `--memory-reservation`, and `--memory-swap` are
+  plumbed to and applied by the in-guest per-container cgroup on the run, CRI,
+  deferred-main (warm-pool), and TTY paths; the dead/redundant host-side cgroup
+  path (which never enforced anything and leaked an empty cgroup) was removed;
+  `container update` no longer writes to the root cgroup when the per-container
+  slice can't be resolved.
+- **CRI lifecycle** — `StartContainer` claims the Created→Running transition
+  before spawning the workload (no concurrent double-spawn); `RunPodSandbox`
+  tears down the booted microVM + network if the request is cancelled before the
+  sandbox is registered (was an orphaned-VM leak); mountinfo octal escapes are
+  decoded before unmount (prevented host-data-loss `remove_dir_all`); a wedged
+  guest can no longer hang the host exec/stop path.
+- **Cross-process data-loss races** — IP allocation, volumes, the image index,
+  and `credentials.json` are guarded by cross-process locks with load-fresh RMW,
+  closing duplicate-IP / lost-pull / lost-login / lost-volume races.
+- **Resource leaks** — a failed VM stop, a box `rm` mid-restart, and a partial
+  `create`/`snapshot restore` no longer leak the VM / overlay / box directory;
+  the host per-box cgroup dir is reclaimed on teardown.
+- **Robustness** — checked integer math in the CLI size/memory parsers (no panic
+  on a fat-fingered flag); atomic + idempotent layer/rootfs cache writes (no
+  concurrent-build corruption); bounded `console.log` for every log driver
+  (no disk-fill); snapshot metadata tolerates missing fields and surfaces a
+  warning instead of silently dropping a snapshot.
+
 ## [2.2.0] — 2026-06-15
 
 A correctness and hardening release: 24 fixes across the CLI state machine,
