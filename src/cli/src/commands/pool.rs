@@ -1008,6 +1008,7 @@ mod tests {
             deferred: false,
             ksm: false,
             snapshot_fork: false,
+            metrics_addr: None,
             json: false,
         };
         let result = execute_start(args).await;
@@ -1027,6 +1028,7 @@ mod tests {
             deferred: false,
             ksm: false,
             snapshot_fork: false,
+            metrics_addr: None,
             json: false,
         };
         let result = execute_start(args).await;
