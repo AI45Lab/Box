@@ -270,6 +270,29 @@ fn handle_pty_connection(fd: std::os::fd::OwnedFd) -> Result<(), Box<dyn std::er
         .as_ref()
         .and_then(|cgroup| std::ffi::CString::new(cgroup.procs_path()).ok());
 
+    // Apply CRI MaskedPaths / ReadonlyPaths / readOnlyRootFilesystem to the
+    // container rootfs before the fork — the child shares this mount namespace
+    // and chroots into it. The exec path does this; the PTY path skipped it, so a
+    // tty container's securityContext path restrictions went unenforced.
+    // Best-effort, mirroring the exec path: a masked path that doesn't exist is
+    // simply skipped.
+    #[cfg(target_os = "linux")]
+    if let Some(ref rootfs) = request.rootfs {
+        let masked = crate::exec_server::parse_sec_path_list(&request.env, "A3S_SEC_MASKED_PATHS=");
+        let readonly =
+            crate::exec_server::parse_sec_path_list(&request.env, "A3S_SEC_READONLY_PATHS=");
+        if !masked.is_empty() || !readonly.is_empty() {
+            crate::exec_server::apply_container_path_restrictions(rootfs, &masked, &readonly);
+        }
+        if request
+            .env
+            .iter()
+            .any(|entry| entry == "A3S_SEC_READONLY_ROOTFS=1")
+        {
+            crate::exec_server::remount_rootfs_readonly(rootfs);
+        }
+    }
+
     // Step 2: Allocate PTY
     let pty = openpty(None, None)?;
     let master_fd = pty.master;

@@ -1635,7 +1635,7 @@ fn parse_sec_int(env: &[String], prefix: &str) -> Option<i64> {
 
 /// Parse a `':'`-separated absolute-path list from an `A3S_SEC_*` env entry.
 #[cfg(target_os = "linux")]
-fn parse_sec_path_list<'a>(env: &'a [String], prefix: &str) -> Vec<&'a str> {
+pub(crate) fn parse_sec_path_list<'a>(env: &'a [String], prefix: &str) -> Vec<&'a str> {
     env.iter()
         .find_map(|entry| entry.strip_prefix(prefix))
         .map(|value| value.split(':').filter(|path| !path.is_empty()).collect())
@@ -1654,7 +1654,7 @@ fn parse_sec_path_list<'a>(env: &'a [String], prefix: &str) -> Vec<&'a str> {
 ///
 /// Best-effort: an absent path is skipped and any mount failure is logged.
 #[cfg(target_os = "linux")]
-fn apply_container_path_restrictions(rootfs: &str, masked: &[&str], readonly: &[&str]) {
+pub(crate) fn apply_container_path_restrictions(rootfs: &str, masked: &[&str], readonly: &[&str]) {
     use nix::mount::{mount, MsFlags};
 
     use std::os::unix::fs::MetadataExt;
@@ -1790,7 +1790,7 @@ fn apply_container_path_restrictions(rootfs: &str, masked: &[&str], readonly: &[
 /// rootfs that is already read-only is left untouched, so re-exec into the
 /// container does not stack mounts.
 #[cfg(target_os = "linux")]
-fn remount_rootfs_readonly(rootfs: &str) {
+pub(crate) fn remount_rootfs_readonly(rootfs: &str) {
     use nix::mount::{mount, MsFlags};
 
     if nix::sys::statvfs::statvfs(rootfs)
