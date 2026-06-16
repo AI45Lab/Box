@@ -566,12 +566,11 @@ impl WarmPool {
         // awaits below; acquired off-runtime so a contended flock doesn't block a
         // worker thread.
         let lock_target = dir.clone();
-        let _lock = tokio::task::spawn_blocking(move || {
-            crate::file_lock::FileLock::acquire(&lock_target)
-        })
-        .await
-        .map_err(|e| BoxError::PoolError(format!("Template lock task failed: {e}")))?
-        .map_err(|e| BoxError::PoolError(format!("Failed to lock template dir: {e}")))?;
+        let _lock =
+            tokio::task::spawn_blocking(move || crate::file_lock::FileLock::acquire(&lock_target))
+                .await
+                .map_err(|e| BoxError::PoolError(format!("Template lock task failed: {e}")))?
+                .map_err(|e| BoxError::PoolError(format!("Failed to lock template dir: {e}")))?;
 
         let mem_file = dir.join("template.ram");
         let sock = dir.join("template.sock");
