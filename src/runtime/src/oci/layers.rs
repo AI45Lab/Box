@@ -6,7 +6,7 @@ use a3s_box_core::error::{BoxError, Result};
 use flate2::read::GzDecoder;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tar::Archive;
 
 /// Extract a single OCI layer (tar.gz) to target directory.
@@ -132,20 +132,33 @@ pub fn extract_layer(layer_path: &Path, target_dir: &Path) -> Result<()> {
         if file_name == ".wh..wh..opq" {
             // Opaque directory marker: discard everything already extracted into
             // the parent directory from lower layers, keeping the directory.
+            // Resolve the parent WITHIN the rootfs first: a malicious layer can
+            // extract an absolute symlink as the parent, and following it here
+            // would wipe a host directory OUTSIDE the extraction target.
             if let Some(parent) = path.parent() {
-                if let Ok(read) = std::fs::read_dir(target_dir.join(parent)) {
-                    for child in read.flatten() {
-                        remove_path(&child.path());
+                if let Some(dir) = resolve_within(target_dir, parent) {
+                    if let Ok(read) = std::fs::read_dir(&dir) {
+                        for child in read.flatten() {
+                            remove_path(&child.path());
+                        }
                     }
+                } else {
+                    tracing::warn!(parent = %parent.display(), "Skipping opaque whiteout: parent escapes the rootfs");
                 }
             }
             continue;
         }
 
         if let Some(victim_name) = file_name.strip_prefix(".wh.") {
-            // Whiteout marker: remove the named sibling from a lower layer.
+            // Whiteout marker: remove the named sibling from a lower layer. Resolve
+            // the parent within the rootfs so a symlinked parent cannot redirect the
+            // deletion to a host file outside the extraction target.
             if let Some(parent) = path.parent() {
-                remove_path(&target_dir.join(parent).join(victim_name));
+                if let Some(dir) = resolve_within(target_dir, parent) {
+                    remove_path(&dir.join(victim_name));
+                } else {
+                    tracing::warn!(parent = %parent.display(), "Skipping whiteout: parent escapes the rootfs");
+                }
             }
             continue;
         }
@@ -166,6 +179,22 @@ pub fn extract_layer(layer_path: &Path, target_dir: &Path) -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Resolve `rel` beneath `target_dir`, following symlinks, returning the real
+/// path ONLY if it stays inside `target_dir`.
+///
+/// A malicious layer can extract an absolute symlink (e.g. `esc -> /etc`) and
+/// then a whiteout whose parent is that symlink; without this guard the
+/// hand-rolled whiteout deletion would follow it and remove host files OUTSIDE
+/// the extraction target. Returns `None` when the parent does not exist or
+/// resolves outside the rootfs (caller skips + warns). Intra-rootfs symlinks
+/// are allowed — the image may already mutate its own files; only escapes past
+/// `target_dir` are blocked.
+fn resolve_within(target_dir: &Path, rel: &Path) -> Option<PathBuf> {
+    let base = target_dir.canonicalize().ok()?;
+    let resolved = base.join(rel).canonicalize().ok()?;
+    resolved.starts_with(&base).then_some(resolved)
 }
 
 /// Remove a file or directory tree for an applied whiteout, ignoring a missing
@@ -383,6 +412,105 @@ mod tests {
             builder.append_data(&mut header, name, *content).unwrap();
         }
         builder.finish().unwrap();
+    }
+
+    /// Build a gzipped layer that first creates a SYMLINK entry, then writes the
+    /// given follow-on entries — used to probe symlink-directed escapes (a later
+    /// entry / whiteout that resolves THROUGH the symlinked parent).
+    fn create_layer_with_symlink(path: &Path, link: &str, target: &Path, then: &[(&str, &[u8])]) {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use tar::Builder;
+
+        let file = File::create(path).unwrap();
+        let mut builder = Builder::new(GzEncoder::new(file, Compression::default()));
+
+        let mut sh = tar::Header::new_gnu();
+        sh.set_entry_type(tar::EntryType::Symlink);
+        sh.set_size(0);
+        sh.set_mode(0o777);
+        sh.set_uid(0);
+        sh.set_gid(0);
+        builder.append_link(&mut sh, link, target).unwrap();
+
+        for (name, content) in then {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(content.len() as u64);
+            h.set_mode(0o644);
+            h.set_uid(0);
+            h.set_gid(0);
+            h.set_cksum();
+            builder.append_data(&mut h, name, *content).unwrap();
+        }
+        builder.finish().unwrap();
+    }
+
+    // ---- Malicious-image extraction hardening (host-side, occurs during pull) ----
+    // A hostile layer must never reach outside the extraction target. These encode
+    // the SECURE expectation: a failure here is a real escape, not a flaky test.
+
+    #[test]
+    fn whiteout_does_not_delete_through_symlinked_parent() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("rootfs");
+        fs::create_dir_all(&target).unwrap();
+        // A host file OUTSIDE the target that a malicious image must not delete.
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let victim = outside.join("victim");
+        fs::write(&victim, b"keep me").unwrap();
+
+        // esc -> <outside> (absolute symlink target, legal in images), then a
+        // whiteout `.wh.victim` whose parent is the symlink.
+        let layer = tmp.path().join("evil.tar.gz");
+        create_layer_with_symlink(&layer, "esc", &outside, &[("esc/.wh.victim", b"")]);
+        let _ = extract_layer(&layer, &target);
+
+        assert!(
+            victim.exists(),
+            "SECURITY: whiteout followed a symlinked parent and deleted a host file outside the target ({})",
+            victim.display()
+        );
+    }
+
+    #[test]
+    fn opaque_whiteout_does_not_wipe_through_symlinked_parent() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("rootfs");
+        fs::create_dir_all(&target).unwrap();
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let a = outside.join("a");
+        let b = outside.join("b");
+        fs::write(&a, b"a").unwrap();
+        fs::write(&b, b"b").unwrap();
+
+        let layer = tmp.path().join("evil.tar.gz");
+        create_layer_with_symlink(&layer, "esc", &outside, &[("esc/.wh..wh..opq", b"")]);
+        let _ = extract_layer(&layer, &target);
+
+        assert!(
+            a.exists() && b.exists(),
+            "SECURITY: opaque whiteout wiped a host directory through a symlinked parent"
+        );
+    }
+
+    #[test]
+    fn layer_entry_cannot_write_through_symlinked_parent() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("rootfs");
+        fs::create_dir_all(&target).unwrap();
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+
+        let layer = tmp.path().join("evil.tar.gz");
+        create_layer_with_symlink(&layer, "esc", &outside, &[("esc/pwned", b"owned")]);
+        let _ = extract_layer(&layer, &target);
+
+        assert!(
+            !outside.join("pwned").exists(),
+            "SECURITY: a layer wrote through a symlinked parent to outside the target"
+        );
     }
 
     #[test]
