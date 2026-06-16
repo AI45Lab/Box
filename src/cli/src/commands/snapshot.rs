@@ -131,6 +131,25 @@ async fn execute_create(args: SnapshotCreateArgs) -> Result<(), Box<dyn std::err
     let store = SnapshotStore::default_path()?;
     let saved = store.save(meta, &rootfs_path)?;
 
+    // Opt-in auto-prune: when A3S_BOX_MAX_SNAPSHOTS / A3S_BOX_MAX_SNAPSHOT_BYTES are
+    // set, evict the oldest snapshots beyond the cap after each create so a
+    // scheduled/per-CI snapshot workflow self-bounds the host disk (each snapshot
+    // deep-copies the rootfs — hundreds of MB-GB). Unset = no auto-prune (unchanged
+    // behaviour); `snapshot prune` remains the explicit operator tool.
+    let max_count = std::env::var("A3S_BOX_MAX_SNAPSHOTS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    let max_bytes = std::env::var("A3S_BOX_MAX_SNAPSHOT_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    if max_count > 0 || max_bytes > 0 {
+        if let Err(e) = store.prune(max_count, max_bytes) {
+            eprintln!("warning: snapshot auto-prune failed: {e}");
+        }
+    }
+
     println!("{}", saved.id);
     Ok(())
 }
