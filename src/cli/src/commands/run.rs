@@ -91,6 +91,12 @@ pub async fn execute(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     let ctx = setup_and_boot(&args).await?;
+    crate::audit::record(
+        a3s_box_core::audit::AuditAction::BoxStart,
+        a3s_box_core::audit::AuditOutcome::Success,
+        &ctx.box_id,
+        &format!("started box from image {}", args.common.image),
+    );
     if args.detach {
         println!("{}", ctx.box_id);
         return Ok(());
