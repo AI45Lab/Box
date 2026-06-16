@@ -72,6 +72,38 @@ type AttachStreamSender = broadcast::Sender<a3s_box_core::exec::ExecEvent>;
 type AttachStreamMap = Arc<RwLock<HashMap<String, AttachStreamSender>>>;
 type WorkloadStdinSender = StreamingInput;
 type WorkloadStdinMap = Arc<RwLock<HashMap<String, WorkloadStdinSender>>>;
+
+/// Runs a cleanup closure on drop unless [`disarm`](CancelGuard::disarm)ed.
+///
+/// `RunPodSandbox` boots the sandbox VM and allocates a network IP BEFORE it
+/// registers the sandbox in the store. If the request future is dropped in
+/// between — a kubelet RunPodSandbox deadline cancels the gRPC call — the booted
+/// shim microVM and its IP would leak: `VmManager` has no `Drop`, and an
+/// unregistered sandbox is invisible to the reaper. This guard tears them down
+/// on unwind and is disarmed the instant the sandbox is stored.
+struct CancelGuard<F: FnOnce()> {
+    cleanup: Option<F>,
+}
+
+impl<F: FnOnce()> CancelGuard<F> {
+    fn new(cleanup: F) -> Self {
+        Self {
+            cleanup: Some(cleanup),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.cleanup = None;
+    }
+}
+
+impl<F: FnOnce()> Drop for CancelGuard<F> {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup();
+        }
+    }
+}
 type WorkloadStopSender = oneshot::Sender<()>;
 type WorkloadStopMap = Arc<RwLock<HashMap<String, WorkloadStopSender>>>;
 /// Per-container handle for CRI ReopenContainerLog. `request` wakes the exit
@@ -566,6 +598,41 @@ impl RuntimeService for BoxRuntimeService {
             }
         };
 
+        // Track the VM immediately (it used to be inserted only after
+        // add_sandbox) so the cancel guard below can find and destroy it.
+        self.vm_managers
+            .write()
+            .await
+            .insert(sandbox_id.clone(), vm);
+
+        // Arm the cancel guard: from here until the sandbox is stored, a dropped
+        // request future (kubelet deadline) must not leak the booted VM + IP.
+        let cancel_network_name = network_allocation.as_ref().map(|a| a.network_name.clone());
+        let mut cancel_guard = {
+            let vm_managers = self.vm_managers.clone();
+            let network_store = self.network_store.clone();
+            let sid = sandbox_id.clone();
+            CancelGuard::new(move || {
+                // Network disconnect is synchronous — do it directly in Drop.
+                if let Some(network_name) = cancel_network_name {
+                    let _ = disconnect_sandbox_from_network_store(
+                        network_store.as_ref(),
+                        &network_name,
+                        &sid,
+                    );
+                }
+                // VM destroy is async — spawn it on the still-running runtime (the
+                // request future is being dropped, not the server). Best-effort.
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        if let Some(mut vm) = vm_managers.write().await.remove(&sid) {
+                            let _ = vm.destroy().await;
+                        }
+                    });
+                }
+            })
+        };
+
         // For a default (TSI) pod that publishes ports but has no
         // allocated/annotated IP, report the loopback as the pod IP: TSI binds
         // 0.0.0.0:<hostPort> and forwards to the guest, so the pod's published
@@ -609,10 +676,11 @@ impl RuntimeService for BoxRuntimeService {
         };
 
         self.store.add_sandbox(sandbox).await;
-        self.vm_managers
-            .write()
-            .await
-            .insert(sandbox_id.clone(), vm);
+        // The sandbox is registered (the VM was inserted above); it is now owned
+        // by the store + vm_managers, so stop guarding it. No `.await` runs
+        // between add_sandbox and here, so a successfully-created sandbox can
+        // never be torn down by a late cancellation.
+        cancel_guard.disarm();
 
         Ok(Response::new(RunPodSandboxResponse {
             pod_sandbox_id: sandbox_id,

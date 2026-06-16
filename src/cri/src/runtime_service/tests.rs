@@ -44,6 +44,41 @@ fn test_kept_capabilities() {
     assert!(kept_capabilities(Some(&cap(&["ALL"], &[]))).is_none());
 }
 
+#[test]
+fn test_cancel_guard_runs_cleanup_unless_disarmed() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    // Armed: a RunPodSandbox future dropped before the sandbox is stored must run
+    // the teardown (destroy the orphaned VM + disconnect its network).
+    {
+        let c = counter.clone();
+        let _guard = CancelGuard::new(move || {
+            c.fetch_add(1, Ordering::SeqCst);
+        });
+    }
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "an armed guard must run its cleanup on drop"
+    );
+
+    // Disarmed: a sandbox that registered successfully must NOT be torn down.
+    {
+        let c = counter.clone();
+        let mut guard = CancelGuard::new(move || {
+            c.fetch_add(1, Ordering::SeqCst);
+        });
+        guard.disarm();
+    }
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "a disarmed guard must not run its cleanup"
+    );
+}
+
 /// Create a BoxRuntimeService for testing.
 /// Uses NoopStateStore (no disk I/O) and a dummy StreamingHandle.
 fn make_test_service() -> BoxRuntimeService {
