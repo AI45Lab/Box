@@ -14,6 +14,9 @@ pub struct PersistentCriStore {
     pub sandboxes: Arc<SandboxStore>,
     pub containers: Arc<ContainerStore>,
     state_store: Arc<dyn StateStore>,
+    /// Serializes `persist()` so the on-disk snapshot order matches the write
+    /// order — see [`PersistentCriStore::persist`].
+    persist_lock: tokio::sync::Mutex<()>,
 }
 
 impl PersistentCriStore {
@@ -23,6 +26,7 @@ impl PersistentCriStore {
             sandboxes: Arc::new(SandboxStore::new()),
             containers: Arc::new(ContainerStore::new()),
             state_store,
+            persist_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -39,7 +43,14 @@ impl PersistentCriStore {
     }
 
     /// Snapshot current in-memory state to disk.
+    ///
+    /// The snapshot + write run under `persist_lock` so the rename order matches
+    /// the snapshot order. Without it, two concurrent mutations could snapshot
+    /// S_A then S_B but have S_A's rename land AFTER S_B's, persisting a STALE
+    /// S_A that — on an ungraceful crash before the next persist — drops a
+    /// just-created sandbox from recovery and leaks its microVM + overlay.
     async fn persist(&self) -> std::io::Result<()> {
+        let _guard = self.persist_lock.lock().await;
         let state = PersistedState {
             sandboxes: self.sandboxes.list(None).await,
             containers: self.containers.list(None, None).await,
@@ -504,5 +515,54 @@ mod tests {
         let c = store2.containers.get("c1").await.unwrap();
         assert_eq!(c.state, ContainerState::Running);
         assert_eq!(c.started_at, 5_000_000_000);
+    }
+
+    // persist() must serialize the snapshot+write so a stale snapshot can never
+    // overwrite a newer one (which would orphan a just-created sandbox on a crash).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn persist_is_serialized() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // A StateStore that records the peak number of concurrent save() calls.
+        struct ConcurrencyProbe {
+            in_flight: Arc<AtomicUsize>,
+            max_in_flight: Arc<AtomicUsize>,
+        }
+        impl StateStore for ConcurrencyProbe {
+            fn save(&self, _state: &PersistedState) -> std::io::Result<()> {
+                let cur = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_in_flight.fetch_max(cur, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn load(&self) -> std::io::Result<PersistedState> {
+                Ok(PersistedState::default())
+            }
+        }
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let store = Arc::new(PersistentCriStore::new(Arc::new(ConcurrencyProbe {
+            in_flight: Arc::clone(&in_flight),
+            max_in_flight: Arc::clone(&max_in_flight),
+        })));
+
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let store = Arc::clone(&store);
+            handles.push(tokio::spawn(async move {
+                store.add_sandbox(sample_sandbox(&format!("sb-{i}"))).await;
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        assert_eq!(
+            max_in_flight.load(Ordering::SeqCst),
+            1,
+            "persist() must serialize state writes (no overlapping save)"
+        );
     }
 }
