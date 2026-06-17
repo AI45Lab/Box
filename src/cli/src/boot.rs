@@ -9,7 +9,7 @@ use a3s_box_runtime::{prom::RuntimeMetrics, NetworkStore, VmManager, VolumeStore
 use std::path::PathBuf;
 
 use crate::commands::common;
-use crate::state::{BoxRecord, HealthCheck};
+use crate::state::{BoxRecord, HealthCheck, StateFile};
 
 /// Result of a successful box boot.
 pub struct BootResult {
@@ -124,6 +124,121 @@ pub fn apply_boot_result(
         RestartCountUpdate::Preserve => {}
         RestartCountUpdate::Increment => record.restart_count += 1,
     }
+}
+
+/// Per-box advisory boot lock.
+///
+/// Serializes boots of the SAME box across processes (the `monitor` daemon vs a
+/// user `restart`/`start`). Without it both can run `boot_from_record` — which
+/// creates a real VM OUTSIDE the state lock — concurrently, and the second
+/// post-boot record write overwrites the first's pid, ORPHANING the first VM
+/// (untracked shim + overlay mount, never reaped). Held across the boot AND the
+/// record write so a waiting actor re-checks AFTER the winner records its pid and
+/// skips booting a duplicate. Lives on a per-box `locks/<box_id>.boot.lock`
+/// sibling; `flock` releases on drop or crash, never stranding the lock.
+struct BootLock {
+    #[cfg(unix)]
+    _file: std::fs::File,
+}
+
+impl BootLock {
+    #[cfg(unix)]
+    fn acquire(box_id: &str) -> std::io::Result<Self> {
+        use std::os::unix::io::AsRawFd;
+        let dir = a3s_box_core::dirs_home().join("locks");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{box_id}.boot.lock"));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        // Blocking exclusive advisory lock; released when `_file` drops.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self { _file: file })
+    }
+
+    #[cfg(not(unix))]
+    fn acquire(_box_id: &str) -> std::io::Result<Self> {
+        Ok(Self {})
+    }
+}
+
+/// Outcome of [`boot_and_record`].
+pub enum BootOutcome {
+    /// Booted a VM and recorded it; carries the (possibly updated) restart count.
+    Restarted { restart_count: u32 },
+    /// Another actor already (re)started this box (observed running with a live
+    /// shim under the per-box lock); no VM was booted — a no-op for the caller.
+    AlreadyRunning,
+    /// The record was removed (concurrent `rm`) while the VM booted; the
+    /// just-booted orphan VM has been torn down here.
+    RemovedDuringBoot,
+}
+
+/// Whether `box_id` is currently running with a live, identity-matched shim.
+/// Loads fresh reconciled state, so a recorded-but-dead pid reads as not-live.
+fn box_already_live(box_id: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    let state = StateFile::load_default()?;
+    Ok(state.find_by_id(box_id).is_some_and(|rec| {
+        rec.status == "running"
+            && rec.pid.is_some_and(|p| {
+                crate::process::is_process_alive_with_identity(p, rec.pid_start_time)
+            })
+    }))
+}
+
+/// Boot a box from its record and persist the result, SERIALIZED per box so
+/// concurrent actors (monitor auto-restart vs user restart/start) cannot boot the
+/// same box twice and orphan a VM. Holds a per-box [`BootLock`] across the boot
+/// and the record write; a loser that finds the box already live skips booting.
+pub async fn boot_and_record(
+    record: &BoxRecord,
+    count_update: RestartCountUpdate,
+) -> Result<BootOutcome, Box<dyn std::error::Error>> {
+    let box_id = record.id.clone();
+    let _lock = {
+        let id = box_id.clone();
+        tokio::task::spawn_blocking(move || BootLock::acquire(&id))
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error> {
+                format!("boot lock task failed: {e}").into()
+            })??
+    };
+
+    // Re-check fresh state UNDER the per-box lock: if another actor already booted
+    // this box, skip — do not create a duplicate VM.
+    if box_already_live(&box_id)? {
+        return Ok(BootOutcome::AlreadyRunning);
+    }
+
+    let result = boot_from_record(record).await?;
+    let booted_pid = result.pid;
+    // Persist atomically; `None` if the record was removed (concurrent rm) mid-boot.
+    let restart_count = StateFile::modify(|s| {
+        Ok::<Option<u32>, std::io::Error>(s.find_by_id_mut(&box_id).map(|rec| {
+            apply_boot_result(rec, result, count_update);
+            rec.restart_count
+        }))
+    })?;
+
+    match restart_count {
+        Some(restart_count) => Ok(BootOutcome::Restarted { restart_count }),
+        None => {
+            // The box was removed while booting: the VM we started has no record.
+            // Tear it down so it doesn't leak as an orphan shim + overlay mount.
+            if let Some(pid) = booted_pid {
+                crate::process::graceful_stop(pid, libc::SIGTERM, 5).await;
+            }
+            crate::cleanup::cleanup_removed_box(record);
+            Ok(BootOutcome::RemovedDuringBoot)
+        }
+    }
+    // `_lock` drops here — AFTER the record write — so a waiting actor's re-check
+    // observes our recorded pid.
 }
 
 fn ensure_boot_resources(
