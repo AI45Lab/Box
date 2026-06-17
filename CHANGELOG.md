@@ -4,6 +4,63 @@ All notable changes to A3S Box will be documented in this file.
 
 ## [Unreleased]
 
+Post-2.3.0 hardening: three adversarial audits — production-operability (24
+findings), untrusted-input security (4), and concurrency/atomicity (4) — all
+fixed and validated on real microVMs. No breaking API changes.
+
+### Security
+
+Image extraction runs **host-side before the microVM boots**, so a malicious
+image's reach here bypasses VM isolation:
+
+- **Arbitrary host file write via registry digest path-traversal (CRITICAL).** The
+  manifest digest (`Docker-Content-Digest`, returned verbatim by the registry)
+  flowed into `Path::join` unvalidated, so `sha256:../../../../<path>` wrote the
+  attacker-shaped manifest to an arbitrary host path on `pull` in the default
+  config (signature policy is Skip by default; the box runtime often runs as
+  root). Digests are now validated as canonical `sha256:<64-hex>` at the trust
+  boundary before any path use.
+- **Arbitrary host file/dir deletion via whiteout symlink escape.** A layer
+  whiteout whose parent was an absolute symlink (e.g. `esc -> /etc`) deleted host
+  files/dirs through it. Whiteout parents are now confined within the extraction
+  target.
+- **Host disk exhaustion via decompression bomb.** Layer pull and build
+  `ADD`/`COPY` auto-extract streamed gzip/zstd/bzip2/xz with no decompressed-size
+  cap. Bounded by `A3S_BOX_MAX_LAYER_BYTES` (16 GiB) and
+  `A3S_BOX_MAX_BUILD_EXTRACT_BYTES` (4 GiB), env-overridable.
+- **CRI seccomp `localhostProfile` path confinement.** The attacker-set pod field
+  was read off disk unconfined (an arbitrary host-file open oracle); it is now
+  confined to `A3S_BOX_SECCOMP_PROFILE_ROOT` (default `/var/lib/kubelet/seccomp`),
+  rejecting `..` and out-of-root paths.
+
+### Fixed
+
+- **Daemonless lifecycle concurrency races** (the `monitor` daemon, CLI
+  processes, and CRI server coordinate via a per-write flock that does not span an
+  `await`):
+  - The monitor no longer resurrects a box the user `stop`ped during its
+    up-to-10s health-restart window.
+  - A user `restart` and the monitor's auto-restart can no longer both boot the
+    same box (now serialized by a per-box boot lock); previously the second record
+    write overwrote the first's PID, orphaning an untracked VM.
+  - `kill`'s host-signal fallback re-checks PID start-time identity before
+    signalling, so a reused PID is never signalled.
+  - The warm pool no longer leaks a VM pushed into the idle set during shutdown
+    drain.
+- **Operability (24 findings)** across crash-recovery, upgrade-compat,
+  disk-pressure, concurrency, network-lifecycle, and config-validation — e.g.
+  PID-reuse liveness via start-time identity, corrupt-store quarantine instead of
+  a hard fail, durable (fsync'd) state writes, bounded snapshot / build-cache /
+  CRI-log growth, atomic CRI network attach, stable bridge IPs across stop/start,
+  and fail-closed `--cpus` / `--memory-swap` validation.
+
+### Changed
+
+- New operator-tunable caps (generous defaults, env-overridable), documented in
+  the Environment variables table: `A3S_BOX_MAX_LAYER_BYTES`,
+  `A3S_BOX_MAX_BUILD_EXTRACT_BYTES`, `A3S_BOX_SECCOMP_PROFILE_ROOT`,
+  `A3S_BOX_MAX_SNAPSHOTS` / `A3S_BOX_MAX_SNAPSHOT_BYTES`.
+
 ## [2.3.0] — 2026-06-16
 
 A security and hardening release closing a 35-finding adversarial audit (plus
