@@ -290,17 +290,32 @@ async fn poll_once(tracker: &mut BackoffTracker) -> Result<(), Box<dyn std::erro
                 }
             }
             tracker.mark_dead(&box_id);
-            // Mark as dead so boot_from_record works; re-load fresh under the
-            // lock and touch only this box's fields.
-            StateFile::modify(|s| {
-                if let Some(rec) = s.find_by_id_mut(&box_id) {
-                    rec.status = "dead".to_string();
-                    rec.pid = None;
-                    rec.health_status = "none".to_string();
-                    rec.health_retries = 0;
-                }
-                Ok::<(), std::io::Error>(())
+            // Mark as dead so boot_from_record works; re-load fresh under the lock.
+            // graceful_stop above can take up to 10s, during which the user may have
+            // `stop`ped (or `rm`ed) the box. Re-validate fresh state and ABORT the
+            // restart if so — otherwise we silently resurrect a box the user
+            // explicitly stopped (overwriting their stopped/stopped_by_user record).
+            let proceed = StateFile::modify(|s| {
+                Ok::<bool, std::io::Error>(match s.find_by_id_mut(&box_id) {
+                    Some(rec) if health_restart_still_wanted(rec) => {
+                        rec.status = "dead".to_string();
+                        rec.pid = None;
+                        rec.health_status = "none".to_string();
+                        rec.health_retries = 0;
+                        true
+                    }
+                    // User stopped/removed the box during the graceful-stop window.
+                    _ => false,
+                })
             })?;
+            if !proceed {
+                println!(
+                    "monitor: box {name} ({short_id}) health-restart aborted — stopped by the user during shutdown",
+                    name = record.name,
+                    short_id = record.short_id,
+                );
+                continue;
+            }
         } else {
             tracker.mark_dead(&box_id);
             println!("{}", restart_log_line(&record, RestartReason::Dead));
@@ -372,6 +387,14 @@ fn is_unhealthy_restart_candidate(record: &BoxRecord) -> bool {
         && record.health_status == "unhealthy"
         && record.health_check.is_some()
         && policy::should_restart(record)
+}
+
+/// Whether a health-restart should still proceed after the (up-to-10s)
+/// graceful-stop await, given the FRESHLY-loaded record. If the user `stop`ped
+/// the box (status=stopped or stopped_by_user) during that window, the restart
+/// must abort so we don't resurrect a box the user explicitly stopped.
+fn health_restart_still_wanted(record: &BoxRecord) -> bool {
+    record.status != "stopped" && !record.stopped_by_user
 }
 
 fn restart_log_line(record: &BoxRecord, reason: RestartReason) -> String {
@@ -498,6 +521,21 @@ async fn run_due_health_checks(_state: &StateFile) -> Result<(), Box<dyn std::er
 mod tests {
     use super::*;
     use crate::test_helpers::fixtures::make_record;
+
+    #[test]
+    fn health_restart_aborts_if_user_stopped_during_window() {
+        // Still running → a health-restart proceeds.
+        let running = make_record("id-1", "box", "running", Some(1));
+        assert!(health_restart_still_wanted(&running));
+        // User `stop`ped the box during the up-to-10s graceful-stop window → abort
+        // (do NOT resurrect a box the user explicitly stopped).
+        let stopped = make_record("id-1", "box", "stopped", None);
+        assert!(!health_restart_still_wanted(&stopped));
+        // stopped_by_user set (even if the status field still reads running) → abort.
+        let mut by_user = make_record("id-1", "box", "running", Some(1));
+        by_user.stopped_by_user = true;
+        assert!(!health_restart_still_wanted(&by_user));
+    }
 
     // --- BackoffTracker tests ---
 

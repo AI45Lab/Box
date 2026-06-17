@@ -131,6 +131,19 @@ async fn kill_one(
             process::deliver_signal_via_guest(&exec_socket, signal).await
         };
         if !delivered {
+            // The guest-delivery attempt above can block up to ~10s. Re-verify the
+            // PID is still THIS box's shim before a bare host kill: during that
+            // window a concurrent force-kill could have made the shim exit and the
+            // kernel reuse its PID for an unrelated process, which we must never
+            // signal. The one-shot identity check in require_live_pid is now stale.
+            if !process::is_process_alive_with_identity(pid, record.pid_start_time) {
+                return Err(format!(
+                    "box {} is no longer running its original shim (PID {pid} exited or was reused); \
+                     not sending {signal} to a possibly-reused PID",
+                    record.name
+                )
+                .into());
+            }
             process::send_signal(pid, signal).map_err(|err| {
                 format!(
                     "Failed to send signal {signal} to box {} (PID {pid}): {err}",
