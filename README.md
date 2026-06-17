@@ -32,6 +32,8 @@ In one line: **the isolation of a VM, the startup and density of a container, th
 
 A3S Box is built toward production use, but it is not a full Docker, containerd, or Kubernetes replacement yet. The local CLI runtime is the primary product surface. Kubernetes CRI, hardware TEE, and Windows support exist in code paths but should be treated as integration surfaces that need host-specific validation before production use.
 
+As of **v2.4.0**, three adversarial audits — production-operability (24 findings), untrusted-input security (4, including a critical registry-digest path-traversal), and concurrency/atomicity (4) — have been closed, every fix verified on real microVMs. The merged tree is validated end-to-end: a composed-main CI integration run on a real `/dev/kvm` host, a **2-hour / 4584-operation endurance soak with zero resource leak**, and complex **stateful** workloads (named-volume persistence across stop/start and restart, a stateful database surviving a restart, and a web server). Net: the local CLI runtime is suitable for **controlled production** with trusted-to-semi-trusted workloads; adversarial multi-tenant deployment at large scale still benefits from independent scale testing and an external security review.
+
 | Area | Status today |
 | --- | --- |
 | Local CLI runtime | Implemented for macOS Apple Silicon/HVF and Linux/KVM style hosts. Real macOS HVF core smoke has passed with an offline Alpine OCI archive. |
@@ -69,9 +71,19 @@ The ignored `core_smoke` suite covers the core CLI path on a real MicroVM host:
 - named volumes, `cp`, `diff`, `export`, `commit`, `snapshot`, restart-policy monitor recovery, and Compose health/volume flow;
 - warm pool (`pool start`/`pool run`): pre-warmed sandboxes served over a socket, with backpressure and multi-image lazy pools; `--deferred` runs each command as the box's real main for full box semantics (real exit code + json-file console logs) with no cold boot; `--snapshot-fork` fills the pool by Copy-on-Write restore from one booted template instead of cold booting each sandbox.
 
-The most recent local record in this branch: all 14 ignored `core_smoke` tests
-passed on macOS HVF with an offline Alpine OCI archive, and the ignored
-`host_smoke` VM command matrix plus Compose smoke passed with the same archive.
+The most recent local record: all 14 ignored `core_smoke` tests passed on macOS
+HVF with an offline Alpine OCI archive, and the ignored `host_smoke` VM command
+matrix plus Compose smoke passed with the same archive.
+
+For **v2.4.0**, the merged tree was additionally validated on a real Linux
+`/dev/kvm` host: the composed-main CI integration suite passed; a **2-hour
+endurance soak of 4584 real-microVM operations** (high-frequency
+create/run/remove churn plus a full run → exec → snapshot → stop → rm lifecycle
+every tenth op) finished with **zero leak** — orphan shims, overlay mounts, box
+directories, and disk all returned to baseline; and complex **stateful**
+containers passed: a named volume's data survived stop/start, a Redis instance's
+key survived a `restart` (`SET` → `SAVE` → `restart` → `GET`), and an nginx box
+served HTTP.
 
 ## Install
 
