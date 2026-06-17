@@ -437,6 +437,12 @@ matrix, and CRI smoke procedures.
 | `A3S_BOX_HOST_SMOKE_TIMEOUT_SECS` | Boot timeout override for ignored host smoke tests. |
 | `A3S_BOX_UNSAFE_HOST_RUN` | Opt into unsafe macOS host execution for Dockerfile `RUN` experiments. |
 | `A3S_BOX_BUILDCACHE_MAX_BYTES` | Cap on the total size of cached build layers at `~/.a3s/buildcache` (oldest evicted first). Default: 2 GiB. |
+| `A3S_BOX_MAX_LAYER_BYTES` | Cap on total decompressed bytes per OCI image layer during `pull` (decompression-bomb guard). Default: 16 GiB. |
+| `A3S_BOX_MAX_BUILD_EXTRACT_BYTES` | Cap on total decompressed bytes when a build `ADD`/`COPY` auto-extracts a local tar archive (decompression-bomb guard). Default: 4 GiB. |
+| `A3S_BOX_MAX_SNAPSHOTS` | Auto-prune on every `snapshot create` to keep at most N newest snapshots per box (unset = unbounded). |
+| `A3S_BOX_MAX_SNAPSHOT_BYTES` | Auto-prune on every `snapshot create` to keep snapshots under a total byte cap (unset = unbounded). |
+| `A3S_BOX_SECCOMP_PROFILE_ROOT` | Root directory a CRI `localhostProfile` seccomp path is confined to (paths outside it, or containing `..`, are rejected). Default: `/var/lib/kubelet/seccomp`. |
+| `A3S_REGISTRY_MIRRORS` | Registry mirror map (`host=mirror,host=mirror`); pulls fetch layers/manifests from the mirror while keeping the canonical image reference. |
 | `KRUN_SNAPSHOT_MEM_FILE` | Path the booted template writes its file-backed guest RAM to when capturing a snapshot-fork template. |
 | `KRUN_SNAPSHOT_SOCK` | Control socket the template listens on for the `snapshot <path>` command (Linux `/dev/kvm` only). |
 | `KRUN_RESTORE_FROM` | Path to a snapshot the microVM restores from as a Copy-on-Write fork instead of cold booting. |
