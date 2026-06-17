@@ -4,9 +4,14 @@ All notable changes to A3S Box will be documented in this file.
 
 ## [Unreleased]
 
+## [2.4.0] — 2026-06-17
+
 Post-2.3.0 hardening: three adversarial audits — production-operability (24
 findings), untrusted-input security (4), and concurrency/atomicity (4) — all
-fixed and validated on real microVMs. No breaking API changes.
+fixed and validated on real microVMs (composed-main real-VM CI Integration, a
+2-hour / 4584-op endurance soak with zero leak, and complex stateful containers:
+volume persistence, a stateful database across restart, and a web server). No
+breaking API changes.
 
 ### Security
 
