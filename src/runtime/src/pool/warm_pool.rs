@@ -259,6 +259,17 @@ impl WarmPool {
     pub async fn release(&self, vm: VmManager) -> Result<()> {
         let mut idle = self.idle.lock().await;
 
+        // Don't return a VM to a pool that is shutting down: drain_idle has (or
+        // soon will have) cleared `idle` and won't run again, so a push here leaks
+        // the VM (no Drop reaper). Checked under the idle lock so it is atomic with
+        // a concurrent drain_idle. Destroy the VM instead.
+        if *self.shutdown_rx.borrow() {
+            drop(idle);
+            let mut vm = vm;
+            vm.destroy().await?;
+            return Ok(());
+        }
+
         if idle.len() >= self.config.max_size {
             // Pool is full — destroy the VM
             drop(idle); // Release lock before async destroy
@@ -809,8 +820,15 @@ impl WarmPool {
                                         // booting, drain_idle has already cleared
                                         // `idle` and will not run again, so a VM
                                         // pushed now leaks (no Drop reaper). Destroy
-                                        // it instead.
+                                        // it instead. Acquire the idle lock FIRST and
+                                        // re-check shutdown UNDER it: drain_idle drains
+                                        // while holding this same lock (always after
+                                        // signal_shutdown), so the check-and-push is
+                                        // atomic against it — closing the TOCTOU window
+                                        // that an unlocked `borrow()` check left open.
+                                        let mut pool = idle.lock().await;
                                         if *shutdown_rx.borrow() {
+                                            drop(pool);
                                             tracing::debug!(
                                                 box_id = %box_id,
                                                 "Pool shutting down mid-replenish; destroying freshly-booted VM"
@@ -818,7 +836,6 @@ impl WarmPool {
                                             let _ = vm.destroy_with_timeout(2000).await;
                                             continue;
                                         }
-                                        let mut pool = idle.lock().await;
                                         pool.push(WarmVm {
                                             vm,
                                             created_at: Instant::now(),
