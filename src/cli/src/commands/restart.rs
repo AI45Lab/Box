@@ -89,19 +89,16 @@ async fn restart_one(
     // (image, cmd, dirs) is immutable across the stop, so the in-memory handle is
     // fine to boot from; only the post-boot status write must be atomic.
     let record = resolve::resolve(state, &box_id)?;
-    let result = boot::boot_from_record(record).await?;
-
-    // Persist the boot result atomically; the closure re-resolves by id against
-    // fresh state so it never persists a stale snapshot (and Preserve keeps the
-    // freshly-loaded restart_count).
-    StateFile::modify(move |s| {
-        if let Some(record) = s.find_by_id_mut(&box_id) {
-            boot::apply_boot_result(record, result, boot::RestartCountUpdate::Preserve);
+    // Boot + persist under a per-box boot lock (see boot::boot_and_record): if the
+    // monitor (or another concurrent restart) already brought this box back, skip
+    // rather than boot a duplicate VM that orphans one of the two.
+    match boot::boot_and_record(record, boot::RestartCountUpdate::Preserve).await? {
+        boot::BootOutcome::Restarted { .. } => println!("{name}"),
+        boot::BootOutcome::AlreadyRunning => println!("{name} (already started)"),
+        boot::BootOutcome::RemovedDuringBoot => {
+            return Err(format!("{name} was removed during restart").into());
         }
-        Ok::<(), std::io::Error>(())
-    })?;
-
-    println!("{name}");
+    }
     Ok(())
 }
 

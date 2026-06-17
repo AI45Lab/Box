@@ -306,44 +306,36 @@ async fn poll_once(tracker: &mut BackoffTracker) -> Result<(), Box<dyn std::erro
             println!("{}", restart_log_line(&record, RestartReason::Dead));
         }
 
-        // Attempt restart
-        match boot::boot_from_record(&record).await {
-            Ok(result) => {
-                // Capture the shim pid before `result` is moved into the closure,
-                // so we can tear the VM down if the record vanished mid-boot.
-                let booted_pid = result.pid;
-                // Re-load fresh under the lock and apply only this box's restart
-                // fields. Returns the new restart count, or None if the record is
-                // gone — a concurrent `rm` removed the box while we were booting.
-                let new_count = StateFile::modify(|s| {
-                    let count = s.find_by_id_mut(&box_id).map(|rec| {
-                        boot::apply_boot_result(rec, result, boot::RestartCountUpdate::Increment);
-                        rec.restart_count
-                    });
-                    Ok::<Option<u32>, std::io::Error>(count)
-                })?;
+        // Attempt restart, SERIALIZED per box via a per-box boot lock so a
+        // concurrent user `restart`/`start` and this monitor restart cannot both
+        // boot the same box (the second record write would overwrite the first's
+        // pid, orphaning a VM). The orphan-on-`rm`-during-boot teardown now lives
+        // inside `boot_and_record`.
+        match boot::boot_and_record(&record, boot::RestartCountUpdate::Increment).await {
+            Ok(boot::BootOutcome::Restarted { restart_count }) => {
                 tracker.record_attempt(&box_id);
-                match new_count {
-                    Some(new_count) => println!(
-                        "monitor: box {name} ({short_id}) restarted (count: {new_count})",
-                        name = record.name,
-                        short_id = record.short_id,
-                    ),
-                    None => {
-                        // The box was removed during the restart boot: the VM we
-                        // just started has no record tracking it. Tear it down so
-                        // it doesn't leak as an orphan shim + overlay mount.
-                        eprintln!(
-                            "monitor: box {name} ({short_id}) was removed during restart; tearing down the orphaned VM",
-                            name = record.name,
-                            short_id = record.short_id,
-                        );
-                        if let Some(pid) = booted_pid {
-                            crate::process::graceful_stop(pid, libc::SIGTERM, 5).await;
-                        }
-                        crate::cleanup::cleanup_removed_box(&record);
-                    }
-                }
+                println!(
+                    "monitor: box {name} ({short_id}) restarted (count: {restart_count})",
+                    name = record.name,
+                    short_id = record.short_id,
+                );
+            }
+            Ok(boot::BootOutcome::AlreadyRunning) => {
+                // Another actor (a user restart/start) already brought this box
+                // back under the per-box boot lock — nothing to do.
+                println!(
+                    "monitor: box {name} ({short_id}) already restarted by another actor; skipping",
+                    name = record.name,
+                    short_id = record.short_id,
+                );
+            }
+            Ok(boot::BootOutcome::RemovedDuringBoot) => {
+                tracker.record_attempt(&box_id);
+                eprintln!(
+                    "monitor: box {name} ({short_id}) was removed during restart; tore down the orphaned VM",
+                    name = record.name,
+                    short_id = record.short_id,
+                );
             }
             Err(e) => {
                 tracker.record_attempt(&box_id);
