@@ -4,6 +4,15 @@ All notable changes to A3S Box will be documented in this file.
 
 ## [Unreleased]
 
+## [2.5.2] — 2026-06-22
+
+### Changed
+
+- **`a3s-box-sdk` pipeline: faster per-step readiness wait.** `pipeline::wait_ready`
+  now polls with exponential backoff (25ms → … → 500ms cap, ~30s budget) instead of a
+  fixed 500ms sleep, so a step's box is detected ready in ~100-200ms instead of ~500ms —
+  cutting noticeable latency from multi-step pipelines. No API change.
+
 ## [2.5.1] — 2026-06-22
 
 SDK crate naming. No runtime behavior change.

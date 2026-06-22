@@ -149,12 +149,18 @@ fn slug(s: &str) -> String {
 
 /// Poll `exec <box> -- true` until the box is ready (box has no "wait-ready" verb).
 fn wait_ready(box_name: &str) -> Result<()> {
-    wait_ready_inner(box_name, 60, 500)
+    // ~30s total budget. A box is usually ready in ~100-300ms, so poll fast first
+    // and back off — far lower per-step latency than a fixed long sleep.
+    wait_ready_inner(box_name, std::time::Duration::from_secs(30))
 }
 
-/// Polling core, parameterized so tests can drive the timeout path without waiting.
-fn wait_ready_inner(box_name: &str, tries: u32, delay_ms: u64) -> Result<()> {
-    for _ in 0..tries {
+/// Polling core: exponential backoff (25ms → … → 500ms cap) bounded by `budget`.
+/// Parameterized so tests can drive the timeout path with a tiny budget.
+fn wait_ready_inner(box_name: &str, budget: std::time::Duration) -> Result<()> {
+    let start = std::time::Instant::now();
+    let mut delay = std::time::Duration::from_millis(25);
+    let cap = std::time::Duration::from_millis(500);
+    loop {
         let ready = Command::new(box_bin())
             .args(["exec", box_name, "--", "true"])
             .output()
@@ -163,9 +169,12 @@ fn wait_ready_inner(box_name: &str, tries: u32, delay_ms: u64) -> Result<()> {
         if ready {
             return Ok(());
         }
-        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        if start.elapsed() >= budget {
+            return Err(PipelineError::NotReady(box_name.to_string()));
+        }
+        std::thread::sleep(delay);
+        delay = (delay * 2).min(cap);
     }
-    Err(PipelineError::NotReady(box_name.to_string()))
 }
 
 /// Content-addressed step cache: one marker file per successful step key.
@@ -574,9 +583,9 @@ esac
         box_cleanup(&["rm", "-f", "x"]); // best-effort: must not panic
         assert!(snapshot_id("any").is_err());
         assert!(warm_base(WarmBase::new("img", "echo hi")).is_err());
-        // wait_ready returns NotReady when the box never becomes ready (fast: 2 tries, 0ms).
+        // wait_ready times out (NotReady) when the box never readies (fast: 0 budget).
         assert!(matches!(
-            wait_ready_inner("b", 2, 0),
+            wait_ready_inner("b", std::time::Duration::from_millis(0)),
             Err(PipelineError::NotReady(_))
         ));
 
