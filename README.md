@@ -24,7 +24,7 @@ Measured on a `/dev/kvm` host (not aspirational):
 | **Cold start** | ~200 ms | Already VM-fast, before forking |
 | **Snapshot-fork** | ~110 ms per fork · 100 forks in **under ~1 s** (~8 ms amortized) · ~13 MB RSS each | VM density and startup at *container* scale |
 | **Warm pool** | a pre-booted box served in ~73 ms (~23× vs cold), CoW-filled | Sub-100 ms acquire for bursty/agent workloads |
-| **Developer surface** | `run` / `build` / `exec` / `logs` / `compose`, OCI images, Kubernetes CRI | No new mental model — your Docker workflow, unchanged |
+| **Developer surface** | `run` / `build` / `exec` / `logs` / `compose`, OCI images, Kubernetes CRI, a Rust SDK (programmable CI pipelines) | No new mental model — your Docker workflow, unchanged |
 
 In one line: **the isolation of a VM, the startup and density of a container, the ergonomics of Docker.** That is the core of A3S Box. Everything below is an honest account of how far each surface is actually built.
 
@@ -227,7 +227,25 @@ a3s-box snapshot prune --keep 5          # bound disk: keep the 5 newest
 
 The `snapshot` command produces configuration/filesystem-oriented Box snapshots, not a live RAM checkpoint. The live RAM Copy-on-Write facility is a separate, lower-level mechanism described in [Warm pool and snapshot-fork](#warm-pool-and-snapshot-fork).
 
-Each snapshot deep-copies the box rootfs, so a scheduled snapshot workflow can fill the disk. `snapshot prune --keep N` / `--max-bytes B` evicts the oldest beyond a cap; set `A3S_BOX_MAX_SNAPSHOTS` / `A3S_BOX_MAX_SNAPSHOT_BYTES` to auto-prune on every `snapshot create` (unset = unbounded).
+`snapshot restore` is **copy-on-write**: the restored box shares the snapshot's rootfs as a read-only overlay lower with its own per-box upper, so forking a warmed snapshot is near-instant, space-cheap (a few MB per fork), and isolated — this is what the [SDK](#sdk) pipeline API forks per step. (On a non-overlay host it falls back to a full copy.) `snapshot create` still deep-copies the box rootfs into the store, so a scheduled snapshot workflow can fill the disk: `snapshot prune --keep N` / `--max-bytes B` evicts the oldest beyond a cap, and `A3S_BOX_MAX_SNAPSHOTS` / `A3S_BOX_MAX_SNAPSHOT_BYTES` auto-prune on every `create` (unset = unbounded). Because a restored box keeps referencing its snapshot, `snapshot rm` / `prune` refuse to delete a snapshot still in use by a box (`--force` overrides).
+
+## SDK
+
+`a3s-box-sdk` is the Rust SDK for A3S Box, published to crates.io. Today it provides a **programmable CI/CD pipeline** API (`a3s_box_sdk::pipeline`): a pipeline is a Rust program and each step runs in its **own MicroVM** (one kernel per step), forking a warmed snapshot via copy-on-write `snapshot restore`. It is a dependency-free wrapper over the `a3s-box` CLI — the DAG is your code, not YAML.
+
+```rust
+use a3s_box_sdk::pipeline::{warm_base, WarmBase, FileCache, Step};
+
+let cache = FileCache::new(".ci-cache")?;             // skip a step when inputs are unchanged
+let mut base = warm_base(                              // clone + install deps ONCE, then snapshot
+    WarmBase::new("node:20", "git clone $REPO /w && cd /w && npm ci").cache(&cache),
+)?;
+base.step(Step::new("test", "cd /w && npm test"))?;   // nonzero exit -> Err (fail-fast)
+base.step(Step::new("build", "cd /w && npm run build"))?;
+base.dispose();
+```
+
+The former MicroVM workload-execution SDK (`ExecutionRegistry`/`VmExecutor`, for embedding Box into higher-level runtimes such as a3s-lambda) is now the **`a3s-box-lambda`** crate.
 
 ## Warm pool and snapshot-fork
 
