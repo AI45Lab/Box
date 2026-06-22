@@ -235,27 +235,59 @@ impl SnapshotStore {
     /// Removes oldest snapshots first until both `max_count` and `max_bytes`
     /// constraints are satisfied. A value of 0 means unlimited.
     pub fn prune(&self, max_count: usize, max_bytes: u64) -> Result<Vec<String>> {
-        let mut snapshots = self.list()?;
+        // A snapshot a restored box shares as its copy-on-write overlay lower must
+        // never be evicted — deleting a live lower breaks the box (ESTALE) or stops
+        // it from re-starting. Read which are in use from the boxes' `.snapshot-lower`
+        // markers and skip them, evicting the oldest *evictable* snapshot instead.
+        let protected = self.referenced_rootfs_paths();
+        let mut snapshots = self.list()?; // newest-first
         let mut removed = Vec::new();
 
-        // Snapshots are sorted newest-first; remove from the end (oldest)
-        while !snapshots.is_empty() {
+        loop {
             let over_count = max_count > 0 && snapshots.len() > max_count;
             let total: u64 = snapshots.iter().map(|s| s.size_bytes).sum();
             let over_size = max_bytes > 0 && total > max_bytes;
-
             if !over_count && !over_size {
                 break;
             }
 
-            // Remove the oldest (last in the list)
-            if let Some(oldest) = snapshots.pop() {
-                self.delete(&oldest.id)?;
-                removed.push(oldest.id);
+            // Oldest (last) snapshot that is not an in-use CoW lower.
+            let idx = snapshots
+                .iter()
+                .rposition(|s| !protected.contains(&self.rootfs_path(&s.id)));
+            match idx {
+                Some(i) => {
+                    let snap = snapshots.remove(i);
+                    self.delete(&snap.id)?;
+                    removed.push(snap.id);
+                }
+                // Everything left is protected; can't prune further without
+                // breaking a live box, so stop (caller stays over the cap).
+                None => break,
             }
         }
 
         Ok(removed)
+    }
+
+    /// Rootfs paths currently referenced by a restored box as its CoW overlay lower
+    /// (`<box_dir>/.snapshot-lower`, written by `snapshot restore`). These snapshots
+    /// must not be pruned. Boxes live next to snapshots under the a3s home
+    /// (`base_dir` = `<home>/snapshots`).
+    fn referenced_rootfs_paths(&self) -> std::collections::HashSet<PathBuf> {
+        let mut set = std::collections::HashSet::new();
+        let boxes = match self.base_dir.parent() {
+            Some(home) => home.join("boxes"),
+            None => return set,
+        };
+        if let Ok(entries) = std::fs::read_dir(&boxes) {
+            for entry in entries.flatten() {
+                if let Ok(content) = std::fs::read_to_string(entry.path().join(".snapshot-lower")) {
+                    set.insert(PathBuf::from(content.trim()));
+                }
+            }
+        }
+        set
     }
 }
 
@@ -598,6 +630,42 @@ mod tests {
         let removed = store.prune(0, 0).unwrap();
         assert!(removed.is_empty());
         assert_eq!(store.count().unwrap(), 3);
+    }
+
+    #[test]
+    fn prune_skips_in_use_snapshots() {
+        let tmp = TempDir::new().unwrap();
+        let store = SnapshotStore::new(&tmp.path().join("snapshots")).unwrap();
+        let rootfs = make_rootfs(&tmp);
+
+        for i in 0..5 {
+            store
+                .save(
+                    make_metadata(&format!("s{}", i), &format!("s{}", i)),
+                    &rootfs,
+                )
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        // Mark the OLDEST (s0) as a box's in-use CoW overlay lower.
+        let box_dir = tmp.path().join("boxes").join("box1");
+        std::fs::create_dir_all(&box_dir).unwrap();
+        std::fs::write(
+            box_dir.join(".snapshot-lower"),
+            store.rootfs_path("s0").to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+
+        // keep=3 would normally evict the oldest two (s0, s1); s0 is protected, so
+        // it survives and s1 + s2 are evicted instead.
+        let removed = store.prune(3, 0).unwrap();
+        assert_eq!(removed.len(), 2);
+        assert!(store.get("s0").unwrap().is_some(), "in-use s0 must be kept");
+        assert!(store.get("s1").unwrap().is_none());
+        assert!(store.get("s2").unwrap().is_none());
+        assert!(store.get("s3").unwrap().is_some());
+        assert!(store.get("s4").unwrap().is_some());
     }
 
     #[test]

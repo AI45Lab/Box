@@ -16,11 +16,12 @@ All notable changes to A3S Box will be documented in this file.
   upper was 5.3 MB vs the 14 MB rootfs). Falls back to a full copy on a non-overlay
   host via the CopyProvider; boxes already restored via the old `.snapshot-rootfs`
   copy path keep booting unchanged.
-- **`snapshot rm` refuses to delete a snapshot still in use.** Because a restored
-  box now shares the snapshot's rootfs as its copy-on-write overlay lower, removing
+- **`snapshot rm`/`prune` never delete a snapshot still in use.** Because a restored
+  box now shares the snapshot's rootfs as its copy-on-write overlay lower, deleting
   that snapshot would break a live overlay or stop the box from re-starting. `rm`
-  now checks every box's `.snapshot-lower` marker and refuses (non-zero exit) while
-  any box references the snapshot, naming them; pass `--force` to override.
+  checks every box's `.snapshot-lower` marker and refuses (non-zero exit) while any
+  box references the snapshot, naming them (`--force` overrides); `snapshot prune`
+  and auto-prune-on-create skip in-use snapshots when evicting.
 
 ## [2.4.0] — 2026-06-17
 
