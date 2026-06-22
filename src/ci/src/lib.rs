@@ -178,6 +178,9 @@ impl FileCache {
         self.dir.join(k).exists()
     }
     fn put(&self, k: &str) {
+        // Recreate the dir if it vanished after construction, so a marker is
+        // never silently dropped (a dropped marker = a missed cache hit).
+        let _ = std::fs::create_dir_all(&self.dir);
         let _ = std::fs::File::create(self.dir.join(k));
     }
 }
@@ -424,6 +427,23 @@ mod tests {
         assert!(!cache.has(&k));
         cache.put(&k);
         assert!(cache.has(&k));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_cache_put_recreates_missing_dir() {
+        // If the cache dir vanishes after construction, put must not silently drop
+        // the marker (regression: a dropped marker is a missed cache hit).
+        let dir = std::env::temp_dir().join(format!("a3s-ci-test-{}", key(&["recreate"])));
+        let cache = FileCache::new(&dir).unwrap();
+        let k = key(&["y"]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!cache.has(&k));
+        cache.put(&k);
+        assert!(
+            cache.has(&k),
+            "put must recreate the dir and write the marker"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
