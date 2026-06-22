@@ -1,0 +1,11 @@
+[package]
+name = "a3s-box-ci"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Programmable CI pipelines on a3s-box — pipelines as Rust code, one MicroVM kernel per step."
+
+[dependencies]
+# none — a thin, dependency-free wrapper over the `a3s-box` CLI.

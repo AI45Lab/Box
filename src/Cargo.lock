@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "a3s-box-ci"
+version = "2.3.0"
+
+[[package]]
 name = "a3s-box-cli"
 version = "2.4.0"
 dependencies = [
