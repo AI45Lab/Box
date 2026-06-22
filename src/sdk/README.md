@@ -1,21 +1,22 @@
-# a3s-box-ci
+# a3s-box-sdk
 
-Programmable CI on a3s-box. A pipeline is a **Rust program**, not a YAML file —
-`a3s-box-ci` runs each step in its own MicroVM (one Linux kernel per step, so an
-untrusted step can't escape to the host or a sibling step). The DAG is your code:
-sequence with plain calls, fan out with threads. No engine, no scheduler.
+The Rust SDK for **a3s-box**. Today it provides a **programmable CI/CD pipeline** API
+(`a3s_box_sdk::pipeline`) — a pipeline is a Rust program, not a YAML file, and each step
+runs in its own MicroVM (one Linux kernel per step, so an untrusted step can't escape to
+the host or a sibling step). More capabilities will be added over time; the crate is
+intentionally not limited to CI.
 
-Dependency-free: a thin wrapper over the `a3s-box` CLI (which owns the box
-lifecycle and state). Set `A3S_BOX` if `a3s-box` is not on `PATH`.
+Dependency-free: a thin wrapper over the `a3s-box` CLI (which owns the box lifecycle and
+state). Set `A3S_BOX` if `a3s-box` is not on `PATH`.
 
-## Model
+## Pipelines
 
 Warm a base box **once** (clone + install deps), snapshot it, fork per step:
 
 ```rust
-use a3s_box_ci::{warm_base, WarmBase, FileCache, Step};
+use a3s_box_sdk::pipeline::{warm_base, WarmBase, FileCache, Step};
 
-fn main() -> Result<(), a3s_box_ci::CiError> {
+fn main() -> Result<(), a3s_box_sdk::pipeline::PipelineError> {
     let cache = FileCache::new(".ci-cache")?;          // skip a step when its inputs are unchanged
     let mut base = warm_base(
         WarmBase::new("node:20", "git clone $REPO /w && cd /w && npm ci")   // runs ONCE
@@ -49,6 +50,6 @@ no-op here (idempotent reruns).
 ## Run the example
 
 ```bash
-cargo test -p a3s-box-ci                                            # offline unit tests
-A3S_BOX=/path/to/a3s-box cargo run -p a3s-box-ci --example pipeline  # live, needs /dev/kvm
+cargo test -p a3s-box-sdk                                            # offline unit tests
+A3S_BOX=/path/to/a3s-box cargo run -p a3s-box-sdk --example pipeline  # live, needs /dev/kvm
 ```

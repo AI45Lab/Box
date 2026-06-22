@@ -9,7 +9,7 @@ members = [
     "cri",
     "cli",
     "sdk",
-    "ci",
+    "lambda",
 ]
 resolver = "2"
 
@@ -23,7 +23,7 @@ resolver = "2"
 h2 = { path = "third_party/h2" }
 
 [workspace.package]
-version = "2.5.0"
+version = "2.5.1"
 edition = "2021"
 authors = ["A3S Lab Team"]
 license = "MIT"

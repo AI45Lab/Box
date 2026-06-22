@@ -16,9 +16,9 @@
 //! Set `A3S_BOX` to the CLI path if `a3s-box` is not on `PATH`.
 //!
 //! ```no_run
-//! use a3s_box_ci::{warm_base, WarmBase, FileCache, Step};
+//! use a3s_box_sdk::pipeline::{warm_base, WarmBase, FileCache, Step};
 //!
-//! # fn main() -> Result<(), a3s_box_ci::CiError> {
+//! # fn main() -> Result<(), a3s_box_sdk::pipeline::PipelineError> {
 //! let cache = FileCache::new(".ci-cache")?;
 //! let mut base = warm_base(
 //!     WarmBase::new("node:20", "git clone $REPO /w && cd /w && npm ci")
@@ -43,7 +43,7 @@ fn box_bin() -> String {
 
 /// Errors from driving the `a3s-box` CLI.
 #[derive(Debug)]
-pub enum CiError {
+pub enum PipelineError {
     /// Spawning `a3s-box` or a filesystem op failed.
     Io(std::io::Error),
     /// A box lifecycle command (run/exec/snapshot/start) exited non-zero.
@@ -62,40 +62,40 @@ pub enum CiError {
     NotReady(String),
 }
 
-impl fmt::Display for CiError {
+impl fmt::Display for PipelineError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            CiError::Io(e) => write!(f, "a3s-box invocation failed: {e}"),
-            CiError::Cli { args, code, stderr } => {
+            PipelineError::Io(e) => write!(f, "a3s-box invocation failed: {e}"),
+            PipelineError::Cli { args, code, stderr } => {
                 write!(
                     f,
                     "`a3s-box {args}` failed (exit {code:?}): {}",
                     stderr.trim()
                 )
             }
-            CiError::StepFailed { name, code, logs } => {
+            PipelineError::StepFailed { name, code, logs } => {
                 write!(f, "step '{name}' failed (exit {code})\n{}", logs.trim())
             }
-            CiError::NotReady(b) => write!(f, "box '{b}' never became ready"),
+            PipelineError::NotReady(b) => write!(f, "box '{b}' never became ready"),
         }
     }
 }
 
-impl std::error::Error for CiError {}
+impl std::error::Error for PipelineError {}
 
-impl From<std::io::Error> for CiError {
+impl From<std::io::Error> for PipelineError {
     fn from(e: std::io::Error) -> Self {
-        CiError::Io(e)
+        PipelineError::Io(e)
     }
 }
 
-type Result<T> = std::result::Result<T, CiError>;
+type Result<T> = std::result::Result<T, PipelineError>;
 
 /// Run an `a3s-box` subcommand, capturing output. `Ok` only on a zero exit.
 fn box_run(args: &[&str]) -> Result<Output> {
     let out = Command::new(box_bin()).args(args).output()?;
     if !out.status.success() {
-        return Err(CiError::Cli {
+        return Err(PipelineError::Cli {
             args: args.join(" "),
             code: out.status.code(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
@@ -165,7 +165,7 @@ fn wait_ready_inner(box_name: &str, tries: u32, delay_ms: u64) -> Result<()> {
         }
         std::thread::sleep(std::time::Duration::from_millis(delay_ms));
     }
-    Err(CiError::NotReady(box_name.to_string()))
+    Err(PipelineError::NotReady(box_name.to_string()))
 }
 
 /// Content-addressed step cache: one marker file per successful step key.
@@ -319,7 +319,7 @@ impl Base<'_> {
             }
         }
         if code != 0 && !step.allow_failure {
-            return Err(CiError::StepFailed {
+            return Err(PipelineError::StepFailed {
                 name: step.name,
                 code,
                 logs,
@@ -343,7 +343,7 @@ impl Base<'_> {
 fn snapshot_id(name: &str) -> Result<String> {
     let out = box_run(&["snapshot", "ls"])?;
     let text = String::from_utf8_lossy(&out.stdout);
-    parse_snapshot_id(&text, name).ok_or_else(|| CiError::Cli {
+    parse_snapshot_id(&text, name).ok_or_else(|| PipelineError::Cli {
         args: format!("snapshot ls (locate '{name}')"),
         code: None,
         stderr: "snapshot not found after create".into(),
@@ -477,22 +477,22 @@ mod tests {
 
     #[test]
     fn ci_error_display_covers_each_variant() {
-        let io = CiError::from(std::io::Error::other("boom"));
+        let io = PipelineError::from(std::io::Error::other("boom"));
         assert!(format!("{io}").contains("boom"));
-        let cli = CiError::Cli {
+        let cli = PipelineError::Cli {
             args: "snapshot rm s".into(),
             code: Some(1),
             stderr: "still used".into(),
         };
         assert!(format!("{cli}").contains("still used"));
-        let step = CiError::StepFailed {
+        let step = PipelineError::StepFailed {
             name: "test".into(),
             code: 7,
             logs: "oops".into(),
         };
         let s = format!("{step}");
         assert!(s.contains("test") && s.contains("exit 7"));
-        assert!(format!("{}", CiError::NotReady("b1".into())).contains("b1"));
+        assert!(format!("{}", PipelineError::NotReady("b1".into())).contains("b1"));
     }
 
     // A POSIX-sh stub standing in for `a3s-box`: enough to drive warm_base + step
@@ -541,12 +541,12 @@ esac
         assert!(base.step(Step::new("build", "make")).expect("step2").cached); // cache hit
         assert!(matches!(
             base.step(Step::new("fail", "boom")),
-            Err(CiError::StepFailed { code: 7, .. })
+            Err(PipelineError::StepFailed { code: 7, .. })
         ));
         // box_run surfaces a non-zero exit as Cli (the stub exits 7 on a "boom" exec).
         assert!(matches!(
             box_run(&["exec", "x", "--", "boom"]),
-            Err(CiError::Cli { code: Some(7), .. })
+            Err(PipelineError::Cli { code: Some(7), .. })
         ));
         // allow_failure: a non-zero step returns Ok with the code instead of Err.
         let allowed = base
@@ -570,14 +570,14 @@ esac
 
         // Failure path: a missing binary must surface as Err, never panic.
         std::env::set_var("A3S_BOX", "/nonexistent/a3s-box-xyzzy");
-        assert!(matches!(box_run(&["version"]), Err(CiError::Io(_))));
+        assert!(matches!(box_run(&["version"]), Err(PipelineError::Io(_))));
         box_cleanup(&["rm", "-f", "x"]); // best-effort: must not panic
         assert!(snapshot_id("any").is_err());
         assert!(warm_base(WarmBase::new("img", "echo hi")).is_err());
         // wait_ready returns NotReady when the box never becomes ready (fast: 2 tries, 0ms).
         assert!(matches!(
             wait_ready_inner("b", 2, 0),
-            Err(CiError::NotReady(_))
+            Err(PipelineError::NotReady(_))
         ));
 
         std::env::remove_var("A3S_BOX");
