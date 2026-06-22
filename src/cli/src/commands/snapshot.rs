@@ -214,7 +214,7 @@ async fn execute_restore(args: SnapshotRestoreArgs) -> Result<(), Box<dyn std::e
     let socket_dir = box_dir.join("sockets");
     let logs_dir = box_dir.join("logs");
 
-    // Arm cleanup: every step below (create dirs, copy rootfs, register) can
+    // Arm cleanup: every step below (create dirs, write marker, register) can
     // fail with `?`. Until the box is in the state file it is invisible to
     // `prune`/`rm`, so a half-created box dir would leak on disk forever. The
     // guard removes it on any early return and is disarmed once registered.
@@ -223,14 +223,19 @@ async fn execute_restore(args: SnapshotRestoreArgs) -> Result<(), Box<dyn std::e
     std::fs::create_dir_all(&socket_dir)?;
     std::fs::create_dir_all(&logs_dir)?;
 
-    // Copy snapshot rootfs to new box
+    // Point the restored box's overlay at the snapshot's pristine stored rootfs
+    // as a read-only lower (copy-on-write): the box writes to its own upper, the
+    // snapshot stays shared and untouched across all forks, and nothing is
+    // copied. The runtime reads `.snapshot-lower` in `prepare_layout` and mounts
+    // the overlay (or, on a non-overlay host, the CopyProvider falls back to a
+    // full copy — same result, slower). This replaces a full per-restore rootfs
+    // deep-copy, so forking a warmed snapshot is near-instant and space-cheap.
     let snap_rootfs = store.rootfs_path(&meta.id);
-    let box_rootfs = box_dir.join("rootfs");
     if snap_rootfs.exists() {
-        copy_dir_recursive_io(&snap_rootfs, &box_rootfs)?;
-        // Mark the box so the runtime boots directly from this restored rootfs
-        // instead of rebuilding from the image (preserves the snapshot's fs).
-        std::fs::write(box_dir.join(".snapshot-rootfs"), b"")?;
+        std::fs::write(
+            box_dir.join(".snapshot-lower"),
+            snap_rootfs.to_string_lossy().as_bytes(),
+        )?;
     }
 
     let record = BoxRecord {
@@ -437,55 +442,6 @@ fn format_size(bytes: u64) -> String {
     } else {
         format!("{}B", bytes)
     }
-}
-
-/// Simple recursive directory copy (std::io version for CLI).
-fn copy_dir_recursive_io(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-        let file_type = entry.file_type()?;
-        if file_type.is_symlink() {
-            copy_symlink_io(&src_path, &dst_path)?;
-        } else if file_type.is_dir() {
-            copy_dir_recursive_io(&src_path, &dst_path)?;
-        } else {
-            std::fs::copy(&src_path, &dst_path)?;
-        }
-    }
-    Ok(())
-}
-
-fn copy_symlink_io(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
-    let target = std::fs::read_link(src)?;
-
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(&target, dst)?;
-    }
-
-    #[cfg(windows)]
-    {
-        let is_dir = src.metadata().map(|m| m.is_dir()).unwrap_or(false);
-        if is_dir {
-            std::os::windows::fs::symlink_dir(&target, dst)?;
-        } else {
-            std::os::windows::fs::symlink_file(&target, dst)?;
-        }
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = target;
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "symlink copy is not supported on this platform",
-        ));
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]

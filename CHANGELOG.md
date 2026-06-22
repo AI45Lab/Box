@@ -4,6 +4,19 @@ All notable changes to A3S Box will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **Snapshot restore is now copy-on-write.** `a3s-box snapshot restore` no longer
+  deep-copies the snapshot's rootfs into the new box. It writes a `.snapshot-lower`
+  marker and the runtime mounts the snapshot's pristine stored rootfs as a
+  read-only overlay lower with a fresh per-box upper. Forking a warmed snapshot is
+  now a near-instant overlay mount instead of a full rootfs copy: forks share one
+  read-only lower, each writes to its own isolated upper, and the snapshot stays
+  pristine — making snapshot-per-step CI fan-out cheap (measured on KVM: a fork's
+  upper was 5.3 MB vs the 14 MB rootfs). Falls back to a full copy on a non-overlay
+  host via the CopyProvider; boxes already restored via the old `.snapshot-rootfs`
+  copy path keep booting unchanged.
+
 ## [2.4.0] — 2026-06-17
 
 Post-2.3.0 hardening: three adversarial audits — production-operability (24

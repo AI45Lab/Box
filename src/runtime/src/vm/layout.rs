@@ -52,6 +52,50 @@ impl VmManager {
                 hint: None,
             })?;
 
+        // Snapshot restore (copy-on-write): `snapshot restore` writes a
+        // `.snapshot-lower` marker pointing at the snapshot's pristine stored
+        // rootfs. Mount it as a read-only overlay lower with a fresh per-box
+        // upper, so the box's writes are copy-on-write, the snapshot stays
+        // shared and untouched across all forks, and nothing is copied. On a
+        // non-overlay host the CopyProvider falls back to a full copy (same
+        // result, slower). This mirrors the rootfs cache-hit path below.
+        if let Some(lower) = snapshot_lower_dir(&box_dir) {
+            if lower.is_dir() {
+                tracing::info!(
+                    lower = %lower.display(),
+                    "Restoring snapshot via copy-on-write overlay lower"
+                );
+                let rootfs_path = self.rootfs_provider.prepare(&box_dir, &lower)?;
+                // Refresh the guest init on the merged view (the write lands in
+                // the per-box upper, never mutating the shared lower) in case the
+                // snapshot carries an older binary than the current runtime.
+                if let Ok(guest_init_path) = Self::find_guest_init() {
+                    if let Err(e) = OciRootfsBuilder::new(&rootfs_path)
+                        .with_guest_init(guest_init_path)
+                        .install_guest_init_only()
+                    {
+                        tracing::warn!(error = %e, "Failed to refresh guest init on restored overlay");
+                    }
+                }
+                let tee_instance_config = self.generate_tee_config(&box_dir)?;
+                return Ok(BoxLayout {
+                    rootfs_path,
+                    exec_socket_path: socket_dir.join("exec.sock"),
+                    pty_socket_path: socket_dir.join("pty.sock"),
+                    attest_socket_path: socket_dir.join("attest.sock"),
+                    port_forward_socket_path: socket_dir.join("portfwd.sock"),
+                    workspace_path,
+                    console_output: Some(logs_dir.join("console.log")),
+                    oci_config: None,
+                    tee_instance_config,
+                });
+            }
+            tracing::warn!(
+                lower = %lower.display(),
+                "`.snapshot-lower` points at a missing dir; falling through to image pull"
+            );
+        }
+
         // Snapshot restore pre-populates `box_dir/rootfs` with a captured full
         // root filesystem. Boot directly from it instead of rebuilding from the
         // image, so the snapshot's filesystem state (including runtime changes)
@@ -611,6 +655,20 @@ impl VmManager {
     }
 }
 
+/// Read the snapshot-restore copy-on-write overlay lower marker, if present and
+/// non-empty. `snapshot restore` writes the snapshot's stored rootfs path here;
+/// the runtime mounts it as a read-only overlay lower instead of copying the
+/// rootfs, so all forks share one pristine lower and each writes to its own upper.
+fn snapshot_lower_dir(box_dir: &Path) -> Option<PathBuf> {
+    let content = std::fs::read_to_string(box_dir.join(".snapshot-lower")).ok()?;
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(trimmed))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::BoxState;
@@ -650,6 +708,27 @@ mod tests {
             pull_progress_fn: None,
             log_config: a3s_box_core::log::LogConfig::default(),
         }
+    }
+
+    #[test]
+    fn test_snapshot_lower_dir_marker() {
+        let tmp = TempDir::new().unwrap();
+        let box_dir = tmp.path();
+        // missing marker -> None
+        assert!(snapshot_lower_dir(box_dir).is_none());
+        // blank marker -> None
+        std::fs::write(box_dir.join(".snapshot-lower"), "  \n").unwrap();
+        assert!(snapshot_lower_dir(box_dir).is_none());
+        // populated marker -> trimmed path
+        std::fs::write(
+            box_dir.join(".snapshot-lower"),
+            "/root/.a3s/snapshots/snap-1/rootfs\n",
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot_lower_dir(box_dir),
+            Some(PathBuf::from("/root/.a3s/snapshots/snap-1/rootfs"))
+        );
     }
 
     #[test]
