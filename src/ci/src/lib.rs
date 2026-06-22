@@ -149,7 +149,12 @@ fn slug(s: &str) -> String {
 
 /// Poll `exec <box> -- true` until the box is ready (box has no "wait-ready" verb).
 fn wait_ready(box_name: &str) -> Result<()> {
-    for _ in 0..60 {
+    wait_ready_inner(box_name, 60, 500)
+}
+
+/// Polling core, parameterized so tests can drive the timeout path without waiting.
+fn wait_ready_inner(box_name: &str, tries: u32, delay_ms: u64) -> Result<()> {
+    for _ in 0..tries {
         let ready = Command::new(box_bin())
             .args(["exec", box_name, "--", "true"])
             .output()
@@ -158,7 +163,7 @@ fn wait_ready(box_name: &str) -> Result<()> {
         if ready {
             return Ok(());
         }
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
     }
     Err(CiError::NotReady(box_name.to_string()))
 }
@@ -338,19 +343,24 @@ impl Base<'_> {
 fn snapshot_id(name: &str) -> Result<String> {
     let out = box_run(&["snapshot", "ls"])?;
     let text = String::from_utf8_lossy(&out.stdout);
-    for line in text.lines() {
-        let mut cols = line.split_whitespace();
-        if let (Some(id), Some(nm)) = (cols.next(), cols.next()) {
-            if nm == name {
-                return Ok(id.to_string());
-            }
-        }
-    }
-    Err(CiError::Cli {
+    parse_snapshot_id(&text, name).ok_or_else(|| CiError::Cli {
         args: format!("snapshot ls (locate '{name}')"),
         code: None,
         stderr: "snapshot not found after create".into(),
     })
+}
+
+/// Find a snapshot's ID (first column) by name (second column) in `snapshot ls` output.
+fn parse_snapshot_id(ls_output: &str, name: &str) -> Option<String> {
+    for line in ls_output.lines() {
+        let mut cols = line.split_whitespace();
+        if let (Some(id), Some(nm)) = (cols.next(), cols.next()) {
+            if nm == name {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Warm a base box: run `setup` once, snapshot the result, return a forkable [`Base`].
@@ -445,5 +455,144 @@ mod tests {
             "put must recreate the dir and write the marker"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_snapshot_id_finds_by_name() {
+        let ls = "SNAPSHOT ID                    NAME                 SOURCE BOX\n\
+                  snap-111                       ci-base-aaa-snap     box-1\n\
+                  snap-222                       ci-base-bbb-snap     box-2\n";
+        assert_eq!(
+            parse_snapshot_id(ls, "ci-base-bbb-snap").as_deref(),
+            Some("snap-222")
+        );
+        assert_eq!(parse_snapshot_id(ls, "nope"), None);
+        assert_eq!(parse_snapshot_id("", "x"), None);
+        // lines with fewer than two columns are skipped, not panicked on
+        assert_eq!(
+            parse_snapshot_id("lonely\n\nsnap-9 found x\n", "found").as_deref(),
+            Some("snap-9")
+        );
+    }
+
+    #[test]
+    fn ci_error_display_covers_each_variant() {
+        let io = CiError::from(std::io::Error::other("boom"));
+        assert!(format!("{io}").contains("boom"));
+        let cli = CiError::Cli {
+            args: "snapshot rm s".into(),
+            code: Some(1),
+            stderr: "still used".into(),
+        };
+        assert!(format!("{cli}").contains("still used"));
+        let step = CiError::StepFailed {
+            name: "test".into(),
+            code: 7,
+            logs: "oops".into(),
+        };
+        let s = format!("{step}");
+        assert!(s.contains("test") && s.contains("exit 7"));
+        assert!(format!("{}", CiError::NotReady("b1".into())).contains("b1"));
+    }
+
+    // A POSIX-sh stub standing in for `a3s-box`: enough to drive warm_base + step
+    // through their happy paths (run/exec/start/rm succeed, `snapshot create`
+    // records name->id in a state file that `snapshot ls` echoes, an exec whose
+    // command contains "boom" exits 7). Lets us cover the orchestration locally,
+    // without a real box or KVM.
+    #[cfg(unix)]
+    const FAKE_BOX: &str = r#"#!/bin/sh
+state="$(dirname "$0")/.snaps"
+case "$1" in
+  run|start|rm) exit 0 ;;
+  exec) last=""; for a in "$@"; do last="$a"; done
+        case "$last" in *boom*) exit 7 ;; *) exit 0 ;; esac ;;
+  snapshot)
+    case "$2" in
+      create) name=""; while [ "$#" -gt 0 ]; do [ "$1" = "--name" ] && name="$2"; shift; done
+              printf '%s %s\n' "snap-fake1" "$name" >> "$state"; printf 'snap-fake1\n'; exit 0 ;;
+      ls) printf 'ID NAME SRC\n'; cat "$state" 2>/dev/null; exit 0 ;;
+      *) exit 0 ;;
+    esac ;;
+  *) exit 0 ;;
+esac
+"#;
+
+    #[cfg(unix)]
+    #[test]
+    fn orchestration_drives_the_cli() {
+        use std::os::unix::fs::PermissionsExt;
+        // The ONLY test that touches the A3S_BOX env, so it cannot race a concurrent
+        // box_bin() reader.
+        let dir = std::env::temp_dir().join(format!("a3s-ci-fakebox-{}", key(&["fakebox"])));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("a3s-box");
+        std::fs::write(&fake, FAKE_BOX).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Happy path against the stub.
+        std::env::set_var("A3S_BOX", &fake);
+        let cache = FileCache::new(dir.join("cache")).unwrap();
+        let mut base = warm_base(WarmBase::new("img", "echo hi").cache(&cache)).expect("warm_base");
+        let r = base.step(Step::new("build", "make")).expect("step");
+        assert_eq!(r.exit_code, 0);
+        assert!(!r.cached);
+        assert!(base.step(Step::new("build", "make")).expect("step2").cached); // cache hit
+        assert!(matches!(
+            base.step(Step::new("fail", "boom")),
+            Err(CiError::StepFailed { code: 7, .. })
+        ));
+        // box_run surfaces a non-zero exit as Cli (the stub exits 7 on a "boom" exec).
+        assert!(matches!(
+            box_run(&["exec", "x", "--", "boom"]),
+            Err(CiError::Cli { code: Some(7), .. })
+        ));
+        // allow_failure: a non-zero step returns Ok with the code instead of Err.
+        let allowed = base
+            .step(Step::new("maybe", "boom").allow_failure())
+            .expect("allow_failure step");
+        assert_eq!(allowed.exit_code, 7);
+        assert!(!allowed.cached);
+        // A second warm_base exercises the stale-snapshot pre-clean path.
+        let _ = warm_base(WarmBase::new("img", "echo hi").cache(&cache)).expect("warm_base #2");
+        base.dispose();
+
+        // A cache-less base exercises the no-cache branch in step().
+        let mut nocache = warm_base(WarmBase::new("img", "echo hi")).expect("warm_base nocache");
+        assert!(
+            !nocache
+                .step(Step::new("x", "make"))
+                .expect("nocache step")
+                .cached
+        );
+        nocache.dispose();
+
+        // Failure path: a missing binary must surface as Err, never panic.
+        std::env::set_var("A3S_BOX", "/nonexistent/a3s-box-xyzzy");
+        assert!(matches!(box_run(&["version"]), Err(CiError::Io(_))));
+        box_cleanup(&["rm", "-f", "x"]); // best-effort: must not panic
+        assert!(snapshot_id("any").is_err());
+        assert!(warm_base(WarmBase::new("img", "echo hi")).is_err());
+        // wait_ready returns NotReady when the box never becomes ready (fast: 2 tries, 0ms).
+        assert!(matches!(
+            wait_ready_inner("b", 2, 0),
+            Err(CiError::NotReady(_))
+        ));
+
+        std::env::remove_var("A3S_BOX");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn builders_chain_all_options() {
+        // Exercise every builder method (fields are private; chaining covers the bodies).
+        let c = FileCache::new(std::env::temp_dir().join(format!("a3s-ci-bld-{}", key(&["bld"]))))
+            .unwrap();
+        let _ = WarmBase::new("img", "setup").env("A", "1").cache(&c);
+        let _ = Step::new("n", "cmd")
+            .input("x")
+            .env("K", "V")
+            .allow_failure();
     }
 }
