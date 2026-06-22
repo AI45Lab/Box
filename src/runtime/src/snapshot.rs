@@ -263,7 +263,15 @@ impl SnapshotStore {
                 }
                 // Everything left is protected; can't prune further without
                 // breaking a live box, so stop (caller stays over the cap).
-                None => break,
+                None => {
+                    tracing::warn!(
+                        in_use = snapshots.len(),
+                        "snapshot prune kept {} in-use snapshot(s) (each referenced as a \
+                         copy-on-write overlay lower); requested limit not fully met",
+                        snapshots.len()
+                    );
+                    break;
+                }
             }
         }
 
@@ -666,6 +674,31 @@ mod tests {
         assert!(store.get("s2").unwrap().is_none());
         assert!(store.get("s3").unwrap().is_some());
         assert!(store.get("s4").unwrap().is_some());
+    }
+
+    #[test]
+    fn prune_keeps_everything_when_all_in_use() {
+        let tmp = TempDir::new().unwrap();
+        let store = SnapshotStore::new(&tmp.path().join("snapshots")).unwrap();
+        let rootfs = make_rootfs(&tmp);
+        store.save(make_metadata("a", "a"), &rootfs).unwrap();
+        store.save(make_metadata("b", "b"), &rootfs).unwrap();
+
+        // Both snapshots are in use as a box's CoW overlay lower.
+        for (i, id) in ["a", "b"].iter().enumerate() {
+            let bd = tmp.path().join("boxes").join(format!("bx{i}"));
+            std::fs::create_dir_all(&bd).unwrap();
+            std::fs::write(
+                bd.join(".snapshot-lower"),
+                store.rootfs_path(id).to_string_lossy().as_bytes(),
+            )
+            .unwrap();
+        }
+
+        // Even asked to keep only 1, prune evicts nothing — both are protected.
+        let removed = store.prune(1, 0).unwrap();
+        assert!(removed.is_empty(), "in-use snapshots must never be pruned");
+        assert_eq!(store.count().unwrap(), 2);
     }
 
     #[test]
