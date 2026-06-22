@@ -4,6 +4,21 @@ All notable changes to A3S Box will be documented in this file.
 
 ## [Unreleased]
 
+## [2.5.0] — 2026-06-22
+
+Programmable CI on a3s-box: copy-on-write snapshot restore — fork a warmed snapshot as
+a near-instant overlay mount instead of a full rootfs copy — plus a new, dependency-free
+Rust SDK crate (`a3s-box-ci`) for writing CI pipelines as code, each step in its own
+MicroVM. No breaking API changes.
+
+### Added
+
+- **`a3s-box-ci` — programmable CI pipeline SDK.** A pipeline is a Rust program; box is
+  the execution backend (one kernel per step, exit code = pass/fail). `warm_base`
+  snapshots a warmed base once, `Base::step` forks it per step, and a content-addressed
+  `FileCache` skips unchanged steps. A thin, zero-dependency wrapper over the `a3s-box`
+  CLI; the DAG is the caller's code (no YAML, no engine).
+
 ### Changed
 
 - **Snapshot restore is now copy-on-write.** `a3s-box snapshot restore` no longer
