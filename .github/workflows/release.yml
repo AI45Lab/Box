@@ -296,8 +296,9 @@ jobs:
           echo "Publishing version $VERSION (in dependency order)"
           FAILED=""
           # Order matters: a dependent is published AFTER its internal deps so
-          # the index has them. runtime depends on core + netproxy + libkrun-sys.
-          for crate in a3s-libkrun-sys a3s-box-core a3s-box-netproxy a3s-box-runtime; do
+          # the index has them. runtime depends on core + netproxy + libkrun-sys;
+          # a3s-box-sdk is dependency-free (a thin CLI wrapper) so its position is free.
+          for crate in a3s-libkrun-sys a3s-box-core a3s-box-netproxy a3s-box-runtime a3s-box-sdk; do
             code=$(curl -s -o /dev/null -w '%{http_code}' "https://crates.io/api/v1/crates/$crate/$VERSION")
             if [ "$code" = "200" ]; then
               echo "✓ $crate@$VERSION already on crates.io — skipping"

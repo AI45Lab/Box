@@ -4,6 +4,20 @@ All notable changes to A3S Box will be documented in this file.
 
 ## [Unreleased]
 
+## [2.5.1] — 2026-06-22
+
+SDK crate naming. No runtime behavior change.
+
+### Changed
+
+- **`a3s-box-sdk` is now the general-purpose Rust SDK.** The programmable-CI pipeline
+  API (added in 2.5.0 as the `a3s-box-ci` crate) is now `a3s-box-sdk`, under the
+  `a3s_box_sdk::pipeline` module, so the SDK can grow beyond CI. The error type
+  `CiError` is now `pipeline::PipelineError`. **`a3s-box-sdk` is published to crates.io.**
+- **The former `a3s-box-sdk` (MicroVM workload-execution SDK for a3s-lambda) is renamed
+  to `a3s-box-lambda`.** Consumers (e.g. a3s-lambda) must update `use a3s_box_sdk::…` →
+  `use a3s_box_lambda::…`. It remains unpublished (path-only deps).
+
 ## [2.5.0] — 2026-06-22
 
 Programmable CI on a3s-box: copy-on-write snapshot restore — fork a warmed snapshot as

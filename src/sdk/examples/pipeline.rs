@@ -1,11 +1,11 @@
 //! A tiny CI pipeline driven from Rust. Needs `a3s-box` + /dev/kvm.
 //!
-//! Run: `A3S_BOX=/path/to/a3s-box cargo run -p a3s-box-ci --example pipeline`
+//! Run: `A3S_BOX=/path/to/a3s-box cargo run -p a3s-box-sdk --example pipeline`
 //! (set `DEMO_IMAGE` to override the alpine default).
 
-use a3s_box_ci::{warm_base, FileCache, Step, WarmBase};
+use a3s_box_sdk::pipeline::{warm_base, FileCache, Step, WarmBase};
 
-fn main() -> Result<(), a3s_box_ci::CiError> {
+fn main() -> Result<(), a3s_box_sdk::pipeline::PipelineError> {
     let image = std::env::var("DEMO_IMAGE")
         .unwrap_or_else(|_| "docker.m.daocloud.io/library/alpine:latest".to_string());
     let _ = std::fs::remove_dir_all("/tmp/.a3s-ci-demo"); // fresh cache for the demo (before create)
