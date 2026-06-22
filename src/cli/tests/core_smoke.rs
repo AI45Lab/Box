@@ -639,7 +639,9 @@ struct SnapshotCleanup<'a> {
 impl Drop for SnapshotCleanup<'_> {
     fn drop(&mut self) {
         if let Some(id) = self.id.as_deref() {
-            self.smoke.best_effort(&["snapshot", "rm", id]);
+            // --force: teardown must remove the snapshot even if a (leaked) restored
+            // box still references it as its CoW lower, or cleanup would leak it.
+            self.smoke.best_effort(&["snapshot", "rm", "--force", id]);
         }
     }
 }
@@ -1514,6 +1516,134 @@ fn real_core_filesystem_image_snapshot_commands() {
 
     smoke.ok(&["stop", &smoke.name]);
     smoke.ok(&["rm", &smoke.name]);
+}
+
+#[test]
+#[ignore]
+fn real_core_snapshot_cow_isolation_and_rm_guard() {
+    // Copy-on-write snapshot restore: forks share the snapshot's rootfs as a
+    // read-only overlay lower, each writing to its own upper. Verifies (1) fork
+    // isolation — a write in one fork is invisible to another, (2) the shared
+    // lower stays pristine, and (3) `snapshot rm` refuses while a fork still
+    // references the snapshot, then succeeds once the forks are gone.
+    let smoke = CoreSmoke::new();
+    let image = smoke_image();
+    let base = format!("{}-cow-base", smoke.name);
+    let fork_a = format!("{}-cow-a", smoke.name);
+    let fork_b = format!("{}-cow-b", smoke.name);
+    let snapshot_name = format!("{}-cow-snap", smoke.name);
+    let _base_cleanup = NamedBoxCleanup {
+        smoke: &smoke,
+        name: base.clone(),
+    };
+    let _fork_a_cleanup = NamedBoxCleanup {
+        smoke: &smoke,
+        name: fork_a.clone(),
+    };
+    let _fork_b_cleanup = NamedBoxCleanup {
+        smoke: &smoke,
+        name: fork_b.clone(),
+    };
+    let mut snapshot_cleanup = SnapshotCleanup {
+        smoke: &smoke,
+        id: None,
+    };
+
+    seed_smoke_image(&smoke, &image);
+
+    // Warm a base, write a marker, snapshot it.
+    smoke.ok(&[
+        "run",
+        "-d",
+        "--name",
+        &base,
+        &image,
+        "--",
+        "/bin/sh",
+        "-c",
+        "sleep 3600",
+    ]);
+    smoke.wait_for_named_running(&base);
+    smoke.ok(&[
+        "exec",
+        &base,
+        "--",
+        "/bin/sh",
+        "-c",
+        "printf BASE >/tmp/cow-shared.txt",
+    ]);
+    let snapshot_id = smoke
+        .ok(&["snapshot", "create", &base, "--name", &snapshot_name])
+        .trim()
+        .to_string();
+    assert!(
+        snapshot_id.starts_with("snap-"),
+        "snapshot id: {snapshot_id}"
+    );
+    snapshot_cleanup.id = Some(snapshot_id.clone());
+    smoke.ok(&["stop", &base]);
+    smoke.ok(&["rm", &base]);
+
+    // Fork A: sees the warmed state, then writes to its own upper.
+    smoke.ok(&["snapshot", "restore", &snapshot_id, "--name", &fork_a]);
+    smoke.ok(&["start", &fork_a]);
+    smoke.wait_for_named_running(&fork_a);
+    assert_eq!(
+        smoke.ok(&[
+            "exec",
+            &fork_a,
+            "--",
+            "/bin/sh",
+            "-c",
+            "cat /tmp/cow-shared.txt"
+        ]),
+        "BASE",
+        "fork A should see the warmed snapshot state"
+    );
+    smoke.ok(&[
+        "exec",
+        &fork_a,
+        "--",
+        "/bin/sh",
+        "-c",
+        "printf A-WROTE >>/tmp/cow-shared.txt",
+    ]);
+
+    // rm guard: the snapshot is still referenced by fork A -> must be refused.
+    let guarded = smoke.output(&["snapshot", "rm", &snapshot_id]);
+    assert!(
+        !guarded.success,
+        "snapshot rm must be refused while a fork references it\nstdout:\n{}\nstderr:\n{}",
+        guarded.stdout, guarded.stderr
+    );
+    assert_contains(&guarded.stderr, "still used", "rm guard message");
+    smoke.ok(&["snapshot", "inspect", &snapshot_id]); // still present
+
+    // Fork B from the SAME snapshot must NOT see fork A's write (isolation +
+    // pristine shared lower).
+    smoke.ok(&["snapshot", "restore", &snapshot_id, "--name", &fork_b]);
+    smoke.ok(&["start", &fork_b]);
+    smoke.wait_for_named_running(&fork_b);
+    assert_eq!(
+        smoke.ok(&[
+            "exec",
+            &fork_b,
+            "--",
+            "/bin/sh",
+            "-c",
+            "cat /tmp/cow-shared.txt"
+        ]),
+        "BASE",
+        "fork B must not see fork A's write (CoW isolation)"
+    );
+
+    // Remove the forks, then `snapshot rm` succeeds (guard clears).
+    smoke.ok(&["stop", &fork_a]);
+    smoke.ok(&["rm", &fork_a]);
+    smoke.ok(&["stop", &fork_b]);
+    smoke.ok(&["rm", &fork_b]);
+    smoke.ok(&["snapshot", "rm", &snapshot_id]);
+    snapshot_cleanup.id = None;
 }
 
 #[cfg(unix)]
