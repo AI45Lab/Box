@@ -419,8 +419,27 @@ fn configure_linking(libkrun_dir: &Path, libkrunfw_dir: &Path) {
 fn download_file(url: &str, dest: &Path) -> io::Result<()> {
     println!("cargo:warning=Downloading {}...", url);
 
+    // Retry + abort-on-stall: some networks intermittently stall on large GitHub
+    // release downloads, and a bare curl with no timeout hangs forever. Retry and
+    // kill transfers that drop below 2KB/s for 30s so a stalled pull self-heals.
     let output = Command::new("curl")
-        .args(["-fsSL", "-o", dest.to_str().unwrap(), url])
+        .args([
+            "-fsSL",
+            "--retry",
+            "20",
+            "--retry-all-errors",
+            "--retry-delay",
+            "3",
+            "--connect-timeout",
+            "20",
+            "--speed-limit",
+            "2048",
+            "--speed-time",
+            "30",
+            "-o",
+            dest.to_str().unwrap(),
+            url,
+        ])
         .output()?;
 
     if !output.status.success() {

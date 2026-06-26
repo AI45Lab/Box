@@ -1,0 +1,27 @@
+# Standalone crate: NOT part of the box workspace (own [workspace] table below).
+# It links no a3s-box crate — it drives the installed `a3s-box` CLI — so it builds
+# fast and in isolation, and never perturbs the runtime's Cargo.lock.
+[package]
+name = "a3s-box-containerd-shim"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "containerd runtime shim v2 that routes RuntimeClass=a3s-box pods to the a3s-box MicroVM runtime"
+
+[[bin]]
+name = "containerd-shim-a3s-box-v2"
+path = "src/main.rs"
+
+[dependencies]
+# ttrpc + protobuf come transitively via containerd-shim-protos; reference them
+# through its re-exports (containerd_shim_protos::{ttrpc, protobuf}) so versions
+# always match the generated Task service.
+containerd-shim = { version = "0.11", features = ["async"] }
+containerd-shim-protos = { version = "0.11", features = ["async"] }
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "sync", "io-util", "fs", "time"] }
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[workspace]

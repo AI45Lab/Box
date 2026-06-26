@@ -4,6 +4,36 @@ All notable changes to A3S Box will be documented in this file.
 
 ## [Unreleased]
 
+## [2.6.0] — 2026-06-26
+
+### Added
+
+- **`containerd-shim-a3s-box-v2` — Kubernetes RuntimeClass integration.** A new
+  containerd runtime-v2 shim (standalone `containerd-shim/` crate) that lets a vanilla
+  Kubernetes cluster route `runtimeClassName: a3s-box` pods to the a3s-box MicroVM
+  runtime via a containerd runtime handler, without replacing the node CRI. It maps the
+  containerd Task API onto the `a3s-box` CLI (pod sandbox → placeholder; workload →
+  detached MicroVM; `kubectl exec` → `a3s-box exec`). Deploy manifests under
+  `deploy/shim/` (RuntimeClass, additive containerd config, example pod). Validated on a
+  real `/dev/kvm` Kubernetes node: a `runtimeClassName: a3s-box` pod reaches Running on
+  a real libkrun MicroVM. Still experimental — `kubectl exec`/log streaming depend on the
+  guest exec control channel and are not yet fully validated; single-container,
+  TSI-networked pods are the supported shape.
+
+### Fixed
+
+- **VMM shim now survives teardown of its launcher's session.** `VmController` puts the
+  libkrun shim in its own session (`setsid` via `pre_exec`) so a process-group/cgroup
+  kill of a foreground launcher (e.g. a containerd-shim `a3s-box run`) no longer reaps
+  the shim and removes the box's `exec.sock`, which previously caused `a3s-box exec` to
+  fail with "exec socket missing".
+
+### Changed
+
+- **`a3s-libkrun-sys` build downloads are resilient.** The libkrunfw fetch now retries and
+  aborts stalled transfers (`curl --retry --speed-limit/--speed-time`) instead of a bare,
+  unbounded `curl` that could hang forever on a flaky network.
+
 ## [2.5.2] — 2026-06-22
 
 ### Changed
