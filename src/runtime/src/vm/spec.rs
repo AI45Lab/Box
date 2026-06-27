@@ -174,12 +174,30 @@ impl VmManager {
                 env.push(("BOX_EXEC_USER".to_string(), b64(user)));
             }
 
-            // Pass container environment variables with BOX_EXEC_ENV_ prefix (values
-            // base64-encoded like the rest, so a value containing `"`/spaces/etc.
-            // reaches the container intact). The key stays raw — env names are
-            // restricted to a safe character set.
-            for (key, value) in container_env {
-                env.push((format!("BOX_EXEC_ENV_{}", key), b64(&value)));
+            // Container environment variables. Values are base64-encoded like the
+            // rest (so `"`/spaces/etc. survive); the key stays raw (env names are a
+            // safe charset). These are staged in a FILE in the guest rootfs rather
+            // than passed inline: Kubernetes injects ~150 service env vars per pod
+            // (one set per Service via enableServiceLinks), and inline they bloat
+            // the env block libkrun packs into the guest kernel cmdline, overflow
+            // COMMAND_LINE_SIZE, and the guest silently fails to boot. Guest-init
+            // reads the file via the BOX_EXEC_ENV_FILE pointer below; only that
+            // small pointer rides the cmdline. Each line is `KEY=base64(value)`.
+            let env_file_body: String = container_env
+                .iter()
+                .map(|(key, value)| format!("{}={}\n", key, b64(value)))
+                .collect();
+            if !env_file_body.is_empty() {
+                let host_path = layout.rootfs_path.join(".a3s-box-env");
+                std::fs::write(&host_path, env_file_body).map_err(|e| BoxError::BoxBootError {
+                    message: format!(
+                        "failed to stage guest env file {}: {}",
+                        host_path.display(),
+                        e
+                    ),
+                    hint: None,
+                })?;
+                env.push(("BOX_EXEC_ENV_FILE".to_string(), "/.a3s-box-env".to_string()));
             }
 
             // Pass user volume mounts to guest init for mounting inside the VM.
@@ -1324,26 +1342,31 @@ mod tests {
 
         let spec = vm.build_instance_spec(&layout).unwrap();
 
+        // Container env is staged in a file in the rootfs, not inlined: only a
+        // small BOX_EXEC_ENV_FILE pointer rides the env block (cmdline overflow).
         assert!(spec
             .entrypoint
             .env
             .iter()
-            .any(|(key, value)| key == "BOX_EXEC_ENV_FOO" && b64d(value) == "cli"));
-        assert!(spec
-            .entrypoint
-            .env
-            .iter()
-            .any(|(key, value)| key == "BOX_EXEC_ENV_BAR" && b64d(value) == "image"));
-        assert!(spec
-            .entrypoint
-            .env
-            .iter()
-            .any(|(key, value)| key == "BOX_EXEC_ENV_BAZ" && b64d(value) == "cli"));
+            .any(|(key, value)| key == "BOX_EXEC_ENV_FILE" && value == "/.a3s-box-env"));
+        // No raw container env keys leak into the inline env block.
         assert!(!spec
             .entrypoint
             .env
             .iter()
-            .any(|(key, _)| key == "FOO" || key == "BAZ"));
+            .any(|(key, _)| key == "FOO" || key == "BAR" || key == "BAZ"));
+
+        // The staged file holds one `KEY=base64(value)` line per var, with the
+        // CLI extra_env overriding the image's env (FOO/BAZ from cli, BAR from image).
+        let staged = std::fs::read_to_string(layout.rootfs_path.join(".a3s-box-env")).unwrap();
+        let entries: std::collections::HashMap<&str, String> = staged
+            .lines()
+            .filter_map(|l| l.split_once('='))
+            .map(|(k, v)| (k, b64d(v)))
+            .collect();
+        assert_eq!(entries.get("FOO").map(String::as_str), Some("cli"));
+        assert_eq!(entries.get("BAR").map(String::as_str), Some("image"));
+        assert_eq!(entries.get("BAZ").map(String::as_str), Some("cli"));
     }
 
     #[test]

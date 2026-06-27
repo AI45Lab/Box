@@ -666,6 +666,7 @@ unsafe fn configure_and_start_vm(spec: &InstanceSpec) -> Result<()> {
                     net_config.prefix_len,
                     &net_config.dns_servers,
                     &spec.port_map,
+                    net_config.net_stats_path.clone(),
                 )?;
             }
             log_inherited_net_fd(fd);
@@ -1030,6 +1031,7 @@ mod tests {
     fn test_network_config() -> a3s_box_core::vmm::NetworkInstanceConfig {
         a3s_box_core::vmm::NetworkInstanceConfig {
             net_socket_path: std::path::PathBuf::from("/tmp/a3s-box-test-net.sock"),
+            net_stats_path: Some(std::path::PathBuf::from("/tmp/a3s-box-test-net.stats.json")),
             #[cfg(target_os = "macos")]
             net_socket_fd: Some(42),
             #[cfg(target_os = "macos")]

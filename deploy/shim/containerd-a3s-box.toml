@@ -1,0 +1,17 @@
+# Additive containerd runtime handler for a3s-box (containerd 2.x config schema).
+#
+# Merge this block into /etc/containerd/config.toml. It ONLY adds a new runtime
+# named `a3s-box`; it does NOT change `default_runtime_name` (stays `runc`), so
+# every existing pod keeps using runc. Only pods with runtimeClassName: a3s-box
+# are routed to the shim.
+#
+# After merging:  systemctl restart containerd   (running containers survive;
+# brief CRI-unavailable window only).
+#
+# Verify:  containerd config dump | grep -A3 runtimes.a3s-box
+
+[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.a3s-box]
+  runtime_type = 'io.containerd.a3s-box.v2'
+  # pod = one sandbox; the shim maps the CRI pause container to a placeholder
+  # and each workload container to an `a3s-box run` MicroVM.
+  [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.a3s-box.options]

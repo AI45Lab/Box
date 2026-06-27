@@ -475,6 +475,23 @@ impl VmmProvider for VmController {
             cmd.env("PATH", path);
         }
 
+        // Put the VMM shim in its own session/process-group so it survives teardown
+        // of the launcher's session — e.g. a containerd-shim foreground `a3s-box run`
+        // whose process group is reaped on container kill. Without this the libkrun
+        // shim (which owns the box's exec.sock) dies with the launcher and `a3s-box
+        // exec` fails with "exec socket missing".
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            unsafe {
+                cmd.pre_exec(|| {
+                    // setsid() fails harmlessly if already a group leader; ignore.
+                    libc::setsid();
+                    Ok(())
+                });
+            }
+        }
+
         let child = cmd.spawn().map_err(|e| BoxError::BoxBootError {
             message: format!("Failed to spawn shim: {}", e),
             hint: Some(format!("Shim path: {}", self.shim_path.display())),

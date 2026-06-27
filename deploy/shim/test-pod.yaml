@@ -1,0 +1,24 @@
+# Smoke pod: routed to a3s-box via RuntimeClass, pinned to the test node.
+# worker-5 is cordoned, so we tolerate the unschedulable taint and set nodeName
+# to land there directly. worker-5 must be labeled a3s-box.io/runtime=true
+# (the RuntimeClass scheduling.nodeSelector is injected into the pod).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: a3s-box-smoke
+  namespace: default
+spec:
+  runtimeClassName: a3s-box
+  nodeName: worker-5
+  tolerations:
+    - key: node.kubernetes.io/unschedulable
+      operator: Exists
+      effect: NoSchedule
+  containers:
+    - name: hello
+      image: docker.io/library/alpine:latest
+      command: ["sh", "-c", "echo HELLO_FROM_A3S_BOX; uname -a; sleep 3600"]
+      resources:
+        requests: { cpu: "250m", memory: "128Mi" }
+        limits: { cpu: "1", memory: "512Mi" }
+  restartPolicy: Never

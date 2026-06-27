@@ -98,7 +98,7 @@ impl VmManager {
         let box_dir = self.home_dir.join("boxes").join(&self.box_id);
 
         #[cfg(target_os = "linux")]
-        let (socket_path, _net_socket_fd, _net_proxy_fd) = {
+        let (socket_path, net_stats_path, _net_socket_fd, _net_proxy_fd) = {
             // passt drops privileges to `nobody` when launched as root, so its
             // socket must live in the world-traversable runtime socket directory
             // (next to the exec/PTY sockets), not under the box's 0700 home.
@@ -108,23 +108,25 @@ impl VmManager {
             let path = passt.socket_path().to_path_buf();
             self.net_manager = Some(Box::new(passt));
             tracing::info!(network = network_name, ip = %ip, gateway = %gateway, "Bridge networking configured via passt");
-            (path, None::<i32>, None::<i32>)
+            (path, None, None::<i32>, None::<i32>)
         };
 
         #[cfg(target_os = "macos")]
-        let (socket_path, net_socket_fd, net_proxy_fd) = {
+        let (socket_path, net_stats_path, net_socket_fd, net_proxy_fd) = {
             let mut netproxy = crate::network::NetProxyManager::new(&box_dir);
             netproxy.spawn(ip, gateway, prefix_len, &dns_servers, &self.config.port_map)?;
             let fd = netproxy.net_socket_fd();
             let proxy_fd = netproxy.net_proxy_fd();
             let path = netproxy.socket_path().to_path_buf();
+            let stats_path = netproxy.stats_path().to_path_buf();
             self.net_manager = Some(Box::new(netproxy));
             tracing::info!(network = network_name, ip = %ip, gateway = %gateway, "Bridge networking configured via built-in netproxy");
-            (path, fd, proxy_fd)
+            (path, Some(stats_path), fd, proxy_fd)
         };
 
         Ok(NetworkInstanceConfig {
             net_socket_path: socket_path,
+            net_stats_path,
             #[cfg(target_os = "macos")]
             net_socket_fd,
             #[cfg(target_os = "macos")]

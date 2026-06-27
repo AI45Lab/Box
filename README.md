@@ -44,7 +44,7 @@ As of **v2.4.0**, three adversarial audits — production-operability (24 findin
 | Networking | Default TSI networking, TCP `host:guest` publishing, user-defined bridge networks, network inspect/connect/disconnect/rm, and `/etc/hosts` peer discovery are implemented with documented platform boundaries. |
 | Compose | A useful local subset is implemented: image, command, entrypoint, env, env_file, ports, volumes, depends_on, networks, DNS, tmpfs, workdir, hostname, extra_hosts, labels, healthcheck, restart, CPU/memory, capabilities, and privileged mode. |
 | TEE | AMD SEV-SNP-oriented attestation, RA-TLS, sealing, and secret injection flows exist, plus simulation mode for development. Hardware-backed operation depends on SEV-SNP-capable hosts and libkrun support. TDX is not a productized path. |
-| Kubernetes CRI | Reachable by `crictl`/kubelet over its Unix socket. Verified on a `/dev/kvm` host: pod + container lifecycle (`RunPodSandbox` → `CreateContainer` → `StartContainer` → `Stop`/`Remove`), `exec` over Kubernetes SPDY/3.1 `remotecommand` (TTY and non-TTY, stdin/stdout/stderr, exit codes), and container log capture to `log_path`. Not yet conformant: `attach` and the stricter `critest` specs (log format, Linux SecurityContext, seccomp/AppArmor, namespaces, mount propagation). Linux-only; not the core completion target. |
+| Kubernetes CRI | Reachable by `crictl`/kubelet over its Unix socket. Verified on a `/dev/kvm` host: pod + container lifecycle (`RunPodSandbox` → `CreateContainer` → `StartContainer` → `Stop`/`Remove`), `exec` over Kubernetes SPDY/3.1 `remotecommand` (TTY and non-TTY, stdin/stdout/stderr, exit codes), and container log capture to `log_path`. Not yet conformant: `attach` and the stricter `critest` specs (log format, Linux SecurityContext, seccomp/AppArmor, namespaces, mount propagation). Linux-only; not the core completion target. **RuntimeClass:** a one-command per-node installer (`deploy/scripts/install-runtimeclass.sh`) registers the `io.containerd.a3s-box.v2` runtime, and `runtimeClassName: a3s-box` is validated end-to-end (pod start + `kubectl exec`) across a 5-node cluster — see [Deploy as a Kubernetes RuntimeClass](#deploy-as-a-kubernetes-runtimeclass). |
 | Windows | Native WHPX backend through libkrun. The Windows package runs directly on Windows with Windows Hypervisor Platform enabled; it does not require WSL. Windows CRI is intentionally out of scope. |
 
 ## What A3S Box is
@@ -364,6 +364,79 @@ helm install a3s-box deploy/helm/a3s-box/ -n a3s-box-system --create-namespace
 ```
 
 Windows CRI is intentionally unsupported.
+
+## Deploy as a Kubernetes RuntimeClass
+
+Run selected pods as a3s-box MicroVMs by setting `runtimeClassName: a3s-box`. Each
+pod's containers become libkrun MicroVMs under containerd, and `kubectl exec` works
+against them. This is opt-in per node — a node must have the runtime installed **and**
+carry the label `a3s-box.io/runtime=true` before a3s-box pods schedule there.
+
+**1. Create the RuntimeClass (once per cluster):**
+
+```bash
+kubectl apply -f - <<'EOF'
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: a3s-box
+handler: a3s-box
+scheduling:
+  nodeSelector:
+    a3s-box.io/runtime: "true"   # only labeled nodes run a3s-box pods
+EOF
+```
+
+**2. Provision each node** — run the installer as root on every node that should
+host a3s-box workloads. It installs the a3s-box CLI + helpers, libkrun, and the
+containerd runtime-v2 shim (`containerd-shim-a3s-box-v2`), registers the
+`io.containerd.a3s-box.v2` runtime via an `/etc/containerd/conf.d` drop-in, restarts
+containerd, and warms the one-time per-node boot cache. Requires containerd ≥ 2.0
+and `/dev/kvm`.
+
+```bash
+# one-liner (downloads the pinned release artifacts from GitHub):
+curl -fsSL https://raw.githubusercontent.com/AI45Lab/Box/main/deploy/scripts/install-runtimeclass.sh | sudo bash
+
+# or from a checkout:
+sudo deploy/scripts/install-runtimeclass.sh                  # default version
+sudo deploy/scripts/install-runtimeclass.sh --version v2.6.0 # pin a version
+```
+
+Then label the node from a machine with `kubectl`:
+
+```bash
+kubectl label node <node-name> a3s-box.io/runtime=true
+```
+
+Notes:
+- **Control-plane nodes** carry a `NoSchedule` taint and are normally excluded —
+  leave them unlabeled unless you intentionally run workloads there.
+- The installer warms up with `busybox:latest` so the *first* pod boots fast (the
+  first box on a fresh node builds a one-time cache that can exceed the shim's boot
+  window). Use `--warmup-image <ref>` to point at a mirror, or `--no-warmup` to skip.
+- **Air-gapped:** pre-stage the release tarball
+  (`a3s-box-<ver>-linux-<arch>.tar.gz`) and `containerd-shim-a3s-box-v2-linux-<arch>`
+  in a directory and pass `--from-dir <dir>` (no network needed).
+
+**3. Run a pod:**
+
+```bash
+kubectl apply -f - <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hello-a3s-box
+spec:
+  runtimeClassName: a3s-box
+  containers:
+  - name: app
+    image: busybox:latest
+    command: ["sleep", "3600"]
+EOF
+
+kubectl exec hello-a3s-box -- sh -c 'echo "hello from $(hostname)"; uname -m'
+```
 
 ## Architecture
 
