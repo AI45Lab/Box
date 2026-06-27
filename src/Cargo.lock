@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "a3s-box-cli"
-version = "2.5.2"
+version = "2.6.0"
 dependencies = [
  "a3s-box-core",
  "a3s-box-runtime",
@@ -36,7 +36,7 @@ dependencies = [
 
 [[package]]
 name = "a3s-box-core"
-version = "2.5.2"
+version = "2.6.0"
 dependencies = [
  "a3s-common",
  "async-trait",
@@ -54,7 +54,7 @@ dependencies = [
 
 [[package]]
 name = "a3s-box-cri"
-version = "2.5.2"
+version = "2.6.0"
 dependencies = [
  "a3s-box-core",
  "a3s-box-runtime",
@@ -84,7 +84,7 @@ dependencies = [
 
 [[package]]
 name = "a3s-box-guest-init"
-version = "2.5.2"
+version = "2.6.0"
 dependencies = [
  "a3s-box-core",
  "a3s-common",
@@ -107,7 +107,7 @@ dependencies = [
 
 [[package]]
 name = "a3s-box-lambda"
-version = "2.5.2"
+version = "2.6.0"
 dependencies = [
  "a3s-box-core",
  "a3s-box-runtime",
@@ -126,10 +126,11 @@ dependencies = [
 
 [[package]]
 name = "a3s-box-netproxy"
-version = "2.5.2"
+version = "2.6.0"
 dependencies = [
  "a3s-box-core",
  "libc",
+ "serde_json",
  "smoltcp",
  "tempfile",
  "tracing",
@@ -137,7 +138,7 @@ dependencies = [
 
 [[package]]
 name = "a3s-box-runtime"
-version = "2.5.2"
+version = "2.6.0"
 dependencies = [
  "a3s-box-core",
  "a3s-box-netproxy",
@@ -184,11 +185,11 @@ dependencies = [
 
 [[package]]
 name = "a3s-box-sdk"
-version = "2.5.2"
+version = "2.6.0"
 
 [[package]]
 name = "a3s-box-shim"
-version = "2.5.2"
+version = "2.6.0"
 dependencies = [
  "a3s-box-core",
  "a3s-box-netproxy",
@@ -222,7 +223,7 @@ dependencies = [
 
 [[package]]
 name = "a3s-libkrun-sys"
-version = "2.5.2"
+version = "2.6.0"
 dependencies = [
  "libc",
  "num_cpus",

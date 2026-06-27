@@ -295,13 +295,35 @@ impl ExecConfig {
             .map(&decode)
             .filter(|u| !u.is_empty());
 
-        // Collect BOX_EXEC_ENV_* variables (values decoded as above).
-        let env: Vec<(String, String)> = std::env::vars()
+        // Collect BOX_EXEC_ENV_* variables (values decoded as above). Skip
+        // BOX_EXEC_ENV_FILE — it's the pointer to the staged env file, not a
+        // container variable. Kept for backward compatibility with a runtime that
+        // still passes container env inline.
+        let mut env: Vec<(String, String)> = std::env::vars()
             .filter_map(|(key, value)| {
                 key.strip_prefix("BOX_EXEC_ENV_")
+                    .filter(|stripped| *stripped != "FILE")
                     .map(|stripped| (stripped.to_string(), decode(value)))
             })
             .collect();
+
+        // Bulk container env is staged in a file (runtime/src/vm/spec.rs): K8s
+        // injects ~150 service env vars, which overflow the guest kernel cmdline
+        // if passed inline, so the runtime writes them to a file and points here.
+        // Each line is `KEY=base64(value)`; the key may itself contain `=`-free
+        // bytes only (env names are a safe charset), so split on the first `=`.
+        if let Ok(path) = std::env::var("BOX_EXEC_ENV_FILE") {
+            match std::fs::read_to_string(&path) {
+                Ok(contents) => {
+                    for line in contents.lines() {
+                        if let Some((k, v)) = line.split_once('=') {
+                            env.push((k.to_string(), decode(v.to_string())));
+                        }
+                    }
+                }
+                Err(e) => eprintln!("init.krun: failed to read BOX_EXEC_ENV_FILE {path}: {e}"),
+            }
+        }
 
         Self {
             executable,

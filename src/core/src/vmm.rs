@@ -59,6 +59,10 @@ pub struct NetworkInstanceConfig {
     /// Path to the network backend Unix socket (passt on Linux, gvproxy on macOS).
     pub net_socket_path: PathBuf,
 
+    /// Optional JSON stats file written by the userspace network backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net_stats_path: Option<PathBuf>,
+
     /// Pre-opened Unix datagram socket fd inherited by the shim on macOS.
     #[cfg(target_os = "macos")]
     #[serde(default)]
@@ -498,6 +502,7 @@ mod tests {
         let spec = InstanceSpec {
             network: Some(NetworkInstanceConfig {
                 net_socket_path: PathBuf::from("/tmp/net.sock"),
+                net_stats_path: Some(PathBuf::from("/tmp/net.stats.json")),
                 #[cfg(target_os = "macos")]
                 net_socket_fd: Some(42),
                 #[cfg(target_os = "macos")]
@@ -515,6 +520,10 @@ mod tests {
         let deserialized: InstanceSpec = serde_json::from_str(&json).unwrap();
 
         let net = deserialized.network.unwrap();
+        assert_eq!(
+            net.net_stats_path,
+            Some(PathBuf::from("/tmp/net.stats.json"))
+        );
         #[cfg(target_os = "macos")]
         assert_eq!(net.net_socket_fd, Some(42));
         #[cfg(target_os = "macos")]

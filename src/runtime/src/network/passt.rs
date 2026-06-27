@@ -14,6 +14,8 @@ use std::process::{Child, Command};
 pub struct PasstManager {
     /// Path to the passt Unix socket.
     socket_path: PathBuf,
+    /// Path to passt's guest-side packet capture.
+    pcap_path: PathBuf,
     /// Child process handle (None if not started).
     child: Option<Child>,
     /// PID file path for the passt process.
@@ -35,6 +37,7 @@ impl PasstManager {
     pub fn new(socket_dir: &Path) -> Self {
         Self {
             socket_path: socket_dir.join("passt.sock"),
+            pcap_path: socket_dir.join("passt.pcap"),
             pid_file: socket_dir.join("passt.pid"),
             child: None,
         }
@@ -43,6 +46,11 @@ impl PasstManager {
     /// Get the passt socket path.
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
+    }
+
+    /// Get the passt packet capture path.
+    pub fn pcap_path(&self) -> &Path {
+        &self.pcap_path
     }
 
     /// Spawn the passt daemon.
@@ -96,12 +104,17 @@ impl PasstManager {
         if self.socket_path.exists() {
             std::fs::remove_file(&self.socket_path).ok();
         }
+        if self.pcap_path.exists() {
+            std::fs::remove_file(&self.pcap_path).ok();
+        }
 
         let mut cmd = Command::new("passt");
         cmd.arg("--socket")
             .arg(&self.socket_path)
             .arg("--pid")
             .arg(&self.pid_file)
+            .arg("--pcap")
+            .arg(&self.pcap_path)
             // Run in foreground (we manage the process)
             .arg("--foreground")
             // Configure the network
@@ -248,6 +261,7 @@ impl PasstManager {
 
         // Clean up socket and PID file
         std::fs::remove_file(&self.socket_path).ok();
+        std::fs::remove_file(&self.pcap_path).ok();
         std::fs::remove_file(&self.pid_file).ok();
     }
 
@@ -295,6 +309,7 @@ pub fn terminate_passt(socket_dir: &Path) {
     }
     let _ = std::fs::remove_file(&pid_file);
     let _ = std::fs::remove_file(socket_dir.join("passt.sock"));
+    let _ = std::fs::remove_file(socket_dir.join("passt.pcap"));
 }
 
 /// Best-effort check that `pid` is actually a passt process, to avoid SIGTERM-ing
@@ -354,6 +369,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mgr = PasstManager::new(dir.path());
         assert_eq!(mgr.socket_path(), dir.path().join("passt.sock"));
+        assert_eq!(mgr.pcap_path(), dir.path().join("passt.pcap"));
     }
 
     #[test]
@@ -378,6 +394,7 @@ mod tests {
         let box_dir = dir.path().join("boxes").join("test-box-id");
         let mgr = PasstManager::new(&box_dir);
         assert_eq!(mgr.socket_path(), box_dir.join("passt.sock"));
+        assert_eq!(mgr.pcap_path(), box_dir.join("passt.pcap"));
     }
 
     #[test]
@@ -385,14 +402,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("passt.sock");
         let pid_path = dir.path().join("passt.pid");
+        let pcap_path = dir.path().join("passt.pcap");
 
         // A non-existent PID so the SIGTERM is a harmless no-op (ESRCH).
         std::fs::write(&socket_path, "fake").unwrap();
         std::fs::write(&pid_path, "2147483647").unwrap();
+        std::fs::write(&pcap_path, "fake pcap").unwrap();
 
         terminate_passt(dir.path());
 
         assert!(!socket_path.exists());
         assert!(!pid_path.exists());
+        assert!(!pcap_path.exists());
     }
 }

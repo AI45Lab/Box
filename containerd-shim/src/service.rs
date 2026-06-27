@@ -39,7 +39,40 @@ fn a3s_box_bin() -> String {
 fn a3s_box_cmd() -> Command {
     let mut c = Command::new(a3s_box_bin());
     c.env("A3S_HOME", logic::a3s_home());
+    harden_child(&mut c);
     c
+}
+
+/// Prepare a child (a3s-box → its libkrun VMM) to match a shell-launched one.
+///
+/// containerd runs the shim under tight rlimits: RLIMIT_MEMLOCK is the 8 MiB
+/// system default. libkrun must mlock the guest's RAM for KVM, so at 8 MiB the
+/// guest boots only partially — no console output, and the exec-server vsock
+/// never comes up, so exec.sock is never bound and `kubectl exec` can't reach
+/// the guest. A root shell has ~unlimited memlock and works; we raise the
+/// child's MEMLOCK to match. NOFILE is bumped for large VMs. We also close
+/// inherited fds (the ttrpc socket, tokio epoll, FIFOs) so the VMM starts with
+/// a clean table. All ops here are async-signal-safe (safe post-fork/pre-exec).
+fn harden_child(cmd: &mut Command) {
+    // tokio::process::Command provides `pre_exec` inherently (no CommandExt import).
+    unsafe {
+        cmd.pre_exec(|| {
+            let unlimited = libc::rlimit {
+                rlim_cur: libc::RLIM_INFINITY,
+                rlim_max: libc::RLIM_INFINITY,
+            };
+            libc::setrlimit(libc::RLIMIT_MEMLOCK, &unlimited);
+            let nofile = libc::rlimit {
+                rlim_cur: 1_048_576,
+                rlim_max: 1_048_576,
+            };
+            libc::setrlimit(libc::RLIMIT_NOFILE, &nofile);
+            for fd in 3..1024 {
+                libc::close(fd);
+            }
+            Ok(())
+        });
+    }
 }
 
 #[derive(Default)]
@@ -85,6 +118,21 @@ pub struct Service {
     // ExitSignal isn't Clone; share one across the Shim + its task service.
     exit: Arc<ExitSignal>,
     state: Arc<Mutex<State>>,
+    // Set on the task service (create_task_service) so we can emit the runtime-v2
+    // lifecycle events (TaskStart/TaskExit) containerd's CRI expects.
+    publisher: Option<Arc<RemotePublisher>>,
+}
+
+impl Service {
+    /// Publish a runtime-v2 task event to containerd (best effort).
+    async fn publish(&self, topic: &str, event: Box<dyn protobuf::MessageDyn>) {
+        if let Some(p) = &self.publisher {
+            let ctx = ttrpc::context::Context::default();
+            if let Err(e) = p.publish(ctx, topic, &self.namespace, event).await {
+                log::warn!("publish {topic} failed: {e}");
+            }
+        }
+    }
 }
 
 // ---- helpers ---------------------------------------------------------------
@@ -153,26 +201,38 @@ impl Shim for Service {
     type T = Service;
 
     async fn new(_runtime_id: &str, args: &Flags, _config: &mut Config) -> Self {
+        // NOTE: reaper/subreaper are disabled via the Config passed to `run()` in
+        // main.rs — the framework reads that Config before this method runs, so
+        // setting it here would be a no-op.
         Service {
             id: args.id.clone(),
             namespace: args.namespace.clone(),
             exit: Arc::new(ExitSignal::default()),
             state: Arc::new(Mutex::new(State::default())),
+            publisher: None,
         }
     }
 
     async fn start_shim(&mut self, opts: StartOpts) -> Result<String, Error> {
-        let grouping = opts.id.clone();
+        // Group every container of a pod under the SAME shim as its sandbox (the CRI
+        // model: one shim per pod). The bundle's config.json carries the sandbox id;
+        // a workload container groups by it, the sandbox itself groups by its own id.
+        // A separate shim per container has the wrong lifecycle — the workload's shim
+        // tears down right after Start.
+        let grouping = std::fs::read_to_string("config.json")
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| {
+                logic::annotation(&v, "io.kubernetes.cri.sandbox-id").map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| opts.id.clone());
         let address = spawn(opts, &grouping, Vec::new()).await?;
         Ok(address)
     }
 
     async fn delete_shim(&mut self) -> Result<api::DeleteResponse, Error> {
         // Out-of-band cleanup: force-remove the box if it lingers.
-        let _ = a3s_box_cmd()
-            .args(["rm", "-f", &self.id])
-            .output()
-            .await;
+        let _ = a3s_box_cmd().args(["rm", "-f", &self.id]).output().await;
         let mut r = api::DeleteResponse::new();
         r.set_exit_status(0);
         Ok(r)
@@ -182,8 +242,10 @@ impl Shim for Service {
         self.exit.wait().await;
     }
 
-    async fn create_task_service(&self, _publisher: RemotePublisher) -> Self::T {
-        self.clone()
+    async fn create_task_service(&self, publisher: RemotePublisher) -> Self::T {
+        let mut s = self.clone();
+        s.publisher = Some(Arc::new(publisher));
+        s
     }
 }
 
@@ -251,12 +313,12 @@ impl Task for Service {
             p.pid = child.id().unwrap_or(0);
             p.child = Some(child);
         } else {
-            // Workload: launch DETACHED via `setsid a3s-box run -d`, fire-and-forget.
-            // This replicates the interactive-shell `run -d` that BINDS exec.sock and
-            // orphans the libkrun shim to init. (Foreground run — and a plain
-            // shim-spawned `run -d` held as a child — do NOT bind exec.sock, so
-            // kubectl exec can't reach the guest.) We then poll the box record until
-            // it reports running, by which point boot's exec-readiness has completed.
+            // Workload: launch the MicroVM DETACHED (`a3s-box run -d`). The libkrun
+            // VMM daemonizes and reparents to init — OUT of this shim's process tree.
+            // That isolation is essential: a box kept inside the containerd-launched
+            // shim's tree (e.g. held as a foreground `a3s-box run`) is killed a few
+            // seconds after boot by the shim's process context, whereas a detached box
+            // survives for its full lifetime exactly as a standalone `run -d` does.
             let image = p
                 .image
                 .clone()
@@ -265,42 +327,144 @@ impl Task for Service {
             let memory = p.memory_mb;
             let env = p.env.clone();
             let args = p.args.clone();
+            let stdout_fifo = p.stdout.clone();
+            let stderr_fifo = p.stderr.clone();
             drop(st); // release the lock across spawn + readiness poll
 
-            let mut cmd = Command::new("setsid");
-            cmd.env("A3S_HOME", logic::a3s_home());
-            cmd.arg(a3s_box_bin());
-            cmd.args(logic::run_args(&id, &image, cpus, memory, &env, &args));
-            cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-            cmd.spawn()
-                .map_err(|e| ttrpc_err(format!("setsid a3s-box run -d spawn failed: {e}")))?;
+            // Hold the container's stdout/stderr FIFO write ends open. containerd's CRI
+            // creates these FIFOs and pumps them to the container log; the box's real
+            // output goes to its systemd journal, so without a writer the CRI's pump
+            // hits "reading from a closed fifo" and tears the container down. Opening
+            // them O_WRONLY|O_NONBLOCK (a reader is present) and leaking the fds keeps
+            // the pipes alive for the shim's lifetime.
+            for path in [&stdout_fifo, &stderr_fifo] {
+                if !path.is_empty() {
+                    if let Ok(c) = std::ffi::CString::new(path.as_str()) {
+                        let fd =
+                            unsafe { libc::open(c.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+                        if fd >= 0 {
+                            std::mem::forget(unsafe { std::fs::File::from_raw_fd(fd) });
+                        }
+                    }
+                }
+            }
 
+            // Launch the box as a transient systemd SERVICE (NOT `--scope`). A scope
+            // runs the command as a child of systemd-run — i.e. of THIS shim — so it
+            // inherits the shim's constrained context (RLIMIT_MEMLOCK=8 MiB, and other
+            // limits we could not fully enumerate) that makes the guest OOM ~5 s into
+            // boot ("workqueue: Failed to create a worker thread: -12"). A transient
+            // service is started by systemd (PID 1) with systemd's OWN default
+            // context, escaping the shim entirely; we also set MEMLOCK/NOFILE
+            // explicitly. KillMode=process keeps the daemonized libkrun VMM alive when
+            // `a3s-box run -d` (the unit's main process) exits. A3S_HOME is passed
+            // because the service does not inherit our env. (Verified: a box launched
+            // from the shim's context dies; one launched in a clean context survives.)
+            let unit = format!("a3sbox-{}", &id[..id.len().min(32)]);
+            let mut rcmd = Command::new("systemd-run");
+            rcmd.arg("--quiet")
+                .arg("--no-block") // enqueue the unit and return at once; do not let
+                // systemd-run linger as our child until `run -d` exits (its exit would
+                // be read as the container exiting).
+                .arg(format!("--unit={unit}"))
+                // KillMode=process: don't kill the daemonized VMM when the unit's
+                // main process (`a3s-box run -d`) exits. RemainAfterExit=yes: keep the
+                // unit (and thus its cgroup, which holds the VMM) ACTIVE after that
+                // main exits — otherwise systemd garbage-collects the finished unit's
+                // cgroup and the VMM dies with it ~2 s after boot.
+                .arg("--property=KillMode=process")
+                .arg("--property=RemainAfterExit=yes")
+                .arg("--property=LimitMEMLOCK=infinity")
+                .arg("--property=LimitNOFILE=1048576")
+                .arg(format!("--setenv=A3S_HOME={}", logic::a3s_home()))
+                .arg(a3s_box_bin())
+                .args(logic::run_args(&id, &image, cpus, memory, &env, &args))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            // Service mode returns as soon as systemd has started the unit; the box
+            // then boots in the background and we poll for it below.
+            let run_status = rcmd
+                .status()
+                .await
+                .map_err(|e| ttrpc_err(format!("systemd-run a3s-box failed: {e}")))?;
+            if !run_status.success() {
+                return Err(ttrpc_err(format!(
+                    "systemd-run a3s-box exited {run_status}"
+                )));
+            }
+
+            // Poll until the box reports RUNNING — i.e. the guest has booted and bound
+            // its exec socket. Only then is `a3s-box wait` guaranteed to block (on a
+            // freshly-created, still-booting box it returns immediately, which the held
+            // child below would read as an instant task-exit and let containerd kill
+            // the box). The box runs in a clean systemd scope, so this ~5 s wait does
+            // not risk it dying meanwhile.
             let mut running = false;
-            for _ in 0..120 {
+            for _ in 0..160 {
                 if let Ok(o) = a3s_box_cmd().args(["inspect", &id]).output().await {
-                    if o.status.success() && logic::is_running(&String::from_utf8_lossy(&o.stdout)) {
+                    if o.status.success() && logic::is_running(&String::from_utf8_lossy(&o.stdout))
+                    {
                         running = true;
                         break;
                     }
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             }
             if !running {
                 return Err(ttrpc_err(format!("box {id} did not become running")));
             }
-            let mut st = self.state.lock().await;
-            if let Some(p) = st.procs.get_mut(&id) {
-                p.status = 2; // RUNNING
-                p.pid = std::process::id();
+
+            // Report the foreground `a3s-box run` (the systemd unit's MainPID) as the
+            // task's init pid: a real, distinct, long-lived host process that lives
+            // exactly as long as the box. containerd loads the task by this pid for
+            // exec, so it must NOT be the shim's own pid (that gives "no running
+            // task"). The framework reaper is off (no_reaper), so this non-child pid
+            // is never waitpid'd into a false exit; Task.wait() polls inspect for the
+            // real exit.
+            let unit_main = format!("a3sbox-{}.service", &id[..id.len().min(32)]);
+            let main_pid = Command::new("systemctl")
+                .args(["show", &unit_main, "-p", "MainPID", "--value"])
+                .output()
+                .await
+                .ok()
+                .and_then(|o| {
+                    String::from_utf8_lossy(&o.stdout)
+                        .trim()
+                        .parse::<u32>()
+                        .ok()
+                })
+                .filter(|&p| p > 0)
+                .unwrap_or_else(std::process::id);
+
+            {
+                let mut st = self.state.lock().await;
+                if let Some(p) = st.procs.get_mut(&id) {
+                    p.status = 2; // RUNNING
+                    p.pid = main_pid;
+                    p.child = None;
+                }
             }
+            // Tell containerd the task is running (runtime-v2 lifecycle event). The
+            // CRI plugin relies on this to register the task as exec-able.
+            let mut ev = containerd_shim_protos::events::task::TaskStart::new();
+            ev.set_container_id(id.clone());
+            ev.set_pid(main_pid);
+            self.publish("/tasks/start", Box::new(ev)).await;
             let mut resp = api::StartResponse::new();
-            resp.set_pid(std::process::id());
+            resp.set_pid(main_pid);
             return Ok(resp);
         }
         p.status = 2; // RUNNING (sandbox)
+        let sandbox_pid = p.pid;
+        drop(st);
 
+        let mut ev = containerd_shim_protos::events::task::TaskStart::new();
+        ev.set_container_id(id.clone());
+        ev.set_pid(sandbox_pid);
+        self.publish("/tasks/start", Box::new(ev)).await;
         let mut resp = api::StartResponse::new();
-        resp.set_pid(p.pid);
+        resp.set_pid(sandbox_pid);
         Ok(resp)
     }
 
@@ -364,20 +528,84 @@ impl Task for Service {
         let code = if let Some(mut c) = child {
             c.wait().await.ok().and_then(|s| s.code()).unwrap_or(0) as u32
         } else {
-            // Workload box (detached): block on `a3s-box wait <id>` until it exits.
-            a3s_box_cmd()
-                .args(["wait", &id])
-                .output()
-                .await
-                .ok()
-                .map(|o| logic::parse_wait_exit_code(&String::from_utf8_lossy(&o.stdout)))
-                .unwrap_or(0)
+            // Workload box: block until the box TRULY exits. `a3s-box wait` can return
+            // early while the box is still mid-transition (just after `run -d`
+            // detaches it), and reporting that to containerd as a task-exit makes it
+            // kill the still-live box. So after each `a3s-box wait` return, confirm
+            // via `inspect` that the box is actually gone; if it still reports
+            // running, the wait was spurious — pause and wait again.
+            // Workload box: block until the box reaches a TERMINAL status. Match the
+            // status field specifically (`"status": "stopped"|"exited"`) — a bare
+            // search for "stopped"/"exited" also hits a RUNNING box's exited_at/
+            // exit_code fields (false exit → containerd kills the live box), and
+            // `!is_running` would fire on a still-booting "created" box (wait() can be
+            // called before boot completes). Only an explicit terminal status, or the
+            // box record vanishing (two failed inspects), ends the wait.
+            let terminal = |s: &str| {
+                s.contains("\"status\": \"stopped\"")
+                    || s.contains("\"status\":\"stopped\"")
+                    || s.contains("\"status\": \"exited\"")
+                    || s.contains("\"status\":\"exited\"")
+            };
+            let mut missing = 0;
+            // containerd calls Task.Wait() right after Create — concurrently with,
+            // and often before, Task.Start finishes booting the box. In that window
+            // the box isn't registered in boxes.json yet, so `inspect` returns "No
+            // such container"; treating that as a terminal exit makes containerd kill
+            // the box it's still starting. So gate the inspect poll on the in-memory
+            // status (which Start sets to running once boot is confirmed): until we've
+            // seen the box running, just wait. None => task deleted; 3 => stopped.
+            let mut seen_running = false;
+            loop {
+                let mem_status = {
+                    let st = self.state.lock().await;
+                    st.procs.get(&id).map(|p| p.status)
+                };
+                match mem_status {
+                    None => break 0,    // task deleted out from under us
+                    Some(3) => break 0, // marked stopped elsewhere
+                    Some(s) if s >= 2 => seen_running = true,
+                    Some(_) => {} // created/unknown: not booted yet
+                }
+                if !seen_running {
+                    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                    continue;
+                }
+                let brk = match a3s_box_cmd().args(["inspect", &id]).output().await {
+                    Ok(o) if o.status.success() => {
+                        let term = terminal(&String::from_utf8_lossy(&o.stdout));
+                        if !term {
+                            missing = 0;
+                        }
+                        term
+                    }
+                    // Two consecutive inspect failures => the box record is gone.
+                    _ => {
+                        missing += 1;
+                        missing >= 2
+                    }
+                };
+                if brk {
+                    break 0;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+            }
         };
-        let mut st = self.state.lock().await;
-        if let Some(p) = st.procs.get_mut(&id) {
-            p.status = 3; // STOPPED
-            p.exit_code = code;
-        }
+        let pid = {
+            let mut st = self.state.lock().await;
+            st.procs.get_mut(&id).map(|p| {
+                p.status = 3; // STOPPED
+                p.exit_code = code;
+                p.pid
+            })
+        };
+        // Now that the box has truly exited, tell containerd (runtime-v2 lifecycle).
+        let mut ev = containerd_shim_protos::events::task::TaskExit::new();
+        ev.set_container_id(id.clone());
+        ev.set_id(id.clone());
+        ev.set_pid(pid.unwrap_or(0));
+        ev.set_exit_status(code);
+        self.publish("/tasks/exit", Box::new(ev)).await;
         let mut resp = api::WaitResponse::new();
         resp.set_exit_status(code);
         Ok(resp)
@@ -442,10 +670,7 @@ impl Task for Service {
             if p.is_sandbox {
                 let _ = Command::new("kill").arg(p.pid.to_string()).output().await;
             } else {
-                let _ = a3s_box_cmd()
-                    .args(["stop", &id])
-                    .output()
-                    .await;
+                let _ = a3s_box_cmd().args(["stop", &id]).output().await;
             }
         }
         Ok(api::Empty::new())
@@ -480,8 +705,17 @@ impl Task for Service {
             .map(|p| (p.pid, p.exit_code))
             .unwrap_or((0, 0));
         drop(st);
-        let _ = a3s_box_cmd()
-            .args(["rm", "-f", &id])
+        let _ = a3s_box_cmd().args(["rm", "-f", &id]).output().await;
+        // Tear down the transient systemd unit that hosts the box (RemainAfterExit
+        // keeps it active, so it must be stopped explicitly) and forget any failed
+        // state, so the unit name is free for a future container with the same id.
+        let unit = format!("a3sbox-{}.service", &id[..id.len().min(32)]);
+        let _ = Command::new("systemctl")
+            .args(["stop", &unit])
+            .output()
+            .await;
+        let _ = Command::new("systemctl")
+            .args(["reset-failed", &unit])
             .output()
             .await;
         let mut resp = api::DeleteResponse::new();
@@ -536,6 +770,7 @@ mod tests {
             namespace: "k8s.io".into(),
             exit: Arc::new(ExitSignal::default()),
             state: Arc::new(Mutex::new(State::default())),
+            publisher: None,
         }
     }
 
@@ -607,7 +842,7 @@ mod tests {
         dreq.set_id("c1".into());
         dreq.set_exec_id("e1".into());
         s.delete(&ctx(), dreq).await.unwrap();
-        assert!(s.state.lock().await.execs.get("e1").is_none());
+        assert!(!s.state.lock().await.execs.contains_key("e1"));
     }
 
     #[tokio::test]
@@ -615,7 +850,10 @@ mod tests {
         let s = svc();
         s.state.lock().await.execs.insert(
             "e9".into(),
-            ExecProc { container_id: "c1".into(), ..Default::default() },
+            ExecProc {
+                container_id: "c1".into(),
+                ..Default::default()
+            },
         );
         let mut req = api::StateRequest::new();
         req.set_id("c1".into());
@@ -629,7 +867,9 @@ mod tests {
         let s = svc();
         let c = s.connect(&ctx(), api::ConnectRequest::new()).await.unwrap();
         assert!(c.shim_pid() > 0);
-        s.shutdown(&ctx(), api::ShutdownRequest::new()).await.unwrap();
+        s.shutdown(&ctx(), api::ShutdownRequest::new())
+            .await
+            .unwrap();
         // shutdown fired the exit signal; Shim::wait would now return.
     }
 
@@ -638,7 +878,11 @@ mod tests {
         let s = svc();
         s.state.lock().await.execs.insert(
             "e0".into(),
-            ExecProc { container_id: "c1".into(), pid: 0, ..Default::default() },
+            ExecProc {
+                container_id: "c1".into(),
+                pid: 0,
+                ..Default::default()
+            },
         );
         let mut req = api::KillRequest::new();
         req.set_id("c1".into());
@@ -668,7 +912,10 @@ mod tests {
         let s = svc();
         s.state.lock().await.execs.insert(
             "e2".into(),
-            ExecProc { container_id: "c1".into(), ..Default::default() },
+            ExecProc {
+                container_id: "c1".into(),
+                ..Default::default()
+            },
         );
         let mut req = api::WaitRequest::new();
         req.set_id("c1".into());
@@ -682,7 +929,11 @@ mod tests {
         let s = svc();
         s.state.lock().await.procs.insert(
             "sb".into(),
-            Proc { is_sandbox: true, status: 1, ..Default::default() },
+            Proc {
+                is_sandbox: true,
+                status: 1,
+                ..Default::default()
+            },
         );
         let mut sreq = api::StartRequest::new();
         sreq.set_id("sb".into());
@@ -724,15 +975,17 @@ mod tests {
     #[tokio::test]
     async fn delete_container_runs_rm() {
         let s = svc();
-        s.state
-            .lock()
-            .await
-            .procs
-            .insert("cdel".into(), Proc { status: 2, ..Default::default() });
+        s.state.lock().await.procs.insert(
+            "cdel".into(),
+            Proc {
+                status: 2,
+                ..Default::default()
+            },
+        );
         let mut req = api::DeleteRequest::new();
         req.set_id("cdel".into());
         s.delete(&ctx(), req).await.unwrap(); // spawns `a3s-box rm -f cdel`
-        assert!(s.state.lock().await.procs.get("cdel").is_none());
+        assert!(!s.state.lock().await.procs.contains_key("cdel"));
     }
 
     #[tokio::test]
@@ -740,7 +993,11 @@ mod tests {
         let s = svc();
         s.state.lock().await.procs.insert(
             "ckill".into(),
-            Proc { is_sandbox: false, status: 2, ..Default::default() },
+            Proc {
+                is_sandbox: false,
+                status: 2,
+                ..Default::default()
+            },
         );
         let mut req = api::KillRequest::new();
         req.set_id("ckill".into());

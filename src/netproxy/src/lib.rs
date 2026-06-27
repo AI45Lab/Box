@@ -19,7 +19,7 @@ use std::os::fd::{FromRawFd, IntoRawFd, RawFd};
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 use std::time::Duration;
@@ -55,6 +55,44 @@ const GATEWAY_MAC: EthernetAddress = EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x
 const MAX_FRAME: usize = 1514;
 /// Ephemeral port range start for outbound TCP connections from the gateway.
 const EPHEMERAL_BASE: u16 = 49152;
+/// How often the proxy refreshes its stats file.
+const STATS_WRITE_INTERVAL: Duration = Duration::from_secs(1);
+
+#[derive(Default)]
+struct NetStats {
+    rx_bytes: AtomicU64,
+    tx_bytes: AtomicU64,
+    rx_packets: AtomicU64,
+    tx_packets: AtomicU64,
+}
+
+struct NetStatsSnapshot {
+    rx_bytes: u64,
+    tx_bytes: u64,
+    rx_packets: u64,
+    tx_packets: u64,
+}
+
+impl NetStats {
+    fn record_rx(&self, bytes: usize) {
+        self.rx_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.rx_packets.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_tx(&self, bytes: usize) {
+        self.tx_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.tx_packets.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> NetStatsSnapshot {
+        NetStatsSnapshot {
+            rx_bytes: self.rx_bytes.load(Ordering::Relaxed),
+            tx_bytes: self.tx_bytes.load(Ordering::Relaxed),
+            rx_packets: self.rx_packets.load(Ordering::Relaxed),
+            tx_packets: self.tx_packets.load(Ordering::Relaxed),
+        }
+    }
+}
 
 // ── smoltcp phy::Device ───────────────────────────────────────────────────────
 
@@ -71,6 +109,7 @@ const EPHEMERAL_BASE: u16 = 49152;
 struct UnixgramDevice {
     socket: UnixDatagram,
     rx_queue: VecDeque<Vec<u8>>,
+    stats: Arc<NetStats>,
 }
 
 impl UnixgramDevice {
@@ -84,6 +123,7 @@ impl UnixgramDevice {
                         bytes = n,
                         "NetProxy received ethernet frame from guest/libkrun"
                     );
+                    self.stats.record_tx(n);
                     self.rx_queue.push_back(buf[..n].to_vec())
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -114,6 +154,7 @@ impl smoltcp::phy::RxToken for OwnedRxToken {
 /// an explicit destination address.
 struct TxToken {
     socket: UnixDatagram,
+    stats: Arc<NetStats>,
 }
 
 impl smoltcp::phy::TxToken for TxToken {
@@ -129,6 +170,8 @@ impl smoltcp::phy::TxToken for TxToken {
         );
         if let Err(e) = self.socket.send(&buf) {
             tracing::warn!(error = %e, len, "NetProxy: send to libkrun failed");
+        } else {
+            self.stats.record_rx(len);
         }
         result
     }
@@ -148,6 +191,7 @@ impl smoltcp::phy::Device for UnixgramDevice {
         let frame = self.rx_queue.pop_front()?;
         let tx = TxToken {
             socket: self.socket.try_clone().ok()?,
+            stats: Arc::clone(&self.stats),
         };
         Some((OwnedRxToken(frame), tx))
     }
@@ -155,6 +199,7 @@ impl smoltcp::phy::Device for UnixgramDevice {
     fn transmit(&mut self, _ts: Instant) -> Option<Self::TxToken<'_>> {
         Some(TxToken {
             socket: self.socket.try_clone().ok()?,
+            stats: Arc::clone(&self.stats),
         })
     }
 
@@ -190,6 +235,9 @@ struct ProxyEngine {
     port_forwards: Vec<PortForward>,
     next_ephemeral: u16,
     shutdown: Arc<AtomicBool>,
+    stats: Arc<NetStats>,
+    stats_path: Option<PathBuf>,
+    last_stats_write: std::time::Instant,
 }
 
 impl ProxyEngine {
@@ -200,10 +248,13 @@ impl ProxyEngine {
         dns_servers: Vec<Ipv4Addr>,
         port_forwards: Vec<PortForward>,
         shutdown: Arc<AtomicBool>,
+        stats: Arc<NetStats>,
+        stats_path: Option<PathBuf>,
     ) -> Self {
         let mut device = UnixgramDevice {
             socket,
             rx_queue: VecDeque::new(),
+            stats: Arc::clone(&stats),
         };
 
         // Configure smoltcp interface as the gateway.
@@ -232,10 +283,14 @@ impl ProxyEngine {
             port_forwards,
             next_ephemeral: EPHEMERAL_BASE,
             shutdown,
+            stats,
+            stats_path,
+            last_stats_write: std::time::Instant::now(),
         }
     }
 
     fn run(&mut self) {
+        self.write_stats_snapshot();
         loop {
             if self.shutdown.load(Ordering::Relaxed) {
                 break;
@@ -264,12 +319,33 @@ impl ProxyEngine {
             // 7. Remove closed connections and release their smoltcp sockets.
             self.cleanup();
 
-            // 8. Sleep until the next smoltcp event or at most 5 ms.
+            // 8. Publish resource counters for `a3s-box stats`.
+            self.maybe_write_stats_snapshot();
+
+            // 9. Sleep until the next smoltcp event or at most 5 ms.
             let delay = self
                 .iface
                 .poll_delay(now, &self.sockets)
                 .unwrap_or(smoltcp::time::Duration::from_millis(1));
             std::thread::sleep(Duration::from_micros(delay.micros().min(5_000)));
+        }
+        self.write_stats_snapshot();
+    }
+
+    fn maybe_write_stats_snapshot(&mut self) {
+        if self.last_stats_write.elapsed() < STATS_WRITE_INTERVAL {
+            return;
+        }
+        self.last_stats_write = std::time::Instant::now();
+        self.write_stats_snapshot();
+    }
+
+    fn write_stats_snapshot(&self) {
+        let Some(path) = self.stats_path.as_deref() else {
+            return;
+        };
+        if let Err(e) = write_stats_file(path, self.stats.snapshot()) {
+            tracing::debug!(error = %e, path = %path.display(), "NetProxy: failed to write stats file");
         }
     }
 
@@ -472,6 +548,7 @@ impl ProxyEngine {
 /// Drop calls `stop()` automatically.
 pub struct NetProxyManager {
     socket_path: PathBuf,
+    stats_path: PathBuf,
     net_socket_fd: Option<RawFd>,
     net_proxy_fd: Option<RawFd>,
 }
@@ -480,8 +557,10 @@ impl NetProxyManager {
     /// Create a new manager. Socket will be placed at
     /// `~/.a3s/boxes/<box_id>/sockets/net.sock`.
     pub fn new(box_dir: &Path) -> Self {
+        let socket_dir = box_dir.join("sockets");
         Self {
-            socket_path: box_dir.join("sockets").join("net.sock"),
+            socket_path: socket_dir.join("net.sock"),
+            stats_path: socket_dir.join("net.stats.json"),
             net_socket_fd: None,
             net_proxy_fd: None,
         }
@@ -489,6 +568,10 @@ impl NetProxyManager {
 
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
+    }
+
+    pub fn stats_path(&self) -> &Path {
+        &self.stats_path
     }
 
     pub fn net_socket_fd(&self) -> Option<RawFd> {
@@ -529,6 +612,7 @@ impl NetProxyManager {
             }
         }
         std::fs::remove_file(&self.socket_path).ok();
+        std::fs::remove_file(&self.stats_path).ok();
     }
 
     pub fn is_running(&mut self) -> bool {
@@ -551,17 +635,19 @@ pub fn spawn_inherited_netproxy(
     prefix_len: u8,
     dns_servers: &[Ipv4Addr],
     port_map: &[String],
+    stats_path: Option<PathBuf>,
 ) -> Result<()> {
     let socket = unsafe { UnixDatagram::from_raw_fd(fd) };
     let port_forwards = parse_port_forwards(port_map, guest_ip)
         .map_err(|e| BoxError::NetworkError(format!("invalid port_map: {}", e)))?;
     let dns_servers = dns_servers.to_vec();
     let shutdown = Arc::new(AtomicBool::new(false));
+    let stats = Arc::new(NetStats::default());
 
     std::thread::Builder::new()
         .name("a3s-netproxy".to_string())
         .spawn(move || {
-            tracing::info!(fd, gateway = %gateway, guest_ip = %guest_ip, "NetProxy thread started");
+            tracing::info!(fd, gateway = %gateway, guest_ip = %guest_ip, stats = ?stats_path, "NetProxy thread started");
             if let Err(e) = socket.set_nonblocking(true) {
                 tracing::error!(error = %e, "NetProxy: set_nonblocking failed");
                 return;
@@ -574,6 +660,8 @@ pub fn spawn_inherited_netproxy(
                 dns_servers,
                 port_forwards,
                 shutdown,
+                stats,
+                stats_path,
             );
             engine.run();
             tracing::info!("NetProxy thread exiting");
@@ -595,6 +683,23 @@ fn socketpair_unixgram() -> Result<(UnixDatagram, RawFd)> {
 
     let proxy_socket = unsafe { UnixDatagram::from_raw_fd(fds[0]) };
     Ok((proxy_socket, fds[1]))
+}
+
+fn write_stats_file(path: &Path, stats: NetStatsSnapshot) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let updated_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let body = format!(
+        "{{\"schema\":\"a3s-box.netproxy.stats.v1\",\"rx_bytes\":{},\"tx_bytes\":{},\"rx_packets\":{},\"tx_packets\":{},\"updated_at_ms\":{}}}\n",
+        stats.rx_bytes, stats.tx_bytes, stats.rx_packets, stats.tx_packets, updated_at_ms
+    );
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(tmp, path)
 }
 
 /// Parse `["8088:80", "443:443"]` into `Vec<PortForward>`.
@@ -724,6 +829,10 @@ mod tests {
             mgr.socket_path(),
             dir.path().join("sockets").join("net.sock")
         );
+        assert_eq!(
+            mgr.stats_path(),
+            dir.path().join("sockets").join("net.stats.json")
+        );
         assert_eq!(mgr.net_socket_fd(), None);
     }
 
@@ -753,6 +862,31 @@ mod tests {
             // Drop triggers cleanup
         }
         assert!(!socket_path.exists());
+    }
+
+    #[test]
+    fn test_write_stats_file_writes_json_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sockets").join("net.stats.json");
+
+        write_stats_file(
+            &path,
+            NetStatsSnapshot {
+                rx_bytes: 1024,
+                tx_bytes: 2048,
+                rx_packets: 3,
+                tx_packets: 4,
+            },
+        )
+        .unwrap();
+
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(json["schema"], "a3s-box.netproxy.stats.v1");
+        assert_eq!(json["rx_bytes"], 1024);
+        assert_eq!(json["tx_bytes"], 2048);
+        assert_eq!(json["rx_packets"], 3);
+        assert_eq!(json["tx_packets"], 4);
     }
 
     #[test]

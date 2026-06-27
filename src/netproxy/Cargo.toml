@@ -26,4 +26,5 @@ smoltcp = { version = "0.11", default-features = false, features = [
 ] }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 tempfile = { workspace = true }

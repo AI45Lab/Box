@@ -16,8 +16,8 @@ pub struct PsArgs {
     #[arg(short, long)]
     pub quiet: bool,
 
-    /// Format output using placeholders: {{.ID}}, {{.Image}}, {{.Status}},
-    /// {{.Created}}, {{.Names}}, {{.Ports}}, {{.Command}}
+    /// Format output as `json` or using placeholders: {{.ID}}, {{.Image}},
+    /// {{.Status}}, {{.Created}}, {{.Names}}, {{.Ports}}, {{.Command}}
     #[arg(long)]
     pub format: Option<String>,
 
@@ -44,8 +44,13 @@ pub async fn execute(args: PsArgs) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // --format: custom template output
+    // --format: json or custom template output
     if let Some(ref fmt) = args.format {
+        if fmt.trim().eq_ignore_ascii_case("json") {
+            print_json(&boxes)?;
+            return Ok(());
+        }
+
         for record in &boxes {
             println!("{}", apply_format(record, fmt));
         }
@@ -70,6 +75,38 @@ pub async fn execute(args: PsArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     println!("{table}");
     Ok(())
+}
+
+fn print_json(records: &[&BoxRecord]) -> Result<(), serde_json::Error> {
+    let rows = records
+        .iter()
+        .map(|record| ps_json(record))
+        .collect::<Vec<_>>();
+    println!("{}", serde_json::to_string(&rows)?);
+    Ok(())
+}
+
+fn ps_json(record: &BoxRecord) -> serde_json::Value {
+    let status = status::format_status(record);
+    let ports = record.port_map.join(", ");
+    serde_json::json!({
+        "id": &record.id,
+        "short_id": &record.short_id,
+        "name": &record.name,
+        "names": &record.name,
+        "image": &record.image,
+        "status": status,
+        "raw_status": &record.status,
+        "created": output::format_ago(&record.created_at),
+        "created_at": record.created_at.to_rfc3339(),
+        "started_at": record.started_at.as_ref().map(|ts| ts.to_rfc3339()),
+        "ports": &record.port_map,
+        "ports_text": ports,
+        "command": record.cmd.join(" "),
+        "labels": &record.labels,
+        "health": &record.health_status,
+        "pid": record.pid,
+    })
 }
 
 /// Check if a box record matches all the given filters.
@@ -335,6 +372,45 @@ mod tests {
         let record = make_record("box1", "running", HashMap::new());
         let result = apply_format(&record, "{{.Labels}}");
         assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_ps_json_record() {
+        let mut labels = HashMap::new();
+        labels.insert("env".to_string(), "prod".to_string());
+        let mut record = make_record("box1", "running", labels);
+        record.pid = Some(4242);
+        record.port_map = vec!["8080:80".to_string()];
+        record.cmd = vec!["sleep".to_string(), "3600".to_string()];
+        record.started_at = Some(record.created_at);
+        record.health_check = Some(crate::state::HealthCheck {
+            cmd: vec!["true".to_string()],
+            interval_secs: 30,
+            timeout_secs: 5,
+            retries: 3,
+            start_period_secs: 0,
+        });
+        record.health_status = "healthy".to_string();
+
+        let value = ps_json(&record);
+
+        assert_eq!(value["id"], "test-id-box1");
+        assert_eq!(value["name"], "box1");
+        assert_eq!(value["names"], "box1");
+        assert_eq!(value["status"], "running (healthy)");
+        assert_eq!(value["raw_status"], "running");
+        assert_eq!(value["ports"][0], "8080:80");
+        assert_eq!(value["ports_text"], "8080:80");
+        assert_eq!(value["command"], "sleep 3600");
+        assert_eq!(value["labels"]["env"], "prod");
+        assert_eq!(value["health"], "healthy");
+        assert_eq!(value["pid"], 4242);
+        assert!(value["created_at"]
+            .as_str()
+            .is_some_and(|s| s.contains('T')));
+        assert!(value["started_at"]
+            .as_str()
+            .is_some_and(|s| s.contains('T')));
     }
 
     // --- existing filter tests ---

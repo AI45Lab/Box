@@ -39,18 +39,31 @@ pub fn parse_spec(spec: &Value) -> ParsedSpec {
         .and_then(|v| v.as_u64())
         .map(|b| (b / (1024 * 1024)).max(1));
     let cpus = match (
-        spec.pointer("/linux/resources/cpu/quota").and_then(|v| v.as_i64()),
-        spec.pointer("/linux/resources/cpu/period").and_then(|v| v.as_u64()),
+        spec.pointer("/linux/resources/cpu/quota")
+            .and_then(|v| v.as_i64()),
+        spec.pointer("/linux/resources/cpu/period")
+            .and_then(|v| v.as_u64()),
     ) {
         (Some(q), Some(p)) if q > 0 && p > 0 => Some(((q as f64 / p as f64).ceil()) as u32),
         _ => None,
     };
-    ParsedSpec { is_sandbox, image, args, env, cpus, memory_mb }
+    ParsedSpec {
+        is_sandbox,
+        image,
+        args,
+        env,
+        cpus,
+        memory_mb,
+    }
 }
 
 fn string_array(v: Option<&Value>) -> Vec<String> {
     v.and_then(|a| a.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -63,12 +76,12 @@ pub fn run_args(
     env: &[String],
     cmd: &[String],
 ) -> Vec<String> {
-    let mut v = vec![
-        "run".to_string(),
-        "-d".to_string(),
-        "--name".to_string(),
-        id.to_string(),
-    ];
+    // Foreground `run` (no -d). This is launched as the main process of a transient
+    // systemd unit (see service.rs): foreground run blocks until the box exits, so
+    // the unit stays active for the container's whole life. A detached `run -d`
+    // would exit right after boot, the unit would deactivate, and that exit gets
+    // reported as the container exiting — tearing the task down seconds after start.
+    let mut v = vec!["run".to_string(), "--name".to_string(), id.to_string()];
     if let Some(c) = cpus {
         v.push("--cpus".to_string());
         v.push(c.to_string());
@@ -118,21 +131,6 @@ pub fn is_running(inspect_stdout: &str) -> bool {
 /// boxes.json regardless of the (often empty) env containerd gives the shim.
 pub fn a3s_home() -> String {
     std::env::var("A3S_HOME").unwrap_or_else(|_| "/var/lib/a3s-box".to_string())
-}
-
-/// Numeric box status -> name (mirrors the protobuf Status enum we report).
-pub fn status_name(s: i32) -> &'static str {
-    match s {
-        1 => "created",
-        2 => "running",
-        3 => "stopped",
-        _ => "unknown",
-    }
-}
-
-/// Parse an exit code printed by `a3s-box wait` (its stdout is the integer code).
-pub fn parse_wait_exit_code(stdout: &str) -> u32 {
-    stdout.trim().parse::<i32>().unwrap_or(0) as u32
 }
 
 #[cfg(test)]
@@ -199,7 +197,7 @@ mod tests {
     fn run_args_minimal() {
         assert_eq!(
             run_args("box1", "alpine", None, None, &[], &[]),
-            vec!["run", "-d", "--name", "box1", "alpine"]
+            vec!["run", "--name", "box1", "alpine"]
         );
     }
 
@@ -216,8 +214,20 @@ mod tests {
         assert_eq!(
             v,
             vec![
-                "run", "-d", "--name", "box1", "--cpus", "2", "--memory", "256m", "-e", "A=1",
-                "redis:7", "--", "redis-server", "--port", "0"
+                "run",
+                "--name",
+                "box1",
+                "--cpus",
+                "2",
+                "--memory",
+                "256m",
+                "-e",
+                "A=1",
+                "redis:7",
+                "--",
+                "redis-server",
+                "--port",
+                "0"
             ]
         );
     }
@@ -245,23 +255,6 @@ mod tests {
         assert!(is_running(r#"{"status":"running","pid":1}"#));
         assert!(!is_running(r#"{"status": "created"}"#));
         assert!(!is_running(""));
-    }
-
-    #[test]
-    fn status_name_maps() {
-        assert_eq!(status_name(1), "created");
-        assert_eq!(status_name(2), "running");
-        assert_eq!(status_name(3), "stopped");
-        assert_eq!(status_name(0), "unknown");
-        assert_eq!(status_name(99), "unknown");
-    }
-
-    #[test]
-    fn parse_wait_exit_code_handles_garbage() {
-        assert_eq!(parse_wait_exit_code("0\n"), 0);
-        assert_eq!(parse_wait_exit_code("  137 "), 137);
-        assert_eq!(parse_wait_exit_code("notanumber"), 0);
-        assert_eq!(parse_wait_exit_code(""), 0);
     }
 
     #[test]
