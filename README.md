@@ -378,7 +378,7 @@ and `/dev/kvm`.
 
 ```bash
 # one-liner (downloads the pinned release artifacts from GitHub):
-curl -fsSL https://raw.githubusercontent.com/AI45Lab/Box/release/2.6.0/deploy/scripts/install-runtimeclass.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/AI45Lab/Box/main/deploy/scripts/install-runtimeclass.sh | sudo bash
 
 # or from a checkout:
 sudo deploy/scripts/install-runtimeclass.sh                  # default version
