@@ -4,6 +4,26 @@ All notable changes to A3S Box will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Programmable-CI pipeline: parallel fan-out + typed JSON report (`a3s-box-sdk`).**
+  `Base::run_parallel(steps, max_concurrency)` runs steps concurrently as isolated
+  copy-on-write MicroVM forks (bounded, collect-all, results in input order) and returns a
+  `Report` with a dependency-free `to_json()`. `StepResult` now carries separated
+  `stdout`/`stderr`, `duration_ms`, and `metrics` parsed from `::metric <key>=<value>`
+  guest-stdout lines (a machine-readable scoring channel for matrix/selection workloads).
+  Steps run via `&self` (atomic fork counter), so fan-out no longer needs hand-rolled
+  threads. The base auto-removes its snapshot on `Drop` (`--force`), and each fork is
+  removed on every path (including panic). Box/snapshot names now carry per-process +
+  per-instance entropy, so concurrent pipelines from the same image+setup can no longer
+  collide and tear down each other's boxes. Validated end-to-end on a real `/dev/kvm` host.
+
+### Changed
+
+- **`StepResult.logs` is replaced by separated `stdout` / `stderr` fields**
+  (use `StepResult::combined()` for the old concatenated view). Breaking for
+  direct `.logs` field access on the `a3s-box-sdk` pipeline API.
+
 ## [2.6.0] — 2026-06-26
 
 ### Added

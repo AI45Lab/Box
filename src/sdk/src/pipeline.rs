@@ -10,8 +10,14 @@
 //! Model: warm a base box once (clone + install deps), `snapshot` it, then fork
 //! the snapshot per step. With a3s-box's copy-on-write restore (overlay lower)
 //! each fork shares the snapshot's pristine rootfs read-only and writes to its
-//! own upper — near-instant, space-cheap, isolated. The DAG is your code:
-//! sequence with plain calls, fan out with threads. No YAML, no engine.
+//! own upper — near-instant, space-cheap, isolated. Steps are *independent*
+//! forks of the same base, so they run sequentially with [`Base::step`]
+//! (fail-fast) or concurrently with [`Base::run_parallel`] (collect-all), which
+//! returns a typed, JSON-serializable [`Report`]. The base auto-disposes its
+//! snapshot on drop; per-step boxes are removed on every path (incl. panic).
+//!
+//! A step reports metrics by printing `::metric <key>=<number>` lines to stdout;
+//! they surface as [`StepResult::metrics`] for scoring (e.g. an evolution loop).
 //!
 //! Set `A3S_BOX` to the CLI path if `a3s-box` is not on `PATH`.
 //!
@@ -20,22 +26,57 @@
 //!
 //! # fn main() -> Result<(), a3s_box_sdk::pipeline::PipelineError> {
 //! let cache = FileCache::new(".ci-cache")?;
-//! let mut base = warm_base(
+//! let base = warm_base(
 //!     WarmBase::new("node:20", "git clone $REPO /w && cd /w && npm ci")
 //!         .env("REPO", "https://github.com/me/app")
 //!         .cache(&cache),
 //! )?;
-//! base.step(Step::new("lint", "cd /w && npm run lint"))?;
-//! base.step(Step::new("test", "cd /w && npm test"))?; // nonzero exit -> Err (fail-fast)
-//! base.step(Step::new("build", "cd /w && npm run build"))?;
-//! base.dispose();
-//! # Ok(()) }
+//! // Fan out in parallel (each step is an isolated CoW fork of the base),
+//! // bounded to 4 at a time; collect a typed report.
+//! let report = base.run_parallel(
+//!     vec![
+//!         Step::new("lint", "cd /w && npm run lint"),
+//!         Step::new("test", "cd /w && npm test"),
+//!         Step::new("build", "cd /w && npm run build"),
+//!     ],
+//!     4,
+//! );
+//! println!("{}", report.to_json()); // {"passed":true,"total_ms":...,"steps":[...]}
+//! assert!(report.passed);
+//! # Ok(()) } // base drops here -> snapshot auto-removed
 //! ```
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Mutex;
+use std::time::Instant;
+
+/// Default per-step cap on captured stdout/stderr — bounds in-memory [`Report`]
+/// size when fanning hundreds of forks out. Override via [`WarmBase::max_output`].
+const DEFAULT_MAX_OUTPUT: usize = 1 << 20; // 1 MiB
+
+/// `exec_step` returns this exit code when the step never ran because of an
+/// *infrastructure* failure (restore/start/exec), distinct from any real exit
+/// code (a host process killed by a signal surfaces as -1, a guest `exit -1` as
+/// 255), so a scorer can tell "never ran" from "ran and failed".
+pub const INFRA_FAILURE: i32 = i32::MIN;
+
+/// Per-process instance seed. Folding it (plus the pid) into box/snapshot NAMES
+/// gives two Bases from the same image+setup — or two processes on one host —
+/// DISJOINT names. The CLI enforces name uniqueness, and a shared name would let
+/// one Base's cleanup tear down another's live box (cross-talk → false CI).
+static INSTANCE_SEQ: AtomicU32 = AtomicU32::new(0);
+
+fn instance_token() -> String {
+    format!(
+        "{}-{}",
+        std::process::id(),
+        INSTANCE_SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
 
 fn box_bin() -> String {
     std::env::var("A3S_BOX").unwrap_or_else(|_| "a3s-box".to_string())
@@ -109,6 +150,15 @@ fn box_cleanup(args: &[&str]) {
     let _ = Command::new(box_bin()).args(args).output();
 }
 
+/// RAII: removes a per-step box on every exit path (normal return, `?`, panic),
+/// so a step that fails after `start`/before exec never leaks a box.
+struct BoxGuard(String);
+impl Drop for BoxGuard {
+    fn drop(&mut self) {
+        box_cleanup(&["rm", "-f", &self.0]);
+    }
+}
+
 /// Content-addressed cache key: FNV-1a over NUL-delimited parts (stable, dep-free).
 fn key(parts: &[&str]) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -145,6 +195,69 @@ fn slug(s: &str) -> String {
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .take(40)
         .collect()
+}
+
+/// Truncate output to `cap` bytes on a UTF-8 boundary, appending a marker, so one
+/// chatty/looping step can't balloon an in-memory [`Report`] during large fan-out.
+fn cap_output(mut s: String, cap: usize) -> String {
+    if s.len() <= cap {
+        return s;
+    }
+    let mut end = cap;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let dropped = s.len() - end;
+    s.truncate(end);
+    s.push_str(&format!("\n[..truncated {dropped} bytes]"));
+    s
+}
+
+/// Parse `::metric <key>=<number>` lines from a step's stdout into a metric map.
+/// Non-numeric and non-finite (NaN/inf) values are ignored; this is the scoring
+/// channel for callers (e.g. an evolution loop that selects on `perf_ms`/`tests`).
+fn parse_metrics(stdout: &str) -> BTreeMap<String, f64> {
+    let mut m = BTreeMap::new();
+    for line in stdout.lines() {
+        if let Some(rest) = line.trim().strip_prefix("::metric ") {
+            if let Some((k, v)) = rest.split_once('=') {
+                if let Ok(val) = v.trim().parse::<f64>() {
+                    if val.is_finite() {
+                        m.insert(k.trim().to_string(), val);
+                    }
+                }
+            }
+        }
+    }
+    m
+}
+
+/// Minimal, correct JSON string encoder (dep-free): quotes + escapes.
+fn json_str(s: &str) -> String {
+    let mut o = String::with_capacity(s.len() + 2);
+    o.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            '\r' => o.push_str("\\r"),
+            '\t' => o.push_str("\\t"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o.push('"');
+    o
+}
+
+/// A finite JSON number, or `null` for NaN/±inf (which are not valid JSON).
+fn json_num(v: f64) -> String {
+    if v.is_finite() {
+        format!("{v}")
+    } else {
+        "null".to_string()
+    }
 }
 
 /// Poll `exec <box> -- true` until the box is ready (box has no "wait-ready" verb).
@@ -205,6 +318,7 @@ pub struct WarmBase<'a> {
     setup: String,
     env: BTreeMap<String, String>,
     cache: Option<&'a FileCache>,
+    max_output: usize,
 }
 
 impl<'a> WarmBase<'a> {
@@ -214,6 +328,7 @@ impl<'a> WarmBase<'a> {
             setup: setup.into(),
             env: BTreeMap::new(),
             cache: None,
+            max_output: DEFAULT_MAX_OUTPUT,
         }
     }
     pub fn env(mut self, k: impl Into<String>, v: impl Into<String>) -> Self {
@@ -222,6 +337,11 @@ impl<'a> WarmBase<'a> {
     }
     pub fn cache(mut self, cache: &'a FileCache) -> Self {
         self.cache = Some(cache);
+        self
+    }
+    /// Cap captured stdout/stderr per step (default 1 MiB) to bound report memory.
+    pub fn max_output(mut self, bytes: usize) -> Self {
+        self.max_output = bytes;
         self
     }
 }
@@ -261,46 +381,128 @@ impl Step {
     }
 }
 
-/// Outcome of a step.
+/// Outcome of a step. `stdout`/`stderr` are separated (and capped, see
+/// [`WarmBase::max_output`]); `metrics` are parsed from `::metric k=v` stdout
+/// lines; `duration_ms` is the command's wall-clock time. An infrastructure
+/// failure surfaces as `exit_code == `[`INFRA_FAILURE`].
 #[derive(Debug, Clone)]
 pub struct StepResult {
     pub name: String,
     pub exit_code: i32,
-    pub logs: String,
+    pub stdout: String,
+    pub stderr: String,
     pub cached: bool,
+    pub allow_failure: bool,
+    pub duration_ms: u128,
+    pub metrics: BTreeMap<String, f64>,
 }
 
-/// A warmed, forkable base — a snapshot plus an optional step cache.
+impl StepResult {
+    /// A passing step: exit 0, or a non-zero step that opted into `allow_failure`.
+    pub fn ok(&self) -> bool {
+        self.exit_code == 0 || self.allow_failure
+    }
+    /// stdout followed by stderr (the legacy combined log view).
+    pub fn combined(&self) -> String {
+        let mut s = self.stdout.clone();
+        s.push_str(&self.stderr);
+        s
+    }
+    /// Serialize to a JSON object (dep-free).
+    pub fn to_json(&self) -> String {
+        let mut metrics = String::from("{");
+        for (i, (k, v)) in self.metrics.iter().enumerate() {
+            if i > 0 {
+                metrics.push(',');
+            }
+            metrics.push_str(&json_str(k));
+            metrics.push(':');
+            metrics.push_str(&json_num(*v));
+        }
+        metrics.push('}');
+        format!(
+            "{{\"name\":{},\"exit_code\":{},\"cached\":{},\"allow_failure\":{},\"duration_ms\":{},\"metrics\":{},\"stdout\":{},\"stderr\":{}}}",
+            json_str(&self.name),
+            self.exit_code,
+            self.cached,
+            self.allow_failure,
+            self.duration_ms,
+            metrics,
+            json_str(&self.stdout),
+            json_str(&self.stderr),
+        )
+    }
+}
+
+/// Aggregate outcome of a [`Base::run_parallel`] batch: per-step results in input
+/// order, total wall-clock, and a `passed` gate (all steps [`StepResult::ok`]).
+#[derive(Debug, Clone)]
+pub struct Report {
+    pub steps: Vec<StepResult>,
+    pub total_ms: u128,
+    pub passed: bool,
+}
+
+impl Report {
+    /// The steps that did not pass (non-zero exit without `allow_failure`).
+    pub fn failures(&self) -> Vec<&StepResult> {
+        self.steps.iter().filter(|r| !r.ok()).collect()
+    }
+    /// Serialize the whole report to a JSON object (dep-free) for an agent/scorer.
+    pub fn to_json(&self) -> String {
+        let steps: Vec<String> = self.steps.iter().map(|s| s.to_json()).collect();
+        format!(
+            "{{\"passed\":{},\"total_ms\":{},\"steps\":[{}]}}",
+            self.passed,
+            self.total_ms,
+            steps.join(",")
+        )
+    }
+}
+
+/// A warmed, forkable base — a snapshot plus an optional step cache. Methods take
+/// `&self` (the fork counter is atomic), so steps can run concurrently across
+/// threads. The snapshot is removed on drop (or eagerly via [`Base::dispose`]).
 pub struct Base<'a> {
     snapshot_name: String,
     snapshot_id: String,
     cache: Option<&'a FileCache>,
-    n: u32,
+    max_output: usize,
+    n: AtomicU32,
+    disposed: AtomicBool,
 }
 
 impl Base<'_> {
-    /// Run one step in its own kernel forked from the warmed base. A non-zero exit
-    /// returns `Err(StepFailed)` (fail-fast) unless `Step::allow_failure` was set.
-    pub fn step(&mut self, step: Step) -> Result<StepResult> {
+    /// Fork the base, run one step in its own kernel, return its [`StepResult`].
+    /// `Err` only on an infrastructure failure (restore/start/exec); a non-zero
+    /// *step* exit is returned as a `StepResult` (caller decides what it means).
+    fn exec_step(&self, step: &Step) -> Result<StepResult> {
         let mut parts: Vec<&str> = vec![&step.name, &step.cmd];
         parts.extend(step.inputs.iter().map(|s| s.as_str()));
         let k = key(&parts);
         if let Some(c) = self.cache {
             if c.has(&k) {
                 return Ok(StepResult {
-                    name: step.name,
+                    name: step.name.clone(),
                     exit_code: 0,
-                    logs: String::new(),
+                    stdout: String::new(),
+                    stderr: String::new(),
                     cached: true,
+                    allow_failure: step.allow_failure,
+                    duration_ms: 0,
+                    metrics: BTreeMap::new(),
                 });
             }
         }
 
-        self.n += 1;
-        let box_name = format!("{}-job{}-{}", self.snapshot_name, self.n, slug(&step.name));
-        box_cleanup(&["rm", "-f", &box_name]); // idempotent: clear a crashed prior run
+        // Names are globally unique (snapshot_name carries pid+instance entropy,
+        // `i` is per-fork), so no cross-process pre-clean is needed; the guard
+        // removes the fork on every exit path.
+        let i = self.n.fetch_add(1, Ordering::Relaxed) + 1;
+        let box_name = format!("{}-job{}-{}", self.snapshot_name, i, slug(&step.name));
+        let _guard = BoxGuard(box_name.clone());
 
-        // Fork = restore + start. Since a3s-box's CoW restore, this mounts the
+        // Fork = restore + start. Thanks to a3s-box's CoW restore, this mounts the
         // snapshot's rootfs as a read-only overlay lower with a fresh per-box upper.
         box_run(&[
             "snapshot",
@@ -313,38 +515,123 @@ impl Base<'_> {
         wait_ready(&box_name)?;
 
         let full = with_env(&step.cmd, &step.env);
+        let t = Instant::now();
         let out = Command::new(box_bin())
             .args(["exec", &box_name, "--", "sh", "-c", &full])
             .output()?;
-        box_cleanup(&["rm", "-f", &box_name]);
+        let duration_ms = t.elapsed().as_millis();
 
         let code = out.status.code().unwrap_or(-1);
-        let mut logs = String::from_utf8_lossy(&out.stdout).into_owned();
-        logs.push_str(&String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        let metrics = parse_metrics(&stdout); // parse BEFORE truncating
 
         if code == 0 {
             if let Some(c) = self.cache {
                 c.put(&k);
             }
         }
-        if code != 0 && !step.allow_failure {
-            return Err(PipelineError::StepFailed {
-                name: step.name,
-                code,
-                logs,
-            });
-        }
         Ok(StepResult {
-            name: step.name,
+            name: step.name.clone(),
             exit_code: code,
-            logs,
+            stdout: cap_output(stdout, self.max_output),
+            stderr: cap_output(stderr, self.max_output),
             cached: false,
+            allow_failure: step.allow_failure,
+            duration_ms,
+            metrics,
         })
     }
 
-    /// Remove the snapshot (by ID — `snapshot rm` does not accept names).
+    /// Run one step, **fail-fast**: a non-zero exit returns `Err(StepFailed)`
+    /// unless `Step::allow_failure` was set. Use for a sequential pipeline.
+    pub fn step(&self, step: Step) -> Result<StepResult> {
+        let r = self.exec_step(&step)?;
+        if r.exit_code != 0 && !step.allow_failure {
+            return Err(PipelineError::StepFailed {
+                name: r.name.clone(),
+                code: r.exit_code,
+                logs: r.combined(),
+            });
+        }
+        Ok(r)
+    }
+
+    /// Run one step for a batch: **never** propagates — an infra failure becomes a
+    /// `StepResult{ exit_code: `[`INFRA_FAILURE`]`, stderr: <error> }` so one bad
+    /// fork can't abort the batch.
+    fn run_one(&self, step: Step) -> StepResult {
+        match self.exec_step(&step) {
+            Ok(r) => r,
+            Err(e) => StepResult {
+                name: step.name.clone(),
+                exit_code: INFRA_FAILURE,
+                stdout: String::new(),
+                stderr: e.to_string(),
+                cached: false,
+                allow_failure: step.allow_failure,
+                duration_ms: 0,
+                metrics: BTreeMap::new(),
+            },
+        }
+    }
+
+    /// Fan steps out concurrently — each is an isolated CoW fork of the base —
+    /// bounded to `max_concurrency` at a time. **Collect-all** (not fail-fast):
+    /// every step runs and is returned in input order. This is the primitive that
+    /// makes a3s-box's cheap fork (~ms) usable for matrix / evolution-scale CI.
+    /// Do not call [`Base::dispose`] while a `run_parallel` is in flight.
+    pub fn run_parallel(&self, steps: Vec<Step>, max_concurrency: usize) -> Report {
+        let start = Instant::now();
+        let n = steps.len();
+        if n == 0 {
+            return Report {
+                steps: Vec::new(),
+                total_ms: 0,
+                passed: true,
+            };
+        }
+        let conc = max_concurrency.max(1).min(n);
+        let queue: Mutex<VecDeque<(usize, Step)>> =
+            Mutex::new(steps.into_iter().enumerate().collect());
+        let results: Mutex<Vec<(usize, StepResult)>> = Mutex::new(Vec::with_capacity(n));
+
+        std::thread::scope(|s| {
+            for _ in 0..conc {
+                s.spawn(|| loop {
+                    let next = { queue.lock().unwrap().pop_front() };
+                    let Some((idx, step)) = next else { break };
+                    let r = self.run_one(step);
+                    results.lock().unwrap().push((idx, r));
+                });
+            }
+        });
+
+        let mut v = results.into_inner().unwrap();
+        v.sort_by_key(|(i, _)| *i);
+        let steps: Vec<StepResult> = v.into_iter().map(|(_, r)| r).collect();
+        let passed = steps.iter().all(|r| r.ok());
+        Report {
+            steps,
+            total_ms: start.elapsed().as_millis(),
+            passed,
+        }
+    }
+
+    /// Eagerly remove the snapshot (by ID, `--force` since forks are CoW lowers).
+    /// Idempotent with the `Drop` impl, so calling it early is safe.
     pub fn dispose(&self) {
-        box_cleanup(&["snapshot", "rm", &self.snapshot_id]);
+        if !self.disposed.swap(true, Ordering::SeqCst) {
+            box_cleanup(&["snapshot", "rm", "--force", &self.snapshot_id]);
+        }
+    }
+}
+
+impl Drop for Base<'_> {
+    fn drop(&mut self) {
+        if !self.disposed.swap(true, Ordering::SeqCst) {
+            box_cleanup(&["snapshot", "rm", "--force", &self.snapshot_id]);
+        }
     }
 }
 
@@ -374,13 +661,14 @@ fn parse_snapshot_id(ls_output: &str, name: &str) -> Option<String> {
 
 /// Warm a base box: run `setup` once, snapshot the result, return a forkable [`Base`].
 pub fn warm_base(spec: WarmBase<'_>) -> Result<Base<'_>> {
-    let base_box = format!("ci-base-{}", key(&[&spec.image, &spec.setup]));
+    // pid+instance entropy: two warms of the same spec get disjoint names, so they
+    // can't tear down each other's box/snapshot. Hence no shared-name pre-clean.
+    let base_box = format!(
+        "ci-base-{}-{}",
+        key(&[&spec.image, &spec.setup]),
+        instance_token()
+    );
     let snap = format!("{base_box}-snap");
-
-    box_cleanup(&["rm", "-f", &base_box]); // idempotent rerun
-    if let Ok(old) = snapshot_id(&snap) {
-        box_cleanup(&["snapshot", "rm", &old]);
-    }
 
     box_run(&[
         "run",
@@ -400,12 +688,21 @@ pub fn warm_base(spec: WarmBase<'_>) -> Result<Base<'_>> {
         snapshot_id(&snap)
     })();
     box_cleanup(&["rm", "-f", &base_box]);
+    // If `snapshot create` succeeded but ID resolution failed, no Base is built,
+    // so Drop never fires — best-effort remove the orphan snapshot.
+    if prepared.is_err() {
+        if let Ok(id) = snapshot_id(&snap) {
+            box_cleanup(&["snapshot", "rm", "--force", &id]);
+        }
+    }
 
     Ok(Base {
         snapshot_name: snap,
         snapshot_id: prepared?,
         cache: spec.cache,
-        n: 0,
+        max_output: spec.max_output,
+        n: AtomicU32::new(0),
+        disposed: AtomicBool::new(false),
     })
 }
 
@@ -422,6 +719,11 @@ mod tests {
     }
 
     #[test]
+    fn instance_token_is_unique_per_call() {
+        assert_ne!(instance_token(), instance_token());
+    }
+
+    #[test]
     fn with_env_escapes_and_prefixes() {
         let mut e = BTreeMap::new();
         assert_eq!(with_env("run", &e), "run");
@@ -435,6 +737,86 @@ mod tests {
     #[test]
     fn slug_sanitizes() {
         assert_eq!(slug("a/b c"), "a-b-c");
+    }
+
+    #[test]
+    fn cap_output_truncates_on_char_boundary() {
+        assert_eq!(cap_output("hello".into(), 10), "hello"); // under cap: untouched
+        let capped = cap_output("a".repeat(100), 10);
+        assert!(capped.starts_with("aaaaaaaaaa"));
+        assert!(capped.contains("[..truncated 90 bytes]"));
+        // a multi-byte char ("é" = 2 bytes) must not be split mid-codepoint.
+        let c = cap_output("é".repeat(10), 5); // floors to a 4-byte boundary
+        assert!(std::str::from_utf8(c.as_bytes()).is_ok());
+        assert!(c.contains("truncated"));
+    }
+
+    #[test]
+    fn parse_metrics_extracts_finite_numeric_only() {
+        let m = parse_metrics(
+            "noise\n::metric perf_ms=84.2\n  ::metric tests=412 \n::metric bad=xyz\n\
+             ::metric inf_m=inf\n::metric nan_m=NaN\ntrailing",
+        );
+        assert_eq!(m.get("perf_ms"), Some(&84.2));
+        assert_eq!(m.get("tests"), Some(&412.0));
+        assert!(!m.contains_key("bad")); // non-numeric ignored
+        assert!(!m.contains_key("inf_m")); // non-finite ignored
+        assert!(!m.contains_key("nan_m"));
+        assert_eq!(m.len(), 2);
+    }
+
+    #[test]
+    fn json_str_escapes_quotes_backslash_control() {
+        assert_eq!(json_str("a\"b\\c\n"), "\"a\\\"b\\\\c\\n\"");
+        assert_eq!(json_str("\u{0001}"), "\"\\u0001\"");
+        assert_eq!(json_num(1.5), "1.5");
+        assert_eq!(json_num(f64::NAN), "null");
+    }
+
+    #[test]
+    fn report_and_step_json_shape() {
+        let mut metrics = BTreeMap::new();
+        metrics.insert("k".to_string(), 2.0);
+        let rep = Report {
+            passed: false,
+            total_ms: 5,
+            steps: vec![StepResult {
+                name: "t".into(),
+                exit_code: 1,
+                stdout: "o".into(),
+                stderr: "e\"x".into(),
+                cached: false,
+                allow_failure: false,
+                duration_ms: 3,
+                metrics,
+            }],
+        };
+        let j = rep.to_json();
+        assert!(j.contains("\"passed\":false"));
+        assert!(j.contains("\"total_ms\":5"));
+        assert!(j.contains("\"name\":\"t\""));
+        assert!(j.contains("\"exit_code\":1"));
+        assert!(j.contains("\"metrics\":{\"k\":2}"));
+        assert!(j.contains("\"stderr\":\"e\\\"x\"")); // escaped quote in stderr
+        assert_eq!(rep.failures().len(), 1);
+    }
+
+    #[test]
+    fn step_result_ok_respects_allow_failure() {
+        let mk = |code: i32, allow: bool| StepResult {
+            name: "s".into(),
+            exit_code: code,
+            stdout: String::new(),
+            stderr: String::new(),
+            cached: false,
+            allow_failure: allow,
+            duration_ms: 0,
+            metrics: BTreeMap::new(),
+        };
+        assert!(mk(0, false).ok());
+        assert!(!mk(1, false).ok());
+        assert!(mk(1, true).ok()); // allowed failure still "ok" for the gate
+        assert!(!mk(INFRA_FAILURE, false).ok());
     }
 
     #[test]
@@ -505,21 +887,26 @@ mod tests {
     }
 
     // A POSIX-sh stub standing in for `a3s-box`: enough to drive warm_base + step
-    // through their happy paths (run/exec/start/rm succeed, `snapshot create`
-    // records name->id in a state file that `snapshot ls` echoes, an exec whose
-    // command contains "boom" exits 7). Lets us cover the orchestration locally,
-    // without a real box or KVM.
+    // through their happy paths (run/exec/start/rm succeed; `snapshot create`
+    // records name->id in a state file that `snapshot ls` echoes; an exec whose
+    // command contains "boom" exits 7, "emitmetric" prints a `::metric` line;
+    // a `snapshot restore` whose target name contains "infrafail" exits 1).
     #[cfg(unix)]
     const FAKE_BOX: &str = r#"#!/bin/sh
 state="$(dirname "$0")/.snaps"
 case "$1" in
   run|start|rm) exit 0 ;;
   exec) last=""; for a in "$@"; do last="$a"; done
-        case "$last" in *boom*) exit 7 ;; *) exit 0 ;; esac ;;
+        case "$last" in
+          *emitmetric*) printf '::metric score=9\n'; exit 0 ;;
+          *boom*) exit 7 ;;
+          *) exit 0 ;;
+        esac ;;
   snapshot)
     case "$2" in
       create) name=""; while [ "$#" -gt 0 ]; do [ "$1" = "--name" ] && name="$2"; shift; done
               printf '%s %s\n' "snap-fake1" "$name" >> "$state"; printf 'snap-fake1\n'; exit 0 ;;
+      restore) for a in "$@"; do case "$a" in *infrafail*) exit 1 ;; esac; done; exit 0 ;;
       ls) printf 'ID NAME SRC\n'; cat "$state" 2>/dev/null; exit 0 ;;
       *) exit 0 ;;
     esac ;;
@@ -543,7 +930,7 @@ esac
         // Happy path against the stub.
         std::env::set_var("A3S_BOX", &fake);
         let cache = FileCache::new(dir.join("cache")).unwrap();
-        let mut base = warm_base(WarmBase::new("img", "echo hi").cache(&cache)).expect("warm_base");
+        let base = warm_base(WarmBase::new("img", "echo hi").cache(&cache)).expect("warm_base");
         let r = base.step(Step::new("build", "make")).expect("step");
         assert_eq!(r.exit_code, 0);
         assert!(!r.cached);
@@ -552,23 +939,63 @@ esac
             base.step(Step::new("fail", "boom")),
             Err(PipelineError::StepFailed { code: 7, .. })
         ));
-        // box_run surfaces a non-zero exit as Cli (the stub exits 7 on a "boom" exec).
-        assert!(matches!(
-            box_run(&["exec", "x", "--", "boom"]),
-            Err(PipelineError::Cli { code: Some(7), .. })
-        ));
         // allow_failure: a non-zero step returns Ok with the code instead of Err.
         let allowed = base
             .step(Step::new("maybe", "boom").allow_failure())
             .expect("allow_failure step");
         assert_eq!(allowed.exit_code, 7);
-        assert!(!allowed.cached);
-        // A second warm_base exercises the stale-snapshot pre-clean path.
-        let _ = warm_base(WarmBase::new("img", "echo hi").cache(&cache)).expect("warm_base #2");
+
+        // run_parallel: collect-all, input order preserved, metrics parsed, gate derived.
+        let rep = base.run_parallel(
+            vec![
+                Step::new("a", "make"),
+                Step::new("b", "boom"),       // exits 7 -> not ok
+                Step::new("m", "emitmetric"), // prints ::metric score=9
+            ],
+            2,
+        );
+        assert_eq!(rep.steps.len(), 3);
+        assert_eq!(rep.steps[0].name, "a"); // order preserved despite concurrency
+        assert_eq!(rep.steps[1].exit_code, 7);
+        assert_eq!(rep.steps[2].metrics.get("score"), Some(&9.0));
+        assert!(!rep.passed);
+        assert_eq!(rep.failures().len(), 1);
+        assert!(rep.to_json().contains("\"score\":9"));
+
+        // an allowed-failure step must NOT fail the batch gate.
+        let rep2 = base.run_parallel(
+            vec![
+                Step::new("ok", "make"),
+                Step::new("soft", "boom").allow_failure(),
+            ],
+            2,
+        );
+        assert!(rep2.passed, "allow_failure step must not fail the batch");
+
+        // an infra failure (restore refuses) surfaces as INFRA_FAILURE, not a panic.
+        let rep3 = base.run_parallel(vec![Step::new("infrafail", "make")], 1);
+        assert_eq!(rep3.steps[0].exit_code, INFRA_FAILURE);
+        assert!(!rep3.steps[0].stderr.is_empty());
+        assert!(!rep3.passed);
+
+        // empty batch is trivially passed.
+        assert!(base.run_parallel(Vec::new(), 4).passed);
+
+        // Two Bases from the SAME spec must get disjoint names (no cross-talk).
+        let b1 = warm_base(WarmBase::new("u", "echo").cache(&cache)).expect("b1");
+        let b2 = warm_base(WarmBase::new("u", "echo").cache(&cache)).expect("b2");
+        assert_ne!(
+            b1.snapshot_name, b2.snapshot_name,
+            "same spec must yield disjoint snapshot names"
+        );
+        b1.dispose();
+        b2.dispose();
+
         base.dispose();
+        base.dispose(); // idempotent: second dispose + Drop must not double-remove
 
         // A cache-less base exercises the no-cache branch in step().
-        let mut nocache = warm_base(WarmBase::new("img", "echo hi")).expect("warm_base nocache");
+        let nocache = warm_base(WarmBase::new("img", "echo hi")).expect("warm_base nocache");
         assert!(
             !nocache
                 .step(Step::new("x", "make"))
@@ -598,7 +1025,10 @@ esac
         // Exercise every builder method (fields are private; chaining covers the bodies).
         let c = FileCache::new(std::env::temp_dir().join(format!("a3s-ci-bld-{}", key(&["bld"]))))
             .unwrap();
-        let _ = WarmBase::new("img", "setup").env("A", "1").cache(&c);
+        let _ = WarmBase::new("img", "setup")
+            .env("A", "1")
+            .cache(&c)
+            .max_output(4096);
         let _ = Step::new("n", "cmd")
             .input("x")
             .env("K", "V")

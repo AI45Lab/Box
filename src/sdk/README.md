@@ -11,28 +11,48 @@ state). Set `A3S_BOX` if `a3s-box` is not on `PATH`.
 
 ## Pipelines
 
-Warm a base box **once** (clone + install deps), snapshot it, fork per step:
+Warm a base box **once** (clone + install deps), snapshot it, fork per step.
+Run steps **sequentially** (fail-fast) or **in parallel** (collect-all → a typed
+report):
 
 ```rust
 use a3s_box_sdk::pipeline::{warm_base, WarmBase, FileCache, Step};
 
 fn main() -> Result<(), a3s_box_sdk::pipeline::PipelineError> {
     let cache = FileCache::new(".ci-cache")?;          // skip a step when its inputs are unchanged
-    let mut base = warm_base(
+    let base = warm_base(
         WarmBase::new("node:20", "git clone $REPO /w && cd /w && npm ci")   // runs ONCE
             .env("REPO", "https://github.com/me/app")
             .cache(&cache),
     )?;
+
+    // Sequential, fail-fast: a non-zero exit returns Err.
     base.step(Step::new("lint", "cd /w && npm run lint"))?;
-    base.step(Step::new("test", "cd /w && npm test"))?;   // nonzero exit -> Err (fail-fast)
-    base.step(Step::new("build", "cd /w && npm run build"))?;
-    base.dispose();                                       // drops the snapshot
-    Ok(())
+
+    // Parallel, collect-all: each step is an isolated CoW fork; <=4 at a time.
+    let report = base.run_parallel(vec![
+        Step::new("test",  "cd /w && npm test"),
+        Step::new("build", "cd /w && npm run build"),
+    ], 4);
+
+    println!("{}", report.to_json());   // {"passed":..,"total_ms":..,"steps":[..]}
+    if !report.passed { /* inspect report.failures() */ }
+    Ok(())  // `base` drops here -> snapshot auto-removed (or call base.dispose())
 }
 ```
 
-`Step::allow_failure()` keeps the pipeline going on a non-zero exit; `Step::input(..)`
-adds extra cache-key parts. Parallel steps = spawn threads (each `step` is blocking).
+- `run_parallel` is the way to use a3s-box's cheap (~ms) CoW fork at scale — a
+  matrix / evolution-style batch — without hand-rolling threads (every method
+  takes `&self`).
+- A step reports a metric by printing `::metric <key>=<number>` to stdout; it
+  surfaces as `StepResult::metrics` (the scoring channel for a selection loop).
+- `StepResult` carries separated `stdout`/`stderr`, `duration_ms`, and `cached`;
+  `Report::to_json()` is the machine-readable handoff to an agent/scorer.
+- `Step::allow_failure()` keeps a non-zero step from failing the run; `Step::input(..)`
+  adds extra cache-key parts.
+
+The base **auto-disposes** its snapshot on drop, and each per-step box is removed
+on every path (including a panic), so a long-running batch doesn't leak.
 
 ## Why forking is cheap
 
