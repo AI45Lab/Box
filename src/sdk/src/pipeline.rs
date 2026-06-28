@@ -52,11 +52,17 @@ use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Default per-step cap on captured stdout/stderr — bounds in-memory [`Report`]
 /// size when fanning hundreds of forks out. Override via [`WarmBase::max_output`].
 const DEFAULT_MAX_OUTPUT: usize = 1 << 20; // 1 MiB
+
+/// Default number of times to retry a fork that hits an *infrastructure* failure
+/// (restore/start/boot/exec-spawn). The step's command never ran, so re-forking is
+/// safe and idempotent; this absorbs the transient boot hiccups that surface under
+/// sustained, highly-concurrent churn. Override via [`WarmBase::infra_retries`].
+const DEFAULT_INFRA_RETRIES: usize = 2;
 
 /// `exec_step` returns this exit code when the step never ran because of an
 /// *infrastructure* failure (restore/start/exec), distinct from any real exit
@@ -319,6 +325,7 @@ pub struct WarmBase<'a> {
     env: BTreeMap<String, String>,
     cache: Option<&'a FileCache>,
     max_output: usize,
+    infra_retries: usize,
 }
 
 impl<'a> WarmBase<'a> {
@@ -329,6 +336,7 @@ impl<'a> WarmBase<'a> {
             env: BTreeMap::new(),
             cache: None,
             max_output: DEFAULT_MAX_OUTPUT,
+            infra_retries: DEFAULT_INFRA_RETRIES,
         }
     }
     pub fn env(mut self, k: impl Into<String>, v: impl Into<String>) -> Self {
@@ -342,6 +350,12 @@ impl<'a> WarmBase<'a> {
     /// Cap captured stdout/stderr per step (default 1 MiB) to bound report memory.
     pub fn max_output(mut self, bytes: usize) -> Self {
         self.max_output = bytes;
+        self
+    }
+    /// Retries for a fork that hits an infrastructure failure (default 2). The
+    /// step's command never ran on such a failure, so re-forking is idempotent.
+    pub fn infra_retries(mut self, n: usize) -> Self {
+        self.infra_retries = n;
         self
     }
 }
@@ -468,6 +482,7 @@ pub struct Base<'a> {
     snapshot_id: String,
     cache: Option<&'a FileCache>,
     max_output: usize,
+    infra_retries: usize,
     n: AtomicU32,
     disposed: AtomicBool,
 }
@@ -543,10 +558,29 @@ impl Base<'_> {
         })
     }
 
+    /// `exec_step` with bounded retry on *infrastructure* failure (the step's
+    /// command never ran, so re-forking is idempotent). A non-zero step exit is
+    /// returned as `Ok` and never retried — only a failed fork is.
+    fn exec_step_retrying(&self, step: &Step) -> Result<StepResult> {
+        let mut last: Option<PipelineError> = None;
+        for attempt in 0..=self.infra_retries {
+            match self.exec_step(step) {
+                Ok(r) => return Ok(r),
+                Err(e) => {
+                    last = Some(e);
+                    if attempt < self.infra_retries {
+                        std::thread::sleep(Duration::from_millis(150 * (attempt as u64 + 1)));
+                    }
+                }
+            }
+        }
+        Err(last.expect("loop runs at least once"))
+    }
+
     /// Run one step, **fail-fast**: a non-zero exit returns `Err(StepFailed)`
     /// unless `Step::allow_failure` was set. Use for a sequential pipeline.
     pub fn step(&self, step: Step) -> Result<StepResult> {
-        let r = self.exec_step(&step)?;
+        let r = self.exec_step_retrying(&step)?;
         if r.exit_code != 0 && !step.allow_failure {
             return Err(PipelineError::StepFailed {
                 name: r.name.clone(),
@@ -561,7 +595,7 @@ impl Base<'_> {
     /// `StepResult{ exit_code: `[`INFRA_FAILURE`]`, stderr: <error> }` so one bad
     /// fork can't abort the batch.
     fn run_one(&self, step: Step) -> StepResult {
-        match self.exec_step(&step) {
+        match self.exec_step_retrying(&step) {
             Ok(r) => r,
             Err(e) => StepResult {
                 name: step.name.clone(),
@@ -701,9 +735,73 @@ pub fn warm_base(spec: WarmBase<'_>) -> Result<Base<'_>> {
         snapshot_id: prepared?,
         cache: spec.cache,
         max_output: spec.max_output,
+        infra_retries: spec.infra_retries,
         n: AtomicU32::new(0),
         disposed: AtomicBool::new(false),
     })
+}
+
+/// The owner pid embedded in a `ci-base-<key>-<pid>-<seq>...` resource name.
+fn parse_owner_pid(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix("ci-base-")?;
+    let mut it = rest.split('-');
+    it.next()?; // key hash
+    it.next()?.parse().ok()
+}
+
+/// `Some(true/false)` where pid-liveness is knowable (Linux `/proc`); `None`
+/// otherwise — so a sweep never reclaims resources whose owner it can't confirm dead.
+fn pid_alive(pid: u32) -> Option<bool> {
+    if !std::path::Path::new("/proc").is_dir() {
+        return None;
+    }
+    Some(std::path::Path::new(&format!("/proc/{pid}")).exists())
+}
+
+/// If `name` is a ci-base resource owned by a confirmed-DEAD pid other than `me`,
+/// return that pid (it is an orphan safe to reclaim).
+fn orphan_pid(name: &str, me: u32) -> Option<u32> {
+    let pid = parse_owner_pid(name)?;
+    if pid == me {
+        return None; // ours — never sweep a live self
+    }
+    match pid_alive(pid) {
+        Some(false) => Some(pid), // confirmed dead
+        _ => None,                // alive or unknowable — leave it
+    }
+}
+
+/// Reclaim `ci-base-*` boxes and snapshots leaked by a **crashed** pipeline
+/// process. `Drop`/guards clean up graceful exits, but `SIGKILL`/OOM/power-loss
+/// skip them; resource names embed the owner pid, so a resource whose pid is no
+/// longer alive (and isn't this process) is removed. Returns the names reclaimed.
+/// Safe to call concurrently with live pipelines: it only touches dead-pid orphans.
+pub fn sweep_orphans() -> Vec<String> {
+    let me = std::process::id();
+    let mut removed = Vec::new();
+
+    if let Ok(out) = box_run(&["ps", "-a", "--format", "{{.Names}}"]) {
+        for name in String::from_utf8_lossy(&out.stdout).lines() {
+            let name = name.trim();
+            if orphan_pid(name, me).is_some() {
+                box_cleanup(&["rm", "-f", name]);
+                removed.push(name.to_string());
+            }
+        }
+    }
+    if let Ok(out) = box_run(&["snapshot", "ls"]) {
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            let mut cols = line.split_whitespace();
+            if let (Some(id), Some(name)) = (cols.next(), cols.next()) {
+                if orphan_pid(name, me).is_some() {
+                    box_cleanup(&["snapshot", "rm", "--force", id]);
+                    removed.push(name.to_string());
+                }
+            }
+        }
+    }
+    removed
 }
 
 #[cfg(test)]
@@ -867,6 +965,31 @@ mod tests {
     }
 
     #[test]
+    fn parse_owner_pid_and_orphan_detection() {
+        assert_eq!(parse_owner_pid("ci-base-deadbeef-4242-0-snap"), Some(4242));
+        assert_eq!(
+            parse_owner_pid("ci-base-deadbeef-4242-7-snap-job3-make"),
+            Some(4242)
+        );
+        assert_eq!(parse_owner_pid("other-box"), None);
+        assert_eq!(parse_owner_pid("ci-base-onlykey"), None);
+        // this process's own resources are never orphans, regardless of liveness.
+        let me = std::process::id();
+        let mine = format!("ci-base-deadbeef-{me}-0-snap");
+        assert_eq!(orphan_pid(&mine, me), None);
+        // a confirmed-dead pid is an orphan — but only where liveness is knowable
+        // (Linux /proc); on hosts where it isn't, sweep must leave it untouched.
+        if pid_alive(4_000_000_000).is_some() {
+            assert_eq!(
+                orphan_pid("ci-base-deadbeef-4000000000-0-snap", me),
+                Some(4_000_000_000)
+            );
+        } else {
+            assert_eq!(orphan_pid("ci-base-deadbeef-4000000000-0-snap", me), None);
+        }
+    }
+
+    #[test]
     fn ci_error_display_covers_each_variant() {
         let io = PipelineError::from(std::io::Error::other("boom"));
         assert!(format!("{io}").contains("boom"));
@@ -906,7 +1029,14 @@ case "$1" in
     case "$2" in
       create) name=""; while [ "$#" -gt 0 ]; do [ "$1" = "--name" ] && name="$2"; shift; done
               printf '%s %s\n' "snap-fake1" "$name" >> "$state"; printf 'snap-fake1\n'; exit 0 ;;
-      restore) for a in "$@"; do case "$a" in *infrafail*) exit 1 ;; esac; done; exit 0 ;;
+      restore)
+        for a in "$@"; do
+          case "$a" in
+            *infrafail*) exit 1 ;;
+            *flaky*) c="$(dirname "$0")/.flaky"; n=$(cat "$c" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$c"; [ "$n" -le 2 ] && exit 1 || exit 0 ;;
+          esac
+        done
+        exit 0 ;;
       ls) printf 'ID NAME SRC\n'; cat "$state" 2>/dev/null; exit 0 ;;
       *) exit 0 ;;
     esac ;;
@@ -972,11 +1102,22 @@ esac
         );
         assert!(rep2.passed, "allow_failure step must not fail the batch");
 
-        // an infra failure (restore refuses) surfaces as INFRA_FAILURE, not a panic.
+        // an infra failure (restore refuses) surfaces as INFRA_FAILURE, not a panic
+        // (it is retried infra_retries times first, then gives up).
         let rep3 = base.run_parallel(vec![Step::new("infrafail", "make")], 1);
         assert_eq!(rep3.steps[0].exit_code, INFRA_FAILURE);
         assert!(!rep3.steps[0].stderr.is_empty());
         assert!(!rep3.passed);
+
+        // a TRANSIENT infra failure is retried: "flaky" restore fails twice then
+        // succeeds, so with the default 2 retries (3 attempts) the step recovers.
+        let _ = std::fs::remove_file(dir.join(".flaky"));
+        let okr = base.run_parallel(vec![Step::new("flaky", "make")], 1);
+        assert_eq!(
+            okr.steps[0].exit_code, 0,
+            "transient infra failure should be retried to success"
+        );
+        assert!(okr.passed);
 
         // empty batch is trivially passed.
         assert!(base.run_parallel(Vec::new(), 4).passed);
@@ -1028,7 +1169,8 @@ esac
         let _ = WarmBase::new("img", "setup")
             .env("A", "1")
             .cache(&c)
-            .max_output(4096);
+            .max_output(4096)
+            .infra_retries(1);
         let _ = Step::new("n", "cmd")
             .input("x")
             .env("K", "V")

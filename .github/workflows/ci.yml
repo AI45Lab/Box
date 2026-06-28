@@ -244,3 +244,27 @@ jobs:
           unset A3S_DEPS_STUB
           chmod +x bench/bench.sh
           bench/bench.sh race
+      # SDK programmable-CI pipeline against REAL microVMs: warm + CoW fork-per-step,
+      # parallel collect-all, `::metric` extraction, fork isolation, leak-freeness,
+      # and crash-orphan recovery (sweep_orphans). The unit suite only drives a fake
+      # CLI, so this is the only gate that the real fork/snapshot path actually works.
+      - name: SDK pipeline integration — real fork-per-step + sweep
+        env:
+          A3S_BOX: ${{ github.workspace }}/src/target/release/a3s-box
+          A3S_SDK_TEST_IMAGE: ${{ vars.KVM_CI_AGENT_IMAGE || 'docker.m.daocloud.io/library/alpine:latest' }}
+        run: |
+          unset A3S_DEPS_STUB
+          cd src
+          cargo test --release -p a3s-box-sdk --test integration_kvm -- --ignored --nocapture --test-threads=1
+      # Soak the fork-eval loop: sustained churn must stay leak-free (no orphan
+      # boxes/snapshots, snapshot count flat) and memory-stable. Light here (120
+      # fork-evals); crank A3S_SDK_SOAK_FORKS for a manual long soak.
+      - name: SDK pipeline soak — leak-free under churn
+        env:
+          A3S_BOX: ${{ github.workspace }}/src/target/release/a3s-box
+          A3S_SDK_TEST_IMAGE: ${{ vars.KVM_CI_AGENT_IMAGE || 'docker.m.daocloud.io/library/alpine:latest' }}
+          A3S_SDK_SOAK_FORKS: "120"
+        run: |
+          unset A3S_DEPS_STUB
+          cd src
+          cargo test --release -p a3s-box-sdk --test soak_kvm -- --ignored --nocapture --test-threads=1

@@ -16,7 +16,18 @@ All notable changes to A3S Box will be documented in this file.
   threads. The base auto-removes its snapshot on `Drop` (`--force`), and each fork is
   removed on every path (including panic). Box/snapshot names now carry per-process +
   per-instance entropy, so concurrent pipelines from the same image+setup can no longer
-  collide and tear down each other's boxes. Validated end-to-end on a real `/dev/kvm` host.
+  collide and tear down each other's boxes. A fork that hits a *transient*
+  infrastructure failure (restore/start/boot) is retried — `WarmBase::infra_retries`,
+  default 2 — since its command never ran, which keeps sustained high-concurrency
+  churn green. Validated end-to-end on a real `/dev/kvm` host.
+- **Crash-orphan recovery + real-VM integration & soak tests.** `sweep_orphans()`
+  reclaims `ci-base-*` boxes/snapshots left behind when a pipeline process is
+  `SIGKILL`ed / OOM-killed (its RAII cleanup never runs), by matching the dead owner
+  pid embedded in the resource name — and it never touches a live peer's resources.
+  Added `#[ignore]`'d real-microVM integration tests (`tests/integration_kvm.rs`:
+  warm + fork-per-step, cache, parallel order/metrics, fork isolation, leak-freeness,
+  sweep) and a soak test (`tests/soak_kvm.rs`: sustained fork-eval churn stays
+  leak-free and RSS-stable), both wired into the KVM CI gate.
 
 ### Changed
 
