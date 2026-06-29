@@ -41,6 +41,21 @@ All notable changes to A3S Box will be documented in this file.
   (use `StepResult::combined()` for the old concatenated view). Breaking for
   direct `.logs` field access on the `a3s-box-sdk` pipeline API.
 
+### Fixed
+
+- **Concurrent same-image pipelines could corrupt each other's rootfs cache.**
+  `RootfsCache::prune` (run after a cache-miss `put`) evicted least-recently-used
+  entries with no in-use guard, so it could `remove_dir_all` a cache entry that
+  another box was simultaneously using as its overlayfs **lowerdir** — the peer's
+  `mount(2)` then failed with `No such file or directory (os error 2)`, and the
+  failure persisted through retries (the backing was gone). Added the same in-use
+  guard `SnapshotStore::prune` already applies to live copy-on-write lowers: each
+  overlay box records the cache key it holds in a `<box_dir>/.rootfs-cache-key`
+  marker (removed with the box dir), and `prune` skips any still-referenced key.
+  Found via a concurrent-pipeline chaos test driven through a3s-code; root-caused
+  and verified on a real `/dev/kvm` host (the concurrency scenario went from ~50%
+  failure to reliably green).
+
 ## [2.6.0] — 2026-06-26
 
 ### Added

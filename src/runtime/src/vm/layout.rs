@@ -156,6 +156,9 @@ impl VmManager {
             let cache_key = RootfsCache::compute_key(reference, &[], &[], &[]);
             if let Some(cached_path) = self.try_rootfs_cache_path(&cache_key)? {
                 let rootfs_path = self.rootfs_provider.prepare(&box_dir, &cached_path)?;
+                // Record that this box holds `cache_key` as its overlay lower, so a
+                // concurrent box's cache prune won't evict it mid-mount (ENOENT).
+                self.mark_rootfs_cache_key(&box_dir, &cache_key);
                 let tee_instance_config = self.generate_tee_config(&box_dir)?;
                 return Ok(BoxLayout {
                     rootfs_path,
@@ -204,6 +207,9 @@ impl VmManager {
                     prom.rootfs_cache_hits.inc();
                 }
                 let rootfs_path = self.rootfs_provider.prepare(&box_dir, &cached_path)?;
+                // Record that this box holds `cache_key` as its overlay lower, so a
+                // concurrent box's cache prune won't evict it mid-mount (ENOENT).
+                self.mark_rootfs_cache_key(&box_dir, &cache_key);
 
                 if let Ok(guest_init_path) = Self::find_guest_init() {
                     tracing::info!(
@@ -377,10 +383,14 @@ impl VmManager {
                     description = %description,
                     "Stored rootfs in cache"
                 );
-                // Prune if needed
-                if let Err(e) = cache.prune(
+                // Prune if needed — but never evict a cache entry that is in use as
+                // a live overlay lower for a concurrent box (deleting the lowerdir
+                // under its mount(2) is the same-image concurrency bug this guards).
+                let protected = self.referenced_rootfs_cache_keys();
+                if let Err(e) = cache.prune_protecting(
                     self.config.cache.max_rootfs_entries,
                     self.config.cache.max_cache_bytes,
+                    &protected,
                 ) {
                     tracing::warn!(error = %e, "Failed to prune rootfs cache");
                 }
@@ -389,6 +399,29 @@ impl VmManager {
                 tracing::warn!(error = %e, "Failed to store rootfs in cache");
             }
         }
+    }
+
+    /// Record which rootfs-cache key this box holds as its overlay lower, in a
+    /// `<box_dir>/.rootfs-cache-key` marker (mirror of the snapshot store's
+    /// `.snapshot-lower`). Read back by [`Self::referenced_rootfs_cache_keys`] so
+    /// the cache prune never evicts a live lower. Best-effort; removed with box_dir.
+    fn mark_rootfs_cache_key(&self, box_dir: &Path, cache_key: &str) {
+        let _ = std::fs::write(box_dir.join(".rootfs-cache-key"), cache_key);
+    }
+
+    /// Rootfs-cache keys currently in use as an overlay lower by some live box.
+    /// Boxes live under `<home>/boxes/<id>/`; a removed box's marker is gone with
+    /// its dir, so an evictable key is simply one no live box references.
+    fn referenced_rootfs_cache_keys(&self) -> std::collections::HashSet<String> {
+        let mut set = std::collections::HashSet::new();
+        if let Ok(entries) = std::fs::read_dir(self.home_dir.join("boxes")) {
+            for entry in entries.flatten() {
+                if let Ok(k) = std::fs::read_to_string(entry.path().join(".rootfs-cache-key")) {
+                    set.insert(k.trim().to_string());
+                }
+            }
+        }
+        set
     }
 
     /// Resolve the cache directory from config or default.

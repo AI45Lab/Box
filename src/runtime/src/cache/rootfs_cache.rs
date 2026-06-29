@@ -190,11 +190,27 @@ impl RootfsCache {
         Ok(())
     }
 
-    /// Prune the cache to stay within the given entry count limit.
+    /// Prune the cache to stay within the given entry count / byte limit.
     ///
-    /// Evicts least-recently-accessed entries first.
-    /// Returns the number of entries evicted.
+    /// Evicts least-recently-accessed entries first. Returns the number evicted.
     pub fn prune(&self, max_entries: usize, max_bytes: u64) -> Result<usize> {
+        self.prune_protecting(max_entries, max_bytes, &std::collections::HashSet::new())
+    }
+
+    /// Like [`RootfsCache::prune`], but never evicts an entry whose key is in
+    /// `protected`. Such an entry is currently serving as a box's overlayfs
+    /// **lowerdir**, and `remove_dir_all`-ing it out from under a concurrent box's
+    /// `mount(2)` makes the mount fail with ENOENT ("No such file or directory").
+    /// This is the same in-use guard [`crate::SnapshotStore::prune`] applies to
+    /// live copy-on-write lowers — without it, two pipelines built from the same
+    /// image (one cache-hit overlay box, one cache-miss box that prunes after its
+    /// put) can race and corrupt each other.
+    pub fn prune_protecting(
+        &self,
+        max_entries: usize,
+        max_bytes: u64,
+        protected: &std::collections::HashSet<String>,
+    ) -> Result<usize> {
         let mut entries = self.list_entries()?;
 
         if entries.len() <= max_entries {
@@ -214,6 +230,11 @@ impl RootfsCache {
         for entry in &entries {
             if current_count <= max_entries && current_size <= max_bytes {
                 break;
+            }
+            // Never evict an entry in use as a live overlay lower — deleting the
+            // lowerdir under a concurrent box's mount(2) is the bug this guards.
+            if protected.contains(&entry.key) {
+                continue;
             }
             self.invalidate(&entry.key)?;
             current_count -= 1;
@@ -493,6 +514,48 @@ mod tests {
         let evicted = cache.prune(10, u64::MAX).unwrap();
         assert_eq!(evicted, 0);
         assert_eq!(cache.entry_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn prune_protecting_never_evicts_in_use_key() {
+        let tmp = TempDir::new().unwrap();
+        let cache = RootfsCache::new(tmp.path()).unwrap();
+        for i in 0..4 {
+            let src = tmp.path().join(format!("s{i}"));
+            create_test_rootfs(&src, &[("f", "x")]);
+            cache.put(&format!("k{i}"), &src, &format!("e{i}")).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // k0 is the OLDEST (normally evicted first) but is in use as an overlay lower.
+        let mut protected = std::collections::HashSet::new();
+        protected.insert("k0".to_string());
+        // keep=2 over 4 entries evicts two; the protected k0 is never one of them.
+        // (last_accessed is second-resolution, so WHICH two unprotected entries go
+        // is not asserted — only that the in-use lower survives.)
+        let evicted = cache.prune_protecting(2, u64::MAX, &protected).unwrap();
+        assert_eq!(evicted, 2, "two unprotected entries evicted to meet keep=2");
+        assert!(
+            cache.get("k0").unwrap().is_some(),
+            "the in-use (protected) lower must survive prune"
+        );
+        assert_eq!(cache.entry_count().unwrap(), 2, "k0 + one unprotected remain");
+    }
+
+    #[test]
+    fn prune_protecting_keeps_all_when_all_in_use() {
+        let tmp = TempDir::new().unwrap();
+        let cache = RootfsCache::new(tmp.path()).unwrap();
+        for i in 0..2 {
+            let src = tmp.path().join(format!("s{i}"));
+            create_test_rootfs(&src, &[("f", "x")]);
+            cache.put(&format!("k{i}"), &src, "e").unwrap();
+        }
+        let protected: std::collections::HashSet<String> =
+            ["k0", "k1"].iter().map(|s| s.to_string()).collect();
+        // Even asked to keep 0, nothing is evicted — every entry is a live lower.
+        let evicted = cache.prune_protecting(0, 0, &protected).unwrap();
+        assert_eq!(evicted, 0, "all in-use -> nothing evicted");
+        assert_eq!(cache.entry_count().unwrap(), 2);
     }
 
     #[test]
