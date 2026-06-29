@@ -538,7 +538,11 @@ mod tests {
             cache.get("k0").unwrap().is_some(),
             "the in-use (protected) lower must survive prune"
         );
-        assert_eq!(cache.entry_count().unwrap(), 2, "k0 + one unprotected remain");
+        assert_eq!(
+            cache.entry_count().unwrap(),
+            2,
+            "k0 + one unprotected remain"
+        );
     }
 
     #[test]
