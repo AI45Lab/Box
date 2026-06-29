@@ -343,6 +343,65 @@ a3s-box unseal dev --context app/key
 
 TEE features include SNP report parsing/verification, RA-TLS certificate extensions, AES-256-GCM sealing with HKDF-SHA256, and RA-TLS secret injection. Treat simulation as a developer workflow only; it does not prove hardware isolation. TDX is not productized.
 
+## Coding-agent skill
+
+`integrations/skills/a3s-box/SKILL.md` is an [Agent Skills](https://agentskills.io)
+`SKILL.md` that teaches an AI coding agent to drive this CLI — the `--` separator,
+the box lifecycle, snapshots, the warm pool, the networking footguns, and an
+errors→fix table for recovery. It is **one file** in the cross-tool Agent Skills
+format, so the same skill works in Claude Code, OpenAI Codex, Gemini CLI, Cursor,
+Sourcegraph Amp, OpenCode, Zed, and a3s-code — no per-agent variant.
+
+### Install
+
+The installer symlinks the single `SKILL.md` into each agent's skills directory
+(one source of truth):
+
+```bash
+cd integrations/skills
+
+./install.sh all                   # this project: .agents + .claude + .codex + .a3s
+./install.sh --home agents claude  # user-wide:    ~/.agents + ~/.claude
+./install.sh --dir ./agent/skills  # any SKILL.md-format skills dir
+./install.sh --copy all            # copy instead of symlink
+```
+
+Two roots reach almost every skill-capable agent; install the targets you use:
+
+| Target | Skills root | Reached by |
+|--------|-------------|------------|
+| `agents`   | `.agents/skills/` | OpenAI Codex · Gemini CLI · Amp · Cursor · OpenCode · Zed |
+| `claude`   | `.claude/skills/` | Claude Code · Claude Agent SDK · Cline · Cursor/OpenCode (compat) |
+| `codex`    | `.codex/skills/`  | Codex (project-specific path) |
+| `a3s-code` | `.a3s/skills/`    | a3s-code |
+| `all`      | all of the above  | |
+
+Manual equivalent (no installer):
+`ln -s "$(pwd)/a3s-box/SKILL.md" <root>/a3s-box/SKILL.md`.
+
+### Use
+
+Reload the agent so it rescans its skills directory. The skill then:
+
+- **surfaces as the `/a3s-box` slash command** (the directory name is the command), and
+- **is auto-invoked** when you ask the agent to run, build, exec into, snapshot, or
+  sandbox something with a3s-box — its `description` is matched against your request.
+
+The agent reads the skill body and drives `a3s-box` for you — e.g. *"build this repo
+and run it in a sandbox"* → `a3s-box build` → `a3s-box run -d` → verify it's up. The
+skill restricts itself to `Bash(a3s-box*)`, so it can only invoke this CLI.
+
+### Agents without a skill mechanism
+
+GitHub Copilot, Windsurf/Devin, Continue.dev, Aider, and Jules/Factory have only
+always-on instruction files (no on-demand skills). To make one aware of a3s-box, add
+a one-line pointer to `integrations/skills/a3s-box/SKILL.md` in that tool's
+instructions file, or in a repo-root **`AGENTS.md`** (which most of them read).
+
+See [`integrations/skills/README.md`](integrations/skills/README.md) for the full
+agent matrix, the no-skill-agent details, and why this is a skill rather than a
+Claude Code plugin.
+
 ## Kubernetes CRI
 
 The CRI server is reachable by standard gRPC clients — `crictl`, the kubelet, and `critest` — over its Unix domain socket, and runs the core pod + container lifecycle and `exec` end to end. It is Linux-only and not yet fully `critest`-conformant.
