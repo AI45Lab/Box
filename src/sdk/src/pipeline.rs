@@ -562,19 +562,7 @@ impl Base<'_> {
     /// command never ran, so re-forking is idempotent). A non-zero step exit is
     /// returned as `Ok` and never retried — only a failed fork is.
     fn exec_step_retrying(&self, step: &Step) -> Result<StepResult> {
-        let mut last: Option<PipelineError> = None;
-        for attempt in 0..=self.infra_retries {
-            match self.exec_step(step) {
-                Ok(r) => return Ok(r),
-                Err(e) => {
-                    last = Some(e);
-                    if attempt < self.infra_retries {
-                        std::thread::sleep(Duration::from_millis(150 * (attempt as u64 + 1)));
-                    }
-                }
-            }
-        }
-        Err(last.expect("loop runs at least once"))
+        retry_infra(self.infra_retries, || self.exec_step(step))
     }
 
     /// Run one step, **fail-fast**: a non-zero exit returns `Err(StepFailed)`
@@ -693,10 +681,36 @@ fn parse_snapshot_id(ls_output: &str, name: &str) -> Option<String> {
     None
 }
 
-/// Warm a base box: run `setup` once, snapshot the result, return a forkable [`Base`].
+/// Retry `f` on an infrastructure failure, with backoff, up to `retries` extra
+/// attempts. Shared by the per-step fork and `warm_base` — both re-run idempotent
+/// work (a fresh box/fork each call), so a transient boot/restore hiccup under
+/// concurrent load is absorbed rather than surfaced.
+fn retry_infra<T>(retries: usize, mut f: impl FnMut() -> Result<T>) -> Result<T> {
+    let mut last: Option<PipelineError> = None;
+    for attempt in 0..=retries {
+        match f() {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                last = Some(e);
+                if attempt < retries {
+                    std::thread::sleep(Duration::from_millis(150 * (attempt as u64 + 1)));
+                }
+            }
+        }
+    }
+    Err(last.expect("loop runs at least once"))
+}
+
+/// Warm a base box: run `setup` once, snapshot the result, return a forkable
+/// [`Base`]. Retried on a transient infrastructure failure (the spec's
+/// `infra_retries` budget) so concurrent same-image warms stay robust under load.
 pub fn warm_base(spec: WarmBase<'_>) -> Result<Base<'_>> {
-    // pid+instance entropy: two warms of the same spec get disjoint names, so they
-    // can't tear down each other's box/snapshot. Hence no shared-name pre-clean.
+    retry_infra(spec.infra_retries, || warm_once(&spec))
+}
+
+/// One warm attempt. Fresh pid+instance-tagged names each call, so a retry can't
+/// collide with its own partial leftovers nor tear down a concurrent peer's box.
+fn warm_once<'a>(spec: &WarmBase<'a>) -> Result<Base<'a>> {
     let base_box = format!(
         "ci-base-{}-{}",
         key(&[&spec.image, &spec.setup]),

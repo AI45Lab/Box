@@ -28,6 +28,12 @@ All notable changes to A3S Box will be documented in this file.
   warm + fork-per-step, cache, parallel order/metrics, fork isolation, leak-freeness,
   sweep) and a soak test (`tests/soak_kvm.rs`: sustained fork-eval churn stays
   leak-free and RSS-stable), both wired into the KVM CI gate.
+- **`a3s-box-ci` runner + `warm_base` retry.** A dependency-free `a3s-box-ci` binary
+  (shipped by the `a3s-box-sdk` crate) bridges any agent/tool to the pipeline: a
+  line-based spec on stdin → a JSON `Report` on stdout (`a3s-box-ci run -`), plus
+  `a3s-box-ci sweep` for crash-orphan recovery. `warm_base` now also retries on a
+  transient infrastructure failure (sharing the step-fork's `retry_infra` budget),
+  so concurrent same-image warms are more robust under load.
 
 ### Changed
 

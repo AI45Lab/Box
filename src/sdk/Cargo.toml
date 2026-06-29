@@ -9,3 +9,9 @@ description = "Rust SDK for a3s-box. Includes a programmable CI/CD pipeline API 
 
 [dependencies]
 # none — a thin, dependency-free wrapper over the `a3s-box` CLI.
+
+# Thin runner that bridges any agent (a3s-code / Claude Code / Codex) to the
+# pipeline API: a line-based spec on stdin -> JSON Report on stdout.
+[[bin]]
+name = "a3s-box-ci"
+path = "src/bin/a3s-box-ci.rs"
