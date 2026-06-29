@@ -4,6 +4,58 @@ All notable changes to A3S Box will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Programmable-CI pipeline: parallel fan-out + typed JSON report (`a3s-box-sdk`).**
+  `Base::run_parallel(steps, max_concurrency)` runs steps concurrently as isolated
+  copy-on-write MicroVM forks (bounded, collect-all, results in input order) and returns a
+  `Report` with a dependency-free `to_json()`. `StepResult` now carries separated
+  `stdout`/`stderr`, `duration_ms`, and `metrics` parsed from `::metric <key>=<value>`
+  guest-stdout lines (a machine-readable scoring channel for matrix/selection workloads).
+  Steps run via `&self` (atomic fork counter), so fan-out no longer needs hand-rolled
+  threads. The base auto-removes its snapshot on `Drop` (`--force`), and each fork is
+  removed on every path (including panic). Box/snapshot names now carry per-process +
+  per-instance entropy, so concurrent pipelines from the same image+setup can no longer
+  collide and tear down each other's boxes. A fork that hits a *transient*
+  infrastructure failure (restore/start/boot) is retried — `WarmBase::infra_retries`,
+  default 2 — since its command never ran, which keeps sustained high-concurrency
+  churn green. Validated end-to-end on a real `/dev/kvm` host.
+- **Crash-orphan recovery + real-VM integration & soak tests.** `sweep_orphans()`
+  reclaims `ci-base-*` boxes/snapshots left behind when a pipeline process is
+  `SIGKILL`ed / OOM-killed (its RAII cleanup never runs), by matching the dead owner
+  pid embedded in the resource name — and it never touches a live peer's resources.
+  Added `#[ignore]`'d real-microVM integration tests (`tests/integration_kvm.rs`:
+  warm + fork-per-step, cache, parallel order/metrics, fork isolation, leak-freeness,
+  sweep) and a soak test (`tests/soak_kvm.rs`: sustained fork-eval churn stays
+  leak-free and RSS-stable), both wired into the KVM CI gate.
+- **`a3s-box-ci` runner + `warm_base` retry.** A dependency-free `a3s-box-ci` binary
+  (shipped by the `a3s-box-sdk` crate) bridges any agent/tool to the pipeline: a
+  line-based spec on stdin → a JSON `Report` on stdout (`a3s-box-ci run -`), plus
+  `a3s-box-ci sweep` for crash-orphan recovery. `warm_base` now also retries on a
+  transient infrastructure failure (sharing the step-fork's `retry_infra` budget),
+  so concurrent same-image warms are more robust under load.
+
+### Changed
+
+- **`StepResult.logs` is replaced by separated `stdout` / `stderr` fields**
+  (use `StepResult::combined()` for the old concatenated view). Breaking for
+  direct `.logs` field access on the `a3s-box-sdk` pipeline API.
+
+### Fixed
+
+- **Concurrent same-image pipelines could corrupt each other's rootfs cache.**
+  `RootfsCache::prune` (run after a cache-miss `put`) evicted least-recently-used
+  entries with no in-use guard, so it could `remove_dir_all` a cache entry that
+  another box was simultaneously using as its overlayfs **lowerdir** — the peer's
+  `mount(2)` then failed with `No such file or directory (os error 2)`, and the
+  failure persisted through retries (the backing was gone). Added the same in-use
+  guard `SnapshotStore::prune` already applies to live copy-on-write lowers: each
+  overlay box records the cache key it holds in a `<box_dir>/.rootfs-cache-key`
+  marker (removed with the box dir), and `prune` skips any still-referenced key.
+  Found via a concurrent-pipeline chaos test driven through a3s-code; root-caused
+  and verified on a real `/dev/kvm` host (the concurrency scenario went from ~50%
+  failure to reliably green).
+
 ## [2.6.0] — 2026-06-26
 
 ### Added

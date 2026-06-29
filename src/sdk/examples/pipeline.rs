@@ -12,25 +12,36 @@ fn main() -> Result<(), a3s_box_sdk::pipeline::PipelineError> {
     let cache = FileCache::new("/tmp/.a3s-ci-demo")?;
 
     // Warm the base once (here: write a marker = "deps installed"), snapshot it.
-    let mut base = warm_base(WarmBase::new(image, "echo DEPS-INSTALLED > /warmed").cache(&cache))?;
+    let base = warm_base(WarmBase::new(image, "echo DEPS-INSTALLED > /warmed").cache(&cache))?;
 
+    // Sequential, fail-fast: a non-zero exit returns Err.
     let r = base.step(Step::new("read", "cat /warmed"))?;
-    println!(
-        "read   -> code={} out={:?} cached={}",
-        r.exit_code,
-        r.logs.trim(),
-        r.cached
-    );
-
+    println!("read   -> code={} out={:?}", r.exit_code, r.stdout.trim());
     let r2 = base.step(Step::new("read", "cat /warmed"))?; // identical -> cache hit
     println!("read#2 -> cached={}", r2.cached);
 
-    match base.step(Step::new("fail", "exit 7")) {
-        Err(e) => println!("fail-fast ok: {e}"),
-        Ok(_) => println!("ERROR: fail step did not error"),
-    }
+    // Parallel matrix, collect-all: each step is an isolated CoW fork of the base.
+    // A step reports a metric by printing `::metric key=value`.
+    let report = base.run_parallel(
+        vec![
+            Step::new("ok", "echo fine"),
+            Step::new("perf", "echo '::metric duration_ms=12.5'"),
+            Step::new("fail", "exit 7"), // collected, not fatal
+        ],
+        4,
+    );
+    println!("report -> {}", report.to_json());
+    println!(
+        "passed={} failures={:?}",
+        report.passed,
+        report
+            .failures()
+            .iter()
+            .map(|s| &s.name)
+            .collect::<Vec<_>>()
+    );
 
-    base.dispose();
+    // base.dispose() is optional — the snapshot is removed when `base` drops.
     println!("demo ok");
     Ok(())
 }
