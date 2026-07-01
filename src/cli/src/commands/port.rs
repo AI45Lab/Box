@@ -21,13 +21,14 @@ pub async fn execute(args: PortArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     for mapping in &record.port_map {
-        // Format: "host_port:guest_port" → "guest_port/tcp -> 0.0.0.0:host_port"
-        if let Some((host_port, guest_port)) = mapping.split_once(':') {
-            println!("{}/tcp -> 0.0.0.0:{}", guest_port, host_port);
-        } else {
-            // Single port: same on both sides
-            println!("{}/tcp -> 0.0.0.0:{}", mapping, mapping);
-        }
+        let mapping = a3s_box_core::parse_port_mapping(mapping)
+            .map_err(|e| format!("Invalid persisted port mapping: {e}"))?;
+        println!(
+            "{}/{} -> 0.0.0.0:{}",
+            mapping.guest_port,
+            mapping.protocol.as_str(),
+            mapping.host_port
+        );
     }
 
     Ok(())

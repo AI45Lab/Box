@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use super::BoxRecord;
-use crate::state::policy::{is_process_alive, should_restart};
+use crate::state::policy::{is_record_pid_live, should_restart};
 
 /// Persistent state file backed by JSON.
 pub struct StateFile {
@@ -11,17 +11,37 @@ pub struct StateFile {
     pub(super) records: Vec<BoxRecord>,
 }
 
+/// In-memory result of a reconcile pass: which records changed, and which dead
+/// boxes need host-resource teardown. The teardown + persistence run in
+/// [`StateFile::flush_reconcile`] under the state lock — never from the bare
+/// (possibly unlocked) read path.
+struct ReconcileOutcome {
+    changed: bool,
+    stopped: Vec<BoxRecord>,
+    removed: Vec<BoxRecord>,
+    #[allow(dead_code)]
+    restart_candidates: Vec<String>,
+}
+
 impl StateFile {
     /// Load state from disk. Creates an empty state if the file doesn't exist.
     pub fn load(path: &Path) -> Result<Self, std::io::Error> {
         if path.exists() {
             let data = std::fs::read_to_string(path)?;
-            let records: Vec<BoxRecord> = serde_json::from_str(&data).unwrap_or_default();
+            let records = Self::parse_or_quarantine(path, &data);
             let mut sf = Self {
                 path: path.to_path_buf(),
                 records,
             };
-            sf.reconcile();
+            // Reconcile in memory so the caller sees accurate live/dead status.
+            let outcome = sf.reconcile();
+            // Persist the change + run teardown under the state lock. Writing /
+            // tearing-down directly from this (often unlocked) read path was a
+            // lost-update + double-teardown race; flush_reconcile re-loads fresh
+            // under the lock so a concurrent run/monitor write is never clobbered.
+            if outcome.changed {
+                let _ = Self::flush_reconcile(path);
+            }
             Ok(sf)
         } else {
             // Ensure parent directory exists
@@ -41,19 +61,184 @@ impl StateFile {
         Self::load(&home.join("boxes.json"))
     }
 
-    /// Save state to disk atomically (write to .tmp, then rename).
+    /// Load the default state WITHOUT the reconcile sweep (PID-liveness checks +
+    /// cleanup over every record). The append hot path (box registration) only adds
+    /// a record, so reconciling every *other* box under the global lock is pure
+    /// overhead — and under a high-concurrency fork burst it makes registration
+    /// O(N²) serialized syscalls. Reconcile still runs on every `list`/status load
+    /// and in the monitor, so liveness/exit-code/restart handling is not lost.
+    fn load_default_raw() -> Result<Self, std::io::Error> {
+        let home = a3s_box_core::dirs_home();
+        let path = home.join("boxes.json");
+        if path.exists() {
+            let data = std::fs::read_to_string(&path)?;
+            let records = Self::parse_or_quarantine(&path, &data);
+            Ok(Self { path, records })
+        } else {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            Ok(Self {
+                path,
+                records: Vec::new(),
+            })
+        }
+    }
+
+    /// Parse box records from an existing state file's contents.
+    ///
+    /// On a parse failure the corrupt file is NOT silently discarded. Discarding
+    /// it would let the next `write_to_disk` overwrite `boxes.json` with `[]`,
+    /// orphaning every running VM/overlay with no error and no recoverable
+    /// record. Instead the corrupt file is quarantined to a timestamped sibling
+    /// (`boxes.json.corrupt-<unix-secs>`) and a loud warning is emitted, so the
+    /// data is preserved for recovery (restore it, then `a3s-box ps` re-reconciles;
+    /// otherwise repair manually) while the process starts from a clean empty
+    /// state rather than crashing.
+    fn parse_or_quarantine(path: &Path, data: &str) -> Vec<BoxRecord> {
+        match serde_json::from_str::<Vec<BoxRecord>>(data) {
+            Ok(records) => records,
+            Err(err) => {
+                let preserved = Self::quarantine_corrupt_file(path)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "<backup failed>".to_string());
+                eprintln!(
+                    "a3s-box: WARNING: state file {} is corrupt ({err}); preserved a \
+                     copy at {preserved} and started from empty state. Running boxes are \
+                     no longer tracked — their records are in the preserved copy; repair \
+                     and restore it, then `a3s-box ps` re-reconciles. Otherwise remove any \
+                     leaked VMs/overlays manually.",
+                    path.display(),
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    /// Move a corrupt state file aside to a timestamped sibling so it is not
+    /// overwritten by the next save. Falls back to a copy if rename fails
+    /// (e.g. cross-device). Returns the backup path on success.
+    fn quarantine_corrupt_file(path: &Path) -> Option<PathBuf> {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let backup = path.with_extension(format!("json.corrupt-{secs}"));
+        if std::fs::rename(path, &backup).is_ok() {
+            return Some(backup);
+        }
+        match std::fs::copy(path, &backup) {
+            Ok(_) => Some(backup),
+            Err(_) => None,
+        }
+    }
+
+    /// Load the default state **read-only**: no reconcile sweep, no PID-liveness
+    /// cleanup, no write-back, and — unlike [`load_default_raw`] — **no
+    /// quarantine** of a corrupt file. For consumers that only need a snapshot
+    /// of the records (e.g. metrics scraping) and must not cause side effects.
+    ///
+    /// `load_default_raw` quarantines a corrupt `boxes.json` by renaming it,
+    /// which mutates the filesystem and bypasses the cross-process state lock —
+    /// wrong for a lock-free, per-scrape reader. Here a corrupt file is surfaced
+    /// as an `Err` (no quarantine — a real writer does that under the lock) so the
+    /// caller can distinguish it from an empty/absent file: swallowing the parse
+    /// error to an empty snapshot made `/metrics` report a falsely-healthy
+    /// all-zeros result for a truncated state file instead of an error.
+    pub(crate) fn load_readonly() -> Result<Self, std::io::Error> {
+        let home = a3s_box_core::dirs_home();
+        Self::load_readonly_from(home.join("boxes.json"))
+    }
+
+    /// Inner [`load_readonly`] over an explicit path (testable).
+    pub(crate) fn load_readonly_from(path: PathBuf) -> Result<Self, std::io::Error> {
+        let records = if path.exists() {
+            let data = std::fs::read_to_string(&path)?;
+            serde_json::from_str(&data)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
+        } else {
+            Vec::new()
+        };
+        Ok(Self { path, records })
+    }
+
+    /// Save state to disk atomically under the cross-process state lock.
     pub fn save(&self) -> Result<(), std::io::Error> {
+        let _lock = super::lock::StateLock::acquire()?;
+        self.write_to_disk()
+    }
+
+    /// Atomic write (tmp + rename) WITHOUT taking the state lock. Callers that
+    /// already hold the lock (`save`, `modify`, and `reconcile` which runs
+    /// inside `load`) use this to avoid re-locking (`flock` is not reentrant).
+    fn write_to_disk(&self) -> Result<(), std::io::Error> {
         let data = serde_json::to_string_pretty(&self.records).map_err(std::io::Error::other)?;
         let tmp_path = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp_path, &data)?;
-        std::fs::rename(&tmp_path, &self.path)?;
-        Ok(())
+        // Durable atomic write (fsync tmp before rename + fsync parent dir): a
+        // hard crash must not leave a truncated boxes.json that then parses-fail
+        // and quarantines the WHOLE box inventory, orphaning every running VM.
+        a3s_box_core::fs_atomic::write_durable(&tmp_path, &self.path, data.as_bytes())
+    }
+
+    /// Atomically apply `f` to the on-disk state under the exclusive
+    /// cross-process lock: load fresh → mutate → save, all while the lock is
+    /// held. This is the race-free read-modify-write primitive — every writer
+    /// should mutate through it (or, for async work, snapshot inputs before the
+    /// await and call `modify` afterward to re-apply only its owned fields), so
+    /// the monitor/compose/health/CLI cannot clobber each other.
+    ///
+    /// `f` MUST be synchronous and MUST NOT `.await` (holding an OS lock across
+    /// a task yield would serialize or deadlock the async runtime).
+    pub fn modify<R, E>(f: impl FnOnce(&mut StateFile) -> Result<R, E>) -> Result<R, E>
+    where
+        E: From<std::io::Error>,
+    {
+        let _lock = super::lock::StateLock::acquire()?;
+        // Load WITHOUT the reconcile sweep: `modify` is a generic locked RMW for
+        // the caller's `f`, and reconcile now persists + tears down under its own
+        // lock (`flush_reconcile`) — running it here would deadlock (flock is not
+        // reentrant) once reconcile takes the lock.
+        let mut sf = Self::load_default_raw()?;
+        let out = f(&mut sf)?;
+        sf.write_to_disk()?;
+        Ok(out)
+    }
+
+    /// Append a record atomically under the state lock (load fresh → push →
+    /// save). Use this instead of `load_default()? + add()` so concurrent
+    /// appends/removals cannot lose records. Loads WITHOUT the reconcile sweep —
+    /// appending a box must not pay an O(N) PID-liveness/cleanup pass over every
+    /// other box (the high-concurrency fork bottleneck).
+    pub fn add_record(record: BoxRecord) -> Result<(), std::io::Error> {
+        let _lock = super::lock::StateLock::acquire()?;
+        let mut sf = Self::load_default_raw()?;
+        sf.records.push(record);
+        sf.write_to_disk()
+    }
+
+    /// Remove a record by id atomically under the state lock. Returns whether a
+    /// record was removed.
+    pub fn remove_record(id: &str) -> Result<bool, std::io::Error> {
+        Self::modify(|sf| {
+            let before = sf.records.len();
+            sf.records.retain(|r| r.id != id);
+            Ok::<bool, std::io::Error>(sf.records.len() < before)
+        })
     }
 
     /// Add a record and persist.
     pub fn add(&mut self, record: BoxRecord) -> Result<(), std::io::Error> {
         self.records.push(record);
         self.save()
+    }
+
+    /// Drop a record from this in-memory handle WITHOUT persisting.
+    ///
+    /// Used by callers that already removed the record from disk atomically via
+    /// [`remove_record`](Self::remove_record); this keeps their in-memory view
+    /// consistent without a second `save` that would clobber concurrent writers.
+    pub(crate) fn forget(&mut self, id: &str) {
+        self.records.retain(|r| r.id != id);
     }
 
     /// Remove a record by ID and persist.
@@ -108,42 +293,103 @@ impl StateFile {
         &self.records
     }
 
-    /// Reconcile: check PID liveness for running boxes, mark dead ones.
-    ///
-    /// Returns a list of box IDs that should be restarted based on their
-    /// restart policy. The caller is responsible for actually restarting them.
-    fn reconcile(&mut self) -> Vec<String> {
+    /// Reconcile IN MEMORY: check PID liveness for active boxes, mark dead ones,
+    /// capture their exit code, and drop auto-remove records. Returns the changed
+    /// flag and the dead boxes needing teardown, but performs NO disk write and
+    /// NO host-resource teardown itself. Both of those happen in
+    /// [`Self::flush_reconcile`] under the cross-process lock, because this runs
+    /// on every (often unlocked) `load()`; writing/tearing-down here was a
+    /// lost-update race (clobbering a concurrent `run`/monitor write) and a
+    /// double-teardown race (two reads cleaning up the same box).
+    fn reconcile(&mut self) -> ReconcileOutcome {
         let mut changed = false;
         let mut restart_candidates = Vec::new();
+        let mut auto_remove_records = Vec::new();
+        let mut stopped_resource_records = Vec::new();
 
         for record in &mut self.records {
-            if record.status == "running" {
-                if let Some(pid) = record.pid {
-                    if !is_process_alive(pid) {
-                        record.status = "dead".to_string();
-                        record.pid = None;
-                        changed = true;
+            if !matches!(record.status.as_str(), "running" | "paused") {
+                continue;
+            }
 
-                        if should_restart(record) {
-                            restart_candidates.push(record.id.clone());
+            let has_live_pid = is_record_pid_live(record);
+            if !has_live_pid {
+                // guest-init writes the container exit code into the overlay
+                // rootfs (`/.a3s_exit_code`) on exit; it surfaces on the host at
+                // <box_dir>/upper/.a3s_exit_code. Capture it here so a detached
+                // box's `wait`/`inspect` report the real code — libkrun's
+                // start_enter takeover means we can't waitpid the VM, so liveness
+                // polling alone would otherwise always yield exit 0.
+                if record.exit_code.is_none() {
+                    if let Ok(contents) =
+                        std::fs::read_to_string(record.box_dir.join("upper").join(".a3s_exit_code"))
+                    {
+                        if let Ok(code) = contents.trim().parse::<i32>() {
+                            record.exit_code = Some(code);
                         }
                     }
-                } else {
-                    // Running but no PID — mark as dead
-                    record.status = "dead".to_string();
-                    changed = true;
+                }
+                record.status = "dead".to_string();
+                record.pid = None;
+                record.health_status = "none".to_string();
+                record.health_retries = 0;
+                changed = true;
 
-                    if should_restart(record) {
-                        restart_candidates.push(record.id.clone());
-                    }
+                if record.auto_remove {
+                    auto_remove_records.push(record.clone());
+                    continue;
+                }
+
+                stopped_resource_records.push(record.clone());
+
+                if should_restart(record) {
+                    restart_candidates.push(record.id.clone());
                 }
             }
         }
-        if changed {
-            let _ = self.save();
+
+        if !auto_remove_records.is_empty() {
+            self.records
+                .retain(|record| !auto_remove_records.iter().any(|r| r.id == record.id));
+            changed = true;
         }
 
-        restart_candidates
+        ReconcileOutcome {
+            changed,
+            stopped: stopped_resource_records,
+            removed: auto_remove_records,
+            restart_candidates,
+        }
+    }
+
+    /// Persist the reconcile sweep (mark-dead, exit-code capture, auto-remove)
+    /// AND run the dead boxes' host-resource teardown for `path` — all under the
+    /// cross-process state lock. Re-loads fresh under the lock and re-reconciles,
+    /// so a concurrent writer is never clobbered and two readers cannot tear down
+    /// the same box twice (the second's fresh re-load sees the box already gone).
+    fn flush_reconcile(path: &Path) -> std::io::Result<()> {
+        let _lock = super::lock::StateLock::acquire()?;
+        let records = if path.exists() {
+            let data = std::fs::read_to_string(path)?;
+            Self::parse_or_quarantine(path, &data)
+        } else {
+            Vec::new()
+        };
+        let mut sf = Self {
+            path: path.to_path_buf(),
+            records,
+        };
+        let outcome = sf.reconcile();
+        if outcome.changed {
+            for record in &outcome.stopped {
+                crate::cleanup::cleanup_stopped_box(record);
+            }
+            for record in &outcome.removed {
+                crate::cleanup::cleanup_removed_box(record);
+            }
+            sf.write_to_disk()?;
+        }
+        Ok(())
     }
 
     /// Get box IDs that are pending restart (dead boxes with active restart policy).
@@ -163,41 +409,5 @@ impl StateFile {
             .iter()
             .filter(|r| r.labels.get(key).is_some_and(|v| v == value))
             .collect()
-    }
-
-    /// Mark a box as stopped and persist.
-    pub fn mark_stopped(&mut self, id: &str, exit_code: Option<i32>) {
-        if let Some(record) = self.find_by_id_mut(id) {
-            record.status = "stopped".to_string();
-            record.pid = None;
-            record.exit_code = exit_code;
-            let _ = self.save();
-        }
-    }
-
-    /// Increment restart count for a box and persist.
-    pub fn increment_restart_count(&mut self, id: &str) {
-        if let Some(record) = self.find_by_id_mut(id) {
-            record.restart_count += 1;
-            let _ = self.save();
-        }
-    }
-
-    /// Mark a box as started with a new PID and persist.
-    pub fn mark_started(&mut self, id: &str, pid: u32) {
-        if let Some(record) = self.find_by_id_mut(id) {
-            record.status = "running".to_string();
-            record.pid = Some(pid);
-            record.started_at = Some(chrono::Utc::now());
-            let _ = self.save();
-        }
-    }
-
-    /// Mark a box as stopped by user (for "unless-stopped" policy).
-    pub fn mark_stopped_by_user(&mut self, id: &str) {
-        if let Some(record) = self.find_by_id_mut(id) {
-            record.stopped_by_user = true;
-            let _ = self.save();
-        }
     }
 }

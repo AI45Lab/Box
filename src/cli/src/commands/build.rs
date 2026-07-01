@@ -31,9 +31,19 @@ pub struct BuildArgs {
     #[arg(short, long)]
     pub quiet: bool,
 
-    /// Target platform(s) for multi-platform builds (e.g., "linux/amd64,linux/arm64")
+    /// Target platform for the build (e.g., "linux/amd64").
+    ///
+    /// Multi-platform image indexes are not supported yet.
     #[arg(long)]
     pub platform: Option<String>,
+
+    /// Build only up to the named (or indexed) stage in a multi-stage build.
+    #[arg(long)]
+    pub target: Option<String>,
+
+    /// Do not use the layer build cache; rebuild every layer.
+    #[arg(long = "no-cache")]
+    pub no_cache: bool,
 }
 
 pub async fn execute(args: BuildArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -57,13 +67,7 @@ pub async fn execute(args: BuildArgs) -> Result<(), Box<dyn std::error::Error>> 
     // Open image store
     let store = Arc::new(super::open_image_store()?);
 
-    // Parse target platforms
-    let platforms = match &args.platform {
-        Some(p) => a3s_box_core::platform::Platform::parse_list(p)
-            .map_err(|e| format!("Invalid --platform: {e}"))?,
-        None => vec![],
-    };
-    validate_build_platforms(&platforms)?;
+    let platforms = parse_platforms(args.platform.as_deref())?;
 
     let config = a3s_box_runtime::BuildConfig {
         context_dir,
@@ -72,6 +76,8 @@ pub async fn execute(args: BuildArgs) -> Result<(), Box<dyn std::error::Error>> 
         build_args,
         quiet: args.quiet,
         platforms,
+        target: args.target.clone(),
+        no_cache: args.no_cache,
         metrics: None,
     };
 
@@ -79,38 +85,6 @@ pub async fn execute(args: BuildArgs) -> Result<(), Box<dyn std::error::Error>> 
 
     if args.quiet {
         println!("{}", result.digest);
-    }
-
-    Ok(())
-}
-
-fn validate_build_platforms(
-    platforms: &[a3s_box_core::platform::Platform],
-) -> Result<(), Box<dyn std::error::Error>> {
-    if platforms.len() > 1 {
-        return Err(
-            "multi-platform image indexes are not implemented yet; pass a single --platform".into(),
-        );
-    }
-
-    let Some(platform) = platforms.first() else {
-        return Ok(());
-    };
-    if platform.os != "linux" {
-        return Err(format!(
-            "build platform '{}' is not supported: a3s-box builds Linux images only",
-            platform
-        )
-        .into());
-    }
-
-    let host_arch = a3s_box_core::platform::Platform::host().architecture;
-    if platform.architecture != host_arch {
-        return Err(format!(
-            "build platform '{}' requires cross-architecture execution, which is not implemented; host architecture is {}",
-            platform, host_arch
-        )
-        .into());
     }
 
     Ok(())
@@ -126,6 +100,27 @@ fn parse_build_args(args: &[String]) -> Result<HashMap<String, String>, String> 
         map.insert(key.to_string(), value.to_string());
     }
     Ok(map)
+}
+
+fn parse_platforms(
+    platform: Option<&str>,
+) -> Result<Vec<a3s_box_core::platform::Platform>, Box<dyn std::error::Error>> {
+    let Some(platform) = platform else {
+        return Ok(vec![]);
+    };
+
+    let platforms = a3s_box_core::platform::Platform::parse_list(platform)
+        .map_err(|e| format!("Invalid --platform: {e}"))?;
+    if platforms.len() > 1 {
+        return Err(
+            "Multi-platform builds are not implemented yet; pass a single --platform value".into(),
+        );
+    }
+    if platforms.iter().any(|p| p.os != "linux") {
+        return Err("Only linux target platforms are supported for builds".into());
+    }
+
+    Ok(platforms)
 }
 
 fn resolve_build_file(
@@ -196,6 +191,35 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_platforms_empty() {
+        let result = parse_platforms(None).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_platforms_single() {
+        let result = parse_platforms(Some("linux/amd64")).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].to_string(), "linux/amd64");
+    }
+
+    #[test]
+    fn test_parse_platforms_rejects_multiple() {
+        let err = parse_platforms(Some("linux/amd64,linux/arm64"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Multi-platform builds are not implemented yet"));
+    }
+
+    #[test]
+    fn test_parse_platforms_rejects_non_linux() {
+        let err = parse_platforms(Some("windows/amd64"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Only linux target platforms"));
+    }
+
+    #[test]
     fn test_resolve_build_file_prefers_dockerfile() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("Dockerfile"), "FROM scratch\n").unwrap();
@@ -230,26 +254,5 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("Dockerfile or Containerfile"));
-    }
-
-    #[test]
-    fn test_validate_build_platforms_rejects_multiple() {
-        let platforms = vec![
-            a3s_box_core::platform::Platform::linux_amd64(),
-            a3s_box_core::platform::Platform::linux_arm64(),
-        ];
-        let err = validate_build_platforms(&platforms)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("multi-platform"));
-    }
-
-    #[test]
-    fn test_validate_build_platforms_rejects_non_linux() {
-        let platforms = vec![a3s_box_core::platform::Platform::new("darwin", "arm64")];
-        let err = validate_build_platforms(&platforms)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("Linux images only"));
     }
 }

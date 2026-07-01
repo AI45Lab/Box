@@ -9,16 +9,25 @@ members = [
     "cri",
     "cli",
     "sdk",
-    "win-launcher",
+    "lambda",
 ]
 resolver = "2"
 
+[patch.crates-io]
+# Patched h2: relax HTTP/2 `:authority` validation so standard gRPC clients
+# (crictl, the kubelet — grpc-go >= 1.57) can reach the CRI server over a Unix
+# domain socket. Upstream h2 rejects the percent-encoded socket-path authority
+# with a PROTOCOL_ERROR stream reset (hyperium/h2#487 unmerged,
+# grpc/grpc#38142 closed wontfix). The vendored copy drops an unparseable
+# UDS-style authority instead of resetting. See third_party/h2/src/server.rs.
+h2 = { path = "third_party/h2" }
+
 [workspace.package]
-version = "2.0.3"
+version = "2.6.0"
 edition = "2021"
 authors = ["A3S Lab Team"]
 license = "MIT"
-repository = "https://github.com/A3S-Lab/Box"
+repository = "https://github.com/AI45Lab/Box"
 
 [workspace.dependencies]
 # Async runtime

@@ -53,9 +53,21 @@ impl VolumeStore {
             ))
         })?;
 
-        let file: VolumesFile = serde_json::from_str(&data).map_err(|e| {
-            BoxError::SerializationError(format!("failed to parse volumes file: {}", e))
-        })?;
+        // A corrupt/old-schema volumes file must not brick the runtime: quarantine
+        // it and start from an empty set (create repopulates) rather than failing
+        // every volume operation. Mirrors the boxes.json hardening.
+        let file: VolumesFile = match serde_json::from_str(&data) {
+            Ok(f) => f,
+            Err(e) => {
+                let preserved = crate::store_io::quarantine_label(&self.path);
+                tracing::warn!(
+                    "volumes file {} is corrupt ({e}); preserved a copy at {preserved} \
+                     and started from an empty volume set",
+                    self.path.display(),
+                );
+                return Ok(HashMap::new());
+            }
+        };
 
         Ok(file.volumes)
     }
@@ -101,6 +113,33 @@ impl VolumeStore {
         Ok(())
     }
 
+    /// Run `f` over the volume map under a cross-process advisory lock,
+    /// re-loading fresh from disk inside the lock and saving the result.
+    ///
+    /// `create`/`remove`/`update`/`modify`/`get_or_create` all funnel through
+    /// here so concurrent `a3s-box` processes cannot lose each other's writes.
+    /// The atomic tmp+rename in `save` only prevents a *torn* read — two
+    /// processes that both load, mutate a different entry, and save would still
+    /// clobber one update (and, for attach/detach, silently drop a volume's
+    /// `in_use_by` entry, letting `prune`/`remove` delete data a live box still
+    /// has mounted). `save` itself stays lock-free: the guard is held here for
+    /// the whole load → mutate → save, and the lock is non-reentrant.
+    fn with_write_lock<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut HashMap<String, VolumeConfig>) -> Result<R>,
+    {
+        let _lock = crate::file_lock::FileLock::acquire(&self.path).map_err(|e| {
+            BoxError::ConfigError(format!(
+                "failed to lock volumes file {}: {e}",
+                self.path.display()
+            ))
+        })?;
+        let mut volumes = self.load()?;
+        let r = f(&mut volumes)?;
+        self.save(&volumes)?;
+        Ok(r)
+    }
+
     /// Get a single volume by name.
     pub fn get(&self, name: &str) -> Result<Option<VolumeConfig>> {
         let volumes = self.load()?;
@@ -110,17 +149,39 @@ impl VolumeStore {
     /// Create a new named volume. Returns the host mount point path.
     ///
     /// Creates the volume data directory under `~/.a3s/volumes/<name>/`.
-    pub fn create(&self, mut config: VolumeConfig) -> Result<VolumeConfig> {
-        let mut volumes = self.load()?;
+    /// Errors if the name already exists (use [`Self::get_or_create`] for the
+    /// idempotent auto-create on the `run -v name:/path` path).
+    pub fn create(&self, config: VolumeConfig) -> Result<VolumeConfig> {
+        self.with_write_lock(|volumes| {
+            if volumes.contains_key(&config.name) {
+                return Err(BoxError::ConfigError(format!(
+                    "volume '{}' already exists",
+                    config.name
+                )));
+            }
+            self.materialize(config, volumes)
+        })
+    }
 
-        if volumes.contains_key(&config.name) {
-            return Err(BoxError::ConfigError(format!(
-                "volume '{}' already exists",
-                config.name
-            )));
-        }
+    /// Return the existing volume, or create it if absent — atomic under the
+    /// cross-process lock. Two concurrent first-time `run -v name:/path` then
+    /// share one volume instead of one racing to an "already exists" error.
+    pub fn get_or_create(&self, config: VolumeConfig) -> Result<VolumeConfig> {
+        self.with_write_lock(|volumes| {
+            if let Some(existing) = volumes.get(&config.name) {
+                return Ok(existing.clone());
+            }
+            self.materialize(config, volumes)
+        })
+    }
 
-        // Create volume data directory
+    /// Create the volume's data directory, set its mount point, and insert it
+    /// into `volumes`. Caller must already hold the write lock.
+    fn materialize(
+        &self,
+        mut config: VolumeConfig,
+        volumes: &mut HashMap<String, VolumeConfig>,
+    ) -> Result<VolumeConfig> {
         let vol_dir = self.volumes_dir.join(&config.name);
         std::fs::create_dir_all(&vol_dir).map_err(|e| {
             BoxError::ConfigError(format!(
@@ -129,35 +190,32 @@ impl VolumeStore {
                 e
             ))
         })?;
-
         config.mount_point = vol_dir.to_string_lossy().into_owned();
-
         volumes.insert(config.name.clone(), config.clone());
-        self.save(&volumes)?;
         Ok(config)
     }
 
     /// Remove a volume by name. Returns error if in use.
     pub fn remove(&self, name: &str, force: bool) -> Result<VolumeConfig> {
-        let mut volumes = self.load()?;
+        let config = self.with_write_lock(|volumes| {
+            let config = volumes
+                .remove(name)
+                .ok_or_else(|| BoxError::ConfigError(format!("volume '{}' not found", name)))?;
 
-        let config = volumes
-            .remove(name)
-            .ok_or_else(|| BoxError::ConfigError(format!("volume '{}' not found", name)))?;
+            if config.is_in_use() && !force {
+                // Put it back
+                volumes.insert(name.to_string(), config.clone());
+                return Err(BoxError::ConfigError(format!(
+                    "volume '{}' is in use by {} box(es); use --force to remove",
+                    name,
+                    config.in_use_by.len()
+                )));
+            }
+            Ok(config)
+        })?;
 
-        if config.is_in_use() && !force {
-            // Put it back
-            volumes.insert(name.to_string(), config.clone());
-            return Err(BoxError::ConfigError(format!(
-                "volume '{}' is in use by {} box(es); use --force to remove",
-                name,
-                config.in_use_by.len()
-            )));
-        }
-
-        self.save(&volumes)?;
-
-        // Remove volume data directory
+        // Remove the data directory outside the lock; it is keyed by name and
+        // the removal is idempotent.
         let vol_dir = self.volumes_dir.join(name);
         if vol_dir.exists() {
             std::fs::remove_dir_all(&vol_dir).ok();
@@ -172,19 +230,41 @@ impl VolumeStore {
         Ok(volumes.into_values().collect())
     }
 
-    /// Update a volume in-place (used for attach/detach).
+    /// Replace a volume's config wholesale under the cross-process lock.
+    ///
+    /// For attach/detach prefer [`Self::modify`]: a `get` → mutate → `update`
+    /// reads outside the lock and would lose a concurrent update made between
+    /// the two calls.
     pub fn update(&self, config: &VolumeConfig) -> Result<()> {
-        let mut volumes = self.load()?;
+        self.with_write_lock(|volumes| {
+            if !volumes.contains_key(&config.name) {
+                return Err(BoxError::ConfigError(format!(
+                    "volume '{}' not found",
+                    config.name
+                )));
+            }
+            volumes.insert(config.name.clone(), config.clone());
+            Ok(())
+        })
+    }
 
-        if !volumes.contains_key(&config.name) {
-            return Err(BoxError::ConfigError(format!(
-                "volume '{}' not found",
-                config.name
-            )));
-        }
-
-        volumes.insert(config.name.clone(), config.clone());
-        self.save(&volumes)
+    /// Atomically mutate one volume's config under the cross-process lock.
+    ///
+    /// Re-reads the current entry inside the lock so concurrent attach/detach
+    /// accumulate correctly — the canonical fix for the split `get` → mutate →
+    /// `update` race that could drop a volume's `in_use_by` entry. Returns
+    /// `false` if the volume does not exist.
+    pub fn modify<F>(&self, name: &str, f: F) -> Result<bool>
+    where
+        F: FnOnce(&mut VolumeConfig),
+    {
+        self.with_write_lock(|volumes| match volumes.get_mut(name) {
+            Some(config) => {
+                f(config);
+                Ok(true)
+            }
+            None => Ok(false),
+        })
     }
 
     /// Remove all volumes that are not in use. Returns names of removed volumes.
@@ -436,5 +516,119 @@ mod tests {
 
         store.remove("mydata", false).unwrap();
         assert!(!vol_dir.exists());
+    }
+
+    #[test]
+    fn test_get_or_create_is_idempotent() {
+        let (_dir, store) = temp_store();
+        let first = store
+            .get_or_create(VolumeConfig::new("shared", ""))
+            .unwrap();
+        let second = store
+            .get_or_create(VolumeConfig::new("shared", ""))
+            .unwrap();
+        assert_eq!(first.mount_point, second.mount_point);
+        assert_eq!(store.list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_modify_missing_returns_false() {
+        let (_dir, store) = temp_store();
+        assert!(!store.modify("nope", |c| c.attach("box-1")).unwrap());
+    }
+
+    // The advisory lock is per-open-file-description, so separate
+    // FileLock::acquire calls serialize even across threads in one process —
+    // which is exactly what lets this exercise the lost-update fix in-process.
+    #[test]
+    fn concurrent_attaches_accumulate_without_lost_update() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(VolumeStore::new(
+            dir.path().join("volumes.json"),
+            dir.path().join("volumes"),
+        ));
+        store.create(VolumeConfig::new("shared", "")).unwrap();
+
+        let n = 16;
+        let handles: Vec<_> = (0..n)
+            .map(|i| {
+                let store = Arc::clone(&store);
+                thread::spawn(move || {
+                    store
+                        .modify("shared", |c| c.attach(&format!("box-{i}")))
+                        .unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let cfg = store.get("shared").unwrap().unwrap();
+        assert_eq!(
+            cfg.in_use_by.len(),
+            n,
+            "every concurrent attach must persist (no lost update): {:?}",
+            cfg.in_use_by
+        );
+        for i in 0..n {
+            assert!(cfg.in_use_by.contains(&format!("box-{i}")));
+        }
+    }
+
+    #[test]
+    fn concurrent_creates_persist_every_volume() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(VolumeStore::new(
+            dir.path().join("volumes.json"),
+            dir.path().join("volumes"),
+        ));
+
+        let n = 16;
+        let handles: Vec<_> = (0..n)
+            .map(|i| {
+                let store = Arc::clone(&store);
+                thread::spawn(move || {
+                    store
+                        .create(VolumeConfig::new(&format!("vol-{i}"), ""))
+                        .unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(
+            store.list().unwrap().len(),
+            n,
+            "every concurrent create must persist (no lost update)"
+        );
+    }
+
+    #[test]
+    fn corrupt_volumes_file_is_quarantined_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("volumes.json");
+        std::fs::write(&path, "{ not valid json").unwrap();
+        let store = VolumeStore::new(path.clone(), dir.path().join("volumes"));
+
+        // load() must succeed (empty) instead of erroring every volume op.
+        assert!(store.load().unwrap().is_empty());
+        let quarantined = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains("volumes.json.corrupt-")
+            });
+        assert!(quarantined, "corrupt volumes.json must be quarantined");
     }
 }

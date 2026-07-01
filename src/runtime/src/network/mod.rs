@@ -12,7 +12,7 @@ mod store;
 #[cfg(target_os = "macos")]
 pub use a3s_box_netproxy::NetProxyManager;
 #[cfg(any(target_os = "linux", test))]
-pub use passt::PasstManager;
+pub use passt::{terminate_passt, PasstManager};
 pub use store::NetworkStore;
 
 /// Platform-agnostic handle to a running network backend process or thread.

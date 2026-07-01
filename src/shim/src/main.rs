@@ -20,7 +20,7 @@ use a3s_box_core::EXEC_VSOCK_PORT;
 #[cfg(target_os = "windows")]
 use a3s_box_core::PORT_FWD_VSOCK_PORT;
 #[cfg(not(target_os = "windows"))]
-use a3s_box_core::{ATTEST_VSOCK_PORT, PTY_VSOCK_PORT};
+use a3s_box_core::{ATTEST_VSOCK_PORT, PORT_FWD_VSOCK_PORT, PTY_VSOCK_PORT};
 #[cfg(target_os = "macos")]
 use a3s_box_netproxy::spawn_inherited_netproxy;
 use clap::Parser;
@@ -75,6 +75,42 @@ fn main() {
     }
 }
 
+/// Opt-in (env `A3S_BOX_KSM=1`): mark this shim's anonymous memory — including
+/// libkrun's guest RAM, which `start_enter` allocates as anonymous `mmap` after
+/// this runs — as KSM-mergeable via `prctl(PR_SET_MEMORY_MERGE)` (Linux 6.4+).
+/// With KSM enabled on the host (`/sys/kernel/mm/ksm/run = 1`), identical pages
+/// across same-image microVMs (kernel text, common runtime/libs) are deduplicated
+/// by ksmd, so N warm VMs of one image cost far less host RAM than N× their size.
+/// Best-effort: a no-op when the env is unset or on pre-6.4 kernels (EINVAL).
+#[cfg(target_os = "linux")]
+fn maybe_enable_ksm_merge() {
+    // PR_SET_MEMORY_MERGE (since Linux 6.4) — not in all libc versions, so use
+    // the numeric value directly.
+    const PR_SET_MEMORY_MERGE: libc::c_int = 67;
+
+    let enabled = std::env::var("A3S_BOX_KSM")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    if !enabled {
+        return;
+    }
+
+    // SAFETY: PR_SET_MEMORY_MERGE takes a single scalar (enable=1); no pointers
+    // or out-params. A non-zero return (e.g. pre-6.4 kernel → EINVAL) is non-fatal.
+    let rc = unsafe { libc::prctl(PR_SET_MEMORY_MERGE, 1, 0, 0, 0) };
+    if rc == 0 {
+        tracing::info!("KSM page-merging enabled for guest memory (PR_SET_MEMORY_MERGE)");
+    } else {
+        tracing::warn!(
+            error = %std::io::Error::last_os_error(),
+            "A3S_BOX_KSM set but PR_SET_MEMORY_MERGE failed (needs Linux 6.4+); continuing without KSM"
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn maybe_enable_ksm_merge() {}
+
 fn run() -> Result<()> {
     let args = Args::parse();
 
@@ -128,6 +164,9 @@ fn run() -> Result<()> {
         rootfs = %spec.rootfs_path.display(),
         "Starting VM"
     );
+
+    // Opt-in KSM: mark guest memory mergeable before libkrun allocates it.
+    maybe_enable_ksm_merge();
 
     // Validate rootfs exists
     if !spec.rootfs_path.exists() {
@@ -258,94 +297,34 @@ fn parse_cpuset_spec(spec: &str) -> std::result::Result<Vec<usize>, String> {
     Ok(cpus)
 }
 
-/// Apply cgroup v2 resource limits (Linux only, best-effort).
-///
-/// Creates a cgroup under /sys/fs/cgroup/a3s-box/<box_id>/ and writes
-/// the appropriate control files. Moves the current process into the cgroup.
-#[cfg(target_os = "linux")]
-fn apply_cgroup_limits(spec: &InstanceSpec) {
-    let limits = &spec.resource_limits;
-    let has_cgroup_limits = limits.cpu_shares.is_some()
-        || limits.cpu_quota.is_some()
-        || limits.memory_reservation.is_some()
-        || limits.memory_swap.is_some();
-
-    if !has_cgroup_limits {
-        return;
+#[cfg(not(target_os = "windows"))]
+fn tsi_port_map_for_spec(spec: &InstanceSpec) -> Vec<String> {
+    if native_bridge_port_forwarding_handles_spec(spec) {
+        return Vec::new();
     }
 
-    let cgroup_path = format!("/sys/fs/cgroup/a3s-box/{}", spec.box_id);
+    spec.port_map
+        .iter()
+        .filter(|mapping| !is_auto_assigned_host_port(mapping))
+        .cloned()
+        .collect()
+}
 
-    // Create cgroup directory
-    if std::fs::create_dir_all(&cgroup_path).is_err() {
-        tracing::debug!(
-            path = cgroup_path,
-            "Cannot create cgroup directory (requires root or cgroup delegation)"
-        );
-        return;
-    }
+// On both macOS (netproxy) and Linux (passt), bridge-mode published ports are
+// forwarded by the native network backend, not TSI. libkrun discards the TSI
+// host_port_map once a virtio-net device is attached anyway, so feeding it the
+// port map is dead work; let the backend own forwarding instead.
+#[cfg(not(target_os = "windows"))]
+fn native_bridge_port_forwarding_handles_spec(spec: &InstanceSpec) -> bool {
+    spec.network.is_some()
+}
 
-    // cpu.weight (from --cpu-shares)
-    // Docker shares range: 2-262144, cgroup v2 weight range: 1-10000
-    // Conversion: weight = 1 + ((shares - 2) * 9999) / 262142
-    if let Some(shares) = limits.cpu_shares {
-        let weight = 1 + ((shares.clamp(2, 262144) - 2) * 9999) / 262142;
-        if let Err(e) = std::fs::write(format!("{}/cpu.weight", cgroup_path), weight.to_string()) {
-            tracing::debug!(error = %e, "Failed to set cpu.weight");
-        } else {
-            tracing::info!(shares, weight, "Applied CPU shares");
-        }
-    }
-
-    // cpu.max (from --cpu-quota / --cpu-period)
-    if let Some(quota) = limits.cpu_quota {
-        let period = limits.cpu_period.unwrap_or(100_000);
-        let quota_str = if quota < 0 {
-            "max".to_string()
-        } else {
-            quota.to_string()
-        };
-        let value = format!("{} {}", quota_str, period);
-        if let Err(e) = std::fs::write(format!("{}/cpu.max", cgroup_path), &value) {
-            tracing::debug!(error = %e, "Failed to set cpu.max");
-        } else {
-            tracing::info!(cpu_max = value, "Applied CPU quota");
-        }
-    }
-
-    // memory.low (from --memory-reservation)
-    if let Some(reservation) = limits.memory_reservation {
-        if let Err(e) = std::fs::write(
-            format!("{}/memory.low", cgroup_path),
-            reservation.to_string(),
-        ) {
-            tracing::debug!(error = %e, "Failed to set memory.low");
-        } else {
-            tracing::info!(bytes = reservation, "Applied memory reservation");
-        }
-    }
-
-    // memory.swap.max (from --memory-swap)
-    if let Some(swap) = limits.memory_swap {
-        let value = if swap < 0 {
-            "max".to_string()
-        } else {
-            swap.to_string()
-        };
-        if let Err(e) = std::fs::write(format!("{}/memory.swap.max", cgroup_path), &value) {
-            tracing::debug!(error = %e, "Failed to set memory.swap.max");
-        } else {
-            tracing::info!(memory_swap = value, "Applied memory swap limit");
-        }
-    }
-
-    // Move current process into the cgroup
-    let pid = std::process::id();
-    if let Err(e) = std::fs::write(format!("{}/cgroup.procs", cgroup_path), pid.to_string()) {
-        tracing::debug!(error = %e, "Failed to move process into cgroup");
-    } else {
-        tracing::info!(cgroup = cgroup_path, "Moved shim process into cgroup");
-    }
+#[cfg(not(target_os = "windows"))]
+fn is_auto_assigned_host_port(mapping: &str) -> bool {
+    mapping
+        .split_once(':')
+        .and_then(|(host, _)| host.parse::<u16>().ok())
+        == Some(0)
 }
 
 /// Configure libkrun context and start the VM.
@@ -425,7 +404,10 @@ unsafe fn configure_and_start_vm(spec: &InstanceSpec) -> Result<()> {
 
         let mount_path: std::path::PathBuf = if host_path.is_file() {
             // Create a temporary directory to hold the file
-            let temp_dir = std::env::temp_dir().join(format!("a3s-fs-mount-{}", spec.box_id));
+            // Per-mount temp dir (keyed by tag) so two file mounts sharing a
+            // basename (e.g. two app.conf to different targets) don't collide.
+            let temp_dir =
+                std::env::temp_dir().join(format!("a3s-fs-mount-{}-{}", spec.box_id, mount.tag));
             let file_name = host_path.file_name().unwrap();
             let temp_file_path = temp_dir.join(file_name);
 
@@ -493,22 +475,11 @@ unsafe fn configure_and_start_vm(spec: &InstanceSpec) -> Result<()> {
     // TSI port mapping for inbound connections (host -> guest)
     // This allows external connections to reach services inside the guest.
     // Must be called before add_vsock_port to avoid EINVAL from libkrun.
-    // Skip port mappings with host_port=0 (auto-assign) - those are handled by
-    // netproxy on macOS and would fail with EINVAL in libkrun's TSI.
+    // Skip entries handled by bridge-native forwarding or host_port=0
+    // auto-assignment, which would fail with EINVAL in libkrun's TSI.
     #[cfg(not(target_os = "windows"))]
     {
-        let valid_port_map: Vec<String> = spec
-            .port_map
-            .iter()
-            .filter(|p| {
-                if let Some((host, _)) = p.split_once(':') {
-                    host.parse::<u16>() != Ok(0)
-                } else {
-                    true
-                }
-            })
-            .cloned()
-            .collect();
+        let valid_port_map = tsi_port_map_for_spec(spec);
 
         if !valid_port_map.is_empty() {
             tracing::info!(
@@ -519,7 +490,7 @@ unsafe fn configure_and_start_vm(spec: &InstanceSpec) -> Result<()> {
         } else if !spec.port_map.is_empty() {
             tracing::debug!(
                 port_map = ?spec.port_map,
-                "Skipping TSI port mapping (all host ports are 0, handled by netproxy)"
+                "Skipping TSI port mapping; native bridge port forwarding or auto-assigned host ports handle these entries"
             );
         }
     }
@@ -582,6 +553,25 @@ unsafe fn configure_and_start_vm(spec: &InstanceSpec) -> Result<()> {
                 "Configuring vsock bridge for attestation"
             );
             ctx.add_vsock_port(ATTEST_VSOCK_PORT, attest_socket_str, true)?;
+        }
+
+        if !spec.port_forward_socket_path.as_os_str().is_empty() {
+            let port_forward_socket_str =
+                spec.port_forward_socket_path
+                    .to_str()
+                    .ok_or_else(|| BoxError::BoxBootError {
+                        message: format!(
+                            "Invalid port-forward socket path: {}",
+                            spec.port_forward_socket_path.display()
+                        ),
+                        hint: None,
+                    })?;
+            tracing::debug!(
+                socket_path = port_forward_socket_str,
+                guest_port = PORT_FWD_VSOCK_PORT,
+                "Configuring vsock bridge for CRI port-forward control"
+            );
+            ctx.add_vsock_port(PORT_FWD_VSOCK_PORT, port_forward_socket_str, true)?;
         }
     }
 
@@ -676,6 +666,7 @@ unsafe fn configure_and_start_vm(spec: &InstanceSpec) -> Result<()> {
                     net_config.prefix_len,
                     &net_config.dns_servers,
                     &spec.port_map,
+                    net_config.net_stats_path.clone(),
                 )?;
             }
             log_inherited_net_fd(fd);
@@ -715,8 +706,40 @@ unsafe fn configure_and_start_vm(spec: &InstanceSpec) -> Result<()> {
                 message: format!("Invalid console output path: {}", console_path.display()),
                 hint: None,
             })?;
-        tracing::debug!(console_path = console_str, "Redirecting console output");
-        ctx.set_console_output(console_str)?;
+        // Split console: guest stdout -> console.log, stderr -> console.err.log
+        // (libkrun's 3-fd virtio-console separates the streams), so the log
+        // processor can tag each line's stream like Docker's json-file driver.
+        // Unix only (uses raw fds); Windows always uses the merged single-file
+        // console. Falls back to merged if the err file can't be opened, and
+        // BOX_NO_SPLIT_STDERR forces the legacy merged behavior.
+        #[allow(unused_mut)]
+        let mut split_done = false;
+        #[cfg(unix)]
+        if std::env::var_os("BOX_NO_SPLIT_STDERR").is_none() {
+            use std::os::unix::io::AsRawFd;
+            let err_path = console_path.with_file_name("console.err.log");
+            let open = |p: &std::path::Path| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(p)
+            };
+            if let (Ok(out_f), Ok(err_f)) = (open(console_path), open(&err_path)) {
+                ctx.add_split_console(-1, out_f.as_raw_fd(), err_f.as_raw_fd())?;
+                // Keep the fds open for the VM's lifetime.
+                std::mem::forget(out_f);
+                std::mem::forget(err_f);
+                tracing::debug!("split console enabled (stdout/stderr separated)");
+                split_done = true;
+            }
+        }
+        if !split_done {
+            tracing::debug!(
+                console_path = console_str,
+                "Redirecting console output (merged)"
+            );
+            ctx.set_console_output(console_str)?;
+        }
     }
 
     // Configure TEE if specified (only available on Linux with SEV support)
@@ -756,13 +779,47 @@ unsafe fn configure_and_start_vm(spec: &InstanceSpec) -> Result<()> {
         }
     }
 
-    // Apply cgroup v2 resource limits (Linux only, best-effort)
-    #[cfg(target_os = "linux")]
-    apply_cgroup_limits(spec);
+    // CPU/memory cgroup limits (--cpu-shares/--cpu-quota/--memory-reservation/
+    // --memory-swap) are NOT applied to the host VM process: they are enforced
+    // INSIDE the guest by guest-init's per-container cgroup (the workload runs in
+    // the microVM, so the in-guest cgroup is what bounds it — real-VM measured
+    // cpu.max actively throttling a 0.5-core cap). The old host-side
+    // apply_cgroup_limits created /sys/fs/cgroup/a3s-box/<id> and wrote
+    // cpu.weight/cpu.max/memory.* there, but the controllers were never delegated
+    // to that subtree (writes ENOENT'd, swallowed) so it never enforced anything —
+    // it only leaked an empty host cgroup. Removed. (cpuset above stays: CPU
+    // pinning of the VM threads has no in-guest equivalent.)
 
-    // Start VM (process takeover - never returns on success)
+    // Spawn the log processor on a dedicated thread for the box's lifetime. The
+    // shim owns console.log and lives exactly as long as the VM, so this is the
+    // daemonless home for log processing — a detached `run -d` box keeps logging
+    // after the launching CLI exits (the processor used to die with that CLI).
+    let log_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let log_thread = spec.console_output.as_ref().map(|console| {
+        let console = console.clone();
+        let log_dir = console
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let config = spec.log_config.clone();
+        let stop = log_stop.clone();
+        std::thread::spawn(move || {
+            a3s_box_core::log::run_log_processor(&console, &log_dir, &config, &stop);
+        })
+    });
+
+    // Start VM. start_enter RETURNS with the guest exit status once the guest
+    // exits (status >= 0) or on a start failure (status < 0).
     tracing::info!(box_id = %spec.box_id, "Starting VM (process takeover)");
     let status = ctx.start_enter();
+
+    // Guest has exited and console.log is fully flushed: signal the processor to
+    // drain the remainder and stop, then join so the final lines reach
+    // container.json before this process exits (no teardown race).
+    log_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    if let Some(handle) = log_thread {
+        let _ = handle.join();
+    }
 
     // If we reach here, either:
     // 1. VM failed to start (negative status)
@@ -925,6 +982,66 @@ mod tests {
         assert!(parse_ulimit("rtprio=10:20").is_some());
         assert!(parse_ulimit("rttime=100:200").is_some());
         assert!(parse_ulimit("sigpending=100:200").is_some());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn test_tsi_port_map_for_spec_filters_auto_assigned_host_ports() {
+        let spec = InstanceSpec {
+            port_map: vec![
+                "0:80".to_string(),
+                "8080:80".to_string(),
+                "9090:90".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            tsi_port_map_for_spec(&spec),
+            vec!["8080:80".to_string(), "9090:90".to_string()]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_tsi_port_map_for_spec_skips_macos_bridge_ports() {
+        let spec = InstanceSpec {
+            port_map: vec!["8080:80".to_string()],
+            network: Some(test_network_config()),
+            ..Default::default()
+        };
+
+        assert!(tsi_port_map_for_spec(&spec).is_empty());
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    #[test]
+    fn test_tsi_port_map_for_spec_skips_linux_bridge_ports() {
+        // On Linux, bridge-mode ports are forwarded by passt, not TSI.
+        let spec = InstanceSpec {
+            port_map: vec!["8080:80".to_string()],
+            network: Some(test_network_config()),
+            ..Default::default()
+        };
+
+        assert!(tsi_port_map_for_spec(&spec).is_empty());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn test_network_config() -> a3s_box_core::vmm::NetworkInstanceConfig {
+        a3s_box_core::vmm::NetworkInstanceConfig {
+            net_socket_path: std::path::PathBuf::from("/tmp/a3s-box-test-net.sock"),
+            net_stats_path: Some(std::path::PathBuf::from("/tmp/a3s-box-test-net.stats.json")),
+            #[cfg(target_os = "macos")]
+            net_socket_fd: Some(42),
+            #[cfg(target_os = "macos")]
+            net_proxy_fd: Some(43),
+            ip_address: "10.89.0.2".parse().unwrap(),
+            gateway: "10.89.0.1".parse().unwrap(),
+            prefix_len: 24,
+            mac_address: [0x02, 0x42, 0x0a, 0x59, 0x00, 0x02],
+            dns_servers: vec!["8.8.8.8".parse().unwrap()],
+        }
     }
 
     #[cfg(target_os = "linux")]

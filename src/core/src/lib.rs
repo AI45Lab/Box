@@ -3,18 +3,20 @@
 //! This module provides the foundational types, traits, and abstractions
 //! used across the A3S Box MicroVM runtime.
 
-pub mod app_config;
 pub mod audit;
 pub mod compose;
 pub mod config;
 pub mod dns;
+pub mod env;
 pub mod error;
 pub mod event;
 pub mod exec;
+pub mod fs_atomic;
 pub mod log;
 pub mod network;
 pub mod operator;
 pub mod platform;
+pub mod port;
 pub mod pty;
 pub mod scale;
 pub mod security;
@@ -26,10 +28,6 @@ pub mod volume;
 pub mod workload;
 
 // Re-export commonly used types
-pub use app_config::{
-    is_docker_hub_registry, normalize_registry_server, registry_uses_http, A3sConfig,
-    RegistryConfig, DOCKER_HUB_AUTH_REGISTRY, DOCKER_HUB_IMAGE_REGISTRY,
-};
 pub use audit::{AuditAction, AuditConfig, AuditEvent, AuditOutcome};
 pub use compose::ComposeConfig;
 pub use config::{BoxConfig, ResourceConfig, ResourceLimits};
@@ -41,7 +39,10 @@ pub use exec::{FileOp, FileRequest, FileResponse};
 pub use exec::{EXEC_VSOCK_PORT, PORT_FWD_VSOCK_PORT};
 pub use network::{IsolationMode, NetworkConfig, NetworkEndpoint, NetworkMode, NetworkPolicy};
 pub use operator::{BoxAutoscaler, BoxAutoscalerSpec, BoxAutoscalerStatus, MetricType};
-pub use platform::{HostGuestChannel, Platform, PlatformCapabilities, VmBackend};
+pub use platform::{
+    BridgeNetworkBackend, HostGuestChannel, Platform, PlatformCapabilities, VmBackend,
+};
+pub use port::{normalize_port_maps, parse_port_mapping, PortMapping, PortProtocol};
 pub use pty::PTY_VSOCK_PORT;
 pub use scale::{
     InstanceDeregistration, InstanceEvent, InstanceHealth, InstanceInfo, InstanceRegistration,

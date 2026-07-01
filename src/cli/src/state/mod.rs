@@ -1,9 +1,10 @@
 //! State management for box instances.
 //!
 //! Persists box metadata to `~/.a3s/boxes.json` with atomic writes.
-//! On every load, dead PIDs are reconciled to mark boxes as dead.
+//! On every load, dead active PIDs are reconciled to mark boxes as dead.
 
 mod file;
+mod lock;
 pub(crate) mod policy;
 #[cfg(test)]
 mod tests;
@@ -32,6 +33,12 @@ pub struct BoxRecord {
     pub status: String,
     /// Shim process PID (set when running)
     pub pid: Option<u32>,
+    /// Start-time identity token (`/proc/<pid>/stat` field 22) captured when
+    /// `pid` was recorded, so a reused PID after a crash/reboot is not mistaken
+    /// for the original shim. `None` for records written before this field
+    /// existed (they fall back to a bare liveness check).
+    #[serde(default)]
+    pub pid_start_time: Option<u64>,
     /// Number of vCPUs
     pub cpus: u32,
     /// Memory in MB
@@ -40,7 +47,7 @@ pub struct BoxRecord {
     pub volumes: Vec<String>,
     /// Environment variables
     pub env: HashMap<String, String>,
-    /// Entrypoint override
+    /// Command override
     pub cmd: Vec<String>,
     /// Entrypoint override (if set via --entrypoint)
     #[serde(default)]
@@ -91,6 +98,9 @@ pub struct BoxRecord {
     /// Health check configuration
     #[serde(default)]
     pub health_check: Option<HealthCheck>,
+    /// Whether image-defined health checks were explicitly disabled.
+    #[serde(default)]
+    pub healthcheck_disabled: bool,
     /// Current health status: "none", "starting", "healthy", "unhealthy"
     #[serde(default = "default_health_status")]
     pub health_status: String,

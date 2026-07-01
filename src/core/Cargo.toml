@@ -18,10 +18,11 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
 dirs = { workspace = true }
-
-[dev-dependencies]
-tempfile = { workspace = true }
+flate2 = "1.0"
 
 [lib]
 name = "a3s_box_core"
 path = "src/lib.rs"
+
+[dev-dependencies]
+tempfile = { workspace = true }

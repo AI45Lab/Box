@@ -1,11 +1,11 @@
 [package]
 name = "a3s-libkrun-sys"
-version = "0.1.5"
+version.workspace = true
 edition = "2021"
 authors = ["A3S Lab Team"]
 description = "FFI bindings to libkrun with Windows WHPX backend support"
 license = "MIT"
-repository = "https://github.com/A3S-Lab/Box"
+repository = "https://github.com/AI45Lab/Box"
 keywords = ["libkrun", "microvm", "whpx", "virtualization", "windows"]
 categories = ["api-bindings", "os::windows-apis", "virtualization"]
 readme = "README.md"

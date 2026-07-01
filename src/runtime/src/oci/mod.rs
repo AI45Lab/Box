@@ -29,6 +29,7 @@ pub mod build;
 pub mod credentials;
 mod image;
 mod layers;
+mod limited_reader;
 mod pull;
 pub mod reference;
 pub mod registry;
@@ -38,14 +39,12 @@ pub mod store;
 
 #[cfg(feature = "build")]
 pub use build::{BuildConfig, BuildResult, Dockerfile, Instruction};
-pub use credentials::{CredentialStore, DockerConfigCredentialStore};
+pub use credentials::CredentialStore;
 pub use image::{OciHealthCheck, OciImage, OciImageConfig};
 pub use layers::extract_layer;
 pub use pull::ImagePuller;
 pub use reference::ImageReference;
-pub use registry::{
-    PushResult, RegistryAuth, RegistryLoginOptions, RegistryLoginVerifier, RegistryPusher,
-};
+pub use registry::{PushResult, RegistryAuth, RegistryPusher};
 pub use rootfs::OciRootfsBuilder;
 pub use signing::{SignResult, SignaturePolicy, VerifyResult};
 pub use store::ImageStore;

@@ -1,0 +1,19 @@
+# RuntimeClass that routes pods to a3s-box via the containerd shim.
+# `handler: a3s-box` must match the runtime name registered in containerd's
+# config.toml (plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.a3s-box),
+# which points at runtime_type io.containerd.a3s-box.v2 -> binary
+# containerd-shim-a3s-box-v2 on the node PATH.
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: a3s-box
+handler: a3s-box
+# Per-pod overhead the scheduler accounts for the MicroVM wrapper.
+overhead:
+  podFixed:
+    cpu: "50m"
+    memory: "64Mi"
+# Only schedule onto nodes that actually run the a3s-box shim + have /dev/kvm.
+scheduling:
+  nodeSelector:
+    a3s-box.io/runtime: "true"

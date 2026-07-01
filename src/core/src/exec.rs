@@ -36,10 +36,16 @@ pub struct ExecRequest {
     /// Working directory for the command.
     #[serde(default)]
     pub working_dir: Option<String>,
+    /// Optional guest-visible rootfs path to chroot into before executing.
+    #[serde(default)]
+    pub rootfs: Option<String>,
     /// Optional stdin data to pipe to the command.
     #[serde(default)]
     pub stdin: Option<Vec<u8>>,
-    /// User to run the command as (e.g., "root", "1000", "1000:1000").
+    /// Keep stdin open for subsequent streaming data frames.
+    #[serde(default)]
+    pub stdin_streaming: bool,
+    /// User to run the command as (supported: "root", "1000", "1000:1000").
     #[serde(default)]
     pub user: Option<String>,
     /// Enable streaming mode (receive output chunks as they arrive).
@@ -90,13 +96,24 @@ pub struct ExecChunk {
 pub struct ExecExit {
     /// Process exit code.
     pub exit_code: i32,
+    /// Set when the process (or its memory cgroup) was killed by the
+    /// out-of-memory killer. Carried back so the CRI can report the container
+    /// exit reason as `OOMKilled`. Defaults to `false` for wire compatibility.
+    #[serde(default)]
+    pub oom_killed: bool,
 }
 
-/// A streaming exec event — either a chunk of output or the final exit.
+/// A streaming exec event — a chunk of output, a flush acknowledgement, or the
+/// final exit.
 #[derive(Debug, Clone)]
 pub enum ExecEvent {
     /// A chunk of stdout or stderr data.
     Chunk(ExecChunk),
+    /// Acknowledgement of a flush request: every output chunk the guest had
+    /// buffered when it received the flush has been sent ahead of this marker.
+    /// Used to establish a definitive pre/post boundary for log rotation
+    /// (`ReopenContainerLog`) without racing in-flight output.
+    FlushAck,
     /// The command has exited.
     Exit(ExecExit),
 }
@@ -163,7 +180,9 @@ mod tests {
             timeout_ns: 3_000_000_000,
             env: vec!["FOO=bar".to_string()],
             working_dir: Some("/tmp".to_string()),
+            rootfs: Some("/run/a3s/cri/rootfs/sb/c/rootfs".to_string()),
             stdin: None,
+            stdin_streaming: false,
             user: None,
             streaming: false,
         };
@@ -173,7 +192,12 @@ mod tests {
         assert_eq!(parsed.timeout_ns, 3_000_000_000);
         assert_eq!(parsed.env, vec!["FOO=bar"]);
         assert_eq!(parsed.working_dir, Some("/tmp".to_string()));
+        assert_eq!(
+            parsed.rootfs,
+            Some("/run/a3s/cri/rootfs/sb/c/rootfs".to_string())
+        );
         assert!(parsed.stdin.is_none());
+        assert!(!parsed.stdin_streaming);
         assert!(parsed.user.is_none());
         assert!(!parsed.streaming);
     }
@@ -185,13 +209,34 @@ mod tests {
             timeout_ns: 0,
             env: vec![],
             working_dir: None,
+            rootfs: None,
             stdin: None,
+            stdin_streaming: false,
             user: None,
             streaming: true,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: ExecRequest = serde_json::from_str(&json).unwrap();
         assert!(parsed.streaming);
+        assert!(!parsed.stdin_streaming);
+    }
+
+    #[test]
+    fn test_exec_request_stdin_streaming_flag() {
+        let req = ExecRequest {
+            cmd: vec!["cat".to_string()],
+            timeout_ns: 0,
+            env: vec![],
+            working_dir: None,
+            rootfs: None,
+            stdin: None,
+            stdin_streaming: true,
+            user: None,
+            streaming: true,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: ExecRequest = serde_json::from_str(&json).unwrap();
+        assert!(parsed.stdin_streaming);
     }
 
     #[test]
@@ -238,7 +283,9 @@ mod tests {
             timeout_ns: 0,
             env: vec![],
             working_dir: None,
+            rootfs: None,
             stdin: None,
+            stdin_streaming: false,
             user: None,
             streaming: false,
         };
@@ -248,18 +295,22 @@ mod tests {
         assert_eq!(parsed.timeout_ns, 0);
         assert!(parsed.env.is_empty());
         assert!(parsed.working_dir.is_none());
+        assert!(parsed.rootfs.is_none());
+        assert!(!parsed.stdin_streaming);
         assert!(parsed.user.is_none());
     }
 
     #[test]
     fn test_exec_request_backward_compatible_deserialization() {
-        // Old format without streaming field should still parse (defaults to false)
+        // Old format without rootfs or streaming fields should still parse.
         let json = r#"{"cmd":["ls"],"timeout_ns":0}"#;
         let parsed: ExecRequest = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.cmd, vec!["ls"]);
         assert!(parsed.env.is_empty());
         assert!(parsed.working_dir.is_none());
+        assert!(parsed.rootfs.is_none());
         assert!(parsed.stdin.is_none());
+        assert!(!parsed.stdin_streaming);
         assert!(parsed.user.is_none());
         assert!(!parsed.streaming);
     }
@@ -271,13 +322,16 @@ mod tests {
             timeout_ns: 0,
             env: vec![],
             working_dir: None,
+            rootfs: None,
             stdin: Some(b"echo hello\n".to_vec()),
+            stdin_streaming: false,
             user: None,
             streaming: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: ExecRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.stdin, Some(b"echo hello\n".to_vec()));
+        assert!(!parsed.stdin_streaming);
     }
 
     #[test]
@@ -287,7 +341,9 @@ mod tests {
             timeout_ns: 0,
             env: vec![],
             working_dir: None,
+            rootfs: None,
             stdin: None,
+            stdin_streaming: false,
             user: Some("root".to_string()),
             streaming: false,
         };
@@ -303,7 +359,9 @@ mod tests {
             timeout_ns: 0,
             env: vec![],
             working_dir: None,
+            rootfs: None,
             stdin: None,
+            stdin_streaming: false,
             user: Some("1000:1000".to_string()),
             streaming: false,
         };
@@ -357,7 +415,10 @@ mod tests {
 
     #[test]
     fn test_exec_exit_serde_roundtrip() {
-        let exit = ExecExit { exit_code: 42 };
+        let exit = ExecExit {
+            exit_code: 42,
+            oom_killed: false,
+        };
         let json = serde_json::to_string(&exit).unwrap();
         let parsed: ExecExit = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.exit_code, 42);

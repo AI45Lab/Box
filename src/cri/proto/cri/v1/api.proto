@@ -23,6 +23,8 @@ service RuntimeService {
     rpc PodSandboxStatus(PodSandboxStatusRequest) returns (PodSandboxStatusResponse) {}
     // ListPodSandbox returns a list of PodSandboxes.
     rpc ListPodSandbox(ListPodSandboxRequest) returns (ListPodSandboxResponse) {}
+    // StreamPodSandboxes returns a stream of PodSandboxes.
+    rpc StreamPodSandboxes(StreamPodSandboxesRequest) returns (stream StreamPodSandboxesResponse) {}
 
     // CreateContainer creates a new container in specified PodSandbox.
     rpc CreateContainer(CreateContainerRequest) returns (CreateContainerResponse) {}
@@ -34,6 +36,8 @@ service RuntimeService {
     rpc RemoveContainer(RemoveContainerRequest) returns (RemoveContainerResponse) {}
     // ListContainers lists all containers by filters.
     rpc ListContainers(ListContainersRequest) returns (ListContainersResponse) {}
+    // StreamContainers returns a stream of containers.
+    rpc StreamContainers(StreamContainersRequest) returns (stream StreamContainersResponse) {}
     // ContainerStatus returns status of the container.
     rpc ContainerStatus(ContainerStatusRequest) returns (ContainerStatusResponse) {}
 
@@ -45,30 +49,50 @@ service RuntimeService {
     rpc Attach(AttachRequest) returns (AttachResponse) {}
     // PortForward prepares a streaming endpoint to forward ports from a PodSandbox.
     rpc PortForward(PortForwardRequest) returns (PortForwardResponse) {}
+    // ContainerStats returns stats of the container.
+    rpc ContainerStats(ContainerStatsRequest) returns (ContainerStatsResponse) {}
+    // ListContainerStats returns stats of running containers.
+    rpc ListContainerStats(ListContainerStatsRequest) returns (ListContainerStatsResponse) {}
+    // StreamContainerStats returns a stream of container stats.
+    rpc StreamContainerStats(StreamContainerStatsRequest) returns (stream StreamContainerStatsResponse) {}
+    // PodSandboxStats returns stats of the pod sandbox.
+    rpc PodSandboxStats(PodSandboxStatsRequest) returns (PodSandboxStatsResponse) {}
+    // ListPodSandboxStats returns stats of pod sandboxes matching a filter.
+    rpc ListPodSandboxStats(ListPodSandboxStatsRequest) returns (ListPodSandboxStatsResponse) {}
+    // StreamPodSandboxStats returns a stream of pod sandbox stats.
+    rpc StreamPodSandboxStats(StreamPodSandboxStatsRequest) returns (stream StreamPodSandboxStatsResponse) {}
 
     // UpdateContainerResources updates ContainerConfig of the container.
     rpc UpdateContainerResources(UpdateContainerResourcesRequest) returns (UpdateContainerResourcesResponse) {}
     // ReopenContainerLog asks runtime to reopen the stdout/stderr log file for the container.
     rpc ReopenContainerLog(ReopenContainerLogRequest) returns (ReopenContainerLogResponse) {}
-    // ContainerStats returns stats of the container.
-    rpc ContainerStats(ContainerStatsRequest) returns (ContainerStatsResponse) {}
-    // ListContainerStats returns stats of all containers.
-    rpc ListContainerStats(ListContainerStatsRequest) returns (ListContainerStatsResponse) {}
-    // PodSandboxStats returns stats of the pod sandbox.
-    rpc PodSandboxStats(PodSandboxStatsRequest) returns (PodSandboxStatsResponse) {}
-    // ListPodSandboxStats returns stats of all pod sandboxes.
-    rpc ListPodSandboxStats(ListPodSandboxStatsRequest) returns (ListPodSandboxStatsResponse) {}
 
     // Status returns the status of the runtime.
     rpc Status(StatusRequest) returns (StatusResponse) {}
     // UpdateRuntimeConfig updates the runtime configuration.
     rpc UpdateRuntimeConfig(UpdateRuntimeConfigRequest) returns (UpdateRuntimeConfigResponse) {}
+    // RuntimeConfig returns runtime-level configuration consumed by kubelet.
+    rpc RuntimeConfig(RuntimeConfigRequest) returns (RuntimeConfigResponse) {}
+    // UpdatePodSandboxResources updates pod-level resource configuration.
+    rpc UpdatePodSandboxResources(UpdatePodSandboxResourcesRequest) returns (UpdatePodSandboxResourcesResponse) {}
+    // CheckpointContainer checkpoints a container.
+    rpc CheckpointContainer(CheckpointContainerRequest) returns (CheckpointContainerResponse) {}
+    // GetContainerEvents streams container lifecycle events.
+    rpc GetContainerEvents(GetEventsRequest) returns (stream ContainerEventResponse) {}
+    // ListMetricDescriptors returns runtime metric descriptors.
+    rpc ListMetricDescriptors(ListMetricDescriptorsRequest) returns (ListMetricDescriptorsResponse) {}
+    // ListPodSandboxMetrics returns pod sandbox metrics.
+    rpc ListPodSandboxMetrics(ListPodSandboxMetricsRequest) returns (ListPodSandboxMetricsResponse) {}
+    // StreamPodSandboxMetrics returns a stream of pod sandbox metrics.
+    rpc StreamPodSandboxMetrics(StreamPodSandboxMetricsRequest) returns (stream StreamPodSandboxMetricsResponse) {}
 }
 
 // ImageService defines the public APIs for managing images.
 service ImageService {
     // ListImages lists existing images.
     rpc ListImages(ListImagesRequest) returns (ListImagesResponse) {}
+    // StreamImages returns a stream of images.
+    rpc StreamImages(StreamImagesRequest) returns (stream StreamImagesResponse) {}
     // ImageStatus returns the status of the image.
     rpc ImageStatus(ImageStatusRequest) returns (ImageStatusResponse) {}
     // PullImage pulls an image with authentication config.
@@ -305,16 +329,45 @@ message KeyValue {
 }
 
 // LinuxContainerSecurityContext holds linux security configuration.
+// Capabilities to add or drop. Field numbers MUST match the official
+// Kubernetes CRI v1 proto so messages from crictl/kubelet decode correctly.
+message Capability {
+    repeated string add_capabilities = 1;
+    repeated string drop_capabilities = 2;
+    repeated string add_ambient_capabilities = 3;
+}
+
+// SecurityProfile defines a seccomp/AppArmor profile selection.
+message SecurityProfile {
+    enum ProfileType {
+        RuntimeDefault = 0;
+        Unconfined = 1;
+        Localhost = 2;
+    }
+    ProfileType profile_type = 1;
+    string localhost_ref = 2;
+}
+
+// Field numbers below MUST match the official Kubernetes CRI v1 proto; the
+// previous hand-numbered version shifted fields (e.g. privileged at 8 instead
+// of 2), so any pod/container with a security context failed to decode.
 message LinuxContainerSecurityContext {
-    NamespaceOption namespace_options = 1;
-    SELinuxOption selinux_options = 2;
-    Int64Value run_as_user = 3;
-    string run_as_username = 4;
-    Int64Value run_as_group = 5;
-    bool readonly_rootfs = 6;
-    repeated int64 supplemental_groups = 7;
-    bool privileged = 8;
-    bool no_new_privs = 9;
+    Capability capabilities = 1;
+    bool privileged = 2;
+    NamespaceOption namespace_options = 3;
+    SELinuxOption selinux_options = 4;
+    Int64Value run_as_user = 5;
+    string run_as_username = 6;
+    bool readonly_rootfs = 7;
+    repeated int64 supplemental_groups = 8;
+    string apparmor_profile = 9 [deprecated = true];
+    string seccomp_profile_path = 10 [deprecated = true];
+    bool no_new_privs = 11;
+    Int64Value run_as_group = 12;
+    repeated string masked_paths = 13;
+    repeated string readonly_paths = 14;
+    SecurityProfile seccomp = 15;
+    SecurityProfile apparmor = 16;
 }
 
 // LinuxContainerConfig contains platform-specific configuration for Linux-based containers.
@@ -677,7 +730,25 @@ message ImageFsInfoResponse {
     repeated FilesystemUsage image_filesystems = 1;
 }
 
-// ContainerAttributes contains basic container metadata for stats responses.
+// StreamPodSandboxesRequest is used to stream PodSandboxes matching a filter.
+message StreamPodSandboxesRequest {
+    PodSandboxFilter filter = 1;
+}
+
+message StreamPodSandboxesResponse {
+    repeated PodSandbox pod_sandboxes = 1;
+}
+
+// StreamContainersRequest is used to stream containers matching a filter.
+message StreamContainersRequest {
+    ContainerFilter filter = 1;
+}
+
+message StreamContainersResponse {
+    repeated Container containers = 1;
+}
+
+// ContainerAttributes describes static container metadata for stats/events.
 message ContainerAttributes {
     string id = 1;
     ContainerMetadata metadata = 2;
@@ -685,14 +756,14 @@ message ContainerAttributes {
     map<string, string> annotations = 4;
 }
 
-// CpuUsage provides the CPU usage information.
+// CpuUsage carries CPU usage counters when available.
 message CpuUsage {
     int64 timestamp = 1;
     UInt64Value usage_core_nano_seconds = 2;
     UInt64Value usage_nano_cores = 3;
 }
 
-// MemoryUsage provides the memory usage information.
+// MemoryUsage carries memory usage counters when available.
 message MemoryUsage {
     int64 timestamp = 1;
     UInt64Value working_set_bytes = 2;
@@ -703,20 +774,11 @@ message MemoryUsage {
     UInt64Value major_page_faults = 7;
 }
 
-// WritableLayerUsage provides the writable layer usage information.
-message WritableLayerUsage {
-    int64 timestamp = 1;
-    FilesystemIdentifier fs_id = 2;
-    UInt64Value used_bytes = 3;
-    UInt64Value inodes_used = 4;
-}
-
-// ContainerStats provides resource usage stats for a container.
 message ContainerStats {
     ContainerAttributes attributes = 1;
     CpuUsage cpu = 2;
     MemoryUsage memory = 3;
-    WritableLayerUsage writable_layer = 4;
+    FilesystemUsage writable_layer = 4;
 }
 
 message ContainerStatsRequest {
@@ -741,6 +803,14 @@ message ListContainerStatsResponse {
     repeated ContainerStats stats = 1;
 }
 
+message StreamContainerStatsRequest {
+    ContainerStatsFilter filter = 1;
+}
+
+message StreamContainerStatsResponse {
+    repeated ContainerStats stats = 1;
+}
+
 message PodSandboxAttributes {
     string id = 1;
     PodSandboxMetadata metadata = 2;
@@ -748,10 +818,31 @@ message PodSandboxAttributes {
     map<string, string> annotations = 4;
 }
 
+message NetworkInterfaceUsage {
+    string name = 1;
+    UInt64Value rx_bytes = 2;
+    UInt64Value rx_errors = 3;
+    UInt64Value tx_bytes = 4;
+    UInt64Value tx_errors = 5;
+}
+
+message NetworkUsage {
+    int64 timestamp = 1;
+    NetworkInterfaceUsage default_interface = 2;
+    repeated NetworkInterfaceUsage interfaces = 3;
+}
+
+message ProcessUsage {
+    int64 timestamp = 1;
+    UInt64Value process_count = 2;
+}
+
 message LinuxPodSandboxStats {
     CpuUsage cpu = 1;
     MemoryUsage memory = 2;
-    repeated ContainerStats containers = 3;
+    NetworkUsage network = 3;
+    ProcessUsage process = 4;
+    repeated ContainerStats containers = 5;
 }
 
 message PodSandboxStats {
@@ -778,4 +869,110 @@ message ListPodSandboxStatsRequest {
 
 message ListPodSandboxStatsResponse {
     repeated PodSandboxStats stats = 1;
+}
+
+message StreamPodSandboxStatsRequest {
+    PodSandboxStatsFilter filter = 1;
+}
+
+message StreamPodSandboxStatsResponse {
+    repeated PodSandboxStats stats = 1;
+}
+
+message RuntimeConfigRequest {}
+
+enum CgroupDriver {
+    SYSTEMD = 0;
+    CGROUPFS = 1;
+}
+
+message LinuxRuntimeConfiguration {
+    CgroupDriver cgroup_driver = 1;
+}
+
+message RuntimeConfigResponse {
+    LinuxRuntimeConfiguration linux = 1;
+}
+
+message UpdatePodSandboxResourcesRequest {
+    string pod_sandbox_id = 1;
+    LinuxContainerResources linux = 2;
+    map<string, string> annotations = 3;
+}
+
+message UpdatePodSandboxResourcesResponse {}
+
+message CheckpointContainerRequest {
+    string container_id = 1;
+    string location = 2;
+    int64 timeout = 3;
+}
+
+message CheckpointContainerResponse {}
+
+message GetEventsRequest {}
+
+enum ContainerEventType {
+    CONTAINER_CREATED_EVENT = 0;
+    CONTAINER_STARTED_EVENT = 1;
+    CONTAINER_STOPPED_EVENT = 2;
+    CONTAINER_DELETED_EVENT = 3;
+}
+
+message ContainerEventResponse {
+    string container_id = 1;
+    string pod_sandbox_id = 2;
+    ContainerEventType container_event_type = 3;
+    int64 created_at = 4;
+    string reason = 5;
+    string message = 6;
+}
+
+message MetricDescriptor {
+    string name = 1;
+    string help = 2;
+    string kind = 3;
+    string unit = 4;
+}
+
+message ListMetricDescriptorsRequest {}
+
+message ListMetricDescriptorsResponse {
+    repeated MetricDescriptor descriptors = 1;
+}
+
+message Metric {
+    string name = 1;
+    map<string, string> labels = 2;
+    double value = 3;
+    int64 timestamp = 4;
+}
+
+message PodSandboxMetrics {
+    string pod_sandbox_id = 1;
+    repeated Metric metrics = 2;
+}
+
+message ListPodSandboxMetricsRequest {
+    PodSandboxStatsFilter filter = 1;
+}
+
+message ListPodSandboxMetricsResponse {
+    repeated PodSandboxMetrics pod_sandbox_metrics = 1;
+}
+
+message StreamPodSandboxMetricsRequest {
+    PodSandboxStatsFilter filter = 1;
+}
+
+message StreamPodSandboxMetricsResponse {
+    repeated PodSandboxMetrics pod_sandbox_metrics = 1;
+}
+
+message StreamImagesRequest {
+    ImageFilter filter = 1;
+}
+
+message StreamImagesResponse {
+    repeated Image images = 1;
 }

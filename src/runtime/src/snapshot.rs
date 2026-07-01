@@ -30,6 +30,20 @@ impl SnapshotStore {
                 e
             ))
         })?;
+        // Sweep leftover `.staging-*` dirs from a prior crashed/aborted save
+        // (mirrors ImageStore::new). `save` builds the whole snapshot in
+        // `.staging-<id>-<pid>-<seq>` and only renames it into `<id>/` after
+        // metadata.json; a SIGKILL/OOM/power-loss mid-copy leaves a full
+        // rootfs-sized staging dir that list/count/prune never see (they key on
+        // metadata.json) and that embeds the dead writer's pid+seq, so no later
+        // process can match it — it would leak permanently without this sweep.
+        if let Ok(entries) = std::fs::read_dir(base_dir) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().starts_with(".staging-") {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+            }
+        }
         Ok(Self {
             base_dir: base_dir.to_path_buf(),
         })
@@ -58,16 +72,30 @@ impl SnapshotStore {
             )));
         }
 
-        std::fs::create_dir_all(&snap_dir).map_err(|e| {
+        // Build the whole snapshot in a staging dir, then atomically rename it to
+        // `<id>/` only after metadata.json is written. A crash mid-save then
+        // leaves at most a `<id>.staging-*` dir (GC-able), never a partial
+        // `<id>/` that get/list ignore (they key on metadata.json) yet that
+        // blocks re-create and never prunes.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static STAGE_SEQ: AtomicU64 = AtomicU64::new(0);
+        let staging = self.base_dir.join(format!(
+            ".staging-{}-{}-{}",
+            metadata.id,
+            std::process::id(),
+            STAGE_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&staging);
+        std::fs::create_dir_all(&staging).map_err(|e| {
             BoxError::CacheError(format!(
-                "Failed to create snapshot directory {}: {}",
-                snap_dir.display(),
+                "Failed to create snapshot staging directory {}: {}",
+                staging.display(),
                 e
             ))
         })?;
 
         // Copy rootfs if source exists
-        let rootfs_dest = snap_dir.join("rootfs");
+        let rootfs_dest = staging.join("rootfs");
         if rootfs_source.exists() {
             copy_dir_recursive(rootfs_source, &rootfs_dest)?;
         } else {
@@ -77,10 +105,10 @@ impl SnapshotStore {
         }
 
         // Calculate size
-        metadata.size_bytes = dir_size(&snap_dir);
+        metadata.size_bytes = dir_size(&staging);
 
-        // Write metadata
-        let meta_path = snap_dir.join("metadata.json");
+        // Write metadata into the staging dir.
+        let meta_path = staging.join("metadata.json");
         let json = serde_json::to_string_pretty(&metadata).map_err(|e| {
             BoxError::SerializationError(format!("Failed to serialize snapshot metadata: {}", e))
         })?;
@@ -88,6 +116,17 @@ impl SnapshotStore {
             BoxError::CacheError(format!(
                 "Failed to write snapshot metadata {}: {}",
                 meta_path.display(),
+                e
+            ))
+        })?;
+
+        // Atomic publish: the snapshot becomes visible (with its metadata) in one
+        // step, or not at all.
+        std::fs::rename(&staging, &snap_dir).map_err(|e| {
+            let _ = std::fs::remove_dir_all(&staging);
+            BoxError::CacheError(format!(
+                "Failed to publish snapshot {}: {}",
+                snap_dir.display(),
                 e
             ))
         })?;
@@ -141,10 +180,24 @@ impl SnapshotStore {
             })?;
             let meta_path = entry.path().join("metadata.json");
             if meta_path.exists() {
-                if let Ok(data) = std::fs::read_to_string(&meta_path) {
-                    if let Ok(meta) = serde_json::from_str::<SnapshotMetadata>(&data) {
-                        snapshots.push(meta);
-                    }
+                match std::fs::read_to_string(&meta_path) {
+                    Ok(data) => match serde_json::from_str::<SnapshotMetadata>(&data) {
+                        Ok(meta) => snapshots.push(meta),
+                        // Don't silently skip: a metadata file that won't parse
+                        // makes the snapshot invisible to count/total_size/prune
+                        // while its rootfs keeps consuming disk. Surface it so it
+                        // can be diagnosed and cleaned up.
+                        Err(e) => tracing::warn!(
+                            path = %meta_path.display(),
+                            error = %e,
+                            "Skipping snapshot with unparseable metadata.json (orphaned on disk)"
+                        ),
+                    },
+                    Err(e) => tracing::warn!(
+                        path = %meta_path.display(),
+                        error = %e,
+                        "Skipping snapshot with unreadable metadata.json"
+                    ),
                 }
             }
         }
@@ -182,27 +235,67 @@ impl SnapshotStore {
     /// Removes oldest snapshots first until both `max_count` and `max_bytes`
     /// constraints are satisfied. A value of 0 means unlimited.
     pub fn prune(&self, max_count: usize, max_bytes: u64) -> Result<Vec<String>> {
-        let mut snapshots = self.list()?;
+        // A snapshot a restored box shares as its copy-on-write overlay lower must
+        // never be evicted — deleting a live lower breaks the box (ESTALE) or stops
+        // it from re-starting. Read which are in use from the boxes' `.snapshot-lower`
+        // markers and skip them, evicting the oldest *evictable* snapshot instead.
+        let protected = self.referenced_rootfs_paths();
+        let mut snapshots = self.list()?; // newest-first
         let mut removed = Vec::new();
 
-        // Snapshots are sorted newest-first; remove from the end (oldest)
-        while !snapshots.is_empty() {
+        loop {
             let over_count = max_count > 0 && snapshots.len() > max_count;
             let total: u64 = snapshots.iter().map(|s| s.size_bytes).sum();
             let over_size = max_bytes > 0 && total > max_bytes;
-
             if !over_count && !over_size {
                 break;
             }
 
-            // Remove the oldest (last in the list)
-            if let Some(oldest) = snapshots.pop() {
-                self.delete(&oldest.id)?;
-                removed.push(oldest.id);
+            // Oldest (last) snapshot that is not an in-use CoW lower.
+            let idx = snapshots
+                .iter()
+                .rposition(|s| !protected.contains(&self.rootfs_path(&s.id)));
+            match idx {
+                Some(i) => {
+                    let snap = snapshots.remove(i);
+                    self.delete(&snap.id)?;
+                    removed.push(snap.id);
+                }
+                // Everything left is protected; can't prune further without
+                // breaking a live box, so stop (caller stays over the cap).
+                None => {
+                    tracing::warn!(
+                        in_use = snapshots.len(),
+                        "snapshot prune kept {} in-use snapshot(s) (each referenced as a \
+                         copy-on-write overlay lower); requested limit not fully met",
+                        snapshots.len()
+                    );
+                    break;
+                }
             }
         }
 
         Ok(removed)
+    }
+
+    /// Rootfs paths currently referenced by a restored box as its CoW overlay lower
+    /// (`<box_dir>/.snapshot-lower`, written by `snapshot restore`). These snapshots
+    /// must not be pruned. Boxes live next to snapshots under the a3s home
+    /// (`base_dir` = `<home>/snapshots`).
+    fn referenced_rootfs_paths(&self) -> std::collections::HashSet<PathBuf> {
+        let mut set = std::collections::HashSet::new();
+        let boxes = match self.base_dir.parent() {
+            Some(home) => home.join("boxes"),
+            None => return set,
+        };
+        if let Ok(entries) = std::fs::read_dir(&boxes) {
+            for entry in entries.flatten() {
+                if let Ok(content) = std::fs::read_to_string(entry.path().join(".snapshot-lower")) {
+                    set.insert(PathBuf::from(content.trim()));
+                }
+            }
+        }
+        set
     }
 }
 
@@ -548,6 +641,67 @@ mod tests {
     }
 
     #[test]
+    fn prune_skips_in_use_snapshots() {
+        let tmp = TempDir::new().unwrap();
+        let store = SnapshotStore::new(&tmp.path().join("snapshots")).unwrap();
+        let rootfs = make_rootfs(&tmp);
+
+        for i in 0..5 {
+            store
+                .save(
+                    make_metadata(&format!("s{}", i), &format!("s{}", i)),
+                    &rootfs,
+                )
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        // Mark the OLDEST (s0) as a box's in-use CoW overlay lower.
+        let box_dir = tmp.path().join("boxes").join("box1");
+        std::fs::create_dir_all(&box_dir).unwrap();
+        std::fs::write(
+            box_dir.join(".snapshot-lower"),
+            store.rootfs_path("s0").to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+
+        // keep=3 would normally evict the oldest two (s0, s1); s0 is protected, so
+        // it survives and s1 + s2 are evicted instead.
+        let removed = store.prune(3, 0).unwrap();
+        assert_eq!(removed.len(), 2);
+        assert!(store.get("s0").unwrap().is_some(), "in-use s0 must be kept");
+        assert!(store.get("s1").unwrap().is_none());
+        assert!(store.get("s2").unwrap().is_none());
+        assert!(store.get("s3").unwrap().is_some());
+        assert!(store.get("s4").unwrap().is_some());
+    }
+
+    #[test]
+    fn prune_keeps_everything_when_all_in_use() {
+        let tmp = TempDir::new().unwrap();
+        let store = SnapshotStore::new(&tmp.path().join("snapshots")).unwrap();
+        let rootfs = make_rootfs(&tmp);
+        store.save(make_metadata("a", "a"), &rootfs).unwrap();
+        store.save(make_metadata("b", "b"), &rootfs).unwrap();
+
+        // Both snapshots are in use as a box's CoW overlay lower.
+        for (i, id) in ["a", "b"].iter().enumerate() {
+            let bd = tmp.path().join("boxes").join(format!("bx{i}"));
+            std::fs::create_dir_all(&bd).unwrap();
+            std::fs::write(
+                bd.join(".snapshot-lower"),
+                store.rootfs_path(id).to_string_lossy().as_bytes(),
+            )
+            .unwrap();
+        }
+
+        // Even asked to keep only 1, prune evicts nothing — both are protected.
+        let removed = store.prune(1, 0).unwrap();
+        assert!(removed.is_empty(), "in-use snapshots must never be pruned");
+        assert_eq!(store.count().unwrap(), 2);
+    }
+
+    #[test]
     fn test_snapshot_save_with_empty_rootfs() {
         let tmp = TempDir::new().unwrap();
         let store = SnapshotStore::new(&tmp.path().join("snapshots")).unwrap();
@@ -612,5 +766,29 @@ mod tests {
             std::fs::read_to_string(dst.join("sub/b.txt")).unwrap(),
             "world"
         );
+    }
+
+    #[test]
+    fn new_sweeps_leftover_staging_dirs() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("snapshots");
+        std::fs::create_dir_all(&base).unwrap();
+
+        // A full rootfs-sized staging dir leaked by a crashed save...
+        let leaked = base.join(".staging-snap1-12345-0");
+        std::fs::create_dir_all(leaked.join("rootfs")).unwrap();
+        std::fs::write(leaked.join("rootfs").join("big"), vec![0u8; 4096]).unwrap();
+        // ...alongside a real snapshot (keyed by metadata.json).
+        let real = base.join("snap1");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("metadata.json"), "{}").unwrap();
+
+        let _store = SnapshotStore::new(&base).unwrap();
+
+        assert!(
+            !leaked.exists(),
+            "leaked .staging-* dir must be swept on open"
+        );
+        assert!(real.exists(), "a real snapshot dir must be preserved");
     }
 }

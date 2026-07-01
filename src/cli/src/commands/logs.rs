@@ -1,6 +1,7 @@
 //! `a3s-box logs` command — View box console logs.
 
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use clap::Args;
@@ -8,7 +9,7 @@ use clap::Args;
 use a3s_box_core::log::{LogDriver, LogEntry};
 
 use crate::resolve;
-use crate::state::StateFile;
+use crate::state::{BoxRecord, StateFile};
 
 #[derive(Args)]
 pub struct LogsArgs {
@@ -19,9 +20,9 @@ pub struct LogsArgs {
     #[arg(short, long)]
     pub follow: bool,
 
-    /// Number of lines to show from the end, or "all"
+    /// Number of lines to show from the end
     #[arg(long)]
-    pub tail: Option<String>,
+    pub tail: Option<usize>,
 
     /// Show logs since timestamp (e.g., "2024-01-01T00:00:00Z", "1h", "30m")
     #[arg(long)]
@@ -34,6 +35,12 @@ pub struct LogsArgs {
     /// Show timestamps on each line
     #[arg(short = 't', long)]
     pub timestamps: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LogSource {
+    path: PathBuf,
+    structured: bool,
 }
 
 pub async fn execute(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -49,28 +56,34 @@ pub async fn execute(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
-    // Prefer structured JSON log (container.json) when available
-    let log_dir = record.box_dir.join("logs");
-    let json_log = a3s_box_runtime::log::json_log_path(&log_dir);
-    let use_json = json_log.exists();
-
-    let log_path = if use_json {
-        &json_log
-    } else {
-        &record.console_log
-    };
-    if !log_path.exists() {
-        return Err(format!("No logs found for box {}", record.name).into());
-    }
-
     let since = args.since.as_deref().map(parse_time_filter).transpose()?;
     let until = args.until.as_deref().map(parse_time_filter).transpose()?;
-    let tail = args.tail.as_deref().map(parse_tail).transpose()?;
 
+    let Some(log_source) = resolve_log_source(record) else {
+        if args.follow && record.status == "running" {
+            match wait_for_log_source(&record.id).await? {
+                Some(source) => return stream_logs(source, args, since, until).await,
+                None => return Ok(()),
+            }
+        }
+        return Ok(());
+    };
+
+    stream_logs(log_source, args, since, until).await
+}
+
+async fn stream_logs(
+    log_source: LogSource,
+    args: LogsArgs,
+    since: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let use_json = log_source.structured;
+    let log_path = log_source.path;
     let has_time_filter = since.is_some() || until.is_some();
 
-    if let Some(TailMode::Lines(tail_n)) = tail {
-        let file = std::fs::File::open(log_path)?;
+    if let Some(tail_n) = args.tail {
+        let file = std::fs::File::open(&log_path)?;
         let reader = BufReader::new(file);
         let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
         let start = lines.len().saturating_sub(tail_n);
@@ -90,8 +103,8 @@ pub async fn execute(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> {
                 print_line(line, args.timestamps);
             }
         }
-    } else if tail == Some(TailMode::All) || !args.follow {
-        let file = std::fs::File::open(log_path)?;
+    } else if !args.follow {
+        let file = std::fs::File::open(&log_path)?;
         let reader = BufReader::new(file);
         for line in reader.lines() {
             let line = line?;
@@ -113,18 +126,41 @@ pub async fn execute(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if args.follow {
-        let file = std::fs::File::open(log_path)?;
+        let file = std::fs::File::open(&log_path)?;
         let mut reader = BufReader::new(file);
-
-        reader.seek(SeekFrom::End(0))?;
+        let mut pos = reader.seek(SeekFrom::End(0))?;
 
         loop {
             let mut line = String::new();
             match reader.read_line(&mut line) {
                 Ok(0) => {
+                    // Follow-by-name (like `tail -F`): the writer either ROTATES
+                    // container.json (rename + new file → new inode) or TRUNCATES
+                    // the raw console.log in place. Handle both so `--follow`
+                    // never freezes on a stale fd after ~max-size of output.
+                    //
+                    // We only get here at EOF, so the old inode is already drained
+                    // up to the rotation point — re-opening loses no lines.
+                    let rotated = reader
+                        .get_ref()
+                        .metadata()
+                        .map(|open| file_rotated(&open, &log_path))
+                        .unwrap_or(false);
+                    if rotated {
+                        if let Ok(f) = std::fs::File::open(&log_path) {
+                            reader = BufReader::new(f);
+                            pos = 0;
+                        }
+                    } else if let Ok(meta) = reader.get_ref().metadata() {
+                        // Truncated in place (bounded console.log): re-read from start.
+                        if pos > meta.len() {
+                            pos = reader.seek(SeekFrom::Start(0)).unwrap_or(0);
+                        }
+                    }
                     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                 }
-                Ok(_) => {
+                Ok(n) => {
+                    pos += n as u64;
                     let trimmed = line.trim_end();
                     if use_json {
                         print_json_line(
@@ -140,7 +176,11 @@ pub async fn execute(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> {
                         {
                             continue;
                         }
-                        print_line(trimmed, args.timestamps);
+                        if args.timestamps {
+                            print!("{} {}", Utc::now().to_rfc3339(), line);
+                        } else {
+                            print!("{line}");
+                        }
                     }
                 }
                 Err(e) => {
@@ -153,21 +193,60 @@ pub async fn execute(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TailMode {
-    All,
-    Lines(usize),
+/// True if the file currently at `path` has a different inode than `open_meta` —
+/// i.e. it was rotated (renamed away, a new one created) under our open fd. Lets
+/// `--follow` re-open the new file (`tail -F`) instead of stalling on the old
+/// inode after the writer rotates `container.json`.
+#[cfg(unix)]
+fn file_rotated(open_meta: &std::fs::Metadata, path: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path)
+        .map(|cur| open_meta.ino() != cur.ino())
+        .unwrap_or(false)
 }
 
-fn parse_tail(value: &str) -> Result<TailMode, String> {
-    if value == "all" {
-        return Ok(TailMode::All);
+#[cfg(not(unix))]
+fn file_rotated(_open_meta: &std::fs::Metadata, _path: &std::path::Path) -> bool {
+    false
+}
+
+fn resolve_log_source(record: &BoxRecord) -> Option<LogSource> {
+    let log_dir = record.box_dir.join("logs");
+    let json_log = a3s_box_runtime::log::json_log_path(&log_dir);
+    if json_log.exists() {
+        return Some(LogSource {
+            path: json_log,
+            structured: true,
+        });
     }
 
-    let lines = value.parse::<usize>().map_err(|_| {
-        format!("Invalid --tail value {value:?}: expected non-negative integer or 'all'")
-    })?;
-    Ok(TailMode::Lines(lines))
+    if record.console_log.exists() {
+        return Some(LogSource {
+            path: record.console_log.clone(),
+            structured: false,
+        });
+    }
+
+    None
+}
+
+async fn wait_for_log_source(
+    box_id: &str,
+) -> Result<Option<LogSource>, Box<dyn std::error::Error>> {
+    loop {
+        let state = StateFile::load_default()?;
+        let Some(record) = state.find_by_id(box_id) else {
+            return Ok(None);
+        };
+        if let Some(source) = resolve_log_source(record) {
+            return Ok(Some(source));
+        }
+        if record.status != "running" || record.log_config.driver == LogDriver::None {
+            return Ok(None);
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    }
 }
 
 /// Print a structured JSON log line, extracting the message and optional timestamp.
@@ -203,11 +282,18 @@ fn print_json_line(
         }
     }
 
-    // The log field already contains the trailing newline
-    if timestamps {
-        print!("{} {}", entry.time, entry.log);
+    // The log field already contains the trailing newline. Route stderr lines to
+    // the terminal's stderr, like Docker `logs`.
+    let line = if timestamps {
+        format!("{} {}", entry.time, entry.log)
     } else {
-        print!("{}", entry.log);
+        entry.log.clone()
+    };
+    if entry.stream == "stderr" {
+        use std::io::Write as _;
+        let _ = std::io::stderr().write_all(line.as_bytes());
+    } else {
+        print!("{line}");
     }
 }
 
@@ -237,49 +323,15 @@ fn parse_time_filter(s: &str) -> Result<DateTime<Utc>, String> {
     Ok(Utc::now() - duration)
 }
 
-/// Parse a human-readable duration string into a chrono::Duration.
-///
-/// Supports: "30s", "5m", "1h", "2d", "1h30m"
+/// Parse a relative duration (e.g. `30s`, `5m`, `1h`, `2d`, `1h30m`) into a
+/// `chrono::Duration` for `--since`/`--until`. A zero duration is rejected here
+/// because a relative time offset of 0 is not meaningful for log filtering.
 fn parse_duration(s: &str) -> Result<chrono::Duration, String> {
-    let mut total_secs: i64 = 0;
-    let mut num_buf = String::new();
-
-    for ch in s.chars() {
-        if ch.is_ascii_digit() {
-            num_buf.push(ch);
-        } else {
-            let n: i64 = num_buf.parse().map_err(|_| {
-                format!("Invalid duration: {s:?} (expected format like '1h', '30m', '2d')")
-            })?;
-            num_buf.clear();
-
-            match ch {
-                's' => total_secs += n,
-                'm' => total_secs += n * 60,
-                'h' => total_secs += n * 3600,
-                'd' => total_secs += n * 86400,
-                _ => {
-                    return Err(format!(
-                        "Unknown duration unit '{ch}' in {s:?} (expected s/m/h/d)"
-                    ))
-                }
-            }
-        }
-    }
-
-    if !num_buf.is_empty() {
-        // Bare number without unit — treat as seconds
-        let n: i64 = num_buf
-            .parse()
-            .map_err(|_| format!("Invalid duration: {s:?}"))?;
-        total_secs += n;
-    }
-
-    if total_secs == 0 {
+    let secs = crate::output::parse_duration_secs(s)?;
+    if secs == 0 {
         return Err(format!("Invalid duration: {s:?} (resolved to 0)"));
     }
-
-    Ok(chrono::Duration::seconds(total_secs))
+    Ok(chrono::Duration::seconds(secs as i64))
 }
 
 /// Check if a log line falls within the [since, until] time range.
@@ -325,24 +377,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_tail_all() {
-        assert_eq!(parse_tail("all").unwrap(), TailMode::All);
-    }
+    #[cfg(unix)]
+    fn test_file_rotated_detects_inode_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("container.json");
+        std::fs::write(&path, b"old\n").unwrap();
+        let open = std::fs::File::open(&path).unwrap().metadata().unwrap();
 
-    #[test]
-    fn test_parse_tail_lines() {
-        assert_eq!(parse_tail("25").unwrap(), TailMode::Lines(25));
-    }
+        // Same inode → not rotated.
+        assert!(!file_rotated(&open, &path));
 
-    #[test]
-    fn test_parse_tail_zero() {
-        assert_eq!(parse_tail("0").unwrap(), TailMode::Lines(0));
-    }
+        // Rotate like the writer does: rename away, create a fresh file.
+        std::fs::rename(&path, dir.path().join("container.json.1")).unwrap();
+        std::fs::write(&path, b"new\n").unwrap();
+        assert!(file_rotated(&open, &path));
 
-    #[test]
-    fn test_parse_tail_invalid() {
-        assert!(parse_tail("latest").is_err());
-        assert!(parse_tail("-1").is_err());
+        // Missing file → not rotated (no panic).
+        assert!(!file_rotated(&open, &dir.path().join("gone")));
     }
 
     #[test]
@@ -426,5 +477,50 @@ mod tests {
     fn test_extract_line_timestamp_none() {
         let ts = extract_line_timestamp("just a regular log line");
         assert!(ts.is_none());
+    }
+
+    #[test]
+    fn test_resolve_log_source_prefers_structured_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut record =
+            crate::test_helpers::fixtures::make_record("log-id", "logs", "stopped", None);
+        record.box_dir = tmp.path().join("box");
+        let log_dir = record.box_dir.join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        record.console_log = log_dir.join("console.log");
+        std::fs::write(&record.console_log, "console\n").unwrap();
+        let json_log = a3s_box_runtime::log::json_log_path(&log_dir);
+        std::fs::write(&json_log, "{}\n").unwrap();
+
+        let source = resolve_log_source(&record).unwrap();
+        assert!(source.structured);
+        assert_eq!(source.path, json_log);
+    }
+
+    #[test]
+    fn test_resolve_log_source_falls_back_to_console_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut record =
+            crate::test_helpers::fixtures::make_record("log-id", "logs", "stopped", None);
+        record.box_dir = tmp.path().join("box");
+        let log_dir = record.box_dir.join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        record.console_log = log_dir.join("console.log");
+        std::fs::write(&record.console_log, "console\n").unwrap();
+
+        let source = resolve_log_source(&record).unwrap();
+        assert!(!source.structured);
+        assert_eq!(source.path, record.console_log);
+    }
+
+    #[test]
+    fn test_resolve_log_source_missing_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut record =
+            crate::test_helpers::fixtures::make_record("log-id", "logs", "stopped", None);
+        record.box_dir = tmp.path().join("box");
+        record.console_log = record.box_dir.join("logs").join("console.log");
+
+        assert!(resolve_log_source(&record).is_none());
     }
 }

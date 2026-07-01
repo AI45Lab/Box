@@ -11,9 +11,16 @@
 //!
 //! # Supported Instructions
 //!
-//! FROM, RUN, COPY, WORKDIR, ENV, ENTRYPOINT, CMD, EXPOSE, LABEL, USER, ARG
+//! FROM, shell-form RUN, shell-form COPY/ADD, WORKDIR, ENV, ENTRYPOINT, CMD,
+//! EXPOSE, LABEL, USER, ARG, SHELL, STOPSIGNAL, HEALTHCHECK, ONBUILD metadata
+//! triggers, VOLUME.
+//!
+//! Unsupported Dockerfile flags and instructions fail with contextual errors
+//! instead of being silently ignored.
 
+pub(crate) mod cache;
 pub mod dockerfile;
+pub(crate) mod dockerignore;
 pub mod engine;
 pub mod layer;
 

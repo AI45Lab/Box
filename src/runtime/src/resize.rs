@@ -50,12 +50,13 @@ impl ResourceUpdate {
 
     /// Build shell commands to apply Tier 2 cgroup changes inside the guest.
     ///
-    /// Returns a list of shell commands that write to cgroup v2 control files.
-    /// The guest init process runs as PID 1 in the root cgroup, so we write
-    /// to `/sys/fs/cgroup/` (the root cgroup or the box's cgroup slice).
+    /// Returns one `sh` command per cgroup v2 control file. The resize exec runs
+    /// in the guest ROOT cgroup, so each command resolves the per-container
+    /// cgroup slice (`box-<pid>-<seq>`, joined by the container at spawn) at
+    /// runtime and writes there — a bare `/sys/fs/cgroup/<file>` write would hit
+    /// the root cgroup and silently leave the container's limits unchanged.
     pub fn build_cgroup_commands(&self) -> Vec<String> {
         let mut cmds = Vec::new();
-        let cg = "/sys/fs/cgroup";
 
         // cpu.max: "$QUOTA $PERIOD" (or "max $PERIOD" for unlimited)
         if self.limits.cpu_quota.is_some() || self.limits.cpu_period.is_some() {
@@ -71,24 +72,24 @@ impl ResourceUpdate {
                 })
                 .unwrap_or_else(|| "max".to_string());
             let period = self.limits.cpu_period.unwrap_or(100_000);
-            cmds.push(format!("echo '{quota} {period}' > {cg}/cpu.max"));
+            cmds.push(cgroup_write_cmd("cpu.max", &format!("{quota} {period}")));
         }
 
         // cpu.weight: 1-10000 (maps from Docker's cpu-shares 2-262144)
         if let Some(shares) = self.limits.cpu_shares {
-            // Docker shares (2-262144) → cgroup v2 weight (1-10000)
-            // Formula: weight = (1 + ((shares - 2) * 9999) / 262142)
-            let weight = if shares <= 2 {
-                1
-            } else {
-                1 + ((shares.saturating_sub(2)) * 9999 / 262142).min(10000)
-            };
-            cmds.push(format!("echo '{weight}' > {cg}/cpu.weight"));
+            // Docker shares (2-262144) → cgroup v2 weight (1-10000), runc's
+            // mapping. Clamp shares into range FIRST (so the `* 9999` cannot
+            // overflow for absurd inputs near u64::MAX) and clamp the final
+            // result to [1, 10000] (the bare `1 + …` can reach 10001). Mirrors
+            // the guest `cgroup::shares_to_weight`.
+            let shares = shares.clamp(2, 262_144);
+            let weight = (1 + ((shares - 2) * 9999) / 262_142).clamp(1, 10_000);
+            cmds.push(cgroup_write_cmd("cpu.weight", &weight.to_string()));
         }
 
         // memory.low (soft limit / reservation)
         if let Some(reservation) = self.limits.memory_reservation {
-            cmds.push(format!("echo '{reservation}' > {cg}/memory.low"));
+            cmds.push(cgroup_write_cmd("memory.low", &reservation.to_string()));
         }
 
         // memory.swap.max
@@ -98,21 +99,69 @@ impl ResourceUpdate {
             } else {
                 swap.to_string()
             };
-            cmds.push(format!("echo '{val}' > {cg}/memory.swap.max"));
+            cmds.push(cgroup_write_cmd("memory.swap.max", &val));
         }
 
         // pids.max
         if let Some(pids) = self.limits.pids_limit {
-            cmds.push(format!("echo '{pids}' > {cg}/pids.max"));
+            cmds.push(cgroup_write_cmd("pids.max", &pids.to_string()));
         }
 
-        // cpuset.cpus
+        // cpuset.cpus — only emit a known-good value. `validate_update` already
+        // rejects malformed cpusets, but guard here too since the value is
+        // interpolated into the resize shell command: a stray quote/`$`/`;`
+        // could otherwise break out of `echo '…'` and run arbitrary shell in the
+        // guest.
         if let Some(ref cpuset) = self.limits.cpuset_cpus {
-            cmds.push(format!("echo '{cpuset}' > {cg}/cpuset.cpus"));
+            if is_valid_cpuset(cpuset) {
+                cmds.push(cgroup_write_cmd("cpuset.cpus", cpuset));
+            } else {
+                tracing::warn!(cpuset = %cpuset, "Skipping malformed cpuset.cpus value");
+            }
         }
 
         cmds
     }
+}
+
+/// Validate a cgroup `cpuset.cpus` value: a comma-separated list of CPU indices
+/// and ranges, e.g. `0`, `0,2,4`, `0-3`, `0-1,4-7`. Only ASCII digits, `,` and
+/// `-` are allowed, so no shell metacharacter can survive — the kernel rejects
+/// anything else anyway. Surrounding whitespace per element is tolerated.
+fn is_valid_cpuset(cpuset: &str) -> bool {
+    let cpuset = cpuset.trim();
+    if cpuset.is_empty() {
+        return false;
+    }
+    cpuset.split(',').all(|element| {
+        let element = element.trim();
+        match element.split_once('-') {
+            Some((lo, hi)) => {
+                !lo.is_empty()
+                    && !hi.is_empty()
+                    && lo.bytes().all(|b| b.is_ascii_digit())
+                    && hi.bytes().all(|b| b.is_ascii_digit())
+            }
+            None => !element.is_empty() && element.bytes().all(|b| b.is_ascii_digit()),
+        }
+    })
+}
+
+/// Build a `sh` command that writes `value` to cgroup v2 control file `file` in
+/// the container's per-container cgroup slice.
+///
+/// The resize exec runs in the guest root cgroup and this exec channel carries
+/// no container id, so the command resolves the slice at runtime: when there is
+/// exactly one `box-*` slice (every CLI box and single-container pod) it writes
+/// there. Otherwise it FAILS (exit 1) — it must never fall back to writing the
+/// bare root cgroup, which either errors (e.g. root has no `cpu.max`) or applies
+/// the limit to the whole root hierarchy instead of the container, while the CLI
+/// still reported success. A non-zero exit surfaces as a visible warning at the
+/// call site (container_update) instead of a silent mis-apply.
+fn cgroup_write_cmd(file: &str, value: &str) -> String {
+    format!(
+        "d=\"\"; n=0; for x in /sys/fs/cgroup/box-*/; do [ -d \"$x\" ] && {{ d=\"$x\"; n=$((n+1)); }}; done; [ \"$n\" = 1 ] || {{ echo \"a3s-resize: cannot resolve a unique per-container cgroup ($n box-* slices) to set {file}\" >&2; exit 1; }}; echo '{value}' > \"${{d}}{file}\""
+    )
 }
 
 /// Validate a resource update request.
@@ -133,6 +182,16 @@ pub fn validate_update(update: &ResourceUpdate) -> Result<()> {
              memory ballooning. Stop and recreate the box with the desired memory size.",
             memory_mb
         )));
+    }
+    // Reject a malformed cpuset before it can be interpolated into the resize
+    // shell command (cgroup `cpuset.cpus` accepts only indices/ranges anyway).
+    if let Some(ref cpuset) = update.limits.cpuset_cpus {
+        if !is_valid_cpuset(cpuset) {
+            return Err(BoxError::ResizeError(format!(
+                "Invalid cpuset.cpus value {cpuset:?}: expected a comma-separated list of CPU \
+                 indices/ranges such as \"0-3\" or \"0,2,4\"."
+            )));
+        }
     }
     Ok(())
 }
@@ -318,6 +377,61 @@ mod tests {
     }
 
     #[test]
+    fn test_cpuset_valid_forms_accepted() {
+        for ok in ["0", "0,1,3", "0-3", "0-1,4-7", " 0 , 2 "] {
+            assert!(is_valid_cpuset(ok), "{ok:?} should be valid");
+        }
+    }
+
+    #[test]
+    fn test_cpuset_injection_rejected() {
+        // Shell-injection payloads and other malformed values must be rejected so
+        // they never reach `echo '…'` in the resize command.
+        for bad in [
+            "",
+            "0'$(id >>/tmp/pwned)",
+            "0; rm -rf /",
+            "0`whoami`",
+            "0\nmalicious",
+            "all",
+            "0-",
+            "-3",
+        ] {
+            assert!(!is_valid_cpuset(bad), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn test_validate_rejects_malformed_cpuset() {
+        let update = ResourceUpdate {
+            limits: ResourceLimits {
+                cpuset_cpus: Some("0'$(id)".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = validate_update(&update).unwrap_err();
+        assert!(err.to_string().contains("cpuset"));
+        // And the dangerous value never makes it into a shell command.
+        assert!(update.build_cgroup_commands().is_empty());
+    }
+
+    #[test]
+    fn test_cpu_weight_clamped_for_oversized_shares() {
+        // Absurd shares must not overflow the `* 9999` nor exceed cgroup's max
+        // weight of 10000.
+        let update = ResourceUpdate {
+            limits: ResourceLimits {
+                cpu_shares: Some(u64::MAX),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let cmds = update.build_cgroup_commands();
+        assert!(cmds[0].contains("'10000'"), "got {}", cmds[0]);
+    }
+
+    #[test]
     fn test_multiple_tier2_commands() {
         let update = ResourceUpdate {
             limits: ResourceLimits {
@@ -330,6 +444,49 @@ mod tests {
         };
         let cmds = update.build_cgroup_commands();
         assert_eq!(cmds.len(), 3);
+    }
+
+    #[test]
+    fn test_cgroup_commands_target_per_container_slice() {
+        let update = ResourceUpdate {
+            limits: ResourceLimits {
+                pids_limit: Some(50),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let cmds = update.build_cgroup_commands();
+        assert_eq!(cmds.len(), 1);
+        // Must resolve the per-container `box-*` slice, not write a bare root path.
+        assert!(cmds[0].contains("/sys/fs/cgroup/box-*"), "got {}", cmds[0]);
+        assert!(cmds[0].contains("pids.max"));
+        assert!(cmds[0].contains("'50'"));
+    }
+
+    #[test]
+    fn test_cgroup_command_fails_instead_of_writing_root() {
+        // When the per-container slice can't be uniquely resolved the command
+        // must exit non-zero (surfacing a warning at the call site), NOT fall
+        // back to writing the bare root cgroup, which mis-applies the limit to
+        // the whole hierarchy while the CLI reports success.
+        let update = ResourceUpdate {
+            limits: ResourceLimits {
+                cpu_quota: Some(50_000),
+                cpu_period: Some(100_000),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let cmds = update.build_cgroup_commands();
+        assert_eq!(cmds.len(), 1);
+        assert!(cmds[0].contains("exit 1"), "must fail loudly: {}", cmds[0]);
+        // The dangerous root-cgroup fallback must be gone: no assignment that
+        // points the write target `d` at the bare root.
+        assert!(
+            !cmds[0].contains("d=\"/sys/fs/cgroup/\""),
+            "must not fall back to the root cgroup: {}",
+            cmds[0]
+        );
     }
 
     #[test]

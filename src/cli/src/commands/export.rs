@@ -19,10 +19,15 @@ pub async fn execute(args: ExportArgs) -> Result<(), Box<dyn std::error::Error>>
     let state = StateFile::load_default()?;
     let record = resolve::resolve(&state, &args.name)?;
 
-    let rootfs_dir = record.box_dir.join("rootfs");
-    if !rootfs_dir.exists() {
-        return Err(format!("Rootfs not found at {}", rootfs_dir.display()).into());
-    }
+    let rootfs_dir = super::resolve_box_rootfs(&record.box_dir).ok_or_else(|| {
+        format!(
+            "Rootfs not found for box '{}' under {} (looked for merged/ and rootfs/). \
+             For overlay-backed boxes the filesystem is only available while the box exists; \
+             export a running box.",
+            args.name,
+            record.box_dir.display()
+        )
+    })?;
 
     let file = std::fs::File::create(&args.output)
         .map_err(|e| format!("Failed to create {}: {e}", args.output))?;

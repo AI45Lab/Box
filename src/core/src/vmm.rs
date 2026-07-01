@@ -59,6 +59,10 @@ pub struct NetworkInstanceConfig {
     /// Path to the network backend Unix socket (passt on Linux, gvproxy on macOS).
     pub net_socket_path: PathBuf,
 
+    /// Optional JSON stats file written by the userspace network backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net_stats_path: Option<PathBuf>,
+
     /// Pre-opened Unix datagram socket fd inherited by the shim on macOS.
     #[cfg(target_os = "macos")]
     #[serde(default)]
@@ -115,11 +119,39 @@ pub struct InstanceSpec {
     #[serde(default)]
     pub attest_socket_path: PathBuf,
 
+    /// Path to the Unix socket for CRI port-forward control
+    #[serde(default)]
+    pub port_forward_socket_path: PathBuf,
+
     /// Filesystem mounts (virtio-fs shares)
     pub fs_mounts: Vec<FsMount>,
 
     /// Guest agent entrypoint
     pub entrypoint: Entrypoint,
+
+    /// Mark guest memory KSM-mergeable (host page dedup across same-image VMs;
+    /// Linux 6.4+, requires /sys/kernel/mm/ksm/run=1 on the host).
+    #[serde(default)]
+    pub ksm: bool,
+
+    /// Snapshot-fork (per-VM): file-backed guest RAM path. When set (with
+    /// `snapshot_sock`), this VM boots as a snapshot TEMPLATE — guest RAM is
+    /// file-backed so it can be snapshotted on demand.
+    #[serde(default)]
+    pub snapshot_mem_file: Option<String>,
+
+    /// Snapshot-fork (per-VM): unix socket on which libkrun serves snapshot
+    /// requests for this template VM.
+    #[serde(default)]
+    pub snapshot_sock: Option<String>,
+
+    /// Snapshot-fork (per-VM): when set (with `snapshot_mem_file`), this VM is a
+    /// RESTORE — it resumes the snapshotted template from this state file with
+    /// MAP_PRIVATE CoW of the RAM file, instead of cold-booting. This is the
+    /// per-VM seam that lets one process fork many VMs (the pool / fork daemon),
+    /// which a process-global `KRUN_RESTORE_FROM` env cannot express.
+    #[serde(default)]
+    pub restore_from: Option<String>,
 
     /// Optional console output file path
     pub console_output: Option<PathBuf>,
@@ -147,6 +179,11 @@ pub struct InstanceSpec {
     /// Resource limits (PID limits, CPU pinning, ulimits, cgroup controls).
     #[serde(default)]
     pub resource_limits: ResourceLimits,
+
+    /// Logging driver config. The shim runs the log processor for the box's
+    /// lifetime (so detached `run -d` logs aren't truncated when the CLI exits).
+    #[serde(default)]
+    pub log_config: crate::log::LogConfig,
 }
 
 impl Default for InstanceSpec {
@@ -159,12 +196,17 @@ impl Default for InstanceSpec {
             exec_socket_path: PathBuf::new(),
             pty_socket_path: PathBuf::new(),
             attest_socket_path: PathBuf::new(),
+            port_forward_socket_path: PathBuf::new(),
             fs_mounts: Vec::new(),
             entrypoint: Entrypoint {
                 executable: String::new(),
                 args: Vec::new(),
                 env: Vec::new(),
             },
+            ksm: false,
+            snapshot_mem_file: None,
+            snapshot_sock: None,
+            restore_from: None,
             console_output: None,
             workdir: "/".to_string(),
             tee_config: None,
@@ -172,6 +214,7 @@ impl Default for InstanceSpec {
             user: None,
             network: None,
             resource_limits: ResourceLimits::default(),
+            log_config: crate::log::LogConfig::default(),
         }
     }
 }
@@ -234,6 +277,26 @@ pub trait VmHandler: Send + Sync {
     /// Check if the VM process is still alive.
     fn is_running(&self) -> bool;
 
+    /// Whether the VM process has exited, treating a zombie (an exited child not
+    /// yet reaped by its parent) as exited.
+    ///
+    /// Distinct from `!is_running()`: shim handlers implement `is_running` with
+    /// `kill(pid, 0)`, which still succeeds for a zombie, so a freshly-exited
+    /// shim looks alive until its parent reaps it. Boot-readiness waits use this
+    /// so a short-lived container's exit does not stall the wait for the full
+    /// timeout. On Linux it inspects `/proc/<pid>` process state; elsewhere it
+    /// falls back to `!is_running()`.
+    fn has_exited(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            linux_process_exited(self.pid())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            !self.is_running()
+        }
+    }
+
     /// Return the OS process ID of the VM.
     fn pid(&self) -> u32;
 
@@ -255,6 +318,28 @@ pub trait VmHandler: Send + Sync {
     }
 }
 
+/// Whether `pid` has exited, treating a zombie/dead process as exited.
+///
+/// Reads `/proc/<pid>/stat` and inspects the process state field. The `comm`
+/// field can contain spaces and parentheses (e.g. libkrun renames the shim to
+/// `(libkrun VM)`), so the state is located after the final `)`. A `Z` (zombie)
+/// or `X` (dead) state, or a missing `/proc` entry, means the process exited.
+#[cfg(target_os = "linux")]
+pub(crate) fn linux_process_exited(pid: u32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => match stat.rfind(')') {
+            Some(idx) => {
+                let state = stat[idx + 1..].trim_start().chars().next();
+                matches!(state, Some('Z') | Some('X'))
+            }
+            // Malformed stat — be conservative and treat as still running.
+            None => false,
+        },
+        // No /proc entry → the process is gone.
+        Err(_) => true,
+    }
+}
+
 // ── VMM provider ─────────────────────────────────────────────────────────────
 
 /// Trait for VMM backend implementations.
@@ -271,6 +356,20 @@ pub trait VmmProvider: Send + Sync {
 mod tests {
     use super::*;
     use crate::config::ResourceLimits;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_linux_process_exited_current_process_is_alive() {
+        // The test process itself is running (state R/S), not exited.
+        assert!(!linux_process_exited(std::process::id()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_linux_process_exited_missing_pid_is_exited() {
+        // A PID with no /proc entry is treated as exited.
+        assert!(linux_process_exited(0x7fff_fffe));
+    }
 
     #[test]
     fn test_parse_signal_name_term() {
@@ -328,12 +427,17 @@ mod tests {
     fn test_instance_spec_serde_roundtrip() {
         let spec = InstanceSpec {
             box_id: "test-box-123".to_string(),
+            ksm: false,
+            snapshot_mem_file: None,
+            snapshot_sock: None,
+            restore_from: None,
             vcpus: 4,
             memory_mib: 2048,
             rootfs_path: PathBuf::from("/tmp/rootfs"),
             exec_socket_path: PathBuf::from("/tmp/exec.sock"),
             pty_socket_path: PathBuf::from("/tmp/pty.sock"),
             attest_socket_path: PathBuf::from("/tmp/attest.sock"),
+            port_forward_socket_path: PathBuf::from("/tmp/portfwd.sock"),
             fs_mounts: vec![FsMount {
                 tag: "workspace".to_string(),
                 host_path: PathBuf::from("/home/user/project"),
@@ -351,6 +455,7 @@ mod tests {
             user: Some("1000:1000".to_string()),
             network: None,
             resource_limits: ResourceLimits::default(),
+            log_config: crate::log::LogConfig::default(),
         };
 
         let json = serde_json::to_string(&spec).unwrap();
@@ -366,6 +471,10 @@ mod tests {
         assert_eq!(deserialized.entrypoint.executable, "/usr/bin/agent");
         assert_eq!(deserialized.entrypoint.args.len(), 2);
         assert_eq!(deserialized.entrypoint.env.len(), 1);
+        assert_eq!(
+            deserialized.port_forward_socket_path,
+            PathBuf::from("/tmp/portfwd.sock")
+        );
         assert_eq!(deserialized.port_map, vec!["8080:80"]);
         assert_eq!(deserialized.user, Some("1000:1000".to_string()));
     }
@@ -393,6 +502,7 @@ mod tests {
         let spec = InstanceSpec {
             network: Some(NetworkInstanceConfig {
                 net_socket_path: PathBuf::from("/tmp/net.sock"),
+                net_stats_path: Some(PathBuf::from("/tmp/net.stats.json")),
                 #[cfg(target_os = "macos")]
                 net_socket_fd: Some(42),
                 #[cfg(target_os = "macos")]
@@ -410,6 +520,10 @@ mod tests {
         let deserialized: InstanceSpec = serde_json::from_str(&json).unwrap();
 
         let net = deserialized.network.unwrap();
+        assert_eq!(
+            net.net_stats_path,
+            Some(PathBuf::from("/tmp/net.stats.json"))
+        );
         #[cfg(target_os = "macos")]
         assert_eq!(net.net_socket_fd, Some(42));
         #[cfg(target_os = "macos")]

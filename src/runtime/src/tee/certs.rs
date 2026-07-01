@@ -36,11 +36,13 @@ impl AmdKdsClient {
     /// * `cache_dir` - Optional directory for caching certificates locally.
     ///   If `None`, certificates are fetched on every request.
     pub fn new(cache_dir: Option<PathBuf>) -> Self {
-        let http = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-        Self { http, cache_dir }
+        Self {
+            http: reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("failed to build AMD KDS HTTP client"),
+            cache_dir,
+        }
     }
 
     /// Fetch the complete certificate chain for verifying an SNP report.

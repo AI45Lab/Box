@@ -167,7 +167,7 @@ cargo run --example nginx_test --target x86_64-pc-windows-msvc
 
 ```powershell
 # Clone with submodules
-git clone --recursive https://github.com/A3S-Lab/Box.git
+git clone --recursive https://github.com/AI45Lab/Box.git
 cd Box/src/deps/libkrun-sys
 
 # Build libkrun

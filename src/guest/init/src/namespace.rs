@@ -7,6 +7,7 @@
 use nix::sched::{unshare, CloneFlags};
 
 use nix::unistd::{fork, ForkResult};
+use std::os::fd::RawFd;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
@@ -156,17 +157,22 @@ impl NamespaceConfig {
 /// # Errors
 ///
 /// Returns error if fork, unshare, or exec fails.
+#[allow(clippy::too_many_arguments)] // syscall-shaped: command + args + env + workdir + user + stdio + cgroup
 pub fn spawn_isolated(
     config: &NamespaceConfig,
     command: &str,
     args: &[&str],
     env: &[(&str, &str)],
     workdir: &str,
+    user: Option<&str>,
+    main_stdio: Option<(RawFd, RawFd)>,
+    cgroup_procs: Option<&str>,
 ) -> Result<u32, NamespaceError> {
     tracing::info!(
         command = %command,
         args = ?args,
         workdir = %workdir,
+        user = ?user,
         "Spawning process in isolated namespace"
     );
 
@@ -174,7 +180,16 @@ pub fn spawn_isolated(
     match unsafe { fork() }.map_err(NamespaceError::ForkFailed)? {
         ForkResult::Child => {
             // Child process: create namespaces and exec
-            if let Err(e) = child_process(config, command, args, env, workdir) {
+            if let Err(e) = child_process(
+                config,
+                command,
+                args,
+                env,
+                workdir,
+                user,
+                main_stdio,
+                cgroup_procs,
+            ) {
                 tracing::error!("Child process failed: {}", e);
                 std::process::exit(1);
             }
@@ -191,12 +206,16 @@ pub fn spawn_isolated(
 
 /// Child process logic: create namespaces and exec command.
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)] // mirrors spawn_isolated's syscall-shaped parameter list
 fn child_process(
     config: &NamespaceConfig,
     command: &str,
     args: &[&str],
     env: &[(&str, &str)],
     workdir: &str,
+    user: Option<&str>,
+    main_stdio: Option<(RawFd, RawFd)>,
+    cgroup_procs: Option<&str>,
 ) -> Result<(), NamespaceError> {
     // Create new namespaces
     let flags = config.to_clone_flags();
@@ -236,6 +255,24 @@ fn child_process(
         }
     }
 
+    // Join the per-container cgroup (e.g. `pids.max` for `--pids-limit`) before
+    // exec, so this process — now the final container task, after any PID-ns
+    // fork above — and every worker it forks are bounded from birth. We move
+    // ourselves in by writing our own PID (resolved in our PID namespace) to the
+    // cgroup's `cgroup.procs`. Best-effort: a failure means no enforcement, not a
+    // failed launch. Plain file I/O is fine here — this is ordinary forked-child
+    // code (not a `pre_exec` hook), like the user/path resolution above.
+    if let Some(procs_path) = cgroup_procs {
+        let pid = std::process::id().to_string();
+        if let Err(e) = std::fs::write(procs_path, &pid) {
+            tracing::warn!(
+                error = %e,
+                procs_path,
+                "Failed to join container cgroup; resource limit not enforced"
+            );
+        }
+    }
+
     // Execute the command. `Command::exec` uses PATH for bare command names, so
     // the preflight check needs to mirror that instead of statting "sleep".
     if let Some(command_path) = resolve_command_path(command, env) {
@@ -264,8 +301,30 @@ fn child_process(
         cmd.env(key, value);
     }
 
-    // Apply security restrictions before exec
-    apply_security_before_exec(&mut cmd)?;
+    // Resolve the container user (image USER / --user) against the container
+    // rootfs (already pivoted to "/"), the same way the exec server does:
+    // names -> uid:gid via /etc/passwd, default the primary gid from passwd,
+    // and gather image supplemental groups. Done here (pre-fork, allocating) so
+    // the pre_exec hook only performs async-signal-safe syscalls.
+    let (process_user, supplemental_groups) = resolve_user_and_groups(user)?;
+
+    // Apply security restrictions + user before exec
+    apply_security_before_exec(&mut cmd, process_user, supplemental_groups)?;
+
+    // Re-openable stdout/stderr: hand the main process pipe write-ends as fd 1/2 so
+    // a container that re-opens /proc/self/fd/{1,2} or /dev/stdout|stderr (Apache
+    // httpd, nginx-to-stdout, and many apps) succeeds. The virtio-console ports it
+    // would otherwise inherit are single-open and return EBUSY on a second open;
+    // a pipe is re-openable. guest-init relays the pipe read-ends back to the
+    // console, so `logs` and the split stdout/stderr streams are unaffected.
+    if let Some((out_w, err_w)) = main_stdio {
+        // SAFETY: out_w/err_w are pipe write-ends owned by this pre-exec child;
+        // dup2 onto fd 1/2 (the O_CLOEXEC originals close on exec).
+        unsafe {
+            libc::dup2(out_w, 1);
+            libc::dup2(err_w, 2);
+        }
+    }
 
     tracing::debug!("Executing command: {} {:?}", command, args);
 
@@ -295,21 +354,60 @@ fn resolve_command_path(command: &str, env: &[(&str, &str)]) -> Option<PathBuf> 
         .find(|path| path.exists())
 }
 
-/// Apply security restrictions (seccomp, no-new-privileges, capabilities)
-/// before exec using the pre_exec hook.
+/// Resolve a container user string (`uid`, `uid:gid`, `root`, or a name) to a
+/// numeric [`ProcessUser`] plus its image supplementary groups, looking names up
+/// in the container rootfs (already pivoted to `/`). Returns `Ok((None, []))` when
+/// NO user is requested (run as default). When a user IS requested but cannot be
+/// resolved/parsed it returns `Err` (fail CLOSED): silently running as root
+/// instead would be a privilege escalation. Pure file reads — call pre-fork.
+#[cfg(target_os = "linux")]
+fn resolve_user_and_groups(
+    user: Option<&str>,
+) -> Result<(Option<crate::user::ProcessUser>, Vec<u32>), NamespaceError> {
+    let Some(user) = user.map(str::trim).filter(|u| !u.is_empty()) else {
+        return Ok((None, Vec::new()));
+    };
+    // Names -> "uid:gid" via the container /etc/passwd; numeric/root pass through.
+    let resolved = crate::user::resolve_named_user(user, "/").unwrap_or_else(|| user.to_string());
+    let mut process_user = match crate::user::parse_process_user(Some(&resolved)) {
+        Ok(Some(pu)) => pu,
+        _ => {
+            // Fail closed: an explicit USER (image USER / --user) that cannot be
+            // resolved (e.g. no /etc/passwd entry) must abort the launch, not
+            // silently run as root. The exec path already fails closed here.
+            return Err(NamespaceError::SecurityFailed(format!(
+                "container user '{user}' could not be resolved (refusing to run as root)"
+            )));
+        }
+    };
+    // Default the primary gid from the user's passwd entry (RunAsUser semantics).
+    if process_user.gid.is_none() {
+        process_user.gid = crate::user::primary_gid_for_uid("/", process_user.uid);
+    }
+    let groups = crate::user::resolve_image_groups("/", process_user.uid, process_user.gid, user);
+    Ok((Some(process_user), groups))
+}
+
+/// Apply security restrictions (seccomp, no-new-privileges, capabilities) and
+/// the container user before exec using the pre_exec hook.
 ///
 /// Reads security configuration from `A3S_SEC_*` environment variables
 /// set by the host runtime.
 #[cfg(target_os = "linux")]
-fn apply_security_before_exec(cmd: &mut Command) -> Result<(), NamespaceError> {
+fn apply_security_before_exec(
+    cmd: &mut Command,
+    process_user: Option<crate::user::ProcessUser>,
+    supplemental_groups: Vec<u32>,
+) -> Result<(), NamespaceError> {
     use a3s_box_core::security::{SeccompMode, SecurityConfig};
 
     let config = SecurityConfig::from_env_vars();
 
-    // Privileged mode: skip all security restrictions
-    if config.privileged {
-        tracing::info!("Privileged mode: skipping security restrictions");
-        return Ok(());
+    // Privileged mode skips seccomp/caps/no-new-privs — but the container USER
+    // (image USER / --user) is still honored, so it is applied below regardless.
+    let privileged = config.privileged;
+    if privileged {
+        tracing::info!("Privileged mode: skipping seccomp/caps/no-new-privs");
     }
 
     tracing::debug!(
@@ -317,19 +415,38 @@ fn apply_security_before_exec(cmd: &mut Command) -> Result<(), NamespaceError> {
         no_new_privs = config.no_new_privileges,
         cap_add = ?config.cap_add,
         cap_drop = ?config.cap_drop,
+        user = ?process_user,
         "Applying security configuration"
     );
 
-    let no_new_privs = config.no_new_privileges;
-    let seccomp_mode = config.seccomp.clone();
-    let cap_drop = config.cap_drop.clone();
+    let no_new_privs = config.no_new_privileges && !privileged;
+    let seccomp_mode = if privileged {
+        SeccompMode::Unconfined
+    } else {
+        config.seccomp.clone()
+    };
+    let cap_drop = if privileged {
+        Vec::new()
+    } else {
+        config.cap_drop.clone()
+    };
+
+    // Build the seccomp BPF filter BEFORE fork. Building allocates, which is
+    // not async-signal-safe in the post-fork child (malloc may deadlock on
+    // musl); the child only installs the prebuilt filter.
+    let seccomp_filter = if matches!(seccomp_mode, SeccompMode::Default) {
+        Some(build_default_bpf_filter())
+    } else {
+        None
+    };
 
     // Use pre_exec to apply security in the child process right before exec
     // SAFETY: pre_exec runs after fork, before exec. We only call
-    // async-signal-safe operations (prctl, seccomp).
+    // async-signal-safe operations (prctl, seccomp) — the seccomp filter is
+    // built above, pre-fork.
     unsafe {
         cmd.pre_exec(move || {
-            // 1. Set no-new-privileges
+            // 1. Set no-new-privileges (does not block the setuid syscall below).
             if no_new_privs {
                 let ret = libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
                 if ret != 0 {
@@ -337,15 +454,36 @@ fn apply_security_before_exec(cmd: &mut Command) -> Result<(), NamespaceError> {
                 }
             }
 
-            // 2. Drop capabilities
+            // 2. Apply the container user, in the proven order used by the exec
+            //    server: supplemental groups -> capabilities -> setgid+setuid.
+            //    Each step needs root/CAP_SET*; setuid is LAST because it clears
+            //    the privileges needed by the earlier ones.
+            if process_user.is_some() && !supplemental_groups.is_empty() {
+                let ret = libc::setgroups(
+                    supplemental_groups.len() as _,
+                    supplemental_groups.as_ptr() as *const libc::gid_t,
+                );
+                if ret != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+
+            // 3. Drop capabilities (while still root, before the uid switch).
             if should_drop_caps(&cap_drop) {
                 drop_capabilities(&cap_drop)?;
             }
 
-            // 3. Apply seccomp filter
+            // 4. Drop to the target uid/gid (image USER / --user).
+            if let Some(user) = process_user {
+                user.apply()?;
+            }
+
+            // 5. Apply seccomp filter (prebuilt before fork)
             match &seccomp_mode {
                 SeccompMode::Default => {
-                    apply_default_seccomp()?;
+                    if let Some(filter) = &seccomp_filter {
+                        install_seccomp_filter(filter)?;
+                    }
                 }
                 SeccompMode::Unconfined => {
                     // No seccomp filter
@@ -378,13 +516,28 @@ fn should_drop_caps(cap_drop: &[String]) -> bool {
     !cap_drop.is_empty()
 }
 
+/// Set `PR_SET_NO_NEW_PRIVS` on the calling thread.
+///
+/// **Async-signal-safe**: a single `prctl` syscall, safe to call in the
+/// post-`fork` child. Once set, no subsequent `execve` can gain privileges via
+/// setuid/setgid bits or file capabilities, and the bit is preserved across the
+/// exec.
+#[cfg(target_os = "linux")]
+pub(crate) fn set_no_new_privs() -> Result<(), std::io::Error> {
+    let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Drop Linux capabilities using prctl.
 ///
 /// Drops capabilities from the bounding set AND clears the effective,
 /// permitted, and inheritable sets to prevent retention of already-held caps.
 /// Supports "ALL" to drop all capabilities, or individual capability names.
 #[cfg(target_os = "linux")]
-fn drop_capabilities(cap_drop: &[String]) -> Result<(), std::io::Error> {
+pub(crate) fn drop_capabilities(cap_drop: &[String]) -> Result<(), std::io::Error> {
     // Map capability names to their Linux constants
     let drop_all = cap_drop.iter().any(|c| c == "ALL");
 
@@ -416,9 +569,11 @@ fn drop_capabilities(cap_drop: &[String]) -> Result<(), std::io::Error> {
         }
     }
 
-    // Also clear the effective, permitted, and inheritable capability sets.
-    // The bounding set only limits future execve() — processes that already
-    // hold capabilities in their effective set retain them without this step.
+    // The bounding-set drop above only limits future execve(); a process that
+    // already holds the capabilities keeps them. Clear them from the effective,
+    // permitted, and inheritable sets so the drop actually takes effect, then
+    // clear the ambient set so they cannot be re-acquired.
+    clear_effective_caps(cap_drop)?;
     clear_ambient_and_inheritable_caps()?;
 
     Ok(())
@@ -442,9 +597,187 @@ fn clear_ambient_and_inheritable_caps() -> Result<(), std::io::Error> {
     Ok(())
 }
 
+/// Clear the dropped capabilities from the **effective, permitted, and
+/// inheritable** sets via `capset(2)`.
+///
+/// `PR_CAPBSET_DROP` only limits what a future `execve` can gain — it does NOT
+/// remove a capability the process currently holds. A privileged (root)
+/// container therefore keeps e.g. `CAP_NET_ADMIN` in its effective set unless we
+/// clear it here, so `capset` is required for `drop_capabilities` to actually
+/// take effect. Async-signal-safe: only `capget`/`capset` syscalls over
+/// stack-resident structs, no allocation, so it is safe in a post-fork child.
+#[cfg(target_os = "linux")]
+fn clear_effective_caps(cap_drop: &[String]) -> Result<(), std::io::Error> {
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+    // Defined locally — this libc version does not export the capability structs.
+    // Stable kernel ABI: capget/capset(hdr {version,pid}, data[2] {eff,perm,inh}).
+    #[repr(C)]
+    struct CapHeader {
+        version: u32,
+        pid: i32,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CapData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+
+    let mut header = CapHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let mut data = [CapData {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; 2];
+
+    if unsafe {
+        libc::syscall(
+            libc::SYS_capget,
+            &mut header as *mut CapHeader,
+            data.as_mut_ptr(),
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    if cap_drop.iter().any(|c| c == "ALL") {
+        for word in data.iter_mut() {
+            word.effective = 0;
+            word.permitted = 0;
+            word.inheritable = 0;
+        }
+    } else {
+        for name in cap_drop {
+            if let Some(cap) = cap_name_to_number(name) {
+                let word = (cap / 32) as usize;
+                if word < data.len() {
+                    let mask = !(1u32 << (cap % 32));
+                    data[word].effective &= mask;
+                    data[word].permitted &= mask;
+                    data[word].inheritable &= mask;
+                }
+            }
+        }
+    }
+
+    if unsafe {
+        libc::syscall(
+            libc::SYS_capset,
+            &mut header as *mut CapHeader,
+            data.as_ptr(),
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Restrict the process to exactly the capability set named in `keep`.
+///
+/// This is how a **non-privileged** CRI container gets the runtime default
+/// capability set (e.g. without `CAP_NET_ADMIN`/`CAP_SYS_ADMIN`): the CRI
+/// resolves `(default ∪ add) − drop` and passes it here. Every capability NOT
+/// in `keep` is dropped from the bounding set, and the effective/permitted/
+/// inheritable sets are reduced to exactly `keep` — a reduction from the full
+/// root set, which is always permitted. An empty `keep` drops everything.
+///
+/// Async-signal-safe: only `prctl` + `capset` over stack-resident structs, no
+/// allocation (names are resolved into a fixed-size bitmask), so it is safe in
+/// the post-fork child.
+#[cfg(target_os = "linux")]
+pub(crate) fn restrict_capabilities_to_keep(keep: &[String]) -> Result<(), std::io::Error> {
+    // Resolve the keep names into a 64-bit capability bitmask.
+    let mut mask = [0u32; 2];
+    for name in keep {
+        if let Some(cap) = cap_name_to_number(name) {
+            let word = (cap / 32) as usize;
+            if word < mask.len() {
+                mask[word] |= 1u32 << (cap % 32);
+            }
+        }
+    }
+
+    // Drop every capability not kept from the bounding set so a future execve
+    // cannot regain it.
+    for cap in 0..=40_i32 {
+        let word = (cap / 32) as usize;
+        let kept = word < mask.len() && (mask[word] & (1u32 << (cap % 32))) != 0;
+        if !kept {
+            let ret = unsafe { libc::prctl(24, cap, 0, 0, 0) }; // PR_CAPBSET_DROP
+            if ret != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::EINVAL) {
+                    return Err(err);
+                }
+            }
+        }
+    }
+
+    set_capability_sets(mask)?;
+    clear_ambient_and_inheritable_caps()?;
+    Ok(())
+}
+
+/// Set the effective/permitted/inheritable capability sets to exactly `mask`
+/// via `capset(2)`. Reducing the sets from the inherited (full-root) set is
+/// always permitted; this never tries to raise a capability the process lacks.
+#[cfg(target_os = "linux")]
+fn set_capability_sets(mask: [u32; 2]) -> Result<(), std::io::Error> {
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+    #[repr(C)]
+    struct CapHeader {
+        version: u32,
+        pid: i32,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CapData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+
+    let mut header = CapHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let data = [
+        CapData {
+            effective: mask[0],
+            permitted: mask[0],
+            inheritable: mask[0],
+        },
+        CapData {
+            effective: mask[1],
+            permitted: mask[1],
+            inheritable: mask[1],
+        },
+    ];
+
+    if unsafe {
+        libc::syscall(
+            libc::SYS_capset,
+            &mut header as *mut CapHeader,
+            data.as_ptr(),
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Map a Linux capability name to its numeric value.
 #[cfg(target_os = "linux")]
 fn cap_name_to_number(name: &str) -> Option<i32> {
+    // Accept both "NET_ADMIN" and "CAP_NET_ADMIN" (CRI naming varies).
+    let name = name.strip_prefix("CAP_").unwrap_or(name);
     // Standard Linux capability constants
     match name {
         "CHOWN" => Some(0),
@@ -496,38 +829,26 @@ fn cap_name_to_number(name: &str) -> Option<i32> {
 ///
 /// Based on Docker's default seccomp profile — blocks syscalls that could
 /// escape the sandbox or compromise the host.
+/// Install a prebuilt seccomp BPF filter on the current thread.
+///
+/// **Async-signal-safe**: performs only `prctl` and the `seccomp` syscall and
+/// reads the caller-owned `filter` slice — it does NOT allocate. It is therefore
+/// safe to call from a post-fork `pre_exec` hook PROVIDED the filter was built
+/// *before* the fork (see [`build_default_bpf_filter`]); building the filter
+/// allocates and must never run in the child of a multi-threaded process.
+///
+/// Sets `PR_SET_NO_NEW_PRIVS` (required for unprivileged seccomp) then loads the
+/// filter via `SECCOMP_SET_MODE_FILTER`, putting the process in
+/// `SECCOMP_MODE_FILTER` (`/proc/self/status` `Seccomp: 2`). The default filter
+/// returns `EPERM` for the syscalls listed in [`build_default_bpf_filter`].
 #[cfg(target_os = "linux")]
-fn apply_default_seccomp() -> Result<(), std::io::Error> {
-    // Use SECCOMP_SET_MODE_FILTER via prctl
-    // The default profile uses a BPF filter that blocks:
-    // - kexec_load, kexec_file_load (kernel replacement)
-    // - reboot (system reboot)
-    // - mount, umount2 (filesystem manipulation — unless in mount namespace)
-    // - pivot_root, chroot (filesystem escape)
-    // - swapon, swapoff (swap manipulation)
-    // - init_module, finit_module, delete_module (kernel modules)
-    // - acct (process accounting)
-    // - settimeofday, clock_settime (time manipulation)
-    // - personality (execution domain change)
-    // - keyctl (kernel keyring)
-    // - ptrace (process tracing — unless CAP_SYS_PTRACE)
-    // - userfaultfd (memory manipulation)
-    // - perf_event_open (performance monitoring)
-    // - bpf (eBPF programs)
-    // - unshare (namespace creation — already in namespace)
-    // - setns (namespace switching)
-
-    // Build BPF filter program
-    let filter = build_default_bpf_filter();
-
-    // Install the filter via prctl + seccomp
-    // First, ensure no-new-privs is set (required for unprivileged seccomp)
+pub(crate) fn install_seccomp_filter(filter: &[libc::sock_filter]) -> Result<(), std::io::Error> {
+    // First, ensure no-new-privs is set (required for unprivileged seccomp).
     let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
     if ret != 0 {
         return Err(std::io::Error::last_os_error());
     }
 
-    // SECCOMP_SET_MODE_FILTER = 1, SECCOMP_FILTER_FLAG_TSYNC = 1
     let prog = libc::sock_fprog {
         len: filter.len() as u16,
         filter: filter.as_ptr() as *mut libc::sock_filter,
@@ -542,32 +863,10 @@ fn apply_default_seccomp() -> Result<(), std::io::Error> {
     Ok(())
 }
 
-/// Build the default BPF seccomp filter.
-///
-/// Returns SECCOMP_RET_ERRNO(EPERM) for blocked syscalls,
-/// SECCOMP_RET_ALLOW for everything else.
+/// Build the default (RuntimeDefault) BPF seccomp filter: allow-default with
+/// `ERRNO(EPERM)` for the dangerous syscalls listed below.
 #[cfg(target_os = "linux")]
-fn build_default_bpf_filter() -> Vec<libc::sock_filter> {
-    // BPF constants
-    const BPF_LD: u16 = 0x00;
-    const BPF_W: u16 = 0x00;
-    const BPF_ABS: u16 = 0x20;
-    const BPF_JMP: u16 = 0x05;
-    const BPF_JEQ: u16 = 0x10;
-    const BPF_K: u16 = 0x00;
-    const BPF_RET: u16 = 0x06;
-
-    // SECCOMP return values
-    const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
-    const SECCOMP_RET_ERRNO_EPERM: u32 = 0x0005_0001; // SECCOMP_RET_ERRNO | EPERM
-    const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
-
-    // Architecture audit value for seccomp_data.arch
-    #[cfg(target_arch = "x86_64")]
-    const AUDIT_ARCH: u32 = 0xC000_003E; // AUDIT_ARCH_X86_64
-    #[cfg(target_arch = "aarch64")]
-    const AUDIT_ARCH: u32 = 0xC000_00B7; // AUDIT_ARCH_AARCH64
-
+pub(crate) fn build_default_bpf_filter() -> Vec<libc::sock_filter> {
     // Blocked syscall numbers (x86_64)
     #[cfg(target_arch = "x86_64")]
     let blocked_syscalls: &[u32] = &[
@@ -610,9 +909,38 @@ fn build_default_bpf_filter() -> Vec<libc::sock_filter> {
         282, // userfaultfd
     ];
 
+    build_seccomp_errno_filter(blocked_syscalls)
+}
+
+/// Build an allow-default seccomp BPF filter that returns `ERRNO(EPERM)` for the
+/// given blocked syscall numbers. Shared by [`build_default_bpf_filter`] and CRI
+/// localhost profiles, which are `defaultAction: SCMP_ACT_ALLOW` plus a list of
+/// `SCMP_ACT_ERRNO` syscalls.
+#[cfg(target_os = "linux")]
+pub(crate) fn build_seccomp_errno_filter(blocked_syscalls: &[u32]) -> Vec<libc::sock_filter> {
+    // BPF constants
+    const BPF_LD: u16 = 0x00;
+    const BPF_W: u16 = 0x00;
+    const BPF_ABS: u16 = 0x20;
+    const BPF_JMP: u16 = 0x05;
+    const BPF_JEQ: u16 = 0x10;
+    const BPF_K: u16 = 0x00;
+    const BPF_RET: u16 = 0x06;
+
+    // SECCOMP return values
+    const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+    const SECCOMP_RET_ERRNO_EPERM: u32 = 0x0005_0001; // SECCOMP_RET_ERRNO | EPERM
+    const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
+
+    // Architecture audit value for seccomp_data.arch
+    #[cfg(target_arch = "x86_64")]
+    const AUDIT_ARCH: u32 = 0xC000_003E; // AUDIT_ARCH_X86_64
+    #[cfg(target_arch = "aarch64")]
+    const AUDIT_ARCH: u32 = 0xC000_00B7; // AUDIT_ARCH_AARCH64
+
     let num_blocked = blocked_syscalls.len();
-    // +5: arch_load, arch_check, syscall_load, allow, deny
-    let mut filter = Vec::with_capacity(num_blocked + 5);
+    // +6: arch_load, arch_check, syscall_load, allow, deny, kill
+    let mut filter = Vec::with_capacity(num_blocked + 6);
 
     // 1. Load architecture: LD [data[4]] (offset 4 = arch in seccomp_data)
     filter.push(libc::sock_filter {
@@ -626,8 +954,13 @@ fn build_default_bpf_filter() -> Vec<libc::sock_filter> {
     //    JEQ AUDIT_ARCH, next(0), kill(num_blocked + 2)
     filter.push(libc::sock_filter {
         code: BPF_JMP | BPF_JEQ | BPF_K,
-        jt: 0,                       // continue to syscall check
-        jf: (num_blocked + 2) as u8, // jump to kill (past load + all checks + allow)
+        jt: 0, // continue to syscall check
+        // On arch MISMATCH jump to the final KILL instruction. A BPF jump goes
+        // to pc+1+jf; this instr is at pc=1, so jf = num_blocked + 3 lands on
+        // index num_blocked + 5 (= KILL). (Was num_blocked + 2, which landed on
+        // the EPERM/deny instr and left KILL as dead code — wrong-arch was only
+        // denied, not killed.)
+        jf: (num_blocked + 3) as u8,
         k: AUDIT_ARCH,
     });
 
@@ -677,14 +1010,57 @@ fn build_default_bpf_filter() -> Vec<libc::sock_filter> {
     filter
 }
 
+/// Map an OCI seccomp syscall name to its number for the guest architecture.
+///
+/// Covers the syscalls used by the CRI localhost-profile conformance plus a few
+/// common ones; unknown names return `None` and are skipped (best-effort —
+/// a profile entry the runtime can't map simply isn't enforced). On aarch64 the
+/// legacy `chmod` syscall does not exist (libc uses `fchmodat`), so it maps to
+/// `None` there.
+#[cfg(target_os = "linux")]
+pub(crate) fn syscall_name_to_number(name: &str) -> Option<u32> {
+    #[cfg(target_arch = "x86_64")]
+    let n: u32 = match name {
+        "chmod" => 90,
+        "fchmod" => 91,
+        "fchmodat" => 268,
+        "sethostname" => 170,
+        "setdomainname" => 171,
+        "mount" => 165,
+        "umount2" => 166,
+        "chroot" => 161,
+        "ptrace" => 101,
+        "reboot" => 169,
+        _ => return None,
+    };
+    #[cfg(target_arch = "aarch64")]
+    let n: u32 = match name {
+        "fchmod" => 52,
+        "fchmodat" => 53,
+        "sethostname" => 161,
+        "setdomainname" => 162,
+        "mount" => 40,
+        "umount2" => 39,
+        "chroot" => 51,
+        "ptrace" => 117,
+        "reboot" => 142,
+        _ => return None,
+    };
+    Some(n)
+}
+
 /// Child process logic for non-Linux platforms (development stub).
 #[cfg(not(target_os = "linux"))]
+#[allow(clippy::too_many_arguments)] // mirrors spawn_isolated's syscall-shaped parameter list
 fn child_process(
     _config: &NamespaceConfig,
     command: &str,
     args: &[&str],
     env: &[(&str, &str)],
     workdir: &str,
+    _user: Option<&str>,
+    _main_stdio: Option<(RawFd, RawFd)>,
+    _cgroup_procs: Option<&str>,
 ) -> Result<(), NamespaceError> {
     // On non-Linux, just exec without namespace isolation or security
     tracing::warn!("Namespace isolation and security enforcement not available on this platform");
@@ -845,7 +1221,15 @@ mod tests {
         assert_eq!(filter[0].k, 4); // offset 4 = arch field
                                     // Second instruction should be JEQ (arch check)
         assert_eq!(filter[1].code, 0x15); // BPF_JMP | BPF_JEQ | BPF_K
-                                          // Third instruction should be BPF_LD (load syscall nr)
+                                          // On arch mismatch it must jump to the FINAL kill instruction, not the
+                                          // deny (a BPF jump lands at pc+1+jf; arch-check is at pc=1). This is the
+                                          // off-by-one regression guard: jf must target the last instruction.
+        assert_eq!(
+            1 + 1 + filter[1].jf as usize,
+            filter.len() - 1,
+            "arch-mismatch must jump to KILL_PROCESS (last instr), not deny"
+        );
+        // Third instruction should be BPF_LD (load syscall nr)
         assert_eq!(filter[2].code, 0x20);
         assert_eq!(filter[2].k, 0); // offset 0 = syscall nr
                                     // Last instruction should be BPF_RET (kill — wrong arch)

@@ -52,6 +52,9 @@ uuid = { workspace = true }
 parking_lot = { workspace = true }
 dashmap = { workspace = true }
 
+# Compression (SPDY streaming header blocks)
+flate2 = "1"
+
 # System
 dirs = { workspace = true }
 
@@ -60,3 +63,4 @@ tonic-build = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+a3s-transport = { workspace = true }

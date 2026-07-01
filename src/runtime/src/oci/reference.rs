@@ -33,11 +33,6 @@ impl ImageReference {
     /// - `ghcr.io/org/image:tag` → ghcr.io/org/image:tag
     /// - `ghcr.io/org/image@sha256:abc...` → ghcr.io/org/image@sha256:abc...
     pub fn parse(reference: &str) -> Result<Self> {
-        Self::parse_with_default_registry(reference, DEFAULT_REGISTRY)
-    }
-
-    /// Parse an image reference string using a configured default registry.
-    pub fn parse_with_default_registry(reference: &str, default_registry: &str) -> Result<Self> {
         let reference = reference.trim();
         if reference.is_empty() {
             return Err(BoxError::OciImageError("Empty image reference".to_string()));
@@ -88,23 +83,20 @@ impl ImageReference {
                     (name_tag.to_string(), None)
                 }
             } else if let Some(colon_pos) = name_tag.rfind(':') {
-                // Could be registry:port or name:tag — check if after colon is numeric (port)
-                let after_colon = &name_tag[colon_pos + 1..];
-                if after_colon.chars().all(|c| c.is_ascii_digit()) {
-                    // Looks like a port, treat whole thing as name
-                    (name_tag.to_string(), None)
-                } else {
-                    let tag = after_colon;
-                    let name = &name_tag[..colon_pos];
-                    (name.to_string(), Some(tag.to_string()))
-                }
+                // No slash: the colon always introduces a tag. A bare
+                // `registry:port` with no repository is not a valid image
+                // reference, so numeric tags (`redis:7`, `node:18`,
+                // `postgres:16`) must NOT be mistaken for a port.
+                let tag = &name_tag[colon_pos + 1..];
+                let name = &name_tag[..colon_pos];
+                (name.to_string(), Some(tag.to_string()))
             } else {
                 (name_tag.to_string(), None)
             }
         };
 
         // Determine registry and repository
-        let (registry, repository) = Self::split_registry_repository(&name, default_registry)?;
+        let (registry, repository) = Self::split_registry_repository(&name)?;
 
         // Apply default tag if no tag and no digest
         let tag = if tag.is_none() && digest.is_none() {
@@ -122,7 +114,7 @@ impl ImageReference {
     }
 
     /// Split a name into registry and repository components.
-    fn split_registry_repository(name: &str, default_registry: &str) -> Result<(String, String)> {
+    fn split_registry_repository(name: &str) -> Result<(String, String)> {
         // Check if the first component looks like a registry hostname
         // (contains a dot or colon, or is "localhost")
         if let Some(slash_pos) = name.find('/') {
@@ -141,22 +133,14 @@ impl ImageReference {
         }
 
         // No registry detected — use default
-        let default_registry = if a3s_box_core::is_docker_hub_registry(default_registry) {
-            DEFAULT_REGISTRY.to_string()
-        } else {
-            a3s_box_core::normalize_registry_server(default_registry)
-        };
-
         let repository = if name.contains('/') {
             name.to_string()
-        } else if a3s_box_core::is_docker_hub_registry(&default_registry) {
+        } else {
             // Single name like "nginx" → "library/nginx" for Docker Hub
             format!("library/{}", name)
-        } else {
-            name.to_string()
         };
 
-        Ok((default_registry, repository))
+        Ok((DEFAULT_REGISTRY.to_string(), repository))
     }
 
     /// Get the full reference string.
@@ -216,22 +200,6 @@ mod tests {
         assert_eq!(r.registry, "docker.io");
         assert_eq!(r.repository, "myuser/myimage");
         assert_eq!(r.tag, Some("v1.0".to_string()));
-    }
-
-    #[test]
-    fn test_parse_with_custom_default_registry() {
-        let r = ImageReference::parse_with_default_registry("nginx:1.25", "registry.example.com")
-            .unwrap();
-        assert_eq!(r.registry, "registry.example.com");
-        assert_eq!(r.repository, "nginx");
-        assert_eq!(r.tag, Some("1.25".to_string()));
-    }
-
-    #[test]
-    fn test_parse_with_docker_hub_default_keeps_library_namespace() {
-        let r = ImageReference::parse_with_default_registry("nginx", "index.docker.io").unwrap();
-        assert_eq!(r.registry, "docker.io");
-        assert_eq!(r.repository, "library/nginx");
     }
 
     #[test]
@@ -336,6 +304,28 @@ mod tests {
     fn test_display() {
         let r = ImageReference::parse("nginx:1.25").unwrap();
         assert_eq!(format!("{}", r), "docker.io/library/nginx:1.25");
+    }
+
+    /// Regression: a purely numeric tag with no registry (`redis:7`, `node:18`)
+    /// must be parsed as a tag, not mistaken for a registry port.
+    #[test]
+    fn test_numeric_tag_is_not_a_port() {
+        for (input, repo, tag) in [
+            ("redis:7", "library/redis", "7"),
+            ("node:18", "library/node", "18"),
+            ("postgres:16", "library/postgres", "16"),
+            ("mgmt:1", "library/mgmt", "1"),
+        ] {
+            let r = ImageReference::parse(input).unwrap();
+            assert_eq!(r.registry, "docker.io", "registry for {input}");
+            assert_eq!(r.repository, repo, "repository for {input}");
+            assert_eq!(r.tag.as_deref(), Some(tag), "tag for {input}");
+        }
+        // A real registry:port/repo:tag still splits correctly.
+        let r = ImageReference::parse("localhost:5000/app:2").unwrap();
+        assert_eq!(r.registry, "localhost:5000");
+        assert_eq!(r.repository, "app");
+        assert_eq!(r.tag.as_deref(), Some("2"));
     }
 
     #[test]

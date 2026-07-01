@@ -9,7 +9,7 @@
 //! - Reaping zombie processes and handling SIGTERM for graceful shutdown
 
 use a3s_box_guest_init::{
-    attest_server, exec_server, namespace, network, port_forward, pty_server,
+    attest_server, exec_server, host_config, namespace, network, port_forward, pty_server,
 };
 use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,6 +17,206 @@ use tracing::{error, info, warn};
 
 /// Global flag set by the SIGTERM handler to request graceful shutdown.
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Relay threads forwarding the main process's stdout/stderr pipes to the console.
+/// Drained at container exit so the tail of the output reaches the console (and
+/// thus `logs` / the foreground terminal) before the VM halts.
+static STDIO_RELAYS: std::sync::OnceLock<std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>> =
+    std::sync::OnceLock::new();
+
+/// Interpose a re-openable pipe between the main container process's stdout/stderr
+/// and the virtio-console.
+///
+/// The container would otherwise inherit guest-init's virtio-console ports as fd
+/// 1/2, which are single-open: a process that re-opens `/proc/self/fd/{1,2}` or
+/// `/dev/stdout`/`/dev/stderr` (Apache httpd, nginx-to-stdout, and many real apps)
+/// gets `EBUSY`. We hand it pipe write-ends instead (installed onto fd 1/2 in the
+/// child by `spawn_isolated`) and relay the read-ends back to the console here, so
+/// re-opening works while `logs` and the split stdout/stderr streams are preserved.
+///
+/// File descriptors for the main-process stdio relay (set up before the fork,
+/// with the relay threads started only *after* the fork — see `start_stdio_relays`).
+#[cfg(target_os = "linux")]
+struct StdioRelayFds {
+    /// Pipe write-ends handed to the child as fd 1/2.
+    out_w: std::os::unix::io::RawFd,
+    err_w: std::os::unix::io::RawFd,
+    /// Pipe read-ends the relay threads drain.
+    out_r: std::os::unix::io::RawFd,
+    err_r: std::os::unix::io::RawFd,
+    /// Console targets (dups of guest-init fd 1/2) the relays write to.
+    console_out: std::os::unix::io::RawFd,
+    console_err: std::os::unix::io::RawFd,
+}
+
+/// Create the relay pipes + console dups (NO threads yet — threads must start after
+/// the container fork to stay fork-safe). Returns `None` (keep console fds, the
+/// pre-fix behavior) if any fd op fails.
+#[cfg(target_os = "linux")]
+fn setup_main_stdio_pipes() -> Option<StdioRelayFds> {
+    use std::os::unix::io::RawFd;
+
+    // Relay targets: dup guest-init's current stdout (fd 1 -> console.log) and
+    // stderr (fd 2 -> console.err.log) so the split-stream routing is preserved.
+    let console_out = unsafe { libc::dup(1) };
+    let console_err = unsafe { libc::dup(2) };
+    if console_out < 0 || console_err < 0 {
+        unsafe {
+            if console_out >= 0 {
+                libc::close(console_out);
+            }
+            if console_err >= 0 {
+                libc::close(console_err);
+            }
+        }
+        return None;
+    }
+
+    // O_CLOEXEC so the raw pipe fds don't leak into the exec'd container; the
+    // child's dup2 onto fd 1/2 clears CLOEXEC there so only those survive exec.
+    let mut out_fds = [0 as RawFd; 2];
+    let mut err_fds = [0 as RawFd; 2];
+    if unsafe { libc::pipe2(out_fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
+        unsafe {
+            libc::close(console_out);
+            libc::close(console_err);
+        }
+        return None;
+    }
+    if unsafe { libc::pipe2(err_fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
+        // The out-pipe succeeded; close it too so a failed err-pipe (e.g. EMFILE)
+        // doesn't leak the two out-pipe fds.
+        unsafe {
+            libc::close(console_out);
+            libc::close(console_err);
+            libc::close(out_fds[0]);
+            libc::close(out_fds[1]);
+        }
+        return None;
+    }
+    Some(StdioRelayFds {
+        out_w: out_fds[1],
+        err_w: err_fds[1],
+        out_r: out_fds[0],
+        err_r: err_fds[0],
+        console_out,
+        console_err,
+    })
+}
+
+/// Start the two relay threads (read pipe -> write console). Called *after* the
+/// container fork so guest-init is single-threaded across `fork()` (fork-safety:
+/// the codebase keeps the post-fork child free of locks held by other threads).
+/// Consumes the read-ends + console dups; the write-ends are closed by the caller.
+///
+/// NOTE: a hand-rolled `read`/`write` loop — NOT `std::io::copy`. On Linux,
+/// `io::copy` takes a `splice(2)` fast path for a pipe source, which on a
+/// pipe → virtio-console pair returns a spurious `Ok(0)` (premature EOF). That
+/// dropped the read-end immediately, so the container's first write hit a
+/// reader-less pipe and died with SIGPIPE. The explicit loop avoids splice.
+#[cfg(target_os = "linux")]
+fn start_stdio_relays(out_r: i32, console_out: i32, err_r: i32, console_err: i32) {
+    let mut handles = Vec::with_capacity(2);
+    for (read_fd, console_fd) in [(out_r, console_out), (err_r, console_err)] {
+        handles.push(std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = unsafe {
+                    libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                };
+                if n < 0 {
+                    // EINTR: a signal (e.g. the SIGTERM handler, installed without
+                    // SA_RESTART) interrupted the blocking read — retry, don't
+                    // mistake it for EOF and truncate the container's final output.
+                    // Any other error means the pipe is gone, so stop.
+                    if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    break;
+                }
+                // EOF — the container closed its pipe write-end (it exited), so the
+                // relay is finished.
+                if n == 0 {
+                    break;
+                }
+                let mut off = 0usize;
+                while off < n as usize {
+                    let w = unsafe {
+                        libc::write(
+                            console_fd,
+                            buf.as_ptr().add(off) as *const libc::c_void,
+                            n as usize - off,
+                        )
+                    };
+                    if w < 0 {
+                        // Same EINTR handling for the write side: retry the same
+                        // offset rather than dropping the rest of the chunk.
+                        if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                            continue;
+                        }
+                        break;
+                    }
+                    if w == 0 {
+                        break;
+                    }
+                    off += w as usize;
+                }
+            }
+            unsafe {
+                libc::close(read_fd);
+                libc::close(console_fd);
+            }
+        }));
+    }
+    if let Ok(mut g) = STDIO_RELAYS
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+    {
+        g.extend(handles);
+    }
+}
+
+/// Create the standard `/dev/std{in,out,err}` + `/dev/fd` symlinks into the
+/// process's own fds, the way container runtimes do.
+///
+/// The main container's `/dev` is a devtmpfs (real `null`/`urandom`/... nodes but
+/// no std* symlinks). Apps that log to `/dev/stdout` or `/dev/stderr` (official
+/// nginx, and many others) need these to resolve to their own stdio — which is
+/// re-openable now that the main process's stdout/stderr are pipes (see
+/// `setup_main_stdio_pipes`). Created once before the container fork so the
+/// container inherits them; best-effort and idempotent.
+#[cfg(target_os = "linux")]
+fn ensure_dev_std_symlinks() {
+    for (link, target) in [
+        ("/dev/stdin", "/proc/self/fd/0"),
+        ("/dev/stdout", "/proc/self/fd/1"),
+        ("/dev/stderr", "/proc/self/fd/2"),
+        ("/dev/fd", "/proc/self/fd"),
+    ] {
+        // symlink_metadata does not follow the link, so an existing symlink whose
+        // target is not yet resolvable still counts as present (idempotent).
+        if std::fs::symlink_metadata(link).is_ok() {
+            continue;
+        }
+        if let Err(e) = std::os::unix::fs::symlink(target, link) {
+            warn!("Failed to symlink {link} -> {target}: {e}");
+        }
+    }
+}
+
+/// Drain the stdout/stderr relay threads so the container's final output reaches
+/// the console before the VM halts. Idempotent; safe from any exit path.
+fn flush_stdio_relays() {
+    if let Some(lock) = STDIO_RELAYS.get() {
+        let handles: Vec<_> = lock
+            .lock()
+            .map(|mut g| std::mem::take(&mut *g))
+            .unwrap_or_default();
+        for h in handles {
+            let _ = h.join();
+        }
+    }
+}
 
 /// Container entrypoint configuration parsed from environment variables.
 struct ExecConfig {
@@ -28,6 +228,9 @@ struct ExecConfig {
     env: Vec<(String, String)>,
     /// Working directory
     workdir: String,
+    /// Container user (`uid`, `uid:gid`, `root`, or a name resolved via the
+    /// image `/etc/passwd`). Applied to the main process before exec.
+    user: Option<String>,
 }
 
 impl ExecConfig {
@@ -40,8 +243,32 @@ impl ExecConfig {
     /// - BOX_EXEC_ENV_*: container environment variables
     /// - BOX_EXEC_WORKDIR: working directory (defaults to "/")
     fn from_env() -> Self {
-        let executable =
-            std::env::var("BOX_EXEC_EXEC").unwrap_or_else(|_| "/sbin/init".to_string());
+        // The runtime always sets BOX_EXEC_EXEC when guest-init is PID 1
+        // (runtime/src/vm/spec.rs), so this default is only a defensive fallback.
+        // Use /bin/sh — universal across distros — never /sbin/init, which does
+        // not exist on Alpine and was the original cause of issue #3.
+        // BOX_EXEC_* values are base64-encoded (URL-safe, no pad) by the runtime
+        // when BOX_EXEC_B64=1, so arbitrary bytes (quotes, spaces, `$`, …) survive
+        // libkrun's env serialization. Decode them back; fall back to the raw value
+        // on any decode error or when the marker is absent (older runtime).
+        use base64::Engine;
+        let b64 = std::env::var("BOX_EXEC_B64")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let decode = |s: String| -> String {
+            if !b64 {
+                return s;
+            }
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(s.as_bytes())
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .unwrap_or(s)
+        };
+
+        let executable = std::env::var("BOX_EXEC_EXEC")
+            .map(&decode)
+            .unwrap_or_else(|_| "/bin/sh".to_string());
 
         // Parse args from individual env vars (BOX_EXEC_ARGC + BOX_EXEC_ARG_0..N)
         let args: Vec<String> = match std::env::var("BOX_EXEC_ARGC")
@@ -49,26 +276,61 @@ impl ExecConfig {
             .and_then(|s| s.parse::<usize>().ok())
         {
             Some(argc) => (0..argc)
-                .filter_map(|i| std::env::var(format!("BOX_EXEC_ARG_{}", i)).ok())
+                .filter_map(|i| {
+                    std::env::var(format!("BOX_EXEC_ARG_{}", i))
+                        .ok()
+                        .map(&decode)
+                })
                 .collect(),
             None => vec![],
         };
 
-        let workdir = std::env::var("BOX_EXEC_WORKDIR").unwrap_or_else(|_| "/".to_string());
+        let workdir = std::env::var("BOX_EXEC_WORKDIR")
+            .map(&decode)
+            .unwrap_or_else(|_| "/".to_string());
 
-        // Collect BOX_EXEC_ENV_* variables
-        let env: Vec<(String, String)> = std::env::vars()
+        // Optional container user (image USER directive or CLI --user).
+        let user = std::env::var("BOX_EXEC_USER")
+            .ok()
+            .map(&decode)
+            .filter(|u| !u.is_empty());
+
+        // Collect BOX_EXEC_ENV_* variables (values decoded as above). Skip
+        // BOX_EXEC_ENV_FILE — it's the pointer to the staged env file, not a
+        // container variable. Kept for backward compatibility with a runtime that
+        // still passes container env inline.
+        let mut env: Vec<(String, String)> = std::env::vars()
             .filter_map(|(key, value)| {
                 key.strip_prefix("BOX_EXEC_ENV_")
-                    .map(|stripped| (stripped.to_string(), value))
+                    .filter(|stripped| *stripped != "FILE")
+                    .map(|stripped| (stripped.to_string(), decode(value)))
             })
             .collect();
+
+        // Bulk container env is staged in a file (runtime/src/vm/spec.rs): K8s
+        // injects ~150 service env vars, which overflow the guest kernel cmdline
+        // if passed inline, so the runtime writes them to a file and points here.
+        // Each line is `KEY=base64(value)`; the key may itself contain `=`-free
+        // bytes only (env names are a safe charset), so split on the first `=`.
+        if let Ok(path) = std::env::var("BOX_EXEC_ENV_FILE") {
+            match std::fs::read_to_string(&path) {
+                Ok(contents) => {
+                    for line in contents.lines() {
+                        if let Some((k, v)) = line.split_once('=') {
+                            env.push((k.to_string(), decode(v.to_string())));
+                        }
+                    }
+                }
+                Err(e) => eprintln!("init.krun: failed to read BOX_EXEC_ENV_FILE {path}: {e}"),
+            }
+        }
 
         Self {
             executable,
             args,
             env,
             workdir,
+            user,
         }
     }
 }
@@ -155,13 +417,83 @@ fn is_tee_environment() -> bool {
     a3s_box_core::tee::is_tee_available()
 }
 
+/// Raw fd of `/dev/kmsg`, opened ONCE before any chroot/pivot and kept open for
+/// the process lifetime. An open file description survives `pivot_root`/`chroot`
+/// (it is independent of the path), so reusing this fd avoids the gap where the
+/// new root has no `/dev/kmsg` yet — which would otherwise leak a few lines back
+/// to the console mid-boot.
+static KMSG_FD: std::sync::OnceLock<Option<std::os::unix::io::RawFd>> = std::sync::OnceLock::new();
+
+/// Writer for guest-init's OWN tracing. Routes it to the kernel log
+/// (`/dev/kmsg`) instead of the VM console so it never pollutes container logs:
+/// the container inherits the console for its stdout/stderr, and Docker-style
+/// `logs` must show only that, not runtime internals (init/exec/pty chatter).
+/// A `<7>` (debug) priority prefix keeps these lines below the guest kernel's
+/// console loglevel (4), so they never echo back to the console. Falls back to
+/// stdout when `/dev/kmsg` is unavailable (e.g. non-Linux), preserving the old
+/// behavior rather than dropping logs.
+enum InitLogWriter {
+    Kmsg(std::os::unix::io::RawFd),
+    Stdout(std::io::Stdout),
+}
+
+impl std::io::Write for InitLogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            InitLogWriter::Kmsg(fd) => {
+                // /dev/kmsg treats each write() as one record: prefix the
+                // priority and flatten embedded newlines so a formatted event
+                // stays a single kernel-log record.
+                let mut record = Vec::with_capacity(buf.len() + 13);
+                record.extend_from_slice(b"<7>a3s-init: ");
+                record.extend(buf.iter().map(|&b| if b == b'\n' { b' ' } else { b }));
+                // SAFETY: *fd is a valid, process-lifetime fd to /dev/kmsg; a
+                // failed write is intentionally ignored (logging must never panic).
+                unsafe {
+                    libc::write(*fd, record.as_ptr() as *const libc::c_void, record.len());
+                }
+                Ok(buf.len())
+            }
+            InitLogWriter::Stdout(out) => out.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            InitLogWriter::Kmsg(_) => Ok(()),
+            InitLogWriter::Stdout(out) => out.flush(),
+        }
+    }
+}
+
+fn make_init_log_writer() -> InitLogWriter {
+    match KMSG_FD.get().copied().flatten() {
+        Some(fd) => InitLogWriter::Kmsg(fd),
+        None => InitLogWriter::Stdout(std::io::stdout()),
+    }
+}
+
 fn main() {
-    // Initialize logging
+    // Open /dev/kmsg once (before any chroot) and keep it open for the whole
+    // process via into_raw_fd, so guest-init's logs reach the kernel log
+    // reliably across the pivot. Container logs stay clean (see InitLogWriter).
+    use std::os::unix::io::IntoRawFd;
+    let kmsg_fd = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/kmsg")
+        .ok()
+        .map(|file| file.into_raw_fd());
+    let _ = KMSG_FD.set(kmsg_fd);
+
+    // Initialize logging. guest-init's own logs go to the kernel log, NOT the
+    // console, to keep container logs clean.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        .with_ansi(false)
+        .with_writer(make_init_log_writer)
         .init();
 
     info!("a3s-box guest init starting (PID {})", process::id());
@@ -182,12 +514,31 @@ fn run_init() -> Result<(), Box<dyn std::error::Error>> {
     // Step 2: Mount virtio-fs shares
     mount_virtio_fs_shares()?;
 
+    // Step 2.25: Mount devpts after the final rootfs is active so PTY
+    // allocation inside exec/attach sessions can open /dev/ptmx.
+    mount_devpts()?;
+
     // Step 2.5: Mount tmpfs volumes
     mount_tmpfs_volumes()?;
+
+    // Step 2.6: Bind the exec (vsock 4089) and PTY (vsock 4090) listening sockets
+    // NOW, before the slower network bring-up and container spawn below. These are
+    // pure socket/bind/listen syscalls on this (still single-threaded) main thread,
+    // so the later container fork stays fork-safe; the accept loops are spawned as
+    // threads only after the fork (Step 8). Binding this early fills the listen
+    // backlog from the start of boot, so a host connect QUEUES instead of being
+    // refused while network setup and the container spawn finish — closing the
+    // exec/PTY startup race of issue #3. CLOEXEC on the fds keeps the forked
+    // container from inheriting the listeners.
+    let exec_listener = exec_server::bind_exec_server()?;
+    let pty_listener = pty_server::bind_pty_server()?;
 
     // Step 3: Configure guest network (if passt mode is active).
     // Network setup may write /etc/resolv.conf — must run before read-only remount.
     network::configure_guest_network()?;
+
+    // Step 3.25: Apply hostname while the rootfs is still writable.
+    host_config::apply_from_env()?;
 
     // Step 3.5: Remount rootfs read-only if BOX_READONLY=1.
     // All writes to / (mount point creation, resolv.conf) must complete first.
@@ -235,6 +586,20 @@ fn run_init() -> Result<(), Box<dyn std::error::Error>> {
     // Step 7: Launch container entrypoint
     info!("Launching container entrypoint");
 
+    // Ensure the working directory exists — Docker creates a missing WORKDIR /
+    // `-w` path before chdir. Best-effort: a pre-existing dir is fine, and a
+    // read-only rootfs (where creation fails) matches Docker's inability to
+    // create it there.
+    if !exec_config.workdir.is_empty() && exec_config.workdir != "/" {
+        if let Err(e) = std::fs::create_dir_all(&exec_config.workdir) {
+            warn!(
+                workdir = %exec_config.workdir,
+                error = %e,
+                "Could not pre-create working directory (continuing)"
+            );
+        }
+    }
+
     // Convert args to &str for spawn_isolated
     let args_refs: Vec<&str> = exec_config.args.iter().map(|s| s.as_str()).collect();
     let env_refs: Vec<(&str, &str)> = exec_config
@@ -243,20 +608,138 @@ fn run_init() -> Result<(), Box<dyn std::error::Error>> {
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
 
-    let container_pid_raw = namespace::spawn_isolated(
-        &namespace_config,
-        &exec_config.executable,
-        &args_refs,
-        &env_refs,
-        &exec_config.workdir,
-    )?;
-    let container_pid = nix::unistd::Pid::from_raw(container_pid_raw as i32);
+    // Deferred-main (BOX_DEFERRED_MAIN=1): boot IDLE — skip the boot spawn and let
+    // the container main be spawned later by a `spawn-main` control frame (for a
+    // pre-warmed/pooled sandbox). CONTAINER_PID stays the -1 sentinel; the exec
+    // server + supervision loop start as usual, so host readiness still passes
+    // (the heartbeat handshake has no container-pid dependency).
+    // Standard /dev/std{in,out,err} symlinks (-> the container's own fds), created
+    // before the container fork so it inherits them. Pairs with setup_main_stdio_pipes.
+    #[cfg(target_os = "linux")]
+    ensure_dev_std_symlinks();
 
-    info!("Container process started with PID {}", container_pid);
+    // Per-container cgroup for run-path resource limits that have no VM-boundary
+    // equivalent — currently `pids.max` (`--pids-limit`). `--memory`/`--cpus` on
+    // `run` are enforced by sizing the microVM itself, so only the process-count
+    // cap needs an in-guest cgroup. Created here in PID 1 before the container
+    // fork; the child joins it from `child_process` before exec (so every worker
+    // it forks is bounded too), and it is removed when this binding drops at
+    // guest-init exit, by which point the container has been reaped. Best-effort:
+    // `create` returns `None` when no such limit is set or cgroup v2 is
+    // unavailable, leaving the normal boot path untouched.
+    // Build the per-container cgroup from the runtime's A3S_SEC_* control vars.
+    // memory_max stays None on the boot path: `--memory` is enforced by sizing
+    // the microVM RAM, not an in-guest cgroup (so the runtime emits no
+    // A3S_SEC_MEM_LIMIT here). The CPU/pids caps and the memory soft-reservation
+    // (--memory-reservation) / swap cap (--memory-swap) DO have to be applied
+    // in-guest, mirrored from the same A3S_SEC_* env vars.
+    #[cfg(target_os = "linux")]
+    let container_cgroup = a3s_box_guest_init::cgroup::ContainerCgroup::create(
+        None,
+        std::env::var("A3S_SEC_MEM_LOW")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok()),
+        std::env::var("A3S_SEC_MEM_SWAP")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok()),
+        std::env::var("A3S_SEC_CPU_QUOTA")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok()),
+        std::env::var("A3S_SEC_CPU_PERIOD")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok()),
+        std::env::var("A3S_SEC_CPU_SHARES")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok()),
+        std::env::var("A3S_SEC_PIDS_LIMIT")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok()),
+    );
+    #[cfg(target_os = "linux")]
+    let cgroup_procs = container_cgroup.as_ref().map(|cgroup| cgroup.procs_path());
+    #[cfg(not(target_os = "linux"))]
+    let cgroup_procs: Option<String> = None;
 
-    // Step 8: Start exec server in background thread
-    std::thread::spawn(|| {
-        if let Err(e) = exec_server::run_exec_server() {
+    let deferred_main = std::env::var("BOX_DEFERRED_MAIN")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+
+    let container_pid = if deferred_main {
+        info!("BOX_DEFERRED_MAIN=1 — booting IDLE; container main deferred to a spawn-main control frame");
+        // Stash the parsed command so a later spawn-main trigger runs it as main.
+        #[cfg(target_os = "linux")]
+        exec_server::set_deferred_main_spec(
+            exec_config.executable.clone(),
+            exec_config.args.clone(),
+            exec_config
+                .env
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            if exec_config.workdir.is_empty() {
+                None
+            } else {
+                Some(exec_config.workdir.clone())
+            },
+            exec_config.user.clone(),
+        );
+        // Stash the cgroup's procs path too, so the deferred main joins the
+        // per-container cgroup when spawned (the non-deferred branch below
+        // passes it to spawn_isolated). Without this a warm/IDLE-boot box runs
+        // its main outside the cgroup and pids.max / cpu.max are unenforced.
+        #[cfg(target_os = "linux")]
+        exec_server::set_deferred_cgroup_procs(cgroup_procs.clone());
+        nix::unistd::Pid::from_raw(-1)
+    } else {
+        // Hand the main process re-openable pipe write-ends as fd 1/2 (see
+        // setup_main_stdio_pipes) so it can re-open its own stdout/stderr by path.
+        #[cfg(target_os = "linux")]
+        let relay = setup_main_stdio_pipes();
+        #[cfg(not(target_os = "linux"))]
+        let relay: Option<()> = None;
+        #[cfg(target_os = "linux")]
+        let main_stdio = relay.as_ref().map(|r| (r.out_w, r.err_w));
+        #[cfg(not(target_os = "linux"))]
+        let main_stdio = None;
+
+        let container_pid_raw = namespace::spawn_isolated(
+            &namespace_config,
+            &exec_config.executable,
+            &args_refs,
+            &env_refs,
+            &exec_config.workdir,
+            exec_config.user.as_deref(),
+            main_stdio,
+            cgroup_procs.as_deref(),
+        )?;
+        info!("Container process started with PID {}", container_pid_raw);
+
+        // Close our copies of the write-ends (the container is now the sole writer),
+        // then start the relay threads. Starting them AFTER the fork keeps guest-init
+        // single-threaded across the container `fork()` (fork-safety).
+        #[cfg(target_os = "linux")]
+        if let Some(r) = relay {
+            unsafe {
+                libc::close(r.out_w);
+                libc::close(r.err_w);
+            }
+            start_stdio_relays(r.out_r, r.console_out, r.err_r, r.console_err);
+        }
+
+        // Make the main container PID available to the exec server so a host
+        // graceful-stop request (signal-main control frame) can deliver the
+        // STOPSIGNAL to it. Must be set before the exec server thread starts.
+        exec_server::set_container_pid(container_pid_raw as i32);
+        nix::unistd::Pid::from_raw(container_pid_raw as i32)
+    };
+
+    expose_container_env_to_exec(&exec_config);
+
+    // Step 8: Start the exec server accept loop on the socket bound in Step 2.6.
+    // (set_container_pid above ran first, so a host signal-main frame still finds
+    // the PID once the loop is serving.)
+    std::thread::spawn(move || {
+        if let Err(e) = exec_server::serve_exec_server(exec_listener) {
             error!("Exec server failed: {}", e);
         }
     });
@@ -268,9 +751,9 @@ fn run_init() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Step 8.5: Start PTY server in background thread
-    std::thread::spawn(|| {
-        if let Err(e) = pty_server::run_pty_server() {
+    // Step 8.5: Start the PTY server accept loop on the socket bound in Step 2.6.
+    std::thread::spawn(move || {
+        if let Err(e) = pty_server::serve_pty_server(pty_listener) {
             error!("PTY server failed: {}", e);
         }
     });
@@ -288,7 +771,21 @@ fn run_init() -> Result<(), Box<dyn std::error::Error>> {
     // Step 9: Wait for agent process (reap zombies, handle SIGTERM)
     wait_for_children(container_pid)?;
 
+    // Drain the stdio relays on the graceful-shutdown / no-children return paths
+    // (the container-exit path flushes before its own process::exit).
+    flush_stdio_relays();
+
     Ok(())
+}
+
+fn expose_container_env_to_exec(config: &ExecConfig) {
+    for (key, value) in &config.env {
+        if key.is_empty() || key.contains(['=', '\0']) || value.contains('\0') {
+            warn!(key, "Skipping invalid container environment entry for exec");
+            continue;
+        }
+        std::env::set_var(key, value);
+    }
 }
 
 /// Launch the sidecar process as a background co-process.
@@ -415,6 +912,36 @@ fn mount_essential_filesystems() -> Result<(), Box<dyn std::error::Error>> {
         info!("Skipping mount on non-Linux platform (development mode)");
     }
 
+    Ok(())
+}
+
+/// Mount devpts for guest-side PTY allocation.
+#[cfg(target_os = "linux")]
+fn mount_devpts() -> Result<(), Box<dyn std::error::Error>> {
+    use nix::mount::{mount, MsFlags};
+
+    std::fs::create_dir_all("/dev/pts")?;
+    match mount(
+        Some("devpts"),
+        "/dev/pts",
+        Some("devpts"),
+        MsFlags::empty(),
+        Some("mode=0620,ptmxmode=0666"),
+    ) {
+        Ok(()) => {
+            info!("Mounted devpts at /dev/pts");
+            Ok(())
+        }
+        Err(nix::errno::Errno::EBUSY) => {
+            info!("/dev/pts already mounted, skipping");
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mount_devpts() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
@@ -614,69 +1141,85 @@ fn mount_user_volumes() -> Result<(), Box<dyn std::error::Error>> {
 
                 let tag = parts[0];
                 let guest_path = parts[1];
-                let read_only = parts.get(2).map(|&m| m == "ro").unwrap_or(false);
-
-                // Check if guest_path is a file (has an extension) or a directory
-                // virtio-fs can only mount directories, so if guest_path is a file,
-                // we need to mount at the parent directory instead
-                let mount_path: &str;
-                let file_name: Option<&str>;
-
-                if guest_path
-                    .rsplit('/')
-                    .next()
-                    .map(|s| s.contains('.'))
-                    .unwrap_or(false)
-                {
-                    // guest_path looks like a file (has extension)
-                    // Extract parent directory and file name
-                    if let Some(last_slash) = guest_path.rfind('/') {
-                        mount_path = &guest_path[..last_slash];
-                        file_name = Some(&guest_path[last_slash + 1..]);
-                    } else {
-                        // No slash, just a filename - mount at current directory
-                        mount_path = ".";
-                        file_name = Some(guest_path);
-                    }
-                    info!(
-                        tag = tag,
-                        guest_path = guest_path,
-                        mount_path = mount_path,
-                        file_name = file_name.unwrap_or(""),
-                        read_only = read_only,
-                        "Mounting user volume (file mount detected, will mount parent directory)"
-                    );
-                } else {
-                    // guest_path is a directory
-                    mount_path = guest_path;
-                    file_name = None;
-                    info!(
-                        tag = tag,
-                        guest_path = guest_path,
-                        read_only = read_only,
-                        "Mounting user volume"
-                    );
-                }
-
-                // Ensure mount point exists (parent directory for file mounts)
-                std::fs::create_dir_all(mount_path)?;
+                // Flags after the guest path may appear in any order: "ro", "file".
+                // The host decides "file" (it can stat the source); the guest obeys.
+                let read_only = parts[2..].contains(&"ro");
+                let is_file = parts[2..].contains(&"file");
 
                 let flags = if read_only {
                     MsFlags::MS_RDONLY
                 } else {
                     MsFlags::empty()
                 };
-                mount(Some(tag), mount_path, Some("virtiofs"), flags, None::<&str>)?;
 
-                // For file mounts, verify the file exists in the mounted directory
-                if let Some(name) = file_name {
-                    let mounted_file = format!("{}/{}", mount_path, name);
-                    if !std::path::Path::new(&mounted_file).exists() {
-                        warn!(
-                            "Expected file {} after mount but it does not exist",
-                            mounted_file
-                        );
+                if is_file {
+                    // Single-file bind mount. The shim shares a temp DIRECTORY
+                    // containing the file (virtio-fs cannot share a bare file), so
+                    // mount that share at a private location and bind just the file
+                    // onto guest_path. This preserves the target's parent directory
+                    // (e.g. /etc) instead of clobbering it with the share.
+                    let file_name = guest_path.rsplit('/').next().unwrap_or(guest_path);
+                    let private_mp = format!("/run/.a3s-filemounts/{}", index);
+                    std::fs::create_dir_all(&private_mp)?;
+                    mount(
+                        Some(tag),
+                        private_mp.as_str(),
+                        Some("virtiofs"),
+                        MsFlags::empty(),
+                        None::<&str>,
+                    )?;
+
+                    let src = format!("{}/{}", private_mp, file_name);
+                    if !std::path::Path::new(&src).exists() {
+                        warn!("File mount source {} missing in share {}", src, tag);
                     }
+
+                    // Ensure the target parent and an (empty) target file exist so
+                    // the bind has somewhere to land.
+                    if let Some(last_slash) = guest_path.rfind('/') {
+                        let parent = &guest_path[..last_slash];
+                        if !parent.is_empty() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                    }
+                    if !std::path::Path::new(guest_path).exists() {
+                        std::fs::File::create(guest_path)?;
+                    }
+
+                    // Bind the file, then remount read-only if requested (a bind
+                    // mount needs a separate MS_REMOUNT pass to apply MS_RDONLY).
+                    mount(
+                        Some(src.as_str()),
+                        guest_path,
+                        None::<&str>,
+                        MsFlags::MS_BIND,
+                        None::<&str>,
+                    )?;
+                    if read_only {
+                        mount(
+                            None::<&str>,
+                            guest_path,
+                            None::<&str>,
+                            MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY,
+                            None::<&str>,
+                        )?;
+                    }
+                    info!(
+                        tag = tag,
+                        guest_path = guest_path,
+                        read_only = read_only,
+                        "Mounted file volume (bind; parent directory preserved)"
+                    );
+                } else {
+                    // Directory mount: mount the virtio-fs share directly at guest_path.
+                    std::fs::create_dir_all(guest_path)?;
+                    mount(Some(tag), guest_path, Some("virtiofs"), flags, None::<&str>)?;
+                    info!(
+                        tag = tag,
+                        guest_path = guest_path,
+                        read_only = read_only,
+                        "Mounted user volume"
+                    );
                 }
 
                 index += 1;
@@ -762,14 +1305,41 @@ fn remount_rootfs_readonly() -> Result<(), Box<dyn std::error::Error>> {
     use nix::mount::{mount, MsFlags};
 
     info!("Remounting rootfs as read-only (--read-only)");
-    mount(
+
+    // A direct `MS_REMOUNT|MS_RDONLY` of the virtio-fs root often fails with
+    // EBUSY. Fall back to the bind-remount trick (bind / onto itself, then
+    // remount that bind read-only), which succeeds where a direct remount
+    // cannot. If both fail, log and continue WRITABLE — a non-enforced
+    // --read-only is far less harmful than killing the container outright.
+    let direct = mount(
         None::<&str>,
         "/",
         None::<&str>,
         MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY,
         None::<&str>,
-    )?;
-    info!("Rootfs remounted read-only");
+    );
+    if direct.is_ok() {
+        info!("Rootfs remounted read-only");
+        return Ok(());
+    }
+
+    let bind = mount(Some("/"), "/", None::<&str>, MsFlags::MS_BIND, None::<&str>).and_then(|_| {
+        mount(
+            None::<&str>,
+            "/",
+            None::<&str>,
+            MsFlags::MS_REMOUNT | MsFlags::MS_BIND | MsFlags::MS_RDONLY,
+            None::<&str>,
+        )
+    });
+    match bind {
+        Ok(()) => info!("Rootfs remounted read-only (via bind)"),
+        Err(error) => warn!(
+            %error,
+            direct_error = ?direct.err(),
+            "Could not remount rootfs read-only; container runs writable"
+        ),
+    }
     Ok(())
 }
 
@@ -778,57 +1348,141 @@ fn remount_rootfs_readonly() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Wait for the main container process.
+/// Supervise children as PID 1: propagate the container's exit, and reap orphans.
 ///
-/// Exec and PTY requests run in other guest-init threads and wait for their
-/// own child processes. The main supervision loop must not call waitpid(-1),
-/// otherwise it can reap those children before the request handler observes
-/// their exit status.
+/// Exec and PTY request handlers reap their OWN children (each `waitpid`s a
+/// specific pid) to read the real exit status, so this loop must not steal them
+/// with a blind `waitpid(-1)`. It peeks exited children non-destructively with
+/// `waitid(WNOWAIT)` and, via the [`reaper`](a3s_box_guest_init::reaper)
+/// registry, reaps only the container (→ VM lifecycle / exit code) and UNMANAGED
+/// children — reparented grandchildren and the sidecar — leaving handler-managed
+/// children for their handler. This propagates the container exit code AND fixes
+/// the zombie leak (orphans were previously never reaped until shutdown).
+#[cfg(target_os = "linux")]
 fn wait_for_children(container_pid: nix::unistd::Pid) -> Result<(), Box<dyn std::error::Error>> {
-    use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+    use a3s_box_guest_init::reaper;
+    use nix::sys::wait::{waitid, waitpid, Id, WaitPidFlag, WaitStatus};
 
     /// Maximum time to wait for children after forwarding SIGTERM (5 seconds).
     const CHILD_SHUTDOWN_TIMEOUT_MS: u64 = 5000;
 
-    info!("Waiting for container process {}", container_pid);
+    info!(
+        "Supervising children as PID 1; container PID {}",
+        container_pid
+    );
 
     loop {
-        // Check if shutdown was requested via SIGTERM
         if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
             info!("SIGTERM received, initiating graceful shutdown");
             graceful_shutdown(CHILD_SHUTDOWN_TIMEOUT_MS);
             return Ok(());
         }
 
+        // Drain currently-exited children. `WNOWAIT` peeks without reaping, so a
+        // handler-managed child stays reapable by its handler; we break on it and
+        // revisit next tick (the handler clears it within its own poll interval).
+        loop {
+            let (pid, code, signaled) = match waitid(
+                Id::All,
+                WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT | WaitPidFlag::WNOHANG,
+            ) {
+                Ok(WaitStatus::Exited(pid, status)) => (pid, status, false),
+                Ok(WaitStatus::Signaled(pid, signal, _)) => (pid, 128 + signal as i32, true),
+                // No exited child right now: stop draining and poll again later.
+                Ok(_) => break,
+                // No children right now. In deferred-main mode (IDLE boot) the
+                // container main has not been spawned yet — keep waiting for the
+                // spawn-main frame rather than exiting (which would halt the VM
+                // before the main ever runs). Otherwise the container is gone: done.
+                Err(nix::errno::Errno::ECHILD) => {
+                    if exec_server::container_pid() < 0 {
+                        break;
+                    }
+                    return Ok(());
+                }
+                // Transient error: retry on the next tick.
+                Err(_) => break,
+            };
+
+            // Read the container pid fresh each iteration: a deferred main (IDLE
+            // boot) publishes it late via spawn-main; the eager path set it at boot.
+            // The -1/-2 sentinels (unset/pending) never match a real pid.
+            let cpid = exec_server::container_pid();
+            if cpid >= 0 && pid.as_raw() == cpid {
+                // The container drives the VM lifecycle: reap it and exit with its
+                // status so the host (and detached `run -d wait`) sees the real code.
+                let _ = waitpid(pid, None);
+                if signaled {
+                    error!("Container process {} terminated (exit code {})", pid, code);
+                } else {
+                    info!("Container process {} exited with status {}", pid, code);
+                }
+                persist_exit_code(code);
+                // Flush the stdout/stderr relays so the container's last output
+                // reaches the console before this process::exit halts the VM.
+                flush_stdio_relays();
+                process::exit(code);
+            } else if reaper::is_managed(pid.as_raw()) {
+                // Owned by an exec/PTY handler, which reaps it for the real status.
+                // Stop draining; it clears shortly and we revisit on the next tick.
+                break;
+            } else {
+                // Orphan (reparented grandchild) or the sidecar: reap it here so it
+                // does not linger as a zombie. Keep draining for more.
+                let _ = waitpid(pid, Some(WaitPidFlag::WNOHANG));
+            }
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Non-Linux development stub: just wait for the container process to exit.
+#[cfg(not(target_os = "linux"))]
+fn wait_for_children(container_pid: nix::unistd::Pid) -> Result<(), Box<dyn std::error::Error>> {
+    use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+
+    loop {
+        if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         match waitpid(container_pid, Some(WaitPidFlag::WNOHANG)) {
-            Ok(WaitStatus::Exited(pid, status)) => {
-                info!("Container process {} exited with status {}", pid, status);
+            Ok(WaitStatus::Exited(_, status)) => {
+                persist_exit_code(status);
                 process::exit(status);
             }
-            Ok(WaitStatus::Signaled(pid, signal, _)) => {
-                error!("Container process {} killed by signal {:?}", pid, signal);
+            Ok(WaitStatus::Signaled(_, signal, _)) => {
+                persist_exit_code(128 + signal as i32);
                 process::exit(128 + signal as i32);
             }
             Ok(WaitStatus::StillAlive) => {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            Ok(_) => {
-                // Other status, continue waiting
-            }
-            Err(nix::errno::Errno::ECHILD) => {
-                info!("Container process {} is no longer a child", container_pid);
-                break;
-            }
-            Err(e) => {
-                return Err(format!("waitpid failed: {}", e).into());
-            }
+            Ok(_) => {}
+            Err(_) => break,
         }
     }
-
     Ok(())
 }
 
+/// Persist the container's exit code to the overlay rootfs so the host can read
+/// it after the VM halts. libkrun's `start_enter` takes over and `exit()`s the
+/// shim process, so the host cannot `waitpid` the VM for a detached `run -d`; the
+/// CLI state reconcile instead reads `<box_dir>/upper/.a3s_exit_code`, which is
+/// this file surfaced through the overlay upperdir. Best-effort, with `sync_all`
+/// so the write reaches the host before PID 1 exits and the VM halts.
+fn persist_exit_code(code: i32) {
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::File::create("/.a3s_exit_code") {
+        let _ = write!(file, "{code}");
+        let _ = file.sync_all();
+    }
+}
+
 /// Perform graceful shutdown: forward SIGTERM to children, wait, then force-kill.
+/// Only the Linux supervision loop drives this (the non-Linux dev stub exits the
+/// process directly), so it is gated to avoid a dead-code warning on macOS.
+#[cfg(target_os = "linux")]
 fn graceful_shutdown(timeout_ms: u64) {
     // Step 1: Send SIGTERM to all processes (except ourselves, PID 1)
     #[cfg(target_os = "linux")]

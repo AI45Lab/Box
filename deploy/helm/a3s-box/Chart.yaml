@@ -10,9 +10,9 @@ keywords:
   - cri
   - tee
   - confidential-computing
-home: https://github.com/A3S-Lab/Box
+home: https://github.com/AI45Lab/Box
 sources:
-  - https://github.com/A3S-Lab/Box
+  - https://github.com/AI45Lab/Box
 maintainers:
   - name: A3S Lab
     url: https://github.com/A3S-Lab

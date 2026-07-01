@@ -25,10 +25,8 @@ pub struct AttachArgs {
 pub async fn execute(args: AttachArgs) -> Result<(), Box<dyn std::error::Error>> {
     let state = StateFile::load_default()?;
     let record = resolve::resolve(&state, &args.r#box)?;
-
-    if record.status != "running" {
-        return Err(format!("Box {} is not running", record.name).into());
-    }
+    crate::socket_paths::require_running(record, "attach to")
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     // Interactive PTY mode
     if args.tty {
@@ -45,17 +43,22 @@ pub async fn execute(args: AttachArgs) -> Result<(), Box<dyn std::error::Error>>
     let console_log = record.console_log.clone();
     if !console_log.exists() {
         return Err(format!(
-            "Console log not found for box {} at {}",
+            "Console log is missing for running box {} at {}. The box may still be starting or the state may be stale; try `a3s-box logs -f {}` or `a3s-box ps`.",
             record.name,
-            console_log.display()
+            console_log.display(),
+            record.name
         )
         .into());
     }
 
     println!("Attached to box {}. Press Ctrl-C to detach.", record.name);
 
+    let console_err = console_log.with_file_name("console.err.log");
     let log_handle = tokio::spawn(async move {
-        super::tail_file(&console_log).await;
+        tokio::join!(
+            super::tail_file(&console_log),
+            super::tail_file_stream(&console_err, true),
+        );
     });
 
     let _ = tokio::signal::ctrl_c().await;
@@ -73,26 +76,25 @@ async fn execute_pty_attach(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::terminal;
     use a3s_box_core::pty::PtyRequest;
-    use a3s_box_runtime::PtyClient;
 
-    let pty_socket_path = crate::socket_paths::pty(record);
-    if !pty_socket_path.exists() {
-        return Err(format!(
-            "PTY socket not found for box {} (guest may not support interactive mode)",
-            record.name,
-        )
-        .into());
-    }
+    let pty_socket_path = crate::socket_paths::require_runtime_socket(
+        record,
+        crate::socket_paths::RuntimeSocket::Pty,
+    )
+    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     let (cols, rows) = terminal::size().unwrap_or((80, 24));
 
-    let mut client = PtyClient::connect(&pty_socket_path).await?;
+    let mut client =
+        super::exec::connect_pty_with_retry(&pty_socket_path, std::time::Duration::from_secs(10))
+            .await?;
 
     // Attach opens a shell
     let request = PtyRequest {
         cmd: vec!["/bin/sh".to_string()],
         env: vec![],
         working_dir: None,
+        rootfs: None,
         user: None,
         cols,
         rows,

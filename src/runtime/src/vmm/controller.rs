@@ -22,16 +22,27 @@ pub struct VmController {
 }
 
 impl VmController {
-    #[cfg(target_os = "windows")]
-    fn configure_windows_shim_logs(&self, cmd: &mut Command, spec: &InstanceSpec) {
+    fn configure_shim_stdio(&self, cmd: &mut Command, spec: &InstanceSpec) {
         use std::fs::OpenOptions;
 
         let Some(console_output) = spec.console_output.as_ref() else {
+            cmd.stdout(Stdio::null()).stderr(Stdio::null());
             return;
         };
         let Some(log_dir) = console_output.parent() else {
+            cmd.stdout(Stdio::null()).stderr(Stdio::null());
             return;
         };
+        if let Err(error) = std::fs::create_dir_all(log_dir) {
+            tracing::warn!(
+                box_id = %spec.box_id,
+                path = %log_dir.display(),
+                error = %error,
+                "Failed to create shim log directory"
+            );
+            cmd.stdout(Stdio::null()).stderr(Stdio::null());
+            return;
+        }
 
         let stdout_path = log_dir.join("shim.stdout.log");
         let stderr_path = log_dir.join("shim.stderr.log");
@@ -53,7 +64,7 @@ impl VmController {
                     box_id = %spec.box_id,
                     stdout = %stdout_path.display(),
                     stderr = %stderr_path.display(),
-                    "Redirecting Windows shim logs to per-box files"
+                    "Redirecting shim stdio to per-box files"
                 );
                 cmd.stdout(Stdio::from(stdout_file))
                     .stderr(Stdio::from(stderr_file));
@@ -64,7 +75,7 @@ impl VmController {
                         box_id = %spec.box_id,
                         path = %stdout_path.display(),
                         error = %error,
-                        "Failed to open Windows shim stdout log file"
+                        "Failed to open shim stdout log file"
                     );
                 }
                 if let Err(error) = stderr_result {
@@ -72,10 +83,10 @@ impl VmController {
                         box_id = %spec.box_id,
                         path = %stderr_path.display(),
                         error = %error,
-                        "Failed to open Windows shim stderr log file"
+                        "Failed to open shim stderr log file"
                     );
                 }
-                cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+                cmd.stdout(Stdio::null()).stderr(Stdio::null());
             }
         }
     }
@@ -317,6 +328,7 @@ impl VmController {
         }
         if let Some(dir) = shim_path.parent() {
             dirs.push(dir.to_path_buf());
+            dirs.push(dir.join("lib"));
         }
 
         let mut seen = HashSet::new();
@@ -325,7 +337,7 @@ impl VmController {
             if !seen.insert(dir.clone()) {
                 continue;
             }
-            if dir.join("krun.dll").exists() && dir.join("libkrunfw.dll").exists() {
+            if dir.join("krun.dll").exists() {
                 path_entries.push(dir);
             }
         }
@@ -399,12 +411,38 @@ impl VmmProvider for VmController {
 
         let mut cmd = Command::new(&self.shim_path);
         cmd.arg("--config").arg(&config_json).stdin(Stdio::null());
+        self.configure_shim_stdio(&mut cmd, spec);
 
-        #[cfg(target_os = "windows")]
-        self.configure_windows_shim_logs(&mut cmd, spec);
+        // KSM page-merging: the shim opts its (guest) memory in via prctl when this
+        // env is set; driven by InstanceSpec.ksm (BoxConfig.ksm or A3S_BOX_KSM).
+        if spec.ksm {
+            cmd.env("A3S_BOX_KSM", "1");
+        }
 
-        #[cfg(not(target_os = "windows"))]
-        cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+        // Snapshot-fork: set the file-backed-RAM / snapshot-trigger / restore paths
+        // for the shim/libkrun. PER-VM values from the InstanceSpec take precedence —
+        // this is what lets ONE process (the pool / fork daemon) drive a different
+        // template/restore per VM, which a process-global env cannot. Fall back to the
+        // process env only when the spec doesn't set a given var (single-VM `run`).
+        let snap_env: [(&str, Option<&str>); 3] = [
+            ("KRUN_SNAPSHOT_MEM_FILE", spec.snapshot_mem_file.as_deref()),
+            ("KRUN_SNAPSHOT_SOCK", spec.snapshot_sock.as_deref()),
+            ("KRUN_RESTORE_FROM", spec.restore_from.as_deref()),
+        ];
+        for (var, spec_val) in snap_env {
+            match spec_val {
+                Some(val) if !val.is_empty() => {
+                    cmd.env(var, val);
+                }
+                _ => {
+                    if let Ok(val) = std::env::var(var) {
+                        if !val.is_empty() {
+                            cmd.env(var, val);
+                        }
+                    }
+                }
+            }
+        }
 
         // On macOS, set DYLD_LIBRARY_PATH to help find libkrunfw
         #[cfg(target_os = "macos")]
@@ -435,6 +473,23 @@ impl VmmProvider for VmController {
         #[cfg(target_os = "windows")]
         if let Some(path) = Self::windows_shim_path_env(&self.shim_path) {
             cmd.env("PATH", path);
+        }
+
+        // Put the VMM shim in its own session/process-group so it survives teardown
+        // of the launcher's session — e.g. a containerd-shim foreground `a3s-box run`
+        // whose process group is reaped on container kill. Without this the libkrun
+        // shim (which owns the box's exec.sock) dies with the launcher and `a3s-box
+        // exec` fails with "exec socket missing".
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            unsafe {
+                cmd.pre_exec(|| {
+                    // setsid() fails harmlessly if already a group leader; ignore.
+                    libc::setsid();
+                    Ok(())
+                });
+            }
         }
 
         let child = cmd.spawn().map_err(|e| BoxError::BoxBootError {

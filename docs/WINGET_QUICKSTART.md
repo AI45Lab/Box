@@ -5,14 +5,14 @@
 ### 1. 等待 GitHub Release 完成
 
 首先确认 v0.8.0 release 已经完成，Windows 资产已上传：
-- 访问: https://github.com/A3S-Lab/Box/releases/tag/v0.8.0
+- 访问: https://github.com/AI45Lab/Box/releases/tag/v0.8.0
 - 确认存在: `a3s-box-v0.8.0-windows-x86_64.zip`
 
 ### 2. 计算 SHA256
 
 ```powershell
 # 下载 Windows 发布资产
-$Url = "https://github.com/A3S-Lab/Box/releases/download/v0.8.0/a3s-box-v0.8.0-windows-x86_64.zip"
+$Url = "https://github.com/AI45Lab/Box/releases/download/v0.8.0/a3s-box-v0.8.0-windows-x86_64.zip"
 Invoke-WebRequest -Uri $Url -OutFile "a3s-box-v0.8.0-windows-x86_64.zip"
 
 # 计算 SHA256
@@ -39,7 +39,7 @@ $env:GITHUB_TOKEN = "your_github_token_here"
 
 #### 方式 B: 使用 GitHub Actions
 
-1. 访问: https://github.com/A3S-Lab/Box/actions/workflows/publish-winget.yml
+1. 访问: https://github.com/AI45Lab/Box/actions/workflows/publish-winget.yml
 2. 点击 "Run workflow"
 3. 输入版本: `0.8.0`
 4. 点击 "Run workflow"
@@ -106,10 +106,11 @@ $env:GITHUB_TOKEN = "your_github_token_here"
 
      - Package: A3SLab.Box
      - Version: 0.8.0
-     - Release: https://github.com/A3S-Lab/Box/releases/tag/v0.8.0
+     - Release: https://github.com/AI45Lab/Box/releases/tag/v0.8.0
 
-     This is a new package submission for a3s-box, a lightweight microVM sandbox
-     runtime with Windows Hypervisor Platform (WHPX) backend support.
+     This is a new package submission for a3s-box, a Docker-like MicroVM
+     runtime that runs natively on Windows through the Windows Hypervisor
+     Platform (WHPX) backend. It does not require WSL.
      ```
    - 创建 PR
 
@@ -159,7 +160,7 @@ winget show A3SLab.Box
 ```powershell
 wingetcreate update A3SLab.Box `
   -v 0.8.1 `
-  -u https://github.com/A3S-Lab/Box/releases/download/v0.8.1/a3s-box-v0.8.1-windows-x86_64.zip `
+  -u https://github.com/AI45Lab/Box/releases/download/v0.8.1/a3s-box-v0.8.1-windows-x86_64.zip `
   -t YOUR_GITHUB_TOKEN
 ```
 

@@ -17,6 +17,6 @@ pub use attestation::{
     SecretInjectionResult, SecretInjector, UnsealResult,
 };
 #[cfg(unix)]
-pub use exec::{ExecClient, StreamingExec};
+pub use exec::{ExecClient, StreamingExec, StreamingExecInput};
 #[cfg(unix)]
-pub use pty::PtyClient;
+pub use pty::{PtyClient, StreamingPty, StreamingPtyInput};

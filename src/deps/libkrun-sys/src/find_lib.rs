@@ -57,10 +57,14 @@ pub fn has_exact_library(dir: &Path, name: &str) -> bool {
                 let Some(rest) = filename_str.strip_prefix(&prefix) else {
                     return false;
                 };
-                // Accept if rest equals extension (unversioned) or starts with
-                // '.' and ends with extension (versioned, e.g. libkrun.so.1)
+                // Accept unversioned names like `libkrun.so` and versioned
+                // names like `libkrun.so.1` without matching siblings such as
+                // `libkrun-efi.so`.
                 extensions.iter().any(|ext| {
-                    rest == *ext || (rest.starts_with('.') && rest.ends_with(ext))
+                    let suffix = format!(".{ext}");
+                    rest == suffix
+                        || rest.starts_with(&format!("{suffix}."))
+                        || (rest.starts_with('.') && rest.ends_with(&suffix))
                 })
             })
         })
@@ -191,17 +195,15 @@ mod tests {
         assert!(!has_exact_library(temp.path(), "krun"));
     }
 
+    // macOS-only: exercises `.dylib` matching; `temp` would be unused on other
+    // platforms (clippy `-D warnings`).
     #[test]
+    #[cfg(target_os = "macos")]
     fn test_has_exact_library_substring_prefix_issue() {
-        // This tests for a specific bug where "libkrunner" might incorrectly
-        // match when looking for "libkrun" due to substring matching
+        // Regression: "libkrunner" must not match a lookup for "libkrun" via
+        // substring — the rest is "er", not a valid extension.
         let temp = create_temp_lib_dir(&["libkrunner.dylib"]);
-
-        #[cfg(target_os = "macos")]
-        {
-            // libkrunner starts with libkrun but rest is "er", not a valid extension
-            assert!(!has_exact_library(temp.path(), "krun"));
-        }
+        assert!(!has_exact_library(temp.path(), "krun"));
     }
 
     #[test]
@@ -210,8 +212,8 @@ mod tests {
         // In CI, the actual libkrun might not be installed
         let result = find_library_in_common_paths("krun");
         // Result depends on whether libkrun is actually installed
-        if result.is_some() {
-            assert!(result.unwrap().exists());
+        if let Some(path) = result {
+            assert!(path.exists());
         }
     }
 

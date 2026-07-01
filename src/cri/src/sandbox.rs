@@ -19,6 +19,20 @@ pub enum SandboxState {
     Removed,
 }
 
+/// Pod DNS configuration captured from the sandbox's CRI `DNSConfig`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SandboxDns {
+    /// DNS server addresses (`nameserver` lines).
+    #[serde(default)]
+    pub servers: Vec<String>,
+    /// DNS search domains (`search` line).
+    #[serde(default)]
+    pub searches: Vec<String>,
+    /// Resolver options (`options` line).
+    #[serde(default)]
+    pub options: Vec<String>,
+}
+
 /// Represents a pod sandbox backed by a Box microVM.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PodSandbox {
@@ -30,6 +44,10 @@ pub struct PodSandbox {
     pub namespace: String,
     /// Pod UID.
     pub uid: String,
+    /// CRI metadata `attempt` (restart generation). kubelet correlates sandboxes
+    /// by `(name, uid, attempt)`, so it must round-trip in status/list responses.
+    #[serde(default)]
+    pub attempt: u32,
     /// Current state.
     pub state: SandboxState,
     /// Creation timestamp in nanoseconds.
@@ -42,12 +60,21 @@ pub struct PodSandbox {
     pub log_directory: String,
     /// Runtime handler name.
     pub runtime_handler: String,
-    /// A3S network name assigned to this sandbox, if bridge networking is used.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub network_name: Option<String>,
-    /// Pod sandbox IP address assigned by A3S IPAM, if available.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ip_address: Option<String>,
+    /// Primary Pod IP known to the runtime or supplied by integration metadata.
+    #[serde(default)]
+    pub network_ip: String,
+    /// Additional Pod IPs, for dual-stack or multi-address integrations.
+    #[serde(default)]
+    pub additional_ips: Vec<String>,
+    /// Pod DNS configuration applied to each container's `/etc/resolv.conf`.
+    #[serde(default)]
+    pub dns: SandboxDns,
+    /// Container ports declared in the sandbox `port_mappings`. Used as the
+    /// fallback target when a PortForward request carries no explicit port
+    /// (e.g. `crictl port-forward`, which puts the port only in the SPDY
+    /// stream); critest passes the port in the RPC and does not need this.
+    #[serde(default)]
+    pub container_ports: Vec<i32>,
 }
 
 /// In-memory store for pod sandboxes.
@@ -107,23 +134,6 @@ impl SandboxStore {
             false
         }
     }
-
-    /// Update the stored network assignment for a sandbox.
-    pub async fn update_network(
-        &self,
-        id: &str,
-        network_name: Option<String>,
-        ip_address: Option<String>,
-    ) -> bool {
-        let mut store = self.sandboxes.write().await;
-        if let Some(sb) = store.get_mut(id) {
-            sb.network_name = network_name;
-            sb.ip_address = ip_address;
-            true
-        } else {
-            false
-        }
-    }
 }
 
 impl Default for SandboxStore {
@@ -142,14 +152,17 @@ mod tests {
             name: format!("pod-{}", id),
             namespace: "default".to_string(),
             uid: format!("uid-{}", id),
+            attempt: 0,
             state: SandboxState::Ready,
             created_at: 1000000000,
             labels: HashMap::from([("app".to_string(), "test".to_string())]),
             annotations: HashMap::new(),
             log_directory: "/var/log/pods".to_string(),
             runtime_handler: "a3s".to_string(),
-            network_name: None,
-            ip_address: None,
+            network_ip: String::new(),
+            additional_ips: vec![],
+            dns: SandboxDns::default(),
+            container_ports: vec![],
         }
     }
 
@@ -161,6 +174,27 @@ mod tests {
         let sb = store.get("sb1").await.unwrap();
         assert_eq!(sb.name, "pod-sb1");
         assert_eq!(sb.state, SandboxState::Ready);
+    }
+
+    #[test]
+    fn test_pod_sandbox_deserializes_legacy_network_defaults() {
+        let json = r#"{
+            "id": "sb1",
+            "name": "pod-sb1",
+            "namespace": "default",
+            "uid": "uid-sb1",
+            "state": "Ready",
+            "created_at": 1000000000,
+            "labels": {},
+            "annotations": {},
+            "log_directory": "/var/log/pods",
+            "runtime_handler": "a3s"
+        }"#;
+
+        let sandbox: PodSandbox = serde_json::from_str(json).unwrap();
+
+        assert!(sandbox.network_ip.is_empty());
+        assert!(sandbox.additional_ips.is_empty());
     }
 
     #[tokio::test]
@@ -218,25 +252,5 @@ mod tests {
     async fn test_update_state_nonexistent() {
         let store = SandboxStore::new();
         assert!(!store.update_state("missing", SandboxState::NotReady).await);
-    }
-
-    #[tokio::test]
-    async fn test_update_network() {
-        let store = SandboxStore::new();
-        store.add(test_sandbox("sb1")).await;
-
-        assert!(
-            store
-                .update_network(
-                    "sb1",
-                    Some("k8s-pods".to_string()),
-                    Some("10.88.0.2".to_string()),
-                )
-                .await
-        );
-
-        let sb = store.get("sb1").await.unwrap();
-        assert_eq!(sb.network_name.as_deref(), Some("k8s-pods"));
-        assert_eq!(sb.ip_address.as_deref(), Some("10.88.0.2"));
     }
 }

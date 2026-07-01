@@ -144,14 +144,20 @@ async fn execute_rm(args: RmArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let store = VolumeStore::default_path()?;
 
+    let mut errors = Vec::new();
     for name in &args.names {
         match store.remove(name, args.force) {
             Ok(_) => println!("{name}"),
-            Err(e) => eprintln!("Error removing volume '{name}': {e}"),
+            Err(e) => errors.push(format!("Error removing volume '{name}': {e}")),
         }
     }
 
-    Ok(())
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        // A failed removal (e.g. volume in use) must be a non-zero exit, like Docker.
+        Err(errors.join("\n").into())
+    }
 }
 
 async fn execute_inspect(args: InspectArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -161,8 +167,18 @@ async fn execute_inspect(args: InspectArgs) -> Result<(), Box<dyn std::error::Er
         .get(&args.name)?
         .ok_or_else(|| format!("volume '{}' not found", args.name))?;
 
-    let json = serde_json::to_string_pretty(&config)?;
-    println!("{json}");
+    // Match `docker volume inspect`: a top-level JSON array of PascalCase objects
+    // (Mountpoint, Scope, etc.), not the raw snake_case VolumeConfig.
+    let output = serde_json::json!([{
+        "Name": config.name,
+        "Driver": config.driver,
+        "Mountpoint": config.mount_point,
+        "Scope": "local",
+        "Labels": config.labels,
+        "Options": serde_json::Map::new(),
+        "CreatedAt": config.created_at,
+    }]);
+    println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(())
 }
 
@@ -221,14 +237,10 @@ pub fn resolve_named_volume(
     let volume_name = host_part;
     let store = VolumeStore::default_path()?;
 
-    // Auto-create volume if it doesn't exist (Docker behavior)
-    let config = match store.get(volume_name)? {
-        Some(config) => config,
-        None => {
-            let config = VolumeConfig::new(volume_name, "");
-            store.create(config)?
-        }
-    };
+    // Auto-create the volume if it doesn't exist (Docker behavior). Atomic
+    // under the store's cross-process lock, so two concurrent first-time
+    // `run -v name:/path` share one volume instead of racing to an error.
+    let config = store.get_or_create(VolumeConfig::new(volume_name, ""))?;
 
     // Replace the named volume with the host mount point path
     let mut resolved = config.mount_point.clone();
@@ -249,11 +261,19 @@ pub fn attach_volumes(
         return Ok(());
     }
     let store = VolumeStore::default_path()?;
+    attach_volumes_with_store(&store, volume_names, box_id)
+}
+
+/// Attach named volumes to a box in a specific VolumeStore.
+pub(crate) fn attach_volumes_with_store(
+    store: &VolumeStore,
+    volume_names: &[String],
+    box_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     for name in volume_names {
-        if let Some(mut config) = store.get(name)? {
-            config.attach(box_id);
-            store.update(&config)?;
-        }
+        // modify() re-reads in_use_by under the lock, so concurrent attaches to
+        // the same volume accumulate instead of clobbering each other.
+        store.modify(name, |config| config.attach(box_id))?;
     }
     Ok(())
 }
@@ -265,10 +285,7 @@ pub fn detach_volumes(volume_names: &[String], box_id: &str) {
     }
     if let Ok(store) = VolumeStore::default_path() {
         for name in volume_names {
-            if let Ok(Some(mut config)) = store.get(name) {
-                config.detach(box_id);
-                store.update(&config).ok();
-            }
+            store.modify(name, |config| config.detach(box_id)).ok();
         }
     }
 }
@@ -344,6 +361,17 @@ mod tests {
         store.update(&updated).unwrap();
 
         assert!(store.remove("testdata", false).is_err());
+    }
+
+    #[test]
+    fn test_attach_volumes_with_store_attaches_existing_volumes() {
+        let (_dir, store) = temp_store();
+        store.create(VolumeConfig::new("testdata", "")).unwrap();
+
+        attach_volumes_with_store(&store, &["testdata".to_string()], "box-1").unwrap();
+
+        let updated = store.get("testdata").unwrap().unwrap();
+        assert!(updated.in_use_by.contains(&"box-1".to_string()));
     }
 
     #[test]

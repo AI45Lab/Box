@@ -20,24 +20,27 @@ pub enum Instruction {
     },
     /// `RUN <command>` (shell form)
     Run { command: String },
-    /// `COPY [--from=<stage>] <src>... <dst>`
+    /// `COPY [--from=<stage>] [--chown=user[:group]] <src>... <dst>`
     Copy {
         src: Vec<String>,
         dst: String,
         from: Option<String>,
+        /// Owner to apply to copied files (`user[:group]`, numeric or named).
+        chown: Option<String>,
     },
     /// `WORKDIR <path>`
     Workdir { path: String },
-    /// `ENV <key>=<value>` or `ENV <key> <value>`
-    Env { key: String, value: String },
+    /// `ENV <key>=<value> [<key>=<value> ...]` or legacy `ENV <key> <value>`.
+    /// Carries one or more key/value pairs (Docker allows several per line).
+    Env { vars: Vec<(String, String)> },
     /// `ENTRYPOINT ["exec", "form"]` or `ENTRYPOINT command`
     Entrypoint { exec: Vec<String> },
     /// `CMD ["exec", "form"]` or `CMD command`
     Cmd { exec: Vec<String> },
-    /// `EXPOSE <port>[/<proto>]`
-    Expose { port: String },
-    /// `LABEL <key>=<value> ...`
-    Label { key: String, value: String },
+    /// `EXPOSE <port>[/<proto>] ...` — one or more ports on a single line.
+    Expose { ports: Vec<String> },
+    /// `LABEL <key>=<value> [<key>=<value> ...]` — one or more pairs per line.
+    Label { pairs: Vec<(String, String)> },
     /// `USER <user>[:<group>]`
     User { user: String },
     /// `ARG <name>[=<default>]`
@@ -45,7 +48,7 @@ pub enum Instruction {
         name: String,
         default: Option<String>,
     },
-    /// `ADD [--chown=<user>] <src>... <dst>`
+    /// `ADD <src>... <dst>`
     Add {
         src: Vec<String>,
         dst: String,
@@ -174,16 +177,22 @@ pub(super) fn parse_instruction(line: &str, line_num: usize) -> Result<Instructi
         "HEALTHCHECK" => parsers::parse_healthcheck(rest, line_num),
         "ONBUILD" => parsers::parse_onbuild(rest, line_num),
         "VOLUME" => parsers::parse_volume(rest, line_num),
-        // Silently ignore unsupported instructions with a warning
+        // MAINTAINER is deprecated but still valid in Docker: it builds and
+        // records the author. Accept it (don't fail the build), storing it as a
+        // `maintainer` label — the modern equivalent Docker itself recommends.
         "MAINTAINER" => {
-            tracing::warn!(
-                line = line_num,
-                instruction = keyword_upper.as_str(),
-                "Deprecated Dockerfile instruction, skipping"
+            if rest.trim().is_empty() {
+                return Err(BoxError::BuildError(format!(
+                    "Line {}: MAINTAINER requires a value",
+                    line_num
+                )));
+            }
+            eprintln!(
+                "Warning: MAINTAINER is deprecated (line {}); recording as label maintainer=...",
+                line_num
             );
             Ok(Instruction::Label {
-                key: "a3s.build.skipped.maintainer".to_string(),
-                value: rest.to_string(),
+                pairs: vec![("maintainer".to_string(), rest.trim().to_string())],
             })
         }
         _ => Err(BoxError::BuildError(format!(

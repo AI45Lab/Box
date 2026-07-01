@@ -135,7 +135,9 @@ async fn is_directory_in_box(
         timeout_ns: DEFAULT_EXEC_TIMEOUT_NS,
         env: vec![],
         working_dir: None,
+        rootfs: None,
         stdin: None,
+        stdin_streaming: false,
         user: None,
         streaming: false,
     };
@@ -165,7 +167,9 @@ async fn copy_file_from_box(
         timeout_ns: DEFAULT_EXEC_TIMEOUT_NS,
         env: vec![],
         working_dir: None,
+        rootfs: None,
         stdin: None,
+        stdin_streaming: false,
         user: None,
         streaming: false,
     };
@@ -204,24 +208,25 @@ async fn copy_file_to_box(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let content =
         std::fs::read(host_path).map_err(|e| format!("Failed to read {host_path}: {e}"))?;
+    let len = content.len();
+    let mode = host_file_mode(host_path);
 
-    use base64::Engine;
-    let encoded = base64::engine::general_purpose::STANDARD.encode(&content);
-
+    // Stream the raw bytes over the exec channel's stdin (not the command line)
+    // so large files do not exceed ARG_MAX, and restore the source file's mode
+    // (Docker `cp` preserves permissions).
+    let dst = shell_escape(box_path);
     let request = ExecRequest {
         cmd: vec![
             "sh".to_string(),
             "-c".to_string(),
-            format!(
-                "echo '{}' | base64 -d > {}",
-                encoded,
-                shell_escape(box_path)
-            ),
+            format!("cat > {dst} && chmod {mode:o} {dst}"),
         ],
         timeout_ns: DEFAULT_EXEC_TIMEOUT_NS,
         env: vec![],
         working_dir: None,
-        stdin: None,
+        rootfs: None,
+        stdin: Some(content),
+        stdin_streaming: false,
         user: None,
         streaming: false,
     };
@@ -233,11 +238,25 @@ async fn copy_file_to_box(
         return Err(format!("Failed to write {box_path} in box: {stderr}").into());
     }
 
-    println!(
-        "{host_path} → {box_name}:{box_path} ({} bytes)",
-        content.len()
-    );
+    println!("{host_path} → {box_name}:{box_path} ({len} bytes)");
     Ok(())
+}
+
+/// Source file's permission bits (lower 12) for `cp` to restore in the box;
+/// defaults to 0o644 off-Unix or on stat failure.
+fn host_file_mode(host_path: &str) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(host_path)
+            .map(|m| m.permissions().mode() & 0o7777)
+            .unwrap_or(0o644)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = host_path;
+        0o644
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -257,12 +276,20 @@ async fn copy_dir_from_box(
         cmd: vec![
             "sh".to_string(),
             "-c".to_string(),
-            format!("tar -cf - -C {} . | base64", shell_escape(box_path)),
+            // `set -o pipefail` so a `tar` failure (EACCES, missing file)
+            // propagates instead of being masked by base64's exit 0 — otherwise
+            // a truncated archive extracts and `cp` falsely reports success.
+            format!(
+                "set -o pipefail; tar -cf - -C {} . | base64",
+                shell_escape(box_path)
+            ),
         ],
         timeout_ns: DIR_TRANSFER_TIMEOUT_NS,
         env: vec![],
         working_dir: None,
+        rootfs: None,
         stdin: None,
+        stdin_streaming: false,
         user: None,
         streaming: false,
     };
@@ -316,7 +343,7 @@ async fn copy_dir_to_box(
             "sh".to_string(),
             "-c".to_string(),
             format!(
-                "mkdir -p {} && echo '{}' | base64 -d | tar -xf - -C {}",
+                "set -o pipefail; mkdir -p {} && echo '{}' | base64 -d | tar -xf - -C {}",
                 shell_escape(box_path),
                 encoded,
                 shell_escape(box_path)
@@ -325,7 +352,9 @@ async fn copy_dir_to_box(
         timeout_ns: DIR_TRANSFER_TIMEOUT_NS,
         env: vec![],
         working_dir: None,
+        rootfs: None,
         stdin: None,
+        stdin_streaming: false,
         user: None,
         streaming: false,
     };
@@ -399,25 +428,11 @@ fn extract_tar_to_dir(tar_data: &[u8], dir_path: &str) -> Result<(), Box<dyn std
 async fn connect_exec(box_name: &str) -> Result<ExecClient, Box<dyn std::error::Error>> {
     let state = StateFile::load_default()?;
     let record = resolve::resolve(&state, box_name)?;
-
-    if record.status != "running" {
-        return Err(format!("Box {} is not running", record.name).into());
-    }
-
-    let exec_socket_path = if !record.exec_socket_path.as_os_str().is_empty() {
-        record.exec_socket_path.clone()
-    } else {
-        record.box_dir.join("sockets").join("exec.sock")
-    };
-
-    if !exec_socket_path.exists() {
-        return Err(format!(
-            "Exec socket not found for box {} at {}",
-            record.name,
-            exec_socket_path.display()
-        )
-        .into());
-    }
+    let exec_socket_path = crate::socket_paths::require_runtime_socket(
+        record,
+        crate::socket_paths::RuntimeSocket::Exec,
+    )
+    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     ExecClient::connect(&exec_socket_path)
         .await

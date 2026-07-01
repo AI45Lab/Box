@@ -24,6 +24,8 @@ pub enum SnapshotAction {
     Rm(SnapshotRmArgs),
     /// Display detailed snapshot information
     Inspect(SnapshotInspectArgs),
+    /// Evict old snapshots to bound disk usage
+    Prune(SnapshotPruneArgs),
 }
 
 /// Arguments for `snapshot create`.
@@ -62,6 +64,10 @@ pub struct SnapshotLsArgs {
 pub struct SnapshotRmArgs {
     /// Snapshot ID(s) to remove
     pub ids: Vec<String>,
+    /// Remove even if a restored box still references the snapshot as its
+    /// copy-on-write overlay lower (`.snapshot-lower`).
+    #[arg(long, short)]
+    pub force: bool,
 }
 
 /// Arguments for `snapshot inspect`.
@@ -69,6 +75,18 @@ pub struct SnapshotRmArgs {
 pub struct SnapshotInspectArgs {
     /// Snapshot ID to inspect
     pub id: String,
+}
+
+/// Arguments for `snapshot prune`.
+#[derive(Parser)]
+pub struct SnapshotPruneArgs {
+    /// Keep at most this many newest snapshots (0 = no count limit)
+    #[arg(long, default_value = "0")]
+    pub keep: usize,
+    /// Evict oldest snapshots until the total size is under this many bytes
+    /// (0 = no size limit)
+    #[arg(long = "max-bytes", default_value = "0")]
+    pub max_bytes: u64,
 }
 
 /// Execute a snapshot command.
@@ -79,7 +97,33 @@ pub async fn execute(args: SnapshotArgs) -> Result<(), Box<dyn std::error::Error
         SnapshotAction::Ls(a) => execute_ls(a).await,
         SnapshotAction::Rm(a) => execute_rm(a).await,
         SnapshotAction::Inspect(a) => execute_inspect(a).await,
+        SnapshotAction::Prune(a) => execute_prune(a).await,
     }
+}
+
+/// Prune snapshots to bound disk usage. Explicit operator action (no surprise
+/// auto-deletion): wires the `SnapshotStore::prune` primitive — which was
+/// implemented and unit-tested but had no caller, so `max_snapshots`/
+/// `max_total_bytes` were inert and scheduled/per-CI snapshots grew the host
+/// disk unbounded with only manual `snapshot rm` as recourse.
+async fn execute_prune(args: SnapshotPruneArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use a3s_box_runtime::SnapshotStore;
+
+    if args.keep == 0 && args.max_bytes == 0 {
+        return Err("specify --keep <N> and/or --max-bytes <BYTES> to prune".into());
+    }
+
+    let store = SnapshotStore::default_path()?;
+    let removed = store.prune(args.keep, args.max_bytes)?;
+    if removed.is_empty() {
+        println!("Nothing to prune");
+    } else {
+        for id in &removed {
+            println!("{id}");
+        }
+        println!("Pruned {} snapshot(s)", removed.len());
+    }
+    Ok(())
 }
 
 /// Create a snapshot from a box.
@@ -118,10 +162,37 @@ async fn execute_create(args: SnapshotCreateArgs) -> Result<(), Box<dyn std::err
         meta.description = desc.clone();
     }
 
-    // Snapshot the rootfs
-    let rootfs_path = record.box_dir.join("rootfs");
+    // Snapshot the box's current root filesystem (overlay `merged` or the plain
+    // provider's `rootfs`), so runtime changes are captured — not an empty dir.
+    let rootfs_path = super::resolve_box_rootfs(&record.box_dir).ok_or_else(|| {
+        format!(
+            "Rootfs not found for box '{}' under {} (looked for merged/ and rootfs/); \
+             snapshot a running box",
+            record.name,
+            record.box_dir.display()
+        )
+    })?;
     let store = SnapshotStore::default_path()?;
     let saved = store.save(meta, &rootfs_path)?;
+
+    // Opt-in auto-prune: when A3S_BOX_MAX_SNAPSHOTS / A3S_BOX_MAX_SNAPSHOT_BYTES are
+    // set, evict the oldest snapshots beyond the cap after each create so a
+    // scheduled/per-CI snapshot workflow self-bounds the host disk (each snapshot
+    // deep-copies the rootfs — hundreds of MB-GB). Unset = no auto-prune (unchanged
+    // behaviour); `snapshot prune` remains the explicit operator tool.
+    let max_count = std::env::var("A3S_BOX_MAX_SNAPSHOTS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    let max_bytes = std::env::var("A3S_BOX_MAX_SNAPSHOT_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    if max_count > 0 || max_bytes > 0 {
+        if let Err(e) = store.prune(max_count, max_bytes) {
+            eprintln!("warning: snapshot auto-prune failed: {e}");
+        }
+    }
 
     println!("{}", saved.id);
     Ok(())
@@ -147,14 +218,28 @@ async fn execute_restore(args: SnapshotRestoreArgs) -> Result<(), Box<dyn std::e
     let socket_dir = box_dir.join("sockets");
     let logs_dir = box_dir.join("logs");
 
+    // Arm cleanup: every step below (create dirs, write marker, register) can
+    // fail with `?`. Until the box is in the state file it is invisible to
+    // `prune`/`rm`, so a half-created box dir would leak on disk forever. The
+    // guard removes it on any early return and is disarmed once registered.
+    let mut dir_guard = crate::cleanup::BoxDirGuard::new(box_dir.clone());
+
     std::fs::create_dir_all(&socket_dir)?;
     std::fs::create_dir_all(&logs_dir)?;
 
-    // Copy snapshot rootfs to new box
+    // Point the restored box's overlay at the snapshot's pristine stored rootfs
+    // as a read-only lower (copy-on-write): the box writes to its own upper, the
+    // snapshot stays shared and untouched across all forks, and nothing is
+    // copied. The runtime reads `.snapshot-lower` in `prepare_layout` and mounts
+    // the overlay (or, on a non-overlay host, the CopyProvider falls back to a
+    // full copy — same result, slower). This replaces a full per-restore rootfs
+    // deep-copy, so forking a warmed snapshot is near-instant and space-cheap.
     let snap_rootfs = store.rootfs_path(&meta.id);
-    let box_rootfs = box_dir.join("rootfs");
     if snap_rootfs.exists() {
-        copy_dir_recursive_io(&snap_rootfs, &box_rootfs)?;
+        std::fs::write(
+            box_dir.join(".snapshot-lower"),
+            snap_rootfs.to_string_lossy().as_bytes(),
+        )?;
     }
 
     let record = BoxRecord {
@@ -164,6 +249,7 @@ async fn execute_restore(args: SnapshotRestoreArgs) -> Result<(), Box<dyn std::e
         image: meta.image.clone(),
         status: "created".to_string(),
         pid: None,
+        pid_start_time: None,
         cpus: meta.vcpus,
         memory_mb: meta.memory_mb,
         volumes: meta.volumes.clone(),
@@ -187,6 +273,7 @@ async fn execute_restore(args: SnapshotRestoreArgs) -> Result<(), Box<dyn std::e
         max_restart_count: 0,
         exit_code: None,
         health_check: None,
+        healthcheck_disabled: false,
         health_status: "none".to_string(),
         health_retries: 0,
         health_last_check: None,
@@ -214,8 +301,10 @@ async fn execute_restore(args: SnapshotRestoreArgs) -> Result<(), Box<dyn std::e
         oom_score_adj: None,
     };
 
-    let mut state = StateFile::load_default()?;
-    state.add(record)?;
+    // Atomic append under the state lock so a concurrent writer (run/monitor/
+    // compose/health) cannot clobber this registration with a stale snapshot.
+    StateFile::add_record(record)?;
+    dir_guard.disarm(); // registered — the box dir is now owned by the record
 
     println!("{}", box_id);
     Ok(())
@@ -265,12 +354,33 @@ async fn execute_ls(args: SnapshotLsArgs) -> Result<(), Box<dyn std::error::Erro
 }
 
 /// Remove snapshots.
+///
+/// Refuses to remove a snapshot that a restored box still references as its
+/// copy-on-write overlay lower (`.snapshot-lower`): the snapshot's rootfs is
+/// shared read-only into every fork, so deleting it would break a live overlay
+/// (ESTALE) or stop a restored box from re-starting. Pass `--force` to override.
 async fn execute_rm(args: SnapshotRmArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::state::StateFile;
     use a3s_box_runtime::SnapshotStore;
 
     let store = SnapshotStore::default_path()?;
+    let state = StateFile::load_default()?;
 
+    let mut refused = false;
     for id in &args.ids {
+        if !args.force {
+            let users = boxes_referencing_snapshot(&state, &store.rootfs_path(id));
+            if !users.is_empty() {
+                refused = true;
+                eprintln!(
+                    "Cannot remove snapshot '{}': still used as a copy-on-write lower by box(es): {}. \
+                     Remove the box(es) first, or re-run with --force.",
+                    id,
+                    users.join(", ")
+                );
+                continue;
+            }
+        }
         if store.delete(id)? {
             println!("{}", id);
         } else {
@@ -278,7 +388,30 @@ async fn execute_rm(args: SnapshotRmArgs) -> Result<(), Box<dyn std::error::Erro
         }
     }
 
+    if refused {
+        return Err("one or more snapshots are still in use (not removed)".into());
+    }
     Ok(())
+}
+
+/// Names of boxes whose `.snapshot-lower` marker points at `snap_rootfs`.
+fn boxes_referencing_snapshot(
+    state: &crate::state::StateFile,
+    snap_rootfs: &std::path::Path,
+) -> Vec<String> {
+    state
+        .records()
+        .iter()
+        .filter(|r| box_references_lower(&r.box_dir, snap_rootfs))
+        .map(|r| r.name.clone())
+        .collect()
+}
+
+/// Whether the box at `box_dir` references `snap_rootfs` as its CoW overlay lower.
+fn box_references_lower(box_dir: &std::path::Path, snap_rootfs: &std::path::Path) -> bool {
+    std::fs::read_to_string(box_dir.join(".snapshot-lower"))
+        .map(|s| std::path::Path::new(s.trim()) == snap_rootfs)
+        .unwrap_or(false)
 }
 
 /// Inspect a snapshot.
@@ -359,58 +492,28 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-/// Simple recursive directory copy (std::io version for CLI).
-fn copy_dir_recursive_io(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-        let file_type = entry.file_type()?;
-        if file_type.is_symlink() {
-            copy_symlink_io(&src_path, &dst_path)?;
-        } else if file_type.is_dir() {
-            copy_dir_recursive_io(&src_path, &dst_path)?;
-        } else {
-            std::fs::copy(&src_path, &dst_path)?;
-        }
-    }
-    Ok(())
-}
-
-fn copy_symlink_io(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
-    let target = std::fs::read_link(src)?;
-
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(&target, dst)?;
-    }
-
-    #[cfg(windows)]
-    {
-        let is_dir = src.metadata().map(|m| m.is_dir()).unwrap_or(false);
-        if is_dir {
-            std::os::windows::fs::symlink_dir(&target, dst)?;
-        } else {
-            std::os::windows::fs::symlink_file(&target, dst)?;
-        }
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = target;
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "symlink copy is not supported on this platform",
-        ));
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_box_references_lower() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let box_dir = tmp.path();
+        let snap = std::path::PathBuf::from("/root/.a3s/snapshots/snap-1/rootfs");
+        // no marker -> not referencing
+        assert!(!box_references_lower(box_dir, &snap));
+        // marker points elsewhere -> not referencing
+        std::fs::write(box_dir.join(".snapshot-lower"), "/other/snap/rootfs").unwrap();
+        assert!(!box_references_lower(box_dir, &snap));
+        // marker points at the snapshot (trailing whitespace tolerated) -> referencing
+        std::fs::write(
+            box_dir.join(".snapshot-lower"),
+            "/root/.a3s/snapshots/snap-1/rootfs\n",
+        )
+        .unwrap();
+        assert!(box_references_lower(box_dir, &snap));
+    }
 
     #[test]
     fn test_format_size_bytes() {

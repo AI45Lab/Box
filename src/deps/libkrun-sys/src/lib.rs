@@ -16,6 +16,7 @@
 
 use std::os::raw::c_char;
 
+#[cfg(test)]
 mod find_lib;
 
 // Log constants from libkrun.h

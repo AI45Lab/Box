@@ -1,9 +1,103 @@
 //! Shared process management utilities for CLI commands.
 
+/// Result of asking a VM/shim process to stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopOutcome {
+    /// The process was already gone before a signal could be delivered.
+    AlreadyExited,
+    /// The process exited after the requested stop signal.
+    GracefulExit,
+    /// The process did not exit before the timeout and was force-killed.
+    ForceKilled,
+}
+
+impl StopOutcome {
+    /// Best-effort container-style exit code for commands that cannot reap the child.
+    pub fn inferred_exit_code(self, stop_signal: i32) -> Option<i32> {
+        match self {
+            Self::AlreadyExited => None,
+            Self::GracefulExit => Some(128 + stop_signal.max(0)),
+            Self::ForceKilled => Some(137),
+        }
+    }
+}
+
 /// Check if a process is alive.
 #[cfg(unix)]
 pub fn is_process_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+/// Whether `pid` has exited, treating a zombie (an exited-but-unreaped child)
+/// as exited. Unlike [`is_process_alive`], whose `kill(pid, 0)` succeeds for a
+/// zombie, this inspects `/proc/<pid>/stat` on Linux so a detached box's shim —
+/// which becomes a zombie under its parent the moment the VM halts — is detected
+/// as completed rather than appearing to run forever.
+#[cfg(target_os = "linux")]
+pub fn is_process_exited(pid: u32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // Format: "<pid> (<comm>) <state> ...". comm may contain spaces/parens,
+        // so scan past the final ')'. Z (zombie) or X (dead) => exited.
+        Ok(stat) => match stat.rfind(')') {
+            Some(idx) => matches!(
+                stat[idx + 1..].trim_start().chars().next(),
+                Some('Z') | Some('X')
+            ),
+            None => false,
+        },
+        // No /proc entry => the process is gone.
+        Err(_) => true,
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+pub fn is_process_exited(pid: u32) -> bool {
+    !is_process_alive(pid)
+}
+
+#[cfg(not(unix))]
+pub fn is_process_exited(pid: u32) -> bool {
+    !is_process_alive(pid)
+}
+
+/// Read a process's start time (field 22 of `/proc/<pid>/stat`, in clock ticks
+/// since boot) as a stable identity token. After a crash or reboot the kernel
+/// can reassign the old shim PID to an unrelated process; the start time lets us
+/// tell the original process apart from a reused PID. `None` when it cannot be
+/// determined (non-Linux, or the process is already gone).
+#[cfg(target_os = "linux")]
+pub fn pid_start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Format: "<pid> (<comm>) <state> ...". comm may contain spaces/parens, so
+    // scan past the final ')': the tokens after it begin at field 3 (state), so
+    // field 22 (starttime) is the 20th of those (index 19).
+    let after = &stat[stat.rfind(')')? + 1..];
+    after
+        .split_whitespace()
+        .nth(19)
+        .and_then(|s| s.parse::<u64>().ok())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn pid_start_time(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// Liveness with PID-identity verification: the process is alive only if it
+/// exists AND — when an identity token was recorded — its current start time
+/// still matches. After a reboot or PID reuse the start time differs, so a stale
+/// record is treated as dead and no signal is ever delivered to an unrelated
+/// process. A `None` expected token (records persisted before this field
+/// existed) falls back to the bare liveness check, so an in-place upgrade never
+/// mis-marks a still-running box.
+pub fn is_process_alive_with_identity(pid: u32, expected_start: Option<u64>) -> bool {
+    if !is_process_alive(pid) {
+        return false;
+    }
+    match expected_start {
+        Some(expected) => pid_start_time(pid) == Some(expected),
+        None => true,
+    }
 }
 
 #[cfg(windows)]
@@ -32,6 +126,17 @@ pub fn terminate_process(pid: u32) {
     }
 }
 
+/// Send a Unix signal to a process and surface the OS error when delivery fails.
+#[cfg(unix)]
+pub fn send_signal(pid: u32, signal: i32) -> Result<(), std::io::Error> {
+    let result = unsafe { libc::kill(pid as i32, signal) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 #[cfg(windows)]
 pub fn terminate_process(pid: u32) {
     use windows_sys::Win32::Foundation::CloseHandle;
@@ -47,32 +152,121 @@ pub fn terminate_process(pid: u32) {
 
 /// Send `signal`, wait up to `timeout` seconds, then force-terminate if still alive.
 #[cfg(unix)]
-pub async fn graceful_stop(pid: u32, signal: i32, timeout: u64) {
+pub async fn graceful_stop(pid: u32, signal: i32, timeout: u64) -> StopOutcome {
+    if !is_process_alive(pid) {
+        return StopOutcome::AlreadyExited;
+    }
+
     unsafe {
-        libc::kill(pid as i32, signal);
+        if libc::kill(pid as i32, signal) != 0 && !is_process_alive(pid) {
+            return StopOutcome::AlreadyExited;
+        }
     }
 
     let start = std::time::Instant::now();
-    let timeout_ms = timeout * 1000;
+    let timeout_ms = timeout.saturating_mul(1000);
     loop {
         if !is_process_alive(pid) {
-            break;
+            return StopOutcome::GracefulExit;
         }
-        if start.elapsed().as_millis() > timeout_ms as u128 {
+        if start.elapsed().as_millis() >= timeout_ms as u128 {
             unsafe {
                 libc::kill(pid as i32, libc::SIGKILL);
             }
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            break;
+            return StopOutcome::ForceKilled;
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
 }
 
 #[cfg(windows)]
-pub async fn graceful_stop(pid: u32, _signal: i32, _timeout: u64) {
+pub async fn graceful_stop(pid: u32, _signal: i32, _timeout: u64) -> StopOutcome {
+    if !is_process_alive(pid) {
+        return StopOutcome::AlreadyExited;
+    }
+
     terminate_process(pid);
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    StopOutcome::ForceKilled
+}
+
+/// Gracefully stop a box by asking the guest to deliver `signal` to the
+/// container's main process over the exec socket, then waiting for the VM (shim
+/// `pid`) to exit on its own; force-kill after `timeout` seconds.
+///
+/// Signalling the shim directly does not reach the container: libkrun renames
+/// the shim and a host signal kills the VM abruptly without running the
+/// container's stop handler. Delivering the signal inside the guest lets the
+/// container run its own shutdown (honouring the image STOPSIGNAL), after which
+/// guest init exits and the VM stops cleanly. If the guest exec server cannot be
+/// reached (older box, socket gone), falls back to signalling the shim.
+#[cfg(unix)]
+pub async fn graceful_stop_via_guest(
+    pid: u32,
+    exec_socket: &std::path::Path,
+    signal: i32,
+    timeout: u64,
+) -> StopOutcome {
+    if !is_process_alive(pid) {
+        return StopOutcome::AlreadyExited;
+    }
+
+    let delivered = match a3s_box_runtime::ExecClient::connect(exec_socket).await {
+        Ok(client) => client.signal_main(signal).await.unwrap_or(false),
+        Err(_) => false,
+    };
+
+    if !delivered {
+        // No reachable guest exec server: fall back to signalling the shim.
+        return graceful_stop(pid, signal, timeout).await;
+    }
+
+    let start = std::time::Instant::now();
+    let timeout_ms = timeout.saturating_mul(1000);
+    loop {
+        if !is_process_alive(pid) {
+            return StopOutcome::GracefulExit;
+        }
+        if start.elapsed().as_millis() >= timeout_ms as u128 {
+            unsafe {
+                libc::kill(pid as i32, libc::SIGKILL);
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            return StopOutcome::ForceKilled;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+}
+
+#[cfg(windows)]
+pub async fn graceful_stop_via_guest(
+    pid: u32,
+    _exec_socket: &std::path::Path,
+    signal: i32,
+    timeout: u64,
+) -> StopOutcome {
+    graceful_stop(pid, signal, timeout).await
+}
+
+/// Deliver `signal` to the container's main process inside the guest over the
+/// exec socket, without waiting for exit or tearing down the VM — the `kill`
+/// primitive (e.g. `kill -USR1`). Returns true if delivered.
+///
+/// Signalling the shim host-side never reaches the container: libkrun renames
+/// the shim and a host signal kills the VM abruptly. The caller falls back to a
+/// host signal only when no guest exec server is reachable (older box).
+#[cfg(unix)]
+pub async fn deliver_signal_via_guest(exec_socket: &std::path::Path, signal: i32) -> bool {
+    match a3s_box_runtime::ExecClient::connect(exec_socket).await {
+        Ok(client) => client.signal_main(signal).await.unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+#[cfg(windows)]
+pub async fn deliver_signal_via_guest(_exec_socket: &std::path::Path, _signal: i32) -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -90,10 +284,42 @@ mod tests {
         assert!(!is_process_alive(99999));
     }
 
+    #[test]
+    fn test_is_process_exited_current_and_missing() {
+        // The running test process has not exited.
+        assert!(!is_process_exited(std::process::id()));
+        // A PID with no process is treated as exited.
+        assert!(is_process_exited(0x7fff_fffe));
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_is_process_alive_parent_process() {
         let parent_pid = unsafe { libc::getppid() as u32 };
         assert!(is_process_alive(parent_pid));
+    }
+
+    #[test]
+    fn test_stop_outcome_exit_code_inference() {
+        assert_eq!(StopOutcome::AlreadyExited.inferred_exit_code(15), None);
+        assert_eq!(StopOutcome::GracefulExit.inferred_exit_code(15), Some(143));
+        assert_eq!(StopOutcome::ForceKilled.inferred_exit_code(15), Some(137));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_pid_identity_distinguishes_reused_pid() {
+        let me = std::process::id();
+        let token = pid_start_time(me);
+        assert!(token.is_some(), "live process must have a start-time token");
+        // Same process, correct token => alive.
+        assert!(is_process_alive_with_identity(me, token));
+        // Live PID but a token that does not match => a reused PID => NOT alive,
+        // so no signal is ever delivered to the impostor process.
+        assert!(!is_process_alive_with_identity(me, Some(u64::MAX)));
+        // Legacy record with no token => falls back to bare liveness => alive.
+        assert!(is_process_alive_with_identity(me, None));
+        // A dead PID is never alive regardless of token.
+        assert!(!is_process_alive_with_identity(99999, None));
     }
 }

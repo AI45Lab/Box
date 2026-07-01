@@ -93,6 +93,13 @@ impl RootfsProvider for OverlayProvider {
             })?;
         }
 
+        // Idempotent: a restart re-runs prepare(); without this guard each call
+        // stacks another overlay on `merged` (the leaked double/triple mounts).
+        if super::is_mountpoint(&merged) {
+            tracing::debug!(merged = %merged.display(), "Overlay already mounted; reusing");
+            return Ok(merged);
+        }
+
         super::overlay::overlay_mount(cache_dir, &upper, &work, &merged)?;
 
         tracing::info!(
@@ -106,15 +113,11 @@ impl RootfsProvider for OverlayProvider {
 
     fn cleanup(&self, box_dir: &Path, persistent: bool) -> Result<()> {
         let merged = box_dir.join("merged");
-        if merged.exists() {
-            if let Err(e) = super::overlay::overlay_unmount(&merged) {
-                tracing::warn!(
-                    path = %merged.display(),
-                    error = %e,
-                    "Failed to unmount overlay (may already be unmounted)"
-                );
-            }
-        }
+        // Bounded unmount-retry rather than a single attempt: a transient EBUSY
+        // must not leave the overlay mounted, or the remove_dir_all below would
+        // recurse into the live mount and leak it. Mirrors the cleanup paths in
+        // cleanup_stopped_box/cleanup_removed_box.
+        super::unmount_box_overlay(&merged);
 
         if persistent {
             // Keep upper (writes) and remove only merged/work (not needed at rest)

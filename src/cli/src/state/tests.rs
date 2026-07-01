@@ -21,6 +21,7 @@ fn sample_record(id: &str, name: &str, status: &str) -> BoxRecord {
         } else {
             None
         },
+        pid_start_time: None,
         cpus: 2,
         memory_mb: 512,
         volumes: vec![],
@@ -51,6 +52,7 @@ fn sample_record(id: &str, name: &str, status: &str) -> BoxRecord {
         max_restart_count: 0,
         exit_code: None,
         health_check: None,
+        healthcheck_disabled: false,
         health_status: "none".to_string(),
         health_retries: 0,
         health_last_check: None,
@@ -166,13 +168,51 @@ fn test_load_creates_parent_dir() {
 }
 
 #[test]
-fn test_load_corrupt_json_returns_empty() {
+fn test_load_corrupt_json_quarantines_instead_of_wiping() {
     let tmp = TempDir::new().unwrap();
     let path = test_state_path(&tmp);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(&path, "not valid json!!!").unwrap();
+    let corrupt = "not valid json!!!";
+    std::fs::write(&path, corrupt).unwrap();
 
     let sf = StateFile::load(&path).unwrap();
+    // Corruption yields an empty in-memory state (the CLI keeps working) ...
+    assert!(sf.records().is_empty());
+
+    // ... but the corrupt data is NOT lost: it is quarantined to a timestamped
+    // sibling so a subsequent save cannot overwrite it with `[]`.
+    let dir = path.parent().unwrap();
+    let backups: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .contains("boxes.json.corrupt-")
+        })
+        .collect();
+    assert_eq!(backups.len(), 1, "expected exactly one quarantined backup");
+    assert_eq!(
+        std::fs::read_to_string(backups[0].path()).unwrap(),
+        corrupt,
+        "the quarantined backup must preserve the original corrupt bytes"
+    );
+}
+
+#[test]
+fn test_load_readonly_surfaces_corrupt_file_as_error() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("boxes.json");
+    std::fs::write(&path, "not valid json!!!").unwrap();
+    // A present-but-corrupt file must surface as an Err so the /metrics scrape
+    // reports a load error instead of a falsely-healthy all-zeros snapshot.
+    assert!(StateFile::load_readonly_from(path).is_err());
+}
+
+#[test]
+fn test_load_readonly_missing_file_is_empty_ok() {
+    let tmp = TempDir::new().unwrap();
+    let sf = StateFile::load_readonly_from(tmp.path().join("absent.json")).unwrap();
     assert!(sf.records().is_empty());
 }
 
@@ -425,6 +465,37 @@ fn test_reconcile_marks_dead_pid() {
 }
 
 #[test]
+fn test_reconcile_reads_exit_code_from_upper() {
+    let tmp = TempDir::new().unwrap();
+    let path = test_state_path(&tmp);
+
+    // guest-init persists the container exit code into the overlay upperdir
+    // (<box_dir>/upper/.a3s_exit_code) since libkrun's start_enter takeover
+    // prevents the host from waitpid-ing a detached VM.
+    let box_dir = tmp.path().join("boxes").join("exitcode-id");
+    std::fs::create_dir_all(box_dir.join("upper")).unwrap();
+    std::fs::write(box_dir.join("upper").join(".a3s_exit_code"), "42").unwrap();
+
+    {
+        let mut sf = StateFile::load(&path).unwrap();
+        let mut record = sample_record("exitcode-id", "exitcode_box", "created");
+        record.status = "running".to_string();
+        record.pid = Some(4294967); // dead pid -> reconcile marks it dead
+        record.box_dir = box_dir.clone();
+        sf.records.push(record);
+        sf.save().unwrap();
+    }
+
+    // Reconcile on reload marks it dead AND captures the persisted exit code.
+    {
+        let sf = StateFile::load(&path).unwrap();
+        let record = sf.find_by_id("exitcode-id").unwrap();
+        assert_eq!(record.status, "dead");
+        assert_eq!(record.exit_code, Some(42));
+    }
+}
+
+#[test]
 fn test_reconcile_running_without_pid() {
     let tmp = TempDir::new().unwrap();
     let path = test_state_path(&tmp);
@@ -442,6 +513,130 @@ fn test_reconcile_running_without_pid() {
         let sf = StateFile::load(&path).unwrap();
         let record = sf.find_by_id("no-pid-id").unwrap();
         assert_eq!(record.status, "dead");
+    }
+}
+
+#[test]
+fn test_reconcile_dead_running_box_removes_external_socket_dir() {
+    let tmp = TempDir::new().unwrap();
+    let path = test_state_path(&tmp);
+    let box_dir = tmp.path().join("box-dir");
+    let external_socket_dir = tmp.path().join("external-sockets");
+
+    {
+        std::fs::create_dir_all(&box_dir).unwrap();
+        std::fs::create_dir_all(&external_socket_dir).unwrap();
+        let mut sf = StateFile::load(&path).unwrap();
+        let mut record = sample_record("external-socket-id", "external_socket_box", "created");
+        record.status = "running".to_string();
+        record.pid = None;
+        record.box_dir = box_dir.clone();
+        record.exec_socket_path = external_socket_dir.join("exec.sock");
+        sf.records.push(record);
+        sf.save().unwrap();
+    }
+
+    {
+        let sf = StateFile::load(&path).unwrap();
+        let record = sf.find_by_id("external-socket-id").unwrap();
+        assert_eq!(record.status, "dead");
+        assert!(!external_socket_dir.exists());
+        assert!(box_dir.exists());
+    }
+}
+
+#[test]
+fn test_reconcile_paused_without_pid_removes_external_socket_dir() {
+    let tmp = TempDir::new().unwrap();
+    let path = test_state_path(&tmp);
+    let box_dir = tmp.path().join("paused-box-dir");
+    let external_socket_dir = tmp.path().join("paused-external-sockets");
+
+    {
+        std::fs::create_dir_all(&box_dir).unwrap();
+        std::fs::create_dir_all(&external_socket_dir).unwrap();
+        let mut sf = StateFile::load(&path).unwrap();
+        let mut record = sample_record("paused-stale-id", "paused_stale_box", "created");
+        record.status = "paused".to_string();
+        record.pid = None;
+        record.box_dir = box_dir.clone();
+        record.exec_socket_path = external_socket_dir.join("exec.sock");
+        sf.records.push(record);
+        sf.save().unwrap();
+    }
+
+    {
+        let sf = StateFile::load(&path).unwrap();
+        let record = sf.find_by_id("paused-stale-id").unwrap();
+        assert_eq!(record.status, "dead");
+        assert!(!external_socket_dir.exists());
+        assert!(box_dir.exists());
+    }
+}
+
+#[test]
+fn test_concurrent_reconcile_load_tears_down_once_no_panic() {
+    // Regression for the unlocked reconcile-on-load races (#1 lost-update, #8
+    // double-teardown): many concurrent reconcile-on-load passes over the same
+    // dead auto-remove box must serialize on the state lock (flush_reconcile),
+    // tear it down exactly once, and never panic / double-free.
+    let tmp = TempDir::new().unwrap();
+    let path = test_state_path(&tmp);
+    let box_dir = tmp.path().join("concurrent-rm-box");
+    std::fs::create_dir_all(box_dir.join("sockets")).unwrap();
+
+    {
+        let mut sf = StateFile::load(&path).unwrap();
+        let mut record = sample_record("conc-rm-id", "conc_rm_box", "created");
+        record.status = "running".to_string();
+        record.pid = None; // dead
+        record.auto_remove = true;
+        record.box_dir = box_dir.clone();
+        record.exec_socket_path = box_dir.join("sockets").join("exec.sock");
+        sf.records.push(record);
+        sf.save().unwrap();
+    }
+
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let p = path.clone();
+            std::thread::spawn(move || {
+                let _ = StateFile::load(&p);
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let sf = StateFile::load(&path).unwrap();
+    assert!(sf.find_by_id("conc-rm-id").is_none());
+    assert!(!box_dir.exists());
+}
+
+#[test]
+fn test_reconcile_auto_removes_dead_running_box() {
+    let tmp = TempDir::new().unwrap();
+    let path = test_state_path(&tmp);
+    let box_dir = tmp.path().join("auto-remove-box");
+
+    {
+        std::fs::create_dir_all(box_dir.join("sockets")).unwrap();
+        let mut sf = StateFile::load(&path).unwrap();
+        let mut record = sample_record("auto-rm-id", "auto_rm_box", "created");
+        record.status = "running".to_string();
+        record.pid = None;
+        record.auto_remove = true;
+        record.box_dir = box_dir.clone();
+        record.exec_socket_path = box_dir.join("sockets").join("exec.sock");
+        sf.records.push(record);
+        sf.save().unwrap();
+    }
+
+    {
+        let sf = StateFile::load(&path).unwrap();
+        assert!(sf.find_by_id("auto-rm-id").is_none());
+        assert!(!box_dir.exists());
     }
 }
 
@@ -599,6 +794,43 @@ fn test_should_restart_on_failure_not_stopped_by_user() {
     record.restart_policy = "on-failure".to_string();
     record.stopped_by_user = false;
     assert!(policy::should_restart(&record));
+}
+
+#[test]
+fn test_should_restart_on_failure_clean_exit_does_not_restart() {
+    // A box that exited 0 under `on-failure` must NOT be restarted (Docker
+    // semantics) — the bug was an infinite restart loop on clean exit.
+    let mut record = sample_record("id-1", "box1", "dead");
+    record.restart_policy = "on-failure".to_string();
+    record.stopped_by_user = false;
+    record.exit_code = Some(0);
+    assert!(!policy::should_restart(&record));
+
+    // A non-zero exit still restarts.
+    record.exit_code = Some(1);
+    assert!(policy::should_restart(&record));
+
+    // An unknown exit (VM lost before the marker) is treated as a failure.
+    record.exit_code = None;
+    assert!(policy::should_restart(&record));
+}
+
+#[test]
+fn test_should_restart_on_failure_n_respects_exit_code() {
+    let mut record = sample_record("id-1", "box1", "dead");
+    record.restart_policy = "on-failure:3".to_string();
+    record.stopped_by_user = false;
+    record.restart_count = 0;
+    record.exit_code = Some(0);
+    assert!(
+        !policy::should_restart(&record),
+        "clean exit must not restart"
+    );
+    record.exit_code = Some(2);
+    assert!(
+        policy::should_restart(&record),
+        "failure under the cap restarts"
+    );
 }
 
 #[test]

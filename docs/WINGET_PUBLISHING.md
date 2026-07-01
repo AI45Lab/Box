@@ -57,7 +57,7 @@ manifest 文件位于 `.winget/` 目录：
 # 下载发布资产
 $Version = "0.8.0"
 $Tag = "v$Version"
-$Url = "https://github.com/A3S-Lab/Box/releases/download/$Tag/a3s-box-$Tag-windows-x86_64.zip"
+$Url = "https://github.com/AI45Lab/Box/releases/download/$Tag/a3s-box-$Tag-windows-x86_64.zip"
 Invoke-WebRequest -Uri $Url -OutFile "a3s-box.zip"
 
 # 计算 SHA256
@@ -118,12 +118,14 @@ MinimumOSVersion: 10.0.19041.0
 InstallerType: zip
 NestedInstallerType: portable
 NestedInstallerFiles:
-- RelativeFilePath: a3s-box-v0.8.0-windows-x86_64\a3s-box-win.exe
+- RelativeFilePath: a3s-box-v0.8.0-windows-x86_64\a3s-box.exe
   PortableCommandAlias: a3s-box
+- RelativeFilePath: a3s-box-v0.8.0-windows-x86_64\a3s-box-shim.exe
+- RelativeFilePath: a3s-box-v0.8.0-windows-x86_64\a3s-box-guest-init
 - RelativeFilePath: a3s-box-v0.8.0-windows-x86_64\lib\krun.dll
 Installers:
 - Architecture: x64
-  InstallerUrl: https://github.com/A3S-Lab/Box/releases/download/v0.8.0/a3s-box-v0.8.0-windows-x86_64.zip
+  InstallerUrl: https://github.com/AI45Lab/Box/releases/download/v0.8.0/a3s-box-v0.8.0-windows-x86_64.zip
   InstallerSha256: <COMPUTED_SHA256>
   Dependencies:
     WindowsFeatures:
@@ -152,12 +154,12 @@ winget upgrade A3SLab.Box
 
 ## 注意事项
 
-1. **Windows Feature 依赖**: manifest 中声明了 `HypervisorPlatform` 依赖，但 winget 不会自动启用。用户仍需手动运行：
+1. **Windows Feature 依赖**: Windows 包使用原生 WHPX 后端，不依赖 WSL。用户需要启用 Windows Hypervisor Platform：
    ```powershell
    Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform
    ```
 
-2. **Portable 安装**: 使用 `portable` 类型，winget 会将文件解压到用户目录并添加到 PATH。
+2. **Portable 安装**: 使用 `portable` 类型，winget 会将 CLI 解压到用户目录并添加到 PATH。
 
 3. **审核时间**: PR 提交后，winget 维护者会审核，通常需要 1-3 天。
 

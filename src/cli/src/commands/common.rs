@@ -3,8 +3,11 @@
 use std::collections::HashMap;
 
 use a3s_box_core::config::ResourceLimits;
-use a3s_box_core::platform::Platform;
+use a3s_box_runtime::oci::{OciHealthCheck, OciImageConfig};
 use clap::Args;
+
+use crate::image_usage;
+use crate::state::HealthCheck;
 
 /// Common arguments shared between `run` and `create` commands.
 #[derive(Args)]
@@ -32,7 +35,7 @@ pub struct CommonBoxArgs {
     #[arg(short = 'e', long = "env")]
     pub env: Vec<String>,
 
-    /// Publish a port (host_port:guest_port), can be repeated
+    /// Publish a TCP port (host_port:guest_port[/tcp]), can be repeated
     #[arg(short = 'p', long = "publish")]
     pub publish: Vec<String>,
 
@@ -48,7 +51,7 @@ pub struct CommonBoxArgs {
     #[arg(long)]
     pub hostname: Option<String>,
 
-    /// Run as a specific user (e.g., "root", "1000:1000")
+    /// Run as a specific user (root, UID, UID:GID, name, or name:group)
     #[arg(short = 'u', long)]
     pub user: Option<String>,
 
@@ -76,20 +79,20 @@ pub struct CommonBoxArgs {
     #[arg(long)]
     pub health_cmd: Option<String>,
 
-    /// Health check interval in seconds (default: 30)
-    #[arg(long, default_value = "30")]
+    /// Health check interval, e.g. `30s`, `1m30s` (bare number = seconds; default: 30s)
+    #[arg(long, default_value = "30", value_parser = crate::output::parse_duration_secs)]
     pub health_interval: u64,
 
-    /// Health check timeout in seconds (default: 5)
-    #[arg(long, default_value = "5")]
+    /// Health check timeout, e.g. `5s`, `1m` (bare number = seconds; default: 5s)
+    #[arg(long, default_value = "5", value_parser = crate::output::parse_duration_secs)]
     pub health_timeout: u64,
 
     /// Health check retries before unhealthy (default: 3)
     #[arg(long, default_value = "3")]
     pub health_retries: u32,
 
-    /// Health check start period in seconds (default: 0)
-    #[arg(long, default_value = "0")]
+    /// Health check start period, e.g. `10s`, `1m` (bare number = seconds; default: 0s)
+    #[arg(long, default_value = "0", value_parser = crate::output::parse_duration_secs)]
     pub health_start_period: u64,
 
     /// Limit PIDs inside the box (--pids-limit)
@@ -152,7 +155,7 @@ pub struct CommonBoxArgs {
     #[arg(long)]
     pub cap_drop: Vec<String>,
 
-    /// Security options (e.g., "seccomp=unconfined"), can be repeated
+    /// Security options (supported: seccomp=default, seccomp=unconfined, no-new-privileges)
     #[arg(long)]
     pub security_opt: Vec<String>,
 
@@ -160,11 +163,11 @@ pub struct CommonBoxArgs {
     #[arg(long)]
     pub privileged: bool,
 
-    /// Add a host device to the box (host_path[:guest_path[:perms]]), can be repeated
+    /// Add a host device to the box (currently unsupported by the libkrun backend)
     #[arg(long)]
     pub device: Vec<String>,
 
-    /// GPU devices to add (e.g., "all", "0,1")
+    /// GPU devices to add (currently unsupported)
     #[arg(long)]
     pub gpus: Option<String>,
 
@@ -197,73 +200,11 @@ pub struct CommonBoxArgs {
     pub persistent: bool,
 }
 
-/// Validate options shared by create/run before any state is persisted or a VM is booted.
-pub(crate) fn validate_common_args(args: &CommonBoxArgs) -> Result<(), String> {
-    if args.cpus == 0 {
-        return Err("--cpus must be greater than 0".to_string());
-    }
-    if args.cpus > u8::MAX as u32 {
-        return Err(format!(
-            "--cpus={} exceeds the libkrun backend limit of {}",
-            args.cpus,
-            u8::MAX
-        ));
-    }
-
-    if !args.device.is_empty() {
-        return Err(
-            "--device is not supported by the libkrun backend yet; remove it or use a runtime with device passthrough"
-                .to_string(),
-        );
-    }
-
-    if args.gpus.is_some() {
-        return Err("--gpus is not supported by a3s-box yet".to_string());
-    }
-
-    let security = a3s_box_core::SecurityConfig::from_options(
-        &args.security_opt,
-        &args.cap_add,
-        &args.cap_drop,
-        args.privileged,
-    );
-    security.validate()?;
-
-    if let Some(platform) = &args.platform {
-        validate_runtime_platform(platform)?;
-    }
-
-    Ok(())
-}
-
-fn validate_runtime_platform(platform: &str) -> Result<(), String> {
-    let platform = Platform::parse(platform)?;
-    if platform.os != "linux" {
-        return Err(format!(
-            "runtime platform '{}' is not supported: a3s-box runs Linux guests only",
-            platform
-        ));
-    }
-
-    let host_arch = Platform::host().architecture;
-    if platform.architecture != host_arch {
-        return Err(format!(
-            "runtime platform '{}' requires CPU emulation, which is not implemented; host architecture is {}",
-            platform, host_arch
-        ));
-    }
-
-    Ok(())
-}
-
 /// Parse KEY=VALUE pairs into a HashMap.
 pub(crate) fn parse_env_vars(vars: &[String]) -> Result<HashMap<String, String>, String> {
     let mut map = HashMap::new();
-    for var in vars {
-        let (key, value) = var
-            .split_once('=')
-            .ok_or_else(|| format!("Invalid environment variable (expected KEY=VALUE): {var}"))?;
-        map.insert(key.to_string(), value.to_string());
+    for (key, value) in a3s_box_core::env::parse_env_vars(vars)? {
+        map.insert(key, value);
     }
     Ok(map)
 }
@@ -274,22 +215,285 @@ pub(crate) fn parse_env_vars(vars: &[String]) -> Result<HashMap<String, String>,
 pub(crate) fn parse_env_file(
     path: &str,
 ) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("Failed to read env file '{}': {}", path, e))?;
     let mut map = HashMap::new();
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        if let Some((key, value)) = trimmed.split_once('=') {
-            map.insert(key.trim().to_string(), value.trim().to_string());
-        } else {
-            // KEY without value — set to empty string (Docker behavior)
-            map.insert(trimmed.to_string(), String::new());
-        }
+    for (key, value) in a3s_box_core::env::parse_env_file(path)
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?
+    {
+        map.insert(key, value);
     }
     Ok(map)
+}
+
+/// Build the effective CLI environment map.
+///
+/// CLI `--env` values take precedence over `--env-file` values, matching the
+/// existing a3s-box run/create behavior.
+pub(crate) fn build_env_map(
+    common: &CommonBoxArgs,
+) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
+    // Runtime `--env` honors `docker run -e KEY` host-env passthrough (bare key).
+    let mut env: HashMap<String, String> = a3s_box_core::env::parse_runtime_env_vars(&common.env)
+        .into_iter()
+        .collect();
+    for env_file in &common.env_file {
+        for (key, value) in parse_env_file(env_file)? {
+            env.entry(key).or_insert(value);
+        }
+    }
+    Ok(env)
+}
+
+/// Build the effective health check from CLI flags and image metadata.
+pub(crate) fn effective_health_check(
+    common: &CommonBoxArgs,
+    image_health_check: Option<&OciHealthCheck>,
+) -> Option<HealthCheck> {
+    if common.no_healthcheck {
+        return None;
+    }
+    if let Some(cmd) = common.health_cmd.as_ref() {
+        return Some(HealthCheck {
+            cmd: vec!["sh".to_string(), "-c".to_string(), cmd.clone()],
+            interval_secs: common.health_interval,
+            timeout_secs: common.health_timeout,
+            retries: common.health_retries,
+            start_period_secs: common.health_start_period,
+        });
+    }
+
+    image_health_check.and_then(health_check_from_oci)
+}
+
+/// Convert Docker-compatible image healthcheck metadata into exec command form.
+pub(crate) fn health_check_from_oci(health_check: &OciHealthCheck) -> Option<HealthCheck> {
+    let cmd = health_check_command(&health_check.test)?;
+    Some(HealthCheck {
+        cmd,
+        interval_secs: health_check.interval.unwrap_or(30),
+        timeout_secs: health_check.timeout.unwrap_or(30),
+        retries: health_check.retries.unwrap_or(3),
+        start_period_secs: health_check.start_period.unwrap_or(0),
+    })
+}
+
+fn health_check_command(test: &[String]) -> Option<Vec<String>> {
+    let marker = test.first()?;
+    if marker.eq_ignore_ascii_case("NONE") {
+        return None;
+    }
+
+    let cmd = if marker.eq_ignore_ascii_case("CMD") {
+        test.get(1..)?.to_vec()
+    } else if marker.eq_ignore_ascii_case("CMD-SHELL") {
+        let shell_cmd = test.get(1..)?.join(" ");
+        if shell_cmd.is_empty() {
+            Vec::new()
+        } else {
+            vec!["sh".to_string(), "-c".to_string(), shell_cmd]
+        }
+    } else {
+        test.to_vec()
+    };
+
+    if cmd.is_empty() {
+        None
+    } else {
+        Some(cmd)
+    }
+}
+
+/// Load OCI config from the local image cache without pulling from a registry.
+pub(crate) async fn cached_image_config(
+    image: &str,
+) -> Result<Option<OciImageConfig>, Box<dyn std::error::Error>> {
+    let store = super::open_image_store()?;
+    let images = store.list().await;
+    let Some(stored) = image_usage::resolve_stored_image(&images, image)? else {
+        return Ok(None);
+    };
+
+    let stored = store.get(&stored.reference).await.unwrap_or(stored);
+    let image = a3s_box_runtime::OciImage::from_path(&stored.path)?;
+    Ok(Some(image.config().clone()))
+}
+
+/// Prefer explicit CLI stop-signal overrides over image defaults.
+pub(crate) fn effective_stop_signal(
+    cli_stop_signal: Option<&str>,
+    image_stop_signal: Option<&str>,
+) -> Option<String> {
+    cli_stop_signal
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| image_stop_signal.filter(|value| !value.trim().is_empty()))
+        .map(ToOwned::to_owned)
+}
+
+/// Validate and normalize published port mappings to the runtime format.
+pub(crate) fn normalize_port_maps(entries: &[String]) -> Result<Vec<String>, String> {
+    a3s_box_core::normalize_port_maps(entries)?
+        .into_iter()
+        .map(resolve_auto_host_port)
+        .collect()
+}
+
+/// Resolve an auto-assign host port (host part `0`, e.g. `-p 0:80`) to a
+/// concrete free ephemeral port by briefly claiming one with a TcpListener, so
+/// the shim/passt actually forward it and `port` prints the real number
+/// (matching Docker). A non-zero host port is returned unchanged.
+fn resolve_auto_host_port(entry: String) -> Result<String, String> {
+    let Some((host, guest)) = entry.split_once(':') else {
+        return Ok(entry);
+    };
+    if host != "0" {
+        return Ok(entry);
+    }
+    let listener = std::net::TcpListener::bind("0.0.0.0:0")
+        .map_err(|e| format!("failed to allocate a host port for '{entry}': {e}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| format!("failed to read allocated host port: {e}"))?
+        .port();
+    // Release it so the box can bind the port (small TOCTOU window, as Docker has).
+    drop(listener);
+    Ok(format!("{port}:{guest}"))
+}
+
+/// Reject runtime options that a3s-box cannot enforce yet.
+pub(crate) fn validate_runtime_options(common: &CommonBoxArgs) -> Result<(), String> {
+    if !common.device.is_empty() {
+        return Err(
+            "--device is not supported by the libkrun backend; device passthrough is not available"
+                .to_string(),
+        );
+    }
+    if common.gpus.is_some() {
+        return Err("--gpus is not implemented; GPU passthrough is not available".to_string());
+    }
+
+    // CPUs must fit the microVM sizing contract: `vcpus as u8` (spec.rs) turned 0
+    // into a non-bootable VM and >= 256 into a wrapped/truncated count.
+    if common.cpus == 0 {
+        return Err("--cpus must be at least 1".to_string());
+    }
+    if common.cpus > 255 {
+        return Err(format!("--cpus {} exceeds the maximum of 255", common.cpus));
+    }
+
+    // OOM controls are accepted for Docker-CLI compatibility but not enforced by
+    // the libkrun backend; warn instead of silently misleading an operator who
+    // relies on them, and validate the documented oom_score_adj range.
+    if common.oom_kill_disable {
+        eprintln!(
+            "a3s-box: warning: --oom-kill-disable is accepted but not enforced by the libkrun backend"
+        );
+    }
+    if let Some(adj) = common.oom_score_adj {
+        if !(-1000..=1000).contains(&adj) {
+            return Err(format!(
+                "--oom-score-adj {adj} is out of range (-1000 to 1000)"
+            ));
+        }
+        eprintln!(
+            "a3s-box: warning: --oom-score-adj is accepted but not enforced by the libkrun backend"
+        );
+    }
+
+    normalize_user_option(common.user.as_deref())?;
+    validate_workdir_option(common.workdir.as_deref())?;
+    normalize_port_maps(&common.publish)?;
+    if let Some(hostname) = common.hostname.as_deref() {
+        a3s_box_core::dns::validate_hostname(hostname)
+            .map_err(|e| format!("Invalid --hostname: {e}"))?;
+    }
+    a3s_box_core::dns::parse_add_host_entries(&common.add_host)
+        .map_err(|e| format!("Invalid --add-host: {e}"))?;
+
+    for opt in &common.security_opt {
+        let opt = opt.trim();
+        if opt.starts_with("apparmor=") {
+            return Err(format!(
+                "AppArmor security options are not supported by a3s-box: {opt}"
+            ));
+        }
+        if opt.starts_with("label=") {
+            return Err(format!(
+                "SELinux label security options are not supported by a3s-box: {opt}"
+            ));
+        }
+    }
+
+    let security = a3s_box_core::SecurityConfig::from_options(
+        &common.security_opt,
+        &common.cap_add,
+        &common.cap_drop,
+        common.privileged,
+    );
+    security.validate()
+}
+
+/// Normalize a user option into the runtime-supported numeric format.
+///
+/// The shim currently enforces users through libkrun UID/GID settings, so the
+/// CLI accepts `root` as a convenience alias but rejects other names instead of
+/// silently running as the wrong user.
+pub(crate) fn normalize_user_option(user: Option<&str>) -> Result<Option<String>, String> {
+    let Some(user) = user else {
+        return Ok(None);
+    };
+    let user = user.trim();
+    if user.is_empty() {
+        return Err("--user must not be empty".to_string());
+    }
+
+    let parts: Vec<&str> = user.split(':').collect();
+    if parts.len() > 2 {
+        return Err(format!(
+            "Invalid --user '{user}' (expected root, UID, or UID:GID)"
+        ));
+    }
+
+    let uid = normalize_user_part(parts[0], "user", user)?;
+    let Some(group_part) = parts.get(1) else {
+        return Ok(Some(uid));
+    };
+    let gid = normalize_user_part(group_part, "group", user)?;
+    Ok(Some(format!("{uid}:{gid}")))
+}
+
+fn normalize_user_part(part: &str, label: &str, original: &str) -> Result<String, String> {
+    if part.is_empty() {
+        return Err(format!(
+            "Invalid --user '{original}' ({label} component is empty)"
+        ));
+    }
+    if part.contains('\0') {
+        return Err(format!(
+            "Invalid --user '{original}' ({label} contains a NUL byte)"
+        ));
+    }
+    if part == "root" {
+        return Ok("0".to_string());
+    }
+    // Numeric stays numeric; a named user/group is forwarded as-is and resolved
+    // in the guest against the container's /etc/passwd and /etc/group, like
+    // Docker's `--user name`.
+    Ok(part.to_string())
+}
+
+/// Validate an in-guest working directory override.
+pub(crate) fn validate_workdir_option(workdir: Option<&str>) -> Result<(), String> {
+    let Some(workdir) = workdir else {
+        return Ok(());
+    };
+    if workdir.is_empty() {
+        return Err("--workdir must not be empty".to_string());
+    }
+    if workdir.contains('\0') {
+        return Err("--workdir must not contain NUL bytes".to_string());
+    }
+    // A relative --workdir is allowed: like Docker, it resolves against the
+    // image WORKDIR at runtime (see VmManager::effective_workdir).
+    Ok(())
 }
 
 /// Parse a memory size string (e.g., "256m", "1g", "1073741824") into bytes.
@@ -322,7 +526,32 @@ pub(crate) fn parse_memory_bytes(s: &str) -> Result<u64, String> {
     let num: u64 = num_str
         .parse()
         .map_err(|_| format!("invalid number: {num_str}"))?;
-    Ok(num * multiplier)
+    // checked_mul: an absurd value (e.g. `20000000000g`) overflows u64 and would
+    // wrap to a small/more-restrictive limit in release (panic in debug). The
+    // sibling parsers (output.rs parse_size_bytes/parse_memory) were already
+    // hardened; this one was missed.
+    num.checked_mul(multiplier)
+        .ok_or_else(|| format!("size value too large: {s}"))
+}
+
+/// Parse a `--memory-swap` value into the cgroup `i64` representation, failing
+/// closed on overflow.
+///
+/// `-1` is Docker's sentinel for "unlimited" and maps to `-1`. Any other value
+/// is a byte size that MUST fit in `i64`: a value > `i64::MAX` would wrap
+/// negative on the `as i64` cast, and `resize.rs` maps `swap < 0` to
+/// `memory.swap.max=max` (unlimited) — so a fat-fingered huge value would
+/// silently become *unlimited* swap. Reject it instead. Shared by the
+/// run/create path and `a3s-box update` so the two cannot diverge.
+pub(crate) fn parse_memory_swap(s: &str) -> Result<i64, String> {
+    if s == "-1" {
+        return Ok(-1);
+    }
+    let bytes = parse_memory_bytes(s).map_err(|e| format!("Invalid --memory-swap: {e}"))?;
+    if bytes > i64::MAX as u64 {
+        return Err(format!("--memory-swap value too large: {s}"));
+    }
+    Ok(bytes as i64)
 }
 
 /// Build ResourceLimits from common box args.
@@ -336,10 +565,7 @@ pub(crate) fn build_resource_limits(
         None => None,
     };
     let memory_swap = match &args.memory_swap {
-        Some(s) if s == "-1" => Some(-1i64),
-        Some(s) => {
-            Some(parse_memory_bytes(s).map_err(|e| format!("Invalid --memory-swap: {e}"))? as i64)
-        }
+        Some(s) => Some(parse_memory_swap(s)?),
         None => None,
     };
 
@@ -358,6 +584,21 @@ pub(crate) fn build_resource_limits(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_resolve_auto_host_port() {
+        // A non-zero host port is unchanged.
+        assert_eq!(
+            resolve_auto_host_port("8080:80".to_string()).unwrap(),
+            "8080:80"
+        );
+        // `0:80` resolves to a concrete non-zero host port, keeping the guest port.
+        let resolved = resolve_auto_host_port("0:80".to_string()).unwrap();
+        let (host, guest) = resolved.split_once(':').unwrap();
+        assert_eq!(guest, "80");
+        assert_ne!(host, "0");
+        assert!(host.parse::<u16>().unwrap() > 0);
+    }
 
     // --- parse_env_vars tests ---
 
@@ -403,6 +644,53 @@ mod tests {
     fn test_parse_memory_bytes_raw_number() {
         assert_eq!(parse_memory_bytes("1073741824").unwrap(), 1073741824);
         assert_eq!(parse_memory_bytes("512").unwrap(), 512);
+    }
+
+    #[test]
+    fn test_parse_memory_bytes_rejects_overflow() {
+        // The unchecked multiply wrapped (release) / panicked (debug) on an
+        // absurd value; it must now be a clean error.
+        assert!(parse_memory_bytes("20000000000g").is_err());
+        assert!(parse_memory_bytes("18446744073709551615k").is_err());
+    }
+
+    #[test]
+    fn test_parse_memory_swap_sentinel_value_and_overflow() {
+        // -1 is Docker's "unlimited" sentinel and must survive verbatim.
+        assert_eq!(parse_memory_swap("-1").unwrap(), -1);
+        // A normal size parses to its byte count.
+        assert_eq!(parse_memory_swap("512m").unwrap(), 512 * 1024 * 1024);
+        // Fail closed: a value > i64::MAX must be rejected, NOT wrap negative
+        // (which resize.rs would map to memory.swap.max=max → silently unlimited).
+        // i64::MAX = 9223372036854775807; this is just above it.
+        let huge = "9300000000000000000";
+        let err = parse_memory_swap(huge).unwrap_err();
+        assert!(err.contains("too large"), "got: {err}");
+        // And the same guard via a suffixed overflow.
+        assert!(parse_memory_swap("9000000000g").is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_and_excessive_cpus() {
+        let mut args = default_common_args();
+        args.cpus = 2;
+        assert!(validate_runtime_options(&args).is_ok());
+        args.cpus = 0;
+        assert!(validate_runtime_options(&args)
+            .unwrap_err()
+            .contains("cpus"));
+        args.cpus = 256;
+        assert!(validate_runtime_options(&args).unwrap_err().contains("255"));
+    }
+
+    #[test]
+    fn test_validate_rejects_out_of_range_oom_score_adj() {
+        let mut args = default_common_args();
+        args.oom_score_adj = Some(2000);
+        let err = validate_runtime_options(&args).unwrap_err();
+        assert!(err.contains("oom-score-adj"), "got: {err}");
+        args.oom_score_adj = Some(-500);
+        assert!(validate_runtime_options(&args).is_ok());
     }
 
     #[test]
@@ -518,6 +806,22 @@ mod tests {
         assert!(map.is_empty());
     }
 
+    #[test]
+    fn test_build_env_map_cli_env_overrides_env_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("env");
+        std::fs::write(&path, "FOO=file\nBAR=file\n").unwrap();
+        let mut args = default_common_args();
+        args.env_file = vec![path.to_string_lossy().to_string()];
+        args.env = vec!["FOO=cli".to_string(), "BAZ=cli".to_string()];
+
+        let map = build_env_map(&args).unwrap();
+
+        assert_eq!(map.get("FOO").map(String::as_str), Some("cli"));
+        assert_eq!(map.get("BAR").map(String::as_str), Some("file"));
+        assert_eq!(map.get("BAZ").map(String::as_str), Some("cli"));
+    }
+
     // --- build_resource_limits tests ---
 
     /// Helper to create a CommonBoxArgs with defaults for testing.
@@ -582,6 +886,249 @@ mod tests {
         assert!(limits.cpu_shares.is_none());
         assert!(limits.memory_reservation.is_none());
         assert!(limits.memory_swap.is_none());
+    }
+
+    #[test]
+    fn test_health_check_from_oci_cmd() {
+        let hc = health_check_from_oci(&OciHealthCheck {
+            test: vec!["CMD".to_string(), "curl".to_string(), "-f".to_string()],
+            interval: Some(10),
+            timeout: Some(2),
+            retries: Some(5),
+            start_period: Some(7),
+        })
+        .unwrap();
+
+        assert_eq!(hc.cmd, vec!["curl", "-f"]);
+        assert_eq!(hc.interval_secs, 10);
+        assert_eq!(hc.timeout_secs, 2);
+        assert_eq!(hc.retries, 5);
+        assert_eq!(hc.start_period_secs, 7);
+    }
+
+    #[test]
+    fn test_health_check_from_oci_cmd_shell() {
+        let hc = health_check_from_oci(&OciHealthCheck {
+            test: vec![
+                "CMD-SHELL".to_string(),
+                "curl -f http://localhost/health".to_string(),
+            ],
+            interval: None,
+            timeout: None,
+            retries: None,
+            start_period: None,
+        })
+        .unwrap();
+
+        assert_eq!(hc.cmd, vec!["sh", "-c", "curl -f http://localhost/health"]);
+        assert_eq!(hc.interval_secs, 30);
+        assert_eq!(hc.timeout_secs, 30);
+        assert_eq!(hc.retries, 3);
+        assert_eq!(hc.start_period_secs, 0);
+    }
+
+    #[test]
+    fn test_effective_health_check_cli_overrides_image() {
+        let mut args = default_common_args();
+        args.health_cmd = Some("test -f /ready".to_string());
+        let image_hc = OciHealthCheck {
+            test: vec!["CMD".to_string(), "false".to_string()],
+            interval: Some(99),
+            timeout: Some(99),
+            retries: Some(99),
+            start_period: Some(99),
+        };
+
+        let hc = effective_health_check(&args, Some(&image_hc)).unwrap();
+        assert_eq!(hc.cmd, vec!["sh", "-c", "test -f /ready"]);
+        assert_eq!(hc.interval_secs, 30);
+        assert_eq!(hc.timeout_secs, 5);
+    }
+
+    #[test]
+    fn test_effective_health_check_disabled() {
+        let mut args = default_common_args();
+        args.no_healthcheck = true;
+        let image_hc = OciHealthCheck {
+            test: vec!["CMD".to_string(), "true".to_string()],
+            interval: None,
+            timeout: None,
+            retries: None,
+            start_period: None,
+        };
+
+        assert!(effective_health_check(&args, Some(&image_hc)).is_none());
+    }
+
+    #[test]
+    fn test_effective_stop_signal_prefers_cli() {
+        assert_eq!(
+            effective_stop_signal(Some("SIGINT"), Some("SIGTERM")),
+            Some("SIGINT".to_string())
+        );
+        assert_eq!(
+            effective_stop_signal(None, Some("SIGQUIT")),
+            Some("SIGQUIT".to_string())
+        );
+        assert_eq!(effective_stop_signal(None, None), None);
+    }
+
+    #[test]
+    fn test_normalize_port_maps_accepts_tcp_suffix() {
+        let maps = normalize_port_maps(&["8080:80/tcp".to_string()]).unwrap();
+
+        assert_eq!(maps, vec!["8080:80"]);
+    }
+
+    #[test]
+    fn test_validate_runtime_options_rejects_udp_publish() {
+        let mut args = default_common_args();
+        args.publish = vec!["8080:80/udp".to_string()];
+
+        let err = validate_runtime_options(&args).unwrap_err();
+
+        assert!(err.contains("only TCP is supported"));
+    }
+
+    #[test]
+    fn test_validate_runtime_options_rejects_host_ip_publish() {
+        let mut args = default_common_args();
+        args.publish = vec!["127.0.0.1:8080:80".to_string()];
+
+        let err = validate_runtime_options(&args).unwrap_err();
+
+        assert!(err.contains("bind-specific host IPs"));
+    }
+
+    #[test]
+    fn test_validate_runtime_options_rejects_devices() {
+        let mut args = default_common_args();
+        args.device = vec!["/dev/fuse".to_string()];
+
+        let err = validate_runtime_options(&args).unwrap_err();
+
+        assert!(err.contains("--device is not supported"));
+    }
+
+    #[test]
+    fn test_validate_runtime_options_rejects_gpus() {
+        let mut args = default_common_args();
+        args.gpus = Some("all".to_string());
+
+        let err = validate_runtime_options(&args).unwrap_err();
+
+        assert!(err.contains("--gpus is not implemented"));
+    }
+
+    #[test]
+    fn test_normalize_user_option_accepts_numeric_and_root() {
+        assert_eq!(
+            normalize_user_option(Some("1000:1000")).unwrap(),
+            Some("1000:1000".to_string())
+        );
+        assert_eq!(
+            normalize_user_option(Some("root:root")).unwrap(),
+            Some("0:0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_validate_runtime_options_accepts_named_user() {
+        // A named user is forwarded as-is and resolved in the guest against the
+        // container's /etc/passwd (like Docker's --user name).
+        let mut args = default_common_args();
+        args.user = Some("node".to_string());
+        validate_runtime_options(&args).unwrap();
+        assert_eq!(
+            normalize_user_option(Some("nobody")).unwrap().as_deref(),
+            Some("nobody")
+        );
+        assert_eq!(
+            normalize_user_option(Some("node:staff"))
+                .unwrap()
+                .as_deref(),
+            Some("node:staff")
+        );
+    }
+
+    #[test]
+    fn test_validate_runtime_options_accepts_relative_workdir() {
+        // A relative --workdir is accepted (resolved against the image WORKDIR
+        // at runtime, like Docker's `-w sub`).
+        let mut args = default_common_args();
+        args.workdir = Some("app".to_string());
+
+        validate_runtime_options(&args).unwrap();
+    }
+
+    #[test]
+    fn test_validate_runtime_options_accepts_user_and_workdir() {
+        let mut args = default_common_args();
+        args.user = Some("root:0".to_string());
+        args.workdir = Some("/app".to_string());
+
+        validate_runtime_options(&args).unwrap();
+    }
+
+    #[test]
+    fn test_validate_runtime_options_rejects_invalid_hostname() {
+        let mut args = default_common_args();
+        args.hostname = Some("bad_host".to_string());
+
+        let err = validate_runtime_options(&args).unwrap_err();
+
+        assert!(err.contains("Invalid --hostname"));
+    }
+
+    #[test]
+    fn test_validate_runtime_options_rejects_invalid_add_host() {
+        let mut args = default_common_args();
+        args.add_host = vec!["db.local:not-an-ip".to_string()];
+
+        let err = validate_runtime_options(&args).unwrap_err();
+
+        assert!(err.contains("Invalid --add-host"));
+    }
+
+    #[test]
+    fn test_validate_runtime_options_accepts_hostname_and_add_host() {
+        let mut args = default_common_args();
+        args.hostname = Some("web-1.local".to_string());
+        args.add_host = vec!["db.local:10.88.0.10".to_string()];
+
+        validate_runtime_options(&args).unwrap();
+    }
+
+    #[test]
+    fn test_validate_runtime_options_rejects_unsupported_security_opts() {
+        let mut args = default_common_args();
+        args.security_opt = vec!["apparmor=runtime/default".to_string()];
+
+        let err = validate_runtime_options(&args).unwrap_err();
+
+        assert!(err.contains("AppArmor"));
+    }
+
+    #[test]
+    fn test_validate_runtime_options_rejects_custom_seccomp() {
+        let mut args = default_common_args();
+        args.security_opt = vec!["seccomp=/tmp/profile.json".to_string()];
+
+        let err = validate_runtime_options(&args).unwrap_err();
+
+        assert!(err.contains("custom seccomp profile"));
+    }
+
+    #[test]
+    fn test_validate_runtime_options_accepts_enforceable_security_opts() {
+        let mut args = default_common_args();
+        args.security_opt = vec![
+            "seccomp=unconfined".to_string(),
+            "no-new-privileges".to_string(),
+        ];
+        args.cap_drop = vec!["NET_RAW".to_string()];
+
+        validate_runtime_options(&args).unwrap();
     }
 
     #[test]

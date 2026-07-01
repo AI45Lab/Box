@@ -6,6 +6,8 @@
 use clap::Args;
 
 #[cfg(not(windows))]
+use super::common;
+#[cfg(not(windows))]
 use crate::resolve;
 #[cfg(not(windows))]
 use crate::state::StateFile;
@@ -19,7 +21,7 @@ pub struct ShellArgs {
     #[arg(long, default_value = "/bin/sh")]
     pub shell: String,
 
-    /// Run as a specific user (e.g., "root", "1000")
+    /// Run as a specific user (supported: root, UID, UID:GID)
     #[arg(short = 'u', long)]
     pub user: Option<String>,
 
@@ -40,33 +42,31 @@ pub async fn execute(_args: ShellArgs) -> Result<(), Box<dyn std::error::Error>>
 pub async fn execute(args: ShellArgs) -> Result<(), Box<dyn std::error::Error>> {
     use crate::terminal;
     use a3s_box_core::pty::PtyRequest;
-    use a3s_box_runtime::PtyClient;
+
+    let user = common::normalize_user_option(args.user.as_deref())
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    common::validate_workdir_option(args.workdir.as_deref())
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     let state = StateFile::load_default()?;
     let record = resolve::resolve(&state, &args.r#box)?;
-
-    if record.status != "running" {
-        return Err(format!("Box {} is not running", record.name).into());
-    }
-
-    let pty_socket_path = crate::socket_paths::pty(record);
-    if !pty_socket_path.exists() {
-        return Err(format!(
-            "PTY socket not found for box {} at {} (guest may not support interactive mode)",
-            record.name,
-            pty_socket_path.display()
-        )
-        .into());
-    }
+    let pty_socket_path = crate::socket_paths::require_runtime_socket(
+        record,
+        crate::socket_paths::RuntimeSocket::Pty,
+    )
+    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     let (cols, rows) = terminal::size().unwrap_or((80, 24));
-    let mut client = PtyClient::connect(&pty_socket_path).await?;
+    let mut client =
+        super::exec::connect_pty_with_retry(&pty_socket_path, std::time::Duration::from_secs(10))
+            .await?;
     client
         .send_request(&PtyRequest {
             cmd: vec![args.shell],
             env: vec![],
             working_dir: args.workdir,
-            user: args.user,
+            rootfs: None,
+            user,
             cols,
             rows,
         })

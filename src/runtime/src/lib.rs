@@ -15,8 +15,8 @@
 
 // -- Core modules (always compiled) --
 pub mod audit;
-pub mod backends;
 pub mod cache;
+pub(crate) mod file_lock;
 pub mod fs;
 pub mod grpc;
 pub mod host_check;
@@ -27,6 +27,7 @@ pub mod prom;
 pub mod resize;
 pub mod rootfs;
 pub mod snapshot;
+mod store_io;
 #[cfg(unix)]
 pub mod tee;
 #[cfg(feature = "vm")]
@@ -52,7 +53,10 @@ pub use audit::{read_audit_log, AuditLog, AuditQuery};
 
 // gRPC clients
 #[cfg(unix)]
-pub use grpc::{AttestationClient, ExecClient, PtyClient, RaTlsAttestationClient, StreamingExec};
+pub use grpc::{
+    AttestationClient, ExecClient, PtyClient, RaTlsAttestationClient, StreamingExec,
+    StreamingExecInput, StreamingPty, StreamingPtyInput,
+};
 #[cfg(unix)]
 pub use grpc::{SealClient, SecretEntry, SecretInjector};
 
@@ -64,10 +68,7 @@ pub use network::NetworkStore;
 
 // OCI images
 pub use a3s_box_core::StoredImage;
-pub use oci::{
-    CredentialStore, DockerConfigCredentialStore, PushResult, RegistryLoginOptions,
-    RegistryLoginVerifier, RegistryPusher,
-};
+pub use oci::{CredentialStore, PushResult, RegistryPusher};
 pub use oci::{ImagePuller, ImageReference, ImageStore, RegistryAuth};
 pub use oci::{OciImage, SignResult, SignaturePolicy};
 

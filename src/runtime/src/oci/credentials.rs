@@ -7,7 +7,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use a3s_box_core::error::{BoxError, Result};
-use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 /// Per-registry credential entry.
@@ -21,19 +20,6 @@ struct CredentialEntry {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct CredentialFile {
     registries: HashMap<String, CredentialEntry>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct DockerConfigFile {
-    #[serde(default)]
-    auths: HashMap<String, DockerAuthEntry>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct DockerAuthEntry {
-    auth: Option<String>,
-    username: Option<String>,
-    password: Option<String>,
 }
 
 /// Persistent credential store for container registries.
@@ -60,15 +46,16 @@ impl CredentialStore {
 
     /// Store credentials for a registry. Overwrites existing entry.
     pub fn store(&self, registry: &str, username: &str, password: &str) -> Result<()> {
-        let mut file = self.load()?;
-        file.registries.insert(
-            a3s_box_core::normalize_registry_server(registry),
-            CredentialEntry {
-                username: username.to_string(),
-                password: password.to_string(),
-            },
-        );
-        self.save(&file)
+        self.with_write_lock(|file| {
+            file.registries.insert(
+                normalize_registry(registry),
+                CredentialEntry {
+                    username: username.to_string(),
+                    password: password.to_string(),
+                },
+            );
+            Ok(())
+        })
     }
 
     /// Get credentials for a registry. Returns `(username, password)`.
@@ -76,21 +63,18 @@ impl CredentialStore {
         let file = self.load()?;
         Ok(file
             .registries
-            .get(&a3s_box_core::normalize_registry_server(registry))
+            .get(&normalize_registry(registry))
             .map(|e| (e.username.clone(), e.password.clone())))
     }
 
     /// Remove credentials for a registry. Returns true if entry existed.
     pub fn remove(&self, registry: &str) -> Result<bool> {
-        let mut file = self.load()?;
-        let removed = file
-            .registries
-            .remove(&a3s_box_core::normalize_registry_server(registry))
-            .is_some();
-        if removed {
-            self.save(&file)?;
-        }
-        Ok(removed)
+        self.with_write_lock(|file| {
+            Ok(file
+                .registries
+                .remove(&normalize_registry(registry))
+                .is_some())
+        })
     }
 
     /// List all registries with stored credentials.
@@ -153,94 +137,40 @@ impl CredentialStore {
         })?;
         Ok(())
     }
-}
 
-/// Read-only Docker CLI credential fallback.
-///
-/// Supports inline `auth` entries and `username`/`password` entries from
-/// `$DOCKER_CONFIG/config.json` or `~/.docker/config.json`. External credential
-/// helpers are intentionally not invoked.
-pub struct DockerConfigCredentialStore {
-    path: PathBuf,
-}
-
-impl DockerConfigCredentialStore {
-    /// Create a Docker config credential reader at the default path.
-    pub fn default_path() -> Result<Self> {
-        let path = match std::env::var("DOCKER_CONFIG") {
-            Ok(dir) => PathBuf::from(dir).join("config.json"),
-            Err(_) => dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".docker")
-                .join("config.json"),
-        };
-        Ok(Self { path })
-    }
-
-    /// Create a Docker config credential reader at a custom path.
-    pub fn new(path: PathBuf) -> Self {
-        Self { path }
-    }
-
-    /// Get Docker CLI credentials for a registry.
-    pub fn get(&self, registry: &str) -> Result<Option<(String, String)>> {
-        let file = self.load()?;
-        let registry = a3s_box_core::normalize_registry_server(registry);
-
-        for (key, entry) in file.auths {
-            if a3s_box_core::normalize_registry_server(&key) == registry {
-                return decode_docker_auth(entry);
-            }
-        }
-
-        Ok(None)
-    }
-
-    fn load(&self) -> Result<DockerConfigFile> {
-        if !self.path.exists() {
-            return Ok(DockerConfigFile::default());
-        }
-
-        let data = std::fs::read_to_string(&self.path).map_err(|e| {
+    /// Run `f` over the credential file under a cross-process advisory lock,
+    /// re-loading fresh inside the lock and saving the result.
+    ///
+    /// `store`/`remove` funnel through here so two concurrent `a3s-box login`
+    /// processes cannot lose each other's entry: the atomic tmp+rename in
+    /// `save` only prevents a torn read, and `save` even uses a fixed `.tmp`
+    /// name that concurrent writers would collide on. `save` stays lock-free —
+    /// the guard is held here across the whole load → mutate → save and is
+    /// non-reentrant.
+    fn with_write_lock<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut CredentialFile) -> Result<R>,
+    {
+        let _lock = crate::file_lock::FileLock::acquire(&self.path).map_err(|e| {
             BoxError::ConfigError(format!(
-                "Failed to read Docker config {}: {}",
-                self.path.display(),
-                e
+                "Failed to lock credential store {}: {e}",
+                self.path.display()
             ))
         })?;
-        serde_json::from_str(&data).map_err(|e| {
-            BoxError::ConfigError(format!(
-                "Failed to parse Docker config {}: {}",
-                self.path.display(),
-                e
-            ))
-        })
+        let mut file = self.load()?;
+        let r = f(&mut file)?;
+        self.save(&file)?;
+        Ok(r)
     }
 }
 
-fn decode_docker_auth(entry: DockerAuthEntry) -> Result<Option<(String, String)>> {
-    if let (Some(username), Some(password)) = (entry.username, entry.password) {
-        if !username.is_empty() && !password.is_empty() {
-            return Ok(Some((username, password)));
-        }
-    }
-
-    let Some(auth) = entry.auth else {
-        return Ok(None);
-    };
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(auth.trim())
-        .map_err(|e| BoxError::ConfigError(format!("Failed to decode Docker auth entry: {e}")))?;
-    let decoded = String::from_utf8(decoded).map_err(|e| {
-        BoxError::ConfigError(format!("Failed to decode Docker auth entry as UTF-8: {e}"))
-    })?;
-    let Some((username, password)) = decoded.split_once(':') else {
-        return Ok(None);
-    };
-    if username.is_empty() || password.is_empty() {
-        Ok(None)
+/// Normalize registry names (e.g., "docker.io" and "index.docker.io" → "index.docker.io").
+fn normalize_registry(registry: &str) -> String {
+    let r = registry.trim().to_lowercase();
+    if r == "docker.io" || r == "registry-1.docker.io" {
+        "index.docker.io".to_string()
     } else {
-        Ok(Some((username.to_string(), password.to_string())))
+        r
     }
 }
 
@@ -265,6 +195,39 @@ mod tests {
 
     fn test_store(dir: &TempDir) -> CredentialStore {
         CredentialStore::new(dir.path().join("credentials.json"))
+    }
+
+    // The advisory lock is per-open-file-description, so separate
+    // FileLock::acquire calls serialize even across threads in one process —
+    // which lets this exercise the lost-update fix in-process.
+    #[test]
+    fn concurrent_logins_to_distinct_registries_no_lost_update() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(test_store(&dir));
+
+        let n = 16;
+        let handles: Vec<_> = (0..n)
+            .map(|i| {
+                let store = Arc::clone(&store);
+                thread::spawn(move || {
+                    store
+                        .store(&format!("reg{i}.example.com"), "user", "pass")
+                        .unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(
+            store.list_registries().unwrap().len(),
+            n,
+            "every concurrent login must persist (no lost update)"
+        );
     }
 
     #[test]
@@ -385,51 +348,5 @@ mod tests {
             store.get("ecr.aws").unwrap(),
             Some(("u3".to_string(), "p3".to_string()))
         );
-    }
-
-    #[test]
-    fn test_docker_config_auth_entry() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("config.json");
-        std::fs::write(
-            &path,
-            r#"{
-                "auths": {
-                    "https://index.docker.io/v1/": {
-                        "auth": "ZG9ja2VyLXVzZXI6ZG9ja2VyLXBhc3M="
-                    }
-                }
-            }"#,
-        )
-        .unwrap();
-
-        let store = DockerConfigCredentialStore::new(path);
-        let creds = store.get("docker.io").unwrap();
-        assert_eq!(
-            creds,
-            Some(("docker-user".to_string(), "docker-pass".to_string()))
-        );
-    }
-
-    #[test]
-    fn test_docker_config_username_password_entry() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("config.json");
-        std::fs::write(
-            &path,
-            r#"{
-                "auths": {
-                    "registry.example.com": {
-                        "username": "alice",
-                        "password": "secret"
-                    }
-                }
-            }"#,
-        )
-        .unwrap();
-
-        let store = DockerConfigCredentialStore::new(path);
-        let creds = store.get("registry.example.com").unwrap();
-        assert_eq!(creds, Some(("alice".to_string(), "secret".to_string())));
     }
 }

@@ -9,12 +9,14 @@ MinimumOSVersion: 10.0.19041.0
 InstallerType: zip
 NestedInstallerType: portable
 NestedInstallerFiles:
-- RelativeFilePath: a3s-box-v0.8.0-windows-x86_64\a3s-box-win.exe
+- RelativeFilePath: a3s-box-v0.8.0-windows-x86_64\a3s-box.exe
   PortableCommandAlias: a3s-box
+- RelativeFilePath: a3s-box-v0.8.0-windows-x86_64\a3s-box-shim.exe
+- RelativeFilePath: a3s-box-v0.8.0-windows-x86_64\a3s-box-guest-init
 - RelativeFilePath: a3s-box-v0.8.0-windows-x86_64\lib\krun.dll
 Installers:
 - Architecture: x64
-  InstallerUrl: https://github.com/A3S-Lab/Box/releases/download/v0.8.0/a3s-box-v0.8.0-windows-x86_64.zip
+  InstallerUrl: https://github.com/AI45Lab/Box/releases/download/v0.8.0/a3s-box-v0.8.0-windows-x86_64.zip
   InstallerSha256: FA85AF0AC8A0BEBAA2A3BB51FE9FE3E966F366746484AFCA3FA72FE540015B3E
   Dependencies:
     WindowsFeatures:

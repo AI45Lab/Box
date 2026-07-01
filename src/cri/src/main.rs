@@ -3,7 +3,6 @@
 //! Serves CRI RuntimeService and ImageService over a Unix domain socket,
 //! allowing kubelet to schedule pods onto A3S Box microVMs.
 
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -12,7 +11,11 @@ use tracing_subscriber::EnvFilter;
 
 use a3s_box_runtime::oci::{ImageStore, RegistryAuth};
 
+use a3s_box_cri::config_mapper::DEFAULT_AGENT_IMAGE;
+use a3s_box_cri::runtime_service::CriRuntimeOptions;
 use a3s_box_cri::server::CriServer;
+
+const AGENT_IMAGE_ENV: &str = "A3S_BOX_CRI_AGENT_IMAGE";
 
 /// A3S Box CRI Runtime
 #[derive(Parser, Debug)]
@@ -26,25 +29,47 @@ struct Args {
     #[arg(long, default_value = "~/.a3s/images")]
     image_dir: String,
 
-    /// Default sandbox/agent image used when a pod omits a3s.box/agent-image.
-    #[arg(long)]
-    sandbox_image: Option<String>,
-
-    /// Default A3S bridge network used when a pod omits a3s.box/network.
-    #[arg(long)]
-    sandbox_network: Option<String>,
-
     /// Maximum image cache size in bytes (default: 10GB).
     #[arg(long, default_value = "10737418240")]
     image_cache_size: u64,
 
-    /// Address for CRI exec/attach/port-forward streaming callbacks.
-    #[arg(long, default_value = "127.0.0.1:18800")]
-    streaming_addr: SocketAddr,
+    /// Default sandbox VM agent/rootfs image used when Pods omit a3s.box/agent-image.
+    #[arg(long)]
+    agent_image: Option<String>,
+
+    /// RuntimeClass-specific agent image override, formatted as HANDLER=IMAGE.
+    #[arg(long = "runtime-handler-agent-image", value_name = "HANDLER=IMAGE")]
+    runtime_handler_agent_image: Vec<String>,
+}
+
+fn parse_runtime_handler_agent_images(
+    values: &[String],
+) -> Result<std::collections::HashMap<String, String>, String> {
+    let mut images = std::collections::HashMap::new();
+    for value in values {
+        let Some((handler, image)) = value.split_once('=') else {
+            return Err(format!(
+                "Invalid --runtime-handler-agent-image '{}': expected HANDLER=IMAGE",
+                value
+            ));
+        };
+
+        let handler = handler.trim();
+        let image = image.trim();
+        if handler.is_empty() || image.is_empty() {
+            return Err(format!(
+                "Invalid --runtime-handler-agent-image '{}': handler and image must be non-empty",
+                value
+            ));
+        }
+
+        images.insert(handler.to_string(), image.to_string());
+    }
+    Ok(images)
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -53,6 +78,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = Args::parse();
+    let default_agent_image = args
+        .agent_image
+        .clone()
+        .or_else(|| std::env::var(AGENT_IMAGE_ENV).ok())
+        .unwrap_or_else(|| DEFAULT_AGENT_IMAGE.to_string());
+    let runtime_handler_agent_images =
+        parse_runtime_handler_agent_images(&args.runtime_handler_agent_image)
+            .map_err(|e| format!("Invalid CRI runtime options: {e}"))?;
+    let runtime_options = CriRuntimeOptions {
+        default_agent_image,
+        runtime_handler_agent_images,
+    };
 
     // Resolve image directory (expand ~)
     let image_dir = if args.image_dir.starts_with('~') {
@@ -65,10 +102,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(
         socket = %args.socket.display(),
         image_dir = %image_dir.display(),
-        sandbox_image = args.sandbox_image.as_deref().unwrap_or(""),
-        sandbox_network = args.sandbox_network.as_deref().unwrap_or(""),
         cache_size = args.image_cache_size,
-        streaming_addr = %args.streaming_addr,
+        agent_image = %runtime_options.default_agent_image,
+        runtime_handler_overrides = runtime_options.runtime_handler_agent_images.len(),
         "Starting A3S Box CRI Runtime"
     );
 
@@ -82,46 +118,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let auth = RegistryAuth::from_env();
 
     // Create and start CRI server
-    let server = CriServer::new(args.socket, image_store, auth)
-        .with_default_sandbox_image(args.sandbox_image)
-        .with_default_sandbox_network(args.sandbox_network)
-        .with_streaming_addr(args.streaming_addr);
+    let server =
+        CriServer::new(args.socket, image_store, auth).with_runtime_options(runtime_options);
     server.serve().await?;
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_args_default_streaming_addr() {
-        let args = Args::try_parse_from(["a3s-box-cri"]).unwrap();
-        assert_eq!(args.streaming_addr, "127.0.0.1:18800".parse().unwrap());
-    }
-
-    #[test]
-    fn test_args_custom_streaming_addr() {
-        let args =
-            Args::try_parse_from(["a3s-box-cri", "--streaming-addr", "0.0.0.0:19090"]).unwrap();
-        assert_eq!(args.streaming_addr, "0.0.0.0:19090".parse().unwrap());
-    }
-
-    #[test]
-    fn test_args_custom_sandbox_image() {
-        let args =
-            Args::try_parse_from(["a3s-box-cri", "--sandbox-image", "registry.local/a3s:cri"])
-                .unwrap();
-        assert_eq!(
-            args.sandbox_image.as_deref(),
-            Some("registry.local/a3s:cri")
-        );
-    }
-
-    #[test]
-    fn test_args_custom_sandbox_network() {
-        let args = Args::try_parse_from(["a3s-box-cri", "--sandbox-network", "k8s-pods"]).unwrap();
-        assert_eq!(args.sandbox_network.as_deref(), Some("k8s-pods"));
-    }
 }

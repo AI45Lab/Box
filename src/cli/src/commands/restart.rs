@@ -5,9 +5,11 @@
 use clap::Args;
 
 use crate::boot;
+use crate::lifecycle;
 use crate::process;
 use crate::resolve;
 use crate::state::StateFile;
+use crate::status;
 
 #[derive(Args)]
 pub struct RestartArgs {
@@ -21,11 +23,11 @@ pub struct RestartArgs {
 }
 
 pub async fn execute(args: RestartArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let mut state = StateFile::load_default()?;
+    let state = StateFile::load_default()?;
     let mut errors: Vec<String> = Vec::new();
 
     for query in &args.boxes {
-        if let Err(e) = restart_one(&mut state, query, args.timeout).await {
+        if let Err(e) = restart_one(&state, query, args.timeout).await {
             errors.push(format!("{query}: {e}"));
         }
     }
@@ -38,7 +40,7 @@ pub async fn execute(args: RestartArgs) -> Result<(), Box<dyn std::error::Error>
 }
 
 async fn restart_one(
-    state: &mut StateFile,
+    state: &StateFile,
     query: &str,
     timeout: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -46,58 +48,107 @@ async fn restart_one(
 
     let box_id = record.id.clone();
     let name = record.name.clone();
-    let was_running = record.status == "running";
-    let pid = record.pid;
+    let restart_plan = restart_plan(record)?;
     let box_dir = record.box_dir.clone();
     let exec_socket_path = record.exec_socket_path.clone();
 
-    // Phase 1: Stop the box if it's running
-    if was_running {
-        if let Some(pid) = pid {
-            let stop_signal = record
-                .stop_signal
-                .as_deref()
-                .map(a3s_box_core::vmm::parse_signal_name)
-                .unwrap_or(libc::SIGTERM);
-            let effective_timeout = record.stop_timeout.unwrap_or(timeout);
-            process::graceful_stop(pid, stop_signal, effective_timeout).await;
-        }
+    // Phase 1: Stop the box if it is active.
+    if restart_plan == RestartPlan::StopThenStart {
+        let pid = lifecycle::require_live_pid(record, "restart")
+            .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+        let stop_signal = record
+            .stop_signal
+            .as_deref()
+            .map(a3s_box_core::vmm::parse_signal_name)
+            .unwrap_or(libc::SIGTERM);
+        let effective_timeout = record.stop_timeout.unwrap_or(timeout);
+        lifecycle::resume_paused_for_termination(record, pid, "restart")
+            .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+        // Deliver the stop signal inside the guest so the container honours its
+        // STOPSIGNAL and runs its own shutdown (then the VM halts cleanly), as
+        // `stop` does. Signalling the host shim never reaches the container and
+        // kills the VM abruptly; graceful_stop_via_guest falls back to that only
+        // when no guest exec server is reachable.
+        process::graceful_stop_via_guest(pid, &exec_socket_path, stop_signal, effective_timeout)
+            .await;
 
-        // Update state to stopped
-        let record = resolve::resolve_mut(state, &box_id)?;
-        record.status = "stopped".to_string();
-        record.pid = None;
+        // Update state to stopped — atomically (load-fresh + mutate + save under
+        // the lock) so the post-await write cannot clobber a concurrent
+        // monitor/run/command writer with our pre-await snapshot.
         crate::cleanup::cleanup_external_socket_dir(&box_dir, &exec_socket_path);
-        state.save()?;
-    } else {
-        // Verify the box is in a startable state
-        match record.status.as_str() {
-            "created" | "stopped" | "dead" => {}
-            other => {
-                return Err(format!("Cannot restart box in state: {other}").into());
+        StateFile::modify(|s| {
+            if let Some(record) = s.find_by_id_mut(&box_id) {
+                record.status = "stopped".to_string();
+                record.pid = None;
             }
+            Ok::<(), std::io::Error>(())
+        })?;
+    }
+
+    // Phase 2: Start the box using shared boot logic. The record's boot config
+    // (image, cmd, dirs) is immutable across the stop, so the in-memory handle is
+    // fine to boot from; only the post-boot status write must be atomic.
+    let record = resolve::resolve(state, &box_id)?;
+    // Boot + persist under a per-box boot lock (see boot::boot_and_record): if the
+    // monitor (or another concurrent restart) already brought this box back, skip
+    // rather than boot a duplicate VM that orphans one of the two.
+    match boot::boot_and_record(record, boot::RestartCountUpdate::Preserve).await? {
+        boot::BootOutcome::Restarted { .. } => println!("{name}"),
+        boot::BootOutcome::AlreadyRunning => println!("{name} (already started)"),
+        boot::BootOutcome::RemovedDuringBoot => {
+            return Err(format!("{name} was removed during restart").into());
         }
     }
-
-    // Phase 2: Start the box using shared boot logic
-    let record = resolve::resolve(state, &box_id)?;
-    let result = boot::boot_from_record(record).await?;
-
-    // Update record to running
-    let record = resolve::resolve_mut(state, &box_id)?;
-    record.status = "running".to_string();
-    record.pid = result.pid;
-    if let Some(exec_socket_path) = result.exec_socket_path {
-        record.exec_socket_path = exec_socket_path;
-    }
-    record.started_at = Some(chrono::Utc::now());
-    state.save()?;
-
-    // Notify monitor about the restarted container
-    if let Some(pid) = result.pid {
-        crate::monitor_global::notify_container_started(box_id.clone(), pid).await;
-    }
-
-    println!("{name}");
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestartPlan {
+    StopThenStart,
+    StartOnly,
+}
+
+fn restart_plan(record: &crate::state::BoxRecord) -> Result<RestartPlan, String> {
+    if status::is_active(record) {
+        return Ok(RestartPlan::StopThenStart);
+    }
+
+    match record.status.as_str() {
+        "created" | "stopped" | "dead" => Ok(RestartPlan::StartOnly),
+        other => Err(format!("Cannot restart box in state: {other}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_helpers::fixtures::make_record;
+
+    #[test]
+    fn test_restart_plan_stops_running_and_paused_first() {
+        assert_eq!(
+            restart_plan(&make_record("id-1", "running", "running", Some(1))).unwrap(),
+            RestartPlan::StopThenStart
+        );
+        assert_eq!(
+            restart_plan(&make_record("id-2", "paused", "paused", Some(1))).unwrap(),
+            RestartPlan::StopThenStart
+        );
+    }
+
+    #[test]
+    fn test_restart_plan_starts_inactive_boxes_directly() {
+        assert_eq!(
+            restart_plan(&make_record("id-1", "created", "created", None)).unwrap(),
+            RestartPlan::StartOnly
+        );
+        assert_eq!(
+            restart_plan(&make_record("id-2", "stopped", "stopped", None)).unwrap(),
+            RestartPlan::StartOnly
+        );
+        assert_eq!(
+            restart_plan(&make_record("id-3", "dead", "dead", None)).unwrap(),
+            RestartPlan::StartOnly
+        );
+    }
 }

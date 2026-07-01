@@ -16,9 +16,7 @@ use a3s_box_runtime::oci::{ImageStore, RegistryAuth};
 use crate::cri_api::image_service_server::ImageServiceServer;
 use crate::cri_api::runtime_service_server::RuntimeServiceServer;
 use crate::image_service::BoxImageService;
-use crate::persistent_store::PersistentCriStore;
-use crate::runtime_service::BoxRuntimeService;
-use crate::state::{default_state_path, JsonStateStore, StateStore};
+use crate::runtime_service::{BoxRuntimeService, CriRuntimeOptions};
 use crate::streaming::StreamingServer;
 
 /// CRI gRPC server configuration.
@@ -29,12 +27,10 @@ pub struct CriServer {
     image_store: Arc<ImageStore>,
     /// Registry authentication.
     auth: RegistryAuth,
-    /// Default sandbox/agent image for pods without an A3S image annotation.
-    default_sandbox_image: Option<String>,
-    /// Default A3S bridge network for pods without an A3S network annotation.
-    default_sandbox_network: Option<String>,
     /// Streaming server bind address.
     streaming_addr: SocketAddr,
+    /// Runtime-level CRI defaults and RuntimeClass overrides.
+    runtime_options: CriRuntimeOptions,
 }
 
 /// Default streaming server bind address.
@@ -47,22 +43,9 @@ impl CriServer {
             socket_path,
             image_store,
             auth,
-            default_sandbox_image: None,
-            default_sandbox_network: None,
             streaming_addr: SocketAddr::from(DEFAULT_STREAMING_ADDR),
+            runtime_options: CriRuntimeOptions::default(),
         }
-    }
-
-    /// Set the default sandbox/agent image used by RuntimeService.
-    pub fn with_default_sandbox_image(mut self, image: Option<String>) -> Self {
-        self.default_sandbox_image = image.filter(|value| !value.trim().is_empty());
-        self
-    }
-
-    /// Set the default A3S bridge network used by RuntimeService.
-    pub fn with_default_sandbox_network(mut self, network: Option<String>) -> Self {
-        self.default_sandbox_network = network.filter(|value| !value.trim().is_empty());
-        self
     }
 
     /// Set the streaming server bind address.
@@ -71,8 +54,14 @@ impl CriServer {
         self
     }
 
+    /// Set runtime-level CRI defaults and RuntimeClass image overrides.
+    pub fn with_runtime_options(mut self, options: CriRuntimeOptions) -> Self {
+        self.runtime_options = options;
+        self
+    }
+
     /// Start serving CRI RPCs on the Unix socket.
-    pub async fn serve(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn serve(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Remove existing socket file if present
         if self.socket_path.exists() {
             std::fs::remove_file(&self.socket_path)?;
@@ -84,7 +73,7 @@ impl CriServer {
         }
 
         // Start streaming server
-        let streaming_server = StreamingServer::new(self.streaming_addr);
+        let streaming_server = StreamingServer::new(self.streaming_addr).bind().await?;
         let streaming_handle = streaming_server.handle();
 
         tokio::spawn(async move {
@@ -93,20 +82,14 @@ impl CriServer {
             }
         });
 
-        let state_store: Arc<dyn StateStore> = Arc::new(JsonStateStore::new(default_state_path()));
-        let cri_store = Arc::new(PersistentCriStore::new(state_store));
-
-        let runtime_service = BoxRuntimeService::with_persistent_store(
+        let runtime_service = BoxRuntimeService::new(
             self.image_store.clone(),
             self.auth.clone(),
             streaming_handle,
-            cri_store.clone(),
         )
-        .with_default_sandbox_image(self.default_sandbox_image.clone())
-        .with_default_sandbox_network(self.default_sandbox_network.clone());
+        .with_runtime_options(self.runtime_options.clone());
         runtime_service.load_state().await;
-        let image_service = BoxImageService::new(self.image_store.clone(), self.auth.clone())
-            .with_cri_store(cri_store);
+        let image_service = BoxImageService::new(self.image_store.clone(), self.auth.clone());
 
         let uds = UnixListener::bind(&self.socket_path)?;
         let uds_stream = UnixListenerStream::new(uds);
@@ -117,12 +100,51 @@ impl CriServer {
             "CRI server listening"
         );
 
-        Server::builder()
+        // Keep a handle so we can reap sandbox VMs once the server stops; the
+        // service itself is moved into the gRPC server below.
+        let shutdown_service = runtime_service.clone();
+        let result = Server::builder()
             .add_service(RuntimeServiceServer::new(runtime_service))
             .add_service(ImageServiceServer::new(image_service))
-            .serve_with_incoming(uds_stream)
-            .await?;
+            .serve_with_incoming_shutdown(uds_stream, shutdown_signal())
+            .await;
+
+        // The server stopped — on graceful signal (Ok) OR a transport error.
+        // Reap sandbox VMs + unmount overlays unconditionally so they do not
+        // orphan across restarts, then surface any server error.
+        tracing::info!("CRI server stopping — reaping sandbox VMs");
+        shutdown_service.shutdown_all_sandboxes().await;
+        result?;
 
         Ok(())
+    }
+}
+
+/// Resolves when the process receives a termination signal, driving a graceful
+/// gRPC server shutdown so the CRI can reap its sandbox VMs.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::interrupt()),
+        ) {
+            (Ok(mut sigterm), Ok(mut sigint)) => {
+                tokio::select! {
+                    _ = sigterm.recv() => tracing::info!("Received SIGTERM, shutting down CRI"),
+                    _ = sigint.recv() => tracing::info!("Received SIGINT, shutting down CRI"),
+                }
+            }
+            _ => {
+                tracing::error!("Failed to install signal handlers; graceful shutdown disabled");
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("Received Ctrl-C, shutting down CRI");
     }
 }

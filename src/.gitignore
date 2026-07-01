@@ -60,3 +60,9 @@ yarn-error.log*
 # Generated files
 runtime/src/grpc/proto/*.rs
 .env
+
+# The Rust build engine source lives at runtime/src/oci/build/. Re-include it:
+# the generic Python `build/` ignore above is unanchored and would otherwise
+# silently drop new source files added to this directory.
+!runtime/src/oci/build/
+!runtime/src/oci/build/**

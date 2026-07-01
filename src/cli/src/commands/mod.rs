@@ -7,8 +7,6 @@ mod build;
 mod commit;
 pub(crate) mod common;
 mod compose;
-mod container;
-mod container_prune;
 mod container_update;
 mod cp;
 mod create;
@@ -18,11 +16,11 @@ mod events;
 pub(crate) mod exec;
 mod export;
 mod history;
-mod image;
 mod image_inspect;
 mod image_prune;
 mod image_tag;
 mod images;
+mod import;
 mod info;
 mod inject_secret;
 mod inspect;
@@ -32,10 +30,13 @@ mod login;
 mod logout;
 mod logs;
 mod monitor;
-mod network;
+mod monitor_metrics;
+mod monitor_service;
+pub(crate) mod network;
 mod pause;
 mod pool;
 mod port;
+mod prune;
 mod ps;
 mod pull;
 mod push;
@@ -51,7 +52,6 @@ mod snapshot;
 mod start;
 mod stats;
 mod stop;
-mod system;
 mod system_prune;
 mod top;
 mod unpause;
@@ -92,8 +92,6 @@ pub enum Command {
     Restart(restart::RestartArgs),
     /// Remove one or more boxes
     Rm(rm::RmArgs),
-    /// Manage boxes using Docker-style container subcommands
-    Container(container::ContainerArgs),
     /// Force-kill one or more running boxes
     Kill(kill::KillArgs),
     /// Pause one or more running boxes
@@ -148,8 +146,6 @@ pub enum Command {
     Build(build::BuildArgs),
     /// List cached images
     Images(images::ImagesArgs),
-    /// Manage images
-    Image(image::ImageArgs),
     /// Pull an image from a registry
     Pull(pull::PullArgs),
     /// Push an image to a registry
@@ -172,6 +168,8 @@ pub enum Command {
     Save(save::SaveArgs),
     /// Load an image from a tar archive
     Load(load::LoadArgs),
+    /// Import a rootfs tarball as a single-layer image
+    Import(import::ImportArgs),
     /// Copy files between host and a running box
     Cp(cp::CpArgs),
     /// Manage networks
@@ -180,8 +178,9 @@ pub enum Command {
     Volume(volume::VolumeArgs),
     /// Show disk usage
     Df(df::DfArgs),
-    /// Manage system-wide data
-    System(system::SystemArgs),
+    /// Remove all stopped boxes (Docker `container prune`)
+    #[command(visible_alias = "container-prune")]
+    Prune(prune::PruneArgs),
     /// Remove all unused data (stopped boxes and unused images)
     SystemPrune(system_prune::SystemPruneArgs),
     /// Show version information
@@ -218,12 +217,45 @@ pub(crate) fn open_image_store() -> Result<a3s_box_runtime::ImageStore, Box<dyn 
     Ok(store)
 }
 
+/// Resolve a box's on-disk full root filesystem directory.
+///
+/// The overlay provider (default on Linux) materializes the rootfs at
+/// `<box_dir>/merged`, while the plain/copy provider uses `<box_dir>/rootfs`.
+/// Returns the first that exists and is non-empty so that `export`/`commit`
+/// work regardless of provider. Returns `None` if neither is available (e.g.
+/// the overlay is unmounted because the box is stopped).
+pub(crate) fn resolve_box_rootfs(box_dir: &std::path::Path) -> Option<PathBuf> {
+    let is_populated = |p: &std::path::Path| -> bool {
+        p.is_dir()
+            && std::fs::read_dir(p)
+                .map(|mut it| it.next().is_some())
+                .unwrap_or(false)
+    };
+    let merged = box_dir.join("merged");
+    if is_populated(&merged) {
+        return Some(merged);
+    }
+    let rootfs = box_dir.join("rootfs");
+    if rootfs.is_dir() {
+        return Some(rootfs);
+    }
+    None
+}
+
 /// Tail a file, printing new content as it appears.
 ///
 /// Waits for the file to exist, then continuously reads and prints new data.
 /// Used by `run` (foreground mode) and `attach`.
 pub(crate) async fn tail_file(path: &std::path::Path) {
-    use tokio::io::AsyncReadExt;
+    tail_file_stream(path, false).await;
+}
+
+/// Tail a console file to the terminal. `to_stderr` routes it to the terminal's
+/// stderr — used for the container's stderr console (console.err.log) so a
+/// foreground `run`/`attach` shows stdout and stderr like Docker.
+pub(crate) async fn tail_file_stream(path: &std::path::Path, to_stderr: bool) {
+    use std::io::Write as _;
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
     // Wait for file to exist
     loop {
@@ -239,14 +271,32 @@ pub(crate) async fn tail_file(path: &std::path::Path) {
     };
 
     let mut buf = vec![0u8; 4096];
+    let mut pos: u64 = 0;
     loop {
         match file.read(&mut buf).await {
             Ok(0) => {
+                // Detect truncation/rotation: if our read offset is past the
+                // file's current end, the shim bounded the raw console under us
+                // (see core::log::console_truncate_if_over). Re-read from the
+                // start so we keep streaming instead of freezing forever at a
+                // stale offset.
+                if let Ok(meta) = file.metadata().await {
+                    if pos > meta.len() {
+                        pos = file.seek(std::io::SeekFrom::Start(0)).await.unwrap_or(0);
+                    }
+                }
                 tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
             }
             Ok(n) => {
+                pos += n as u64;
                 let text = String::from_utf8_lossy(&buf[..n]);
-                print!("{text}");
+                if to_stderr {
+                    let mut err = std::io::stderr();
+                    let _ = err.write_all(text.as_bytes());
+                    let _ = err.flush();
+                } else {
+                    print!("{text}");
+                }
             }
             Err(_) => break,
         }
@@ -262,7 +312,6 @@ pub async fn dispatch(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Stop(args) => stop::execute(args).await,
         Command::Restart(args) => restart::execute(args).await,
         Command::Rm(args) => rm::execute(args).await,
-        Command::Container(args) => container::execute(args).await,
         Command::Kill(args) => kill::execute(args).await,
         Command::Pause(args) => pause::execute(args).await,
         Command::Unpause(args) => unpause::execute(args).await,
@@ -290,7 +339,6 @@ pub async fn dispatch(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Snapshot(args) => snapshot::execute(args).await,
         Command::Build(args) => build::execute(args).await,
         Command::Images(args) => images::execute(args).await,
-        Command::Image(args) => image::execute(args).await,
         Command::Pull(args) => pull::execute(args).await,
         Command::Push(args) => push::execute(args).await,
         Command::Login(args) => login::execute(args).await,
@@ -302,327 +350,17 @@ pub async fn dispatch(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Tag(args) => image_tag::execute(args).await,
         Command::Save(args) => save::execute(args).await,
         Command::Load(args) => load::execute(args).await,
+        Command::Import(args) => import::execute(args).await,
         Command::Cp(args) => cp::execute(args).await,
         Command::Network(args) => network::execute(args).await,
         Command::Volume(args) => volume::execute(args).await,
         Command::Df(args) => df::execute(args).await,
-        Command::System(args) => system::execute(args).await,
+        Command::Prune(args) => prune::execute(args).await,
         Command::SystemPrune(args) => system_prune::execute(args).await,
         Command::Version(args) => version::execute(args).await,
         Command::Info(args) => info::execute(args).await,
         Command::Monitor(args) => monitor::execute(args).await,
         Command::Pool(args) => pool::execute(args).await,
         Command::Shell(args) => shell::execute(args).await,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_image_ls_namespace() {
-        let cli = Cli::try_parse_from(["a3s-box", "image", "ls", "-q"]).unwrap();
-
-        let Command::Image(args) = cli.command else {
-            panic!("expected image command");
-        };
-        let image::ImageCommand::Ls(args) = args.command else {
-            panic!("expected image ls command");
-        };
-
-        assert!(args.quiet);
-    }
-
-    #[test]
-    fn test_parse_images_docker_compat_flags() {
-        let cli =
-            Cli::try_parse_from(["a3s-box", "images", "--all", "--digests", "--no-trunc"]).unwrap();
-
-        let Command::Images(args) = cli.command else {
-            panic!("expected images command");
-        };
-
-        assert!(args.all);
-        assert!(args.digests);
-        assert!(args.no_trunc);
-    }
-
-    #[test]
-    fn test_parse_image_ls_docker_compat_flags() {
-        let cli =
-            Cli::try_parse_from(["a3s-box", "image", "ls", "--all", "--digests", "--no-trunc"])
-                .unwrap();
-
-        let Command::Image(args) = cli.command else {
-            panic!("expected image command");
-        };
-        let image::ImageCommand::Ls(args) = args.command else {
-            panic!("expected image ls command");
-        };
-
-        assert!(args.all);
-        assert!(args.digests);
-        assert!(args.no_trunc);
-    }
-
-    #[test]
-    fn test_parse_image_list_alias() {
-        let cli = Cli::try_parse_from(["a3s-box", "image", "list"]).unwrap();
-
-        let Command::Image(args) = cli.command else {
-            panic!("expected image command");
-        };
-        assert!(matches!(args.command, image::ImageCommand::Ls(_)));
-    }
-
-    #[test]
-    fn test_parse_image_remove_alias() {
-        let cli = Cli::try_parse_from(["a3s-box", "image", "remove", "nginx"]).unwrap();
-
-        let Command::Image(args) = cli.command else {
-            panic!("expected image command");
-        };
-        let image::ImageCommand::Rm(args) = args.command else {
-            panic!("expected image rm command");
-        };
-
-        assert_eq!(args.images, vec!["nginx"]);
-    }
-
-    #[test]
-    fn test_parse_image_inspect_namespace() {
-        let cli = Cli::try_parse_from(["a3s-box", "image", "inspect", "nginx"]).unwrap();
-
-        let Command::Image(args) = cli.command else {
-            panic!("expected image command");
-        };
-        let image::ImageCommand::Inspect(args) = args.command else {
-            panic!("expected image inspect command");
-        };
-
-        assert_eq!(args.image, "nginx");
-    }
-
-    #[test]
-    fn test_parse_container_ls_namespace() {
-        let cli = Cli::try_parse_from(["a3s-box", "container", "ls", "-a", "-q"]).unwrap();
-
-        let Command::Container(args) = cli.command else {
-            panic!("expected container command");
-        };
-        let container::ContainerCommand::Ls(args) = args.command else {
-            panic!("expected container ls command");
-        };
-
-        assert!(args.all);
-        assert!(args.quiet);
-    }
-
-    #[test]
-    fn test_parse_ps_docker_compat_flags() {
-        let cli = Cli::try_parse_from(["a3s-box", "ps", "--no-trunc", "--latest"]).unwrap();
-
-        let Command::Ps(args) = cli.command else {
-            panic!("expected ps command");
-        };
-
-        assert!(args.no_trunc);
-        assert!(args.latest);
-    }
-
-    #[test]
-    fn test_parse_ps_last_flag() {
-        let cli = Cli::try_parse_from(["a3s-box", "ps", "-n", "2"]).unwrap();
-
-        let Command::Ps(args) = cli.command else {
-            panic!("expected ps command");
-        };
-
-        assert_eq!(args.last, Some(2));
-    }
-
-    #[test]
-    fn test_parse_container_ls_docker_compat_flags() {
-        let cli = Cli::try_parse_from(["a3s-box", "container", "ls", "--no-trunc", "--last", "3"])
-            .unwrap();
-
-        let Command::Container(args) = cli.command else {
-            panic!("expected container command");
-        };
-        let container::ContainerCommand::Ls(args) = args.command else {
-            panic!("expected container ls command");
-        };
-
-        assert!(args.no_trunc);
-        assert_eq!(args.last, Some(3));
-    }
-
-    #[test]
-    fn test_parse_logs_tail_all() {
-        let cli = Cli::try_parse_from(["a3s-box", "logs", "--tail", "all", "web"]).unwrap();
-
-        let Command::Logs(args) = cli.command else {
-            panic!("expected logs command");
-        };
-
-        assert_eq!(args.r#box, "web");
-        assert_eq!(args.tail.as_deref(), Some("all"));
-    }
-
-    #[test]
-    fn test_parse_login_skip_verify() {
-        let cli = Cli::try_parse_from([
-            "a3s-box",
-            "login",
-            "registry.example.com",
-            "--username",
-            "alice",
-            "--password-stdin",
-            "--skip-verify",
-        ])
-        .unwrap();
-
-        let Command::Login(args) = cli.command else {
-            panic!("expected login command");
-        };
-
-        assert_eq!(args.server.as_deref(), Some("registry.example.com"));
-        assert_eq!(args.username.as_deref(), Some("alice"));
-        assert!(args.password_stdin);
-        assert!(args.skip_verify);
-    }
-
-    #[test]
-    fn test_parse_container_logs_tail_all() {
-        let cli =
-            Cli::try_parse_from(["a3s-box", "container", "logs", "--tail", "all", "web"]).unwrap();
-
-        let Command::Container(args) = cli.command else {
-            panic!("expected container command");
-        };
-        let container::ContainerCommand::Logs(args) = args.command else {
-            panic!("expected container logs command");
-        };
-
-        assert_eq!(args.r#box, "web");
-        assert_eq!(args.tail.as_deref(), Some("all"));
-    }
-
-    #[test]
-    fn test_parse_container_list_alias() {
-        let cli = Cli::try_parse_from(["a3s-box", "container", "list"]).unwrap();
-
-        let Command::Container(args) = cli.command else {
-            panic!("expected container command");
-        };
-        assert!(matches!(args.command, container::ContainerCommand::Ls(_)));
-    }
-
-    #[test]
-    fn test_parse_container_ps_alias() {
-        let cli = Cli::try_parse_from(["a3s-box", "container", "ps"]).unwrap();
-
-        let Command::Container(args) = cli.command else {
-            panic!("expected container command");
-        };
-        assert!(matches!(args.command, container::ContainerCommand::Ls(_)));
-    }
-
-    #[test]
-    fn test_parse_container_remove_alias() {
-        let cli = Cli::try_parse_from(["a3s-box", "container", "remove", "-f", "web"]).unwrap();
-
-        let Command::Container(args) = cli.command else {
-            panic!("expected container command");
-        };
-        let container::ContainerCommand::Rm(args) = args.command else {
-            panic!("expected container rm command");
-        };
-
-        assert!(args.force);
-        assert_eq!(args.boxes, vec!["web"]);
-    }
-
-    #[test]
-    fn test_parse_container_inspect_namespace() {
-        let cli = Cli::try_parse_from(["a3s-box", "container", "inspect", "web"]).unwrap();
-
-        let Command::Container(args) = cli.command else {
-            panic!("expected container command");
-        };
-        let container::ContainerCommand::Inspect(args) = args.command else {
-            panic!("expected container inspect command");
-        };
-
-        assert_eq!(args.r#box, "web");
-    }
-
-    #[test]
-    fn test_parse_container_prune_namespace() {
-        let cli = Cli::try_parse_from(["a3s-box", "container", "prune", "-f"]).unwrap();
-
-        let Command::Container(args) = cli.command else {
-            panic!("expected container command");
-        };
-        let container::ContainerCommand::Prune(args) = args.command else {
-            panic!("expected container prune command");
-        };
-
-        assert!(args.force);
-    }
-
-    #[test]
-    fn test_parse_system_df_namespace() {
-        let cli = Cli::try_parse_from(["a3s-box", "system", "df", "-v"]).unwrap();
-
-        let Command::System(args) = cli.command else {
-            panic!("expected system command");
-        };
-        let system::SystemCommand::Df(args) = args.command else {
-            panic!("expected system df command");
-        };
-
-        assert!(args.verbose);
-    }
-
-    #[test]
-    fn test_parse_system_prune_namespace() {
-        let cli = Cli::try_parse_from(["a3s-box", "system", "prune", "-a", "-f"]).unwrap();
-
-        let Command::System(args) = cli.command else {
-            panic!("expected system command");
-        };
-        let system::SystemCommand::Prune(args) = args.command else {
-            panic!("expected system prune command");
-        };
-
-        assert!(args.all);
-        assert!(args.force);
-    }
-
-    #[test]
-    fn test_parse_system_info_namespace() {
-        let cli = Cli::try_parse_from(["a3s-box", "system", "info"]).unwrap();
-
-        let Command::System(args) = cli.command else {
-            panic!("expected system command");
-        };
-        assert!(matches!(args.command, system::SystemCommand::Info(_)));
-    }
-
-    #[test]
-    fn test_parse_system_events_namespace() {
-        let cli = Cli::try_parse_from(["a3s-box", "system", "events", "--filter", "event=start"])
-            .unwrap();
-
-        let Command::System(args) = cli.command else {
-            panic!("expected system command");
-        };
-        let system::SystemCommand::Events(args) = args.command else {
-            panic!("expected system events command");
-        };
-
-        assert_eq!(args.filter, vec!["event=start"]);
     }
 }

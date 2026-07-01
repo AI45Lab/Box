@@ -14,11 +14,11 @@ pub struct StartArgs {
 }
 
 pub async fn execute(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let mut state = StateFile::load_default()?;
+    let state = StateFile::load_default()?;
     let mut errors: Vec<String> = Vec::new();
 
     for query in &args.boxes {
-        if let Err(e) = start_one(&mut state, query).await {
+        if let Err(e) = start_one(&state, query).await {
             errors.push(format!("{query}: {e}"));
         }
     }
@@ -30,7 +30,7 @@ pub async fn execute(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> 
     }
 }
 
-async fn start_one(state: &mut StateFile, query: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn start_one(state: &StateFile, query: &str) -> Result<(), Box<dyn std::error::Error>> {
     let record = resolve::resolve(state, query)?;
 
     match record.status.as_str() {
@@ -45,22 +45,15 @@ async fn start_one(state: &mut StateFile, query: &str) -> Result<(), Box<dyn std
     println!("Starting box {name}...");
     let result = boot::boot_from_record(record).await?;
 
-    // Update record
-    let record = resolve::resolve_mut(state, &box_id)?;
-    record.status = "running".to_string();
-    record.pid = result.pid;
-    if let Some(exec_socket_path) = result.exec_socket_path {
-        record.exec_socket_path = exec_socket_path;
-    }
-    record.started_at = Some(chrono::Utc::now());
-    record.stopped_by_user = false;
-    record.restart_count = 0;
-    state.save()?;
-
-    // Notify monitor about the started container
-    if let Some(pid) = result.pid {
-        crate::monitor_global::notify_container_started(box_id.clone(), pid).await;
-    }
+    // Persist the boot result atomically (load-fresh + mutate + save under the
+    // state lock) so it cannot clobber a concurrent writer with our pre-boot
+    // snapshot.
+    StateFile::modify(move |s| {
+        if let Some(record) = s.find_by_id_mut(&box_id) {
+            boot::apply_boot_result(record, result, boot::RestartCountUpdate::Reset);
+        }
+        Ok::<(), std::io::Error>(())
+    })?;
 
     println!("{name}");
     Ok(())

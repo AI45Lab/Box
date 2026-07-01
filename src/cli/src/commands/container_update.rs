@@ -102,12 +102,9 @@ pub async fn execute(args: ContainerUpdateArgs) -> Result<(), Box<dyn std::error
     }
 
     if let Some(ref swap) = args.memory_swap {
-        let val = if swap == "-1" {
-            -1i64
-        } else {
-            common::parse_memory_bytes(swap).map_err(|e| format!("Invalid --memory-swap: {e}"))?
-                as i64
-        };
+        // Same fail-closed parse as the run/create path so `update --memory-swap`
+        // can't silently grant unlimited swap on an overflowing value.
+        let val = common::parse_memory_swap(swap)?;
         update.limits.memory_swap = Some(val);
         record.resource_limits.memory_swap = Some(val);
         updated.push(format!("memory-swap={swap}"));
@@ -156,6 +153,18 @@ pub async fn execute(args: ContainerUpdateArgs) -> Result<(), Box<dyn std::error
         return Ok(());
     }
 
+    // Snapshot this box's owned fields BEFORE the (awaiting) live-apply below.
+    // The final persist re-applies them via StateFile::modify (load-fresh under
+    // the lock) instead of saving the full records vector loaded above — which,
+    // across the exec awaits, would clobber a concurrent writer (e.g. the
+    // monitor updating another box, or this box's status/pid/restart_count).
+    let box_id = record.id.clone();
+    let new_cpus = record.cpus;
+    let new_memory_mb = record.memory_mb;
+    let new_limits = record.resource_limits.clone();
+    let new_restart_policy = record.restart_policy.clone();
+    let new_max_restart = record.max_restart_count;
+
     // If the box is running, validate and apply live changes
     if is_running {
         // Tier 1 changes on a running box → clear error
@@ -168,16 +177,17 @@ pub async fn execute(args: ContainerUpdateArgs) -> Result<(), Box<dyn std::error
         if update.has_tier2_changes() {
             #[cfg(not(windows))]
             {
-                let exec_socket_path = if !record.exec_socket_path.as_os_str().is_empty() {
-                    record.exec_socket_path.clone()
-                } else {
-                    record.box_dir.join("sockets").join("exec.sock")
-                };
+                let exec_socket_path = crate::socket_paths::runtime_socket(
+                    record,
+                    crate::socket_paths::RuntimeSocket::Exec,
+                );
 
                 if !exec_socket_path.exists() {
                     eprintln!(
-                        "Warning: exec socket not found at {}, changes saved but not applied live",
-                        exec_socket_path.display()
+                        "Warning: exec socket missing for running box {} at {}; changes saved but not applied live. Run `a3s-box ps` to reconcile state, then `a3s-box restart {}` if the control channel remains missing.",
+                        record.name,
+                        exec_socket_path.display(),
+                        record.name
                     );
                 } else {
                     let client = ExecClient::connect(&exec_socket_path).await?;
@@ -189,7 +199,9 @@ pub async fn execute(args: ContainerUpdateArgs) -> Result<(), Box<dyn std::error
                             timeout_ns: 5_000_000_000,
                             env: vec![],
                             working_dir: None,
+                            rootfs: None,
                             stdin: None,
+                            stdin_streaming: false,
                             user: None,
                             streaming: false,
                         };
@@ -214,8 +226,18 @@ pub async fn execute(args: ContainerUpdateArgs) -> Result<(), Box<dyn std::error
         }
     }
 
-    // Always persist to state file (applies on next restart for Tier 1)
-    state.save()?;
+    // Persist this box's updated fields atomically (load-fresh under the lock),
+    // touching only the fields `update` owns so a concurrent writer is not lost.
+    StateFile::modify(|s| {
+        if let Some(rec) = s.find_by_id_mut(&box_id) {
+            rec.cpus = new_cpus;
+            rec.memory_mb = new_memory_mb;
+            rec.resource_limits = new_limits;
+            rec.restart_policy = new_restart_policy;
+            rec.max_restart_count = new_max_restart;
+        }
+        Ok::<(), std::io::Error>(())
+    })?;
     println!("{name}");
 
     Ok(())

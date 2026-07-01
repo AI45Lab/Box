@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use a3s_box_core::error::{BoxError, Result};
@@ -14,7 +15,8 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use super::reference::ImageReference;
+/// Per-process counter for unique staging-dir names in `put`.
+static PUT_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Persistent index stored as JSON on disk.
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -45,6 +47,15 @@ impl ImageStore {
                 e
             ))
         })?;
+
+        // Sweep leftover pull staging directories from prior crashed/aborted
+        // pulls so they don't linger under store_dir/tmp forever.
+        let tmp_dir = store_dir.join("tmp");
+        if tmp_dir.is_dir() {
+            if let Err(e) = std::fs::remove_dir_all(&tmp_dir) {
+                tracing::debug!(path = %tmp_dir.display(), error = %e, "Failed to sweep image store tmp dir");
+            }
+        }
 
         let mut store = Self {
             store_dir: store_dir.to_path_buf(),
@@ -90,32 +101,22 @@ impl ImageStore {
         }
     }
 
-    /// Find an image using Docker-compatible reference matching.
+    /// Resolve an image reference to a stored image.
     ///
-    /// This accepts exact stored references, Docker short names (e.g. `nginx`),
-    /// fully-qualified names (`docker.io/library/nginx:latest`), digest-only
-    /// references, and repo-digest references.
-    pub async fn find(&self, reference: &str) -> Option<StoredImage> {
-        let mut index = self.index.write().await;
-        let key = index
-            .iter()
-            .filter_map(|(key, image)| {
-                image_reference_match_score(reference, image).map(|score| (key.clone(), score))
-            })
-            .max_by_key(|(_, score)| *score)
-            .map(|(key, _)| key);
-
-        if let Some(key) = key {
-            let image = index.get_mut(&key)?;
-            image.last_used = Utc::now();
-            let updated = image.clone();
-            drop(index);
-            if let Err(e) = self.save_index_inner().await {
-                tracing::warn!(error = %e, "Failed to persist image store index (last_used may be stale)");
-            }
-            Some(updated)
-        } else {
-            None
+    /// CRI callers may address an image by an exact stored reference, by its
+    /// image id (a bare `sha256:...` or a `name@sha256:...` digest pin), or by
+    /// an unnormalized name (e.g. a tagless name that defaults to `:latest`).
+    pub async fn resolve(&self, image: &str) -> Option<StoredImage> {
+        if let Some(found) = self.get(image).await {
+            return Some(found);
+        }
+        let digest_part = image.rsplit_once('@').map_or(image, |(_, digest)| digest);
+        if let Some(found) = self.get_by_digest(digest_part).await {
+            return Some(found);
+        }
+        match super::ImageReference::parse(image) {
+            Ok(parsed) => self.get(&parsed.full_reference()).await,
+            Err(_) => None,
         }
     }
 
@@ -133,11 +134,36 @@ impl ImageStore {
         let digest_hex = digest.strip_prefix("sha256:").unwrap_or(digest);
         let target_dir = self.store_dir.join("sha256").join(digest_hex);
 
-        // Copy source to target if not already present
+        // Copy source to target if not already present. Stage into a unique temp
+        // dir then atomically rename into place, so a concurrent put() for the
+        // same digest — or a copy that fails partway — can never leave a
+        // half-populated content-addressed dir that a later caller mistakes for a
+        // complete image (the bare check-then-copy raced on both counts).
         if !target_dir.exists() {
-            copy_dir_recursive(source_dir, &target_dir).map_err(|e| {
+            let seq = PUT_SEQ.fetch_add(1, Ordering::Relaxed);
+            let staging = self.store_dir.join("sha256").join(format!(
+                ".staging-{}-{}-{}",
+                digest_hex,
+                std::process::id(),
+                seq
+            ));
+            let _ = std::fs::remove_dir_all(&staging);
+            copy_dir_recursive(source_dir, &staging).map_err(|e| {
+                let _ = std::fs::remove_dir_all(&staging);
                 BoxError::OciImageError(format!("Failed to copy image to store: {}", e))
             })?;
+            if let Err(e) = std::fs::rename(&staging, &target_dir) {
+                let _ = std::fs::remove_dir_all(&staging);
+                // A concurrent put() may have populated target_dir first (rename
+                // onto a non-empty dir fails); that's fine — only propagate if the
+                // image still isn't there.
+                if !target_dir.exists() {
+                    return Err(BoxError::OciImageError(format!(
+                        "Failed to publish image to store: {}",
+                        e
+                    )));
+                }
+            }
         }
 
         let size_bytes = dir_size(&target_dir);
@@ -152,52 +178,82 @@ impl ImageStore {
             path: target_dir,
         };
 
-        let mut index = self.index.write().await;
-        index.insert(reference.to_string(), stored.clone());
-        drop(index);
-
-        self.save_index_inner().await?;
-
-        Ok(stored)
-    }
-
-    /// Remove an image by reference.
-    pub async fn remove(&self, reference: &str) -> Result<()> {
-        let mut index = self.index.write().await;
-        if let Some(image) = index.remove(reference) {
-            // Check if any other reference points to the same digest
-            let digest_still_used = index.values().any(|img| img.digest == image.digest);
-            drop(index);
-
-            if !digest_still_used && image.path.exists() {
-                std::fs::remove_dir_all(&image.path).map_err(|e| {
-                    BoxError::OciImageError(format!(
-                        "Failed to remove image directory {}: {}",
-                        image.path.display(),
-                        e
-                    ))
-                })?;
+        self.with_index_lock(|index| {
+            // Docker parity: if this reference already points at a DIFFERENT
+            // digest and that old digest is about to lose its last reference,
+            // keep the displaced image as a dangling entry (keyed by its digest)
+            // instead of dropping it. This makes a rebuilt/re-tagged image show
+            // up as `<none>` in `images`, be removable by `image prune`, and
+            // prevents silently orphaning its on-disk layout.
+            if let Some(old) = index.get(reference).cloned() {
+                if old.digest != digest {
+                    let still_referenced = index
+                        .iter()
+                        .any(|(key, img)| key.as_str() != reference && img.digest == old.digest);
+                    if !still_referenced && !index.contains_key(&old.digest) {
+                        let mut dangling = old.clone();
+                        dangling.reference = old.digest.clone();
+                        index.insert(old.digest.clone(), dangling);
+                    }
+                }
             }
 
-            self.save_index_inner().await?;
+            index.insert(reference.to_string(), stored.clone());
             Ok(())
-        } else {
-            drop(index);
-            Err(BoxError::OciImageError(format!(
-                "Image not found: {}",
-                reference
-            )))
-        }
+        })
+        .await?;
+
+        Ok(stored)
     }
 
-    /// Remove an image using Docker-compatible reference matching.
-    pub async fn remove_resolved(&self, reference: &str) -> Result<StoredImage> {
-        let stored = self
-            .find(reference)
-            .await
-            .ok_or_else(|| BoxError::OciImageError(format!("Image not found: {}", reference)))?;
-        self.remove(&stored.reference).await?;
-        Ok(stored)
+    /// Remove an image by reference or by image ID (digest).
+    ///
+    /// The CRI `RemoveImage` may identify an image either by a repo
+    /// reference/tag or by its image ID (`sha256:<digest>`, as returned in
+    /// `ImageStatus`). When `image` does not match a stored reference key,
+    /// fall back to removing every reference that points at the matching
+    /// digest.
+    pub async fn remove(&self, image: &str) -> Result<()> {
+        self.with_index_lock(|index| {
+            // Resolve the reference keys to remove: the exact reference if it is
+            // a known key, otherwise every key sharing the requested digest.
+            let keys: Vec<String> = if index.contains_key(image) {
+                vec![image.to_string()]
+            } else {
+                index
+                    .values()
+                    .filter(|img| img.digest == image)
+                    .map(|img| img.reference.clone())
+                    .collect()
+            };
+
+            if keys.is_empty() {
+                return Err(BoxError::OciImageError(format!(
+                    "Image not found: {}",
+                    image
+                )));
+            }
+
+            let removed: Vec<StoredImage> = keys.iter().filter_map(|k| index.remove(k)).collect();
+
+            // Delete each image's on-disk layout once no remaining reference
+            // points at the same digest. References sharing a digest share the
+            // same directory, so the `path.exists()` guard makes this idempotent.
+            for img in removed {
+                let digest_still_used = index.values().any(|other| other.digest == img.digest);
+                if !digest_still_used && img.path.exists() {
+                    std::fs::remove_dir_all(&img.path).map_err(|e| {
+                        BoxError::OciImageError(format!(
+                            "Failed to remove image directory {}: {}",
+                            img.path.display(),
+                            e
+                        ))
+                    })?;
+                }
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// List all stored images.
@@ -244,9 +300,17 @@ impl ImageStore {
 
     /// Load index from disk.
     fn load_index(&mut self) -> Result<()> {
+        // Construction-time load; reuse the shared disk reader.
+        self.index = Arc::new(RwLock::new(self.read_index_from_disk()?));
+        Ok(())
+    }
+
+    /// Read and parse `index.json` from disk into a fresh map (entries whose
+    /// content dir vanished are dropped). Does NOT touch `self.index`.
+    fn read_index_from_disk(&self) -> Result<HashMap<String, StoredImage>> {
         let index_path = self.store_dir.join("index.json");
         if !index_path.exists() {
-            return Ok(());
+            return Ok(HashMap::new());
         }
 
         let data = std::fs::read_to_string(&index_path).map_err(|e| {
@@ -257,21 +321,97 @@ impl ImageStore {
             ))
         })?;
 
-        let store_index: StoreIndex = serde_json::from_str(&data).map_err(|e| {
-            BoxError::OciImageError(format!("Failed to parse image store index: {}", e))
-        })?;
-
-        let mut index = HashMap::new();
-        for image in store_index.images {
-            // Only include images whose directories still exist
-            if image.path.exists() {
-                index.insert(image.reference.clone(), image);
-            }
+        // Parse resiliently so a corrupt/old-schema index never bricks the whole
+        // catalog or blocks CRI/CLI startup. First read the `{ images: [...] }`
+        // envelope leniently (entries as raw values); if even that fails the file
+        // is unusable, so quarantine it and start from an empty catalog that
+        // re-pulls repopulate. Then deserialize each entry independently, skipping
+        // (not failing on) any one corrupt/incompatible record.
+        #[derive(serde::Deserialize)]
+        struct RawIndex {
+            #[serde(default)]
+            images: Vec<serde_json::Value>,
         }
 
-        // We need to set the inner value directly since we're in a sync context during construction
-        self.index = Arc::new(RwLock::new(index));
-        Ok(())
+        let raw: RawIndex = match serde_json::from_str(&data) {
+            Ok(raw) => raw,
+            Err(err) => {
+                let preserved = crate::store_io::quarantine_label(&index_path);
+                tracing::warn!(
+                    "image store index {} is corrupt ({err}); preserved a copy at \
+                     {preserved} and started from an empty catalog (re-pulled images \
+                     will repopulate it)",
+                    index_path.display(),
+                );
+                return Ok(HashMap::new());
+            }
+        };
+
+        let mut index = HashMap::new();
+        let mut skipped = 0usize;
+        for value in raw.images {
+            match serde_json::from_value::<StoredImage>(value) {
+                Ok(image) => {
+                    if image.path.exists() {
+                        index.insert(image.reference.clone(), image);
+                    }
+                }
+                Err(err) => {
+                    skipped += 1;
+                    tracing::warn!("skipping unreadable image index entry ({err})");
+                }
+            }
+        }
+        if skipped > 0 {
+            // Preserve the original (with the un-deserializable entries) before the
+            // next save rewrites index.json with only the survivors — otherwise the
+            // skipped records are erased with no backup, unlike the whole-file path.
+            let preserved = crate::store_io::quarantine_copy(&index_path)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<backup failed>".to_string());
+            tracing::warn!(
+                "{skipped} image index entr{} skipped as unreadable; preserved a copy at \
+                 {preserved}; affected images will be re-pulled on demand",
+                if skipped == 1 { "y" } else { "ies" },
+            );
+        }
+        Ok(index)
+    }
+
+    /// Apply `f` to the image index under the **cross-process write lock**:
+    /// reload `index.json` from disk (so this process observes other processes'
+    /// pulls/removes), let `f` mutate the map, then save. Without this, two
+    /// processes pulling concurrently each load their own snapshot and the
+    /// second `save` drops the first's entry (and leaks its content dir).
+    ///
+    /// The blocking `flock` is acquired off the runtime via `spawn_blocking`;
+    /// `save_index_inner` is lock-free, so there is no re-entrant `flock`.
+    async fn with_index_lock<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut HashMap<String, StoredImage>) -> Result<R>,
+    {
+        let index_path = self.store_dir.join("index.json");
+        let _lock = {
+            let p = index_path.clone();
+            tokio::task::spawn_blocking(move || crate::file_lock::FileLock::acquire(&p))
+                .await
+                .map_err(|e| BoxError::OciImageError(format!("index lock task failed: {e}")))?
+                .map_err(|e| {
+                    BoxError::OciImageError(format!(
+                        "failed to lock image index {}: {e}",
+                        index_path.display()
+                    ))
+                })?
+        };
+        // Sync the in-memory index with disk (pick up other processes' writes).
+        let fresh = self.read_index_from_disk()?;
+        let result = {
+            let mut idx = self.index.write().await;
+            *idx = fresh;
+            f(&mut idx)?
+        };
+        self.save_index_inner().await?;
+        Ok(result)
     }
 
     /// Save index to disk (async inner helper).
@@ -284,14 +424,27 @@ impl ImageStore {
 
         let data = serde_json::to_string_pretty(&store_index)?;
         let index_path = self.store_dir.join("index.json");
-
-        tokio::fs::write(&index_path, data).await.map_err(|e| {
+        // Write atomically (tmp + rename) so a concurrent reader (e.g. another
+        // process running `create`/`run`) never observes a truncated/empty
+        // index.json mid-write — which previously surfaced as
+        // "Failed to parse image store index: EOF".
+        let tmp_path = self.store_dir.join("index.json.tmp");
+        tokio::fs::write(&tmp_path, data).await.map_err(|e| {
             BoxError::OciImageError(format!(
                 "Failed to write image store index {}: {}",
-                index_path.display(),
+                tmp_path.display(),
                 e
             ))
         })?;
+        tokio::fs::rename(&tmp_path, &index_path)
+            .await
+            .map_err(|e| {
+                BoxError::OciImageError(format!(
+                    "Failed to commit image store index {}: {}",
+                    index_path.display(),
+                    e
+                ))
+            })?;
 
         Ok(())
     }
@@ -300,50 +453,6 @@ impl ImageStore {
     pub fn store_dir(&self) -> &Path {
         &self.store_dir
     }
-}
-
-fn image_reference_match_score(query: &str, image: &StoredImage) -> Option<u8> {
-    let query = query.trim();
-    if query.is_empty() {
-        return None;
-    }
-
-    if query == image.reference {
-        return Some(100);
-    }
-    if query == image.digest {
-        return Some(80);
-    }
-
-    let query_ref = ImageReference::parse(query).ok()?;
-    if query_ref.full_reference() == image.reference {
-        return Some(100);
-    }
-
-    let image_ref = ImageReference::parse(&image.reference).ok();
-    if let Some(query_digest) = query_ref.digest.as_deref() {
-        if image.digest != query_digest {
-            return None;
-        }
-
-        if let Some(image_ref) = image_ref {
-            if image_ref.registry == query_ref.registry
-                && image_ref.repository == query_ref.repository
-            {
-                if query_ref.tag.is_none() || query_ref.tag == image_ref.tag {
-                    return Some(95);
-                }
-            }
-        }
-
-        return None;
-    }
-
-    let image_ref = image_ref?;
-    (image_ref.registry == query_ref.registry
-        && image_ref.repository == query_ref.repository
-        && image_ref.tag == query_ref.tag)
-        .then_some(90)
 }
 
 #[async_trait::async_trait]
@@ -467,66 +576,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_find_matches_docker_short_and_full_references() {
-        let tmp = TempDir::new().unwrap();
-        let store_dir = tmp.path().join("store");
-        let source_dir = tmp.path().join("source");
-        create_test_oci_layout(&source_dir);
-
-        let store = ImageStore::new(&store_dir, 10 * 1024 * 1024).unwrap();
-        store
-            .put(
-                "docker.io/library/nginx:latest",
-                "sha256:abc123",
-                &source_dir,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(store.find("nginx").await.unwrap().digest, "sha256:abc123");
-        assert_eq!(
-            store.find("nginx:latest").await.unwrap().reference,
-            "docker.io/library/nginx:latest"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_find_repo_digest_prefers_matching_reference() {
-        let tmp = TempDir::new().unwrap();
-        let store_dir = tmp.path().join("store");
-        let source_dir = tmp.path().join("source");
-        create_test_oci_layout(&source_dir);
-
-        let store = ImageStore::new(&store_dir, 10 * 1024 * 1024).unwrap();
-        store
-            .put(
-                "docker.io/library/nginx:latest",
-                "sha256:abc123",
-                &source_dir,
-            )
-            .await
-            .unwrap();
-        store
-            .put(
-                "docker.io/library/alpine:3.18",
-                "sha256:abc123",
-                &source_dir,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(
-            store
-                .find("alpine:3.18@sha256:abc123")
-                .await
-                .unwrap()
-                .reference,
-            "docker.io/library/alpine:3.18"
-        );
-        assert!(store.find("redis:7@sha256:abc123").await.is_none());
-    }
-
-    #[tokio::test]
     async fn test_remove() {
         let tmp = TempDir::new().unwrap();
         let store_dir = tmp.path().join("store");
@@ -544,14 +593,104 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_remove_nonexistent() {
+    async fn test_retag_keeps_displaced_image_as_dangling() {
+        // Docker parity: re-pointing a tag at a new digest leaves the old image
+        // as a dangling entry (keyed by its digest), not silently dropped.
         let tmp = TempDir::new().unwrap();
-        let store = ImageStore::new(tmp.path(), 1024 * 1024).unwrap();
-        assert!(store.remove("nonexistent").await.is_err());
+        let store_dir = tmp.path().join("store");
+        let source_dir = tmp.path().join("source");
+        create_test_oci_layout(&source_dir);
+
+        let store = ImageStore::new(&store_dir, 10 * 1024 * 1024).unwrap();
+        store
+            .put("app:latest", "sha256:old", &source_dir)
+            .await
+            .unwrap();
+        store
+            .put("app:latest", "sha256:new", &source_dir)
+            .await
+            .unwrap();
+
+        // The tag now resolves to the new digest...
+        assert_eq!(store.get("app:latest").await.unwrap().digest, "sha256:new");
+        // ...and the displaced image survives as a digest-keyed dangling entry.
+        let dangling = store.get("sha256:old").await.unwrap();
+        assert_eq!(dangling.digest, "sha256:old");
+        assert_eq!(store.list().await.len(), 2);
     }
 
     #[tokio::test]
-    async fn test_remove_resolved_removes_compatible_reference() {
+    async fn test_reput_same_digest_does_not_create_dangling() {
+        // Re-putting the same reference at the SAME digest (e.g. pulling latest
+        // when content is unchanged) must not spawn a spurious dangling entry.
+        let tmp = TempDir::new().unwrap();
+        let store_dir = tmp.path().join("store");
+        let source_dir = tmp.path().join("source");
+        create_test_oci_layout(&source_dir);
+
+        let store = ImageStore::new(&store_dir, 10 * 1024 * 1024).unwrap();
+        store
+            .put("app:latest", "sha256:same", &source_dir)
+            .await
+            .unwrap();
+        store
+            .put("app:latest", "sha256:same", &source_dir)
+            .await
+            .unwrap();
+
+        assert_eq!(store.list().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_remove_by_digest() {
+        // CRI RemoveImage identifies the image by its ID (sha256 digest),
+        // not its tag. Removing by digest must drop the reference + layout.
+        let tmp = TempDir::new().unwrap();
+        let store_dir = tmp.path().join("store");
+        let source_dir = tmp.path().join("source");
+        create_test_oci_layout(&source_dir);
+
+        let store = ImageStore::new(&store_dir, 10 * 1024 * 1024).unwrap();
+        let stored = store
+            .put("gcr.io/test/img:test", "sha256:deadbeef", &source_dir)
+            .await
+            .unwrap();
+        let path = stored.path.clone();
+
+        store.remove("sha256:deadbeef").await.unwrap();
+        assert!(store.get("gcr.io/test/img:test").await.is_none());
+        assert!(store.get_by_digest("sha256:deadbeef").await.is_none());
+        assert!(!path.exists(), "on-disk layout should be deleted");
+    }
+
+    #[tokio::test]
+    async fn test_remove_by_digest_removes_all_tags() {
+        // Two tags sharing one digest: removing by digest drops both and
+        // deletes the shared layout exactly once.
+        let tmp = TempDir::new().unwrap();
+        let store_dir = tmp.path().join("store");
+        let source_dir = tmp.path().join("source");
+        create_test_oci_layout(&source_dir);
+
+        let store = ImageStore::new(&store_dir, 10 * 1024 * 1024).unwrap();
+        store
+            .put("img:v1", "sha256:shared", &source_dir)
+            .await
+            .unwrap();
+        let stored = store
+            .put("img:latest", "sha256:shared", &source_dir)
+            .await
+            .unwrap();
+        let path = stored.path.clone();
+
+        store.remove("sha256:shared").await.unwrap();
+        assert!(store.get("img:v1").await.is_none());
+        assert!(store.get("img:latest").await.is_none());
+        assert!(!path.exists(), "shared layout should be deleted");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_by_name_digest_and_normalized() {
         let tmp = TempDir::new().unwrap();
         let store_dir = tmp.path().join("store");
         let source_dir = tmp.path().join("source");
@@ -560,16 +699,41 @@ mod tests {
         let store = ImageStore::new(&store_dir, 10 * 1024 * 1024).unwrap();
         store
             .put(
-                "docker.io/library/nginx:latest",
-                "sha256:abc123",
+                "gcr.io/x/test-image-predefined-group:latest",
+                "sha256:grp",
                 &source_dir,
             )
             .await
             .unwrap();
 
-        let removed = store.remove_resolved("nginx").await.unwrap();
-        assert_eq!(removed.reference, "docker.io/library/nginx:latest");
-        assert!(store.find("nginx").await.is_none());
+        // Exact reference.
+        assert!(store
+            .resolve("gcr.io/x/test-image-predefined-group:latest")
+            .await
+            .is_some());
+        // Unnormalized name (no tag -> :latest) — the CreateContainer case.
+        assert_eq!(
+            store
+                .resolve("gcr.io/x/test-image-predefined-group")
+                .await
+                .map(|i| i.digest),
+            Some("sha256:grp".to_string())
+        );
+        // Image id (bare digest) and a name@digest pin.
+        assert!(store.resolve("sha256:grp").await.is_some());
+        assert!(store
+            .resolve("gcr.io/x/test-image-predefined-group@sha256:grp")
+            .await
+            .is_some());
+        // Unknown.
+        assert!(store.resolve("nope:latest").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_remove_nonexistent() {
+        let tmp = TempDir::new().unwrap();
+        let store = ImageStore::new(tmp.path(), 1024 * 1024).unwrap();
+        assert!(store.remove("nonexistent").await.is_err());
     }
 
     #[tokio::test]
@@ -664,5 +828,71 @@ mod tests {
             assert!(image.is_some());
             assert_eq!(image.unwrap().digest, "sha256:persist");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_cross_instance_puts_persist_both() {
+        use std::collections::HashSet;
+        use std::sync::Arc;
+
+        let tmp = TempDir::new().unwrap();
+        let store_dir = tmp.path().join("store");
+        let source_dir = tmp.path().join("source");
+        create_test_oci_layout(&source_dir);
+
+        // Two ImageStore instances on the SAME dir simulate two processes, each
+        // with its own in-memory index. Concurrent puts of distinct images must
+        // BOTH persist — the lost-update bug dropped one. with_index_lock
+        // reloads under the cross-process lock, so neither overwrites the other.
+        let s1 = Arc::new(ImageStore::new(&store_dir, u64::MAX).unwrap());
+        let s2 = Arc::new(ImageStore::new(&store_dir, u64::MAX).unwrap());
+        let (src1, src2) = (source_dir.clone(), source_dir.clone());
+        let h1 = {
+            let s1 = Arc::clone(&s1);
+            tokio::spawn(async move { s1.put("img:a", "sha256:aaaa", &src1).await.unwrap() })
+        };
+        let h2 = {
+            let s2 = Arc::clone(&s2);
+            tokio::spawn(async move { s2.put("img:b", "sha256:bbbb", &src2).await.unwrap() })
+        };
+        h1.await.unwrap();
+        h2.await.unwrap();
+
+        // A fresh instance reads index.json from disk: both must be there.
+        let s3 = ImageStore::new(&store_dir, u64::MAX).unwrap();
+        let refs: HashSet<String> = s3.list().await.into_iter().map(|i| i.reference).collect();
+        assert!(refs.contains("img:a"), "img:a lost: {refs:?}");
+        assert!(refs.contains("img:b"), "img:b lost: {refs:?}");
+    }
+
+    #[tokio::test]
+    async fn corrupt_index_is_quarantined_not_fatal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().join("images");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        std::fs::write(store_dir.join("index.json"), "{ not valid json").unwrap();
+
+        // Construction must SUCCEED (start from an empty catalog) rather than
+        // erroring and blocking CRI/CLI startup on a corrupt/old-schema index.
+        let store = ImageStore::new(&store_dir, u64::MAX)
+            .expect("corrupt index.json must not brick the image store");
+        assert!(
+            store.list().await.is_empty(),
+            "store must start from an empty catalog after quarantine"
+        );
+
+        // The corrupt index is preserved as a timestamped sibling, not lost.
+        let quarantined = std::fs::read_dir(&store_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains("index.json.corrupt-")
+            });
+        assert!(
+            quarantined,
+            "corrupt index.json must be quarantined to a sibling"
+        );
     }
 }

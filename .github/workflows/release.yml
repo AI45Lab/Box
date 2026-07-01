@@ -170,10 +170,10 @@ jobs:
 
   # ── Create GitHub Release ──────────────────────────────────────
 
-  # ── Windows launcher build ─────────────────────────────────────
+  # ── Windows native WHPX build ──────────────────────────────────
   build-windows:
     name: Build Windows (WHPX Backend)
-    needs: test
+    needs: [test, build]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -187,14 +187,16 @@ jobs:
           workspaces: src
           key: release-windows
 
-      - name: Build Windows runtime and launcher
+      - name: Build Windows native binaries
         run: |
           cd src
-          # Build runtime with Windows WHPX backend
-          cargo build --release -p a3s-box-runtime --target x86_64-pc-windows-msvc
-          # Build Windows launcher (not in workspace)
-          cd win-launcher
-          cargo build --release --target x86_64-pc-windows-msvc
+          cargo build --release -p a3s-box-cli -p a3s-box-shim --target x86_64-pc-windows-msvc
+
+      - name: Download Linux guest init artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-x86_64
+          path: linux-x86_64
 
       - name: Package Windows release
         shell: bash
@@ -203,12 +205,19 @@ jobs:
           DIR="a3s-box-${TAG}-windows-x86_64"
           mkdir -p "$DIR/lib"
 
-          # Copy launcher
-          cp src/target/x86_64-pc-windows-msvc/release/a3s-box-win.exe "$DIR/"
+          cp src/target/x86_64-pc-windows-msvc/release/a3s-box.exe "$DIR/"
+          cp src/target/x86_64-pc-windows-msvc/release/a3s-box-shim.exe "$DIR/"
 
-          # Copy krun.dll from prebuilt
-          if [ -f "src/deps/libkrun-sys/prebuilt/x86_64-pc-windows-msvc/krun.dll" ]; then
+          tar -xzf "linux-x86_64/a3s-box-${TAG}-linux-x86_64.tar.gz" -C linux-x86_64
+          cp "linux-x86_64/a3s-box-${TAG}-linux-x86_64/a3s-box-guest-init" "$DIR/"
+
+          if [ -f "src/target/x86_64-pc-windows-msvc/release/krun.dll" ]; then
+            cp src/target/x86_64-pc-windows-msvc/release/krun.dll "$DIR/lib/"
+          elif [ -f "src/deps/libkrun-sys/prebuilt/x86_64-pc-windows-msvc/krun.dll" ]; then
             cp src/deps/libkrun-sys/prebuilt/x86_64-pc-windows-msvc/krun.dll "$DIR/lib/"
+          else
+            echo "krun.dll is required for the native WHPX package" >&2
+            exit 1
           fi
 
           # Copy README and LICENSE
@@ -275,13 +284,38 @@ jobs:
       - name: Publish crates
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        # NOTE: crates.io is NOT the primary distribution channel — the GitHub
+        # Release tarballs + Homebrew + winget are. This step is best-effort but
+        # MUST NOT silently report success on a real failure (it used to:
+        # `cargo publish || echo "Skipped"` masked 403s / version-requirement
+        # errors as "may already be published"). Now an already-published
+        # version is skipped truthfully and a genuine failure is a ::warning::.
         run: |
           cd src
-          for crate in a3s-libkrun-sys a3s-box-core a3s-box-runtime; do
-            echo "Publishing $crate..."
-            cargo publish -p "$crate" --allow-dirty 2>&1 || echo "Skipped $crate (may already be published)"
-            sleep 30
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "Publishing version $VERSION (in dependency order)"
+          FAILED=""
+          # Order matters: a dependent is published AFTER its internal deps so
+          # the index has them. runtime depends on core + netproxy + libkrun-sys;
+          # a3s-box-sdk is dependency-free (a thin CLI wrapper) so its position is free.
+          for crate in a3s-libkrun-sys a3s-box-core a3s-box-netproxy a3s-box-runtime a3s-box-sdk; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "https://crates.io/api/v1/crates/$crate/$VERSION")
+            if [ "$code" = "200" ]; then
+              echo "✓ $crate@$VERSION already on crates.io — skipping"
+              continue
+            fi
+            echo "Publishing $crate@$VERSION..."
+            if cargo publish -p "$crate" --allow-dirty; then
+              echo "✓ published $crate@$VERSION"
+              sleep 30   # let the sparse index update before dependents publish
+            else
+              echo "::warning title=crates.io publish failed::$crate@$VERSION failed (token/auth or version requirement). GitHub Release + Homebrew + winget are unaffected."
+              FAILED="$FAILED $crate"
+            fi
           done
+          if [ -n "$FAILED" ]; then
+            echo "::warning::crates.io publish incomplete for:$FAILED — does NOT block the release; rotate CARGO_REGISTRY_TOKEN / fix version requirements to resolve."
+          fi
 
   # ── Update Homebrew Formula ────────────────────────────────────
   publish-homebrew:

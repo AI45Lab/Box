@@ -40,4 +40,5 @@ base64 = { workspace = true }
 default = []
 
 [dev-dependencies]
+tempfile = { workspace = true }
 serial_test = "3"

@@ -2,119 +2,219 @@
 //!
 //! Maps CRI image operations to A3S Box ImageStore and ImagePuller.
 
-use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
 
-use a3s_box_core::StoredImage;
-use base64::Engine;
+use futures::Stream;
 use tonic::{Request, Response, Status};
 
-use a3s_box_runtime::oci::{ImagePuller, ImageReference, ImageStore, OciImage, RegistryAuth};
+use a3s_box_core::StoredImage;
+use a3s_box_runtime::oci::{ImagePuller, ImageStore, OciImage, RegistryAuth};
 
 use crate::cri_api::image_service_server::ImageService;
 use crate::cri_api::*;
 use crate::error::box_error_to_status;
-use crate::persistent_store::PersistentCriStore;
+
+type CriImageResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
+
+/// Strip a `:tag` suffix from an image reference, leaving the repository name.
+///
+/// A `:` only separates a tag when it appears in the final path segment, so
+/// registry ports such as `host:5000/img` are preserved.
+fn repo_name(reference: &str) -> &str {
+    let segment_start = reference.rfind('/').map_or(0, |i| i + 1);
+    match reference[segment_start..].find(':') {
+        Some(rel) => &reference[..segment_start + rel],
+        None => reference,
+    }
+}
+
+/// Split an OCI config `User` string into a CRI uid / username.
+///
+/// The user may be `uid`, `uid:gid`, `name`, or `name:group`. A numeric
+/// principal yields a uid; a named principal yields a username.
+fn parse_image_user(user: &str) -> (Option<i64>, String) {
+    let principal = user.split(':').next().unwrap_or(user);
+    if principal.is_empty() {
+        return (None, String::new());
+    }
+    match principal.parse::<i64>() {
+        Ok(uid) => (Some(uid), String::new()),
+        Err(_) => (None, principal.to_string()),
+    }
+}
+
+/// Read the configured user of a stored image from its on-disk OCI config.
+///
+/// Returns empty values when the image declares no user or its config can't be
+/// read (the CRI `Image` then reports neither a uid nor a username).
+fn image_user(path: &std::path::Path) -> (Option<i64>, String) {
+    OciImage::from_path(path)
+        .ok()
+        .and_then(|image| image.config().user.clone())
+        .filter(|user| !user.is_empty())
+        .map(|user| parse_image_user(&user))
+        .unwrap_or((None, String::new()))
+}
+
+/// Build a single CRI [`Image`] from one or more stored images that share a
+/// content digest.
+///
+/// CRI identifies an image by its digest (`id`); multiple tags pointing at the
+/// same digest collapse into one image whose `repo_tags` lists every tag. The
+/// group must be non-empty.
+fn coalesced_image(group: &[StoredImage]) -> Image {
+    let first = &group[0];
+    let mut repo_tags: Vec<String> = Vec::new();
+    let mut repo_digests: Vec<String> = Vec::new();
+    for img in group {
+        if img.reference.contains('@') {
+            // A digest-pinned reference (`repo@sha256:...`) is a repo digest,
+            // not a tag — an image pulled by digest has no repo tags.
+            repo_digests.push(img.reference.clone());
+        } else {
+            repo_tags.push(img.reference.clone());
+            repo_digests.push(format!("{}@{}", repo_name(&img.reference), first.digest));
+        }
+    }
+    repo_tags.sort();
+    repo_tags.dedup();
+    repo_digests.sort();
+    repo_digests.dedup();
+    let (uid, username) = image_user(&first.path);
+    Image {
+        id: first.digest.clone(),
+        repo_tags,
+        repo_digests,
+        size: first.size_bytes,
+        uid: uid.map(|value| Int64Value { value }),
+        username,
+        spec: Some(ImageSpec {
+            image: first.reference.clone(),
+            annotations: Default::default(),
+        }),
+        pinned: false,
+    }
+}
+
+/// Group stored images by digest into coalesced CRI images.
+fn coalesce_images(stored: Vec<StoredImage>) -> Vec<Image> {
+    let mut by_digest: std::collections::BTreeMap<String, Vec<StoredImage>> =
+        std::collections::BTreeMap::new();
+    for img in stored {
+        by_digest.entry(img.digest.clone()).or_default().push(img);
+    }
+    by_digest
+        .into_values()
+        .map(|group| coalesced_image(&group))
+        .collect()
+}
+
+/// Whether an image matches a CRI `ImageFilter` image reference (by id, tag,
+/// or digest).
+fn image_matches_filter(image: &Image, filter: &str) -> bool {
+    image.id == filter
+        || image.repo_tags.iter().any(|t| t == filter)
+        || image.repo_digests.iter().any(|d| d == filter)
+}
 
 /// A3S Box implementation of the CRI ImageService.
+/// Convert a CRI per-request `AuthConfig` (kubelet fills it from a pod's
+/// `imagePullSecrets`) into a registry credential. Supports the standard
+/// username/password shape and the Docker-config base64 `auth` ("user:pass")
+/// field. Bearer tokens (`identity_token`/`registry_token`) are not modeled by
+/// `RegistryAuth` yet, so a token-only AuthConfig yields `None` and the caller
+/// falls back to the service-default credential.
+fn auth_config_to_registry_auth(auth: &AuthConfig) -> Option<RegistryAuth> {
+    if !auth.username.is_empty() {
+        return Some(RegistryAuth::basic(
+            auth.username.clone(),
+            auth.password.clone(),
+        ));
+    }
+    if !auth.auth.is_empty() {
+        use base64::Engine;
+        if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(auth.auth.trim()) {
+            if let Ok(pair) = String::from_utf8(decoded) {
+                if let Some((user, pass)) = pair.split_once(':') {
+                    return Some(RegistryAuth::basic(user, pass));
+                }
+            }
+        }
+    }
+    None
+}
+
 pub struct BoxImageService {
     image_store: Arc<ImageStore>,
-    cri_store: Option<Arc<PersistentCriStore>>,
+    image_puller: Arc<ImagePuller>,
 }
 
 impl BoxImageService {
     /// Create a new BoxImageService.
-    pub fn new(image_store: Arc<ImageStore>, _auth: RegistryAuth) -> Self {
+    pub fn new(image_store: Arc<ImageStore>, auth: RegistryAuth) -> Self {
+        let image_puller = Arc::new(ImagePuller::new(image_store.clone(), auth));
         Self {
             image_store,
-            cri_store: None,
+            image_puller,
         }
     }
 
-    /// Attach shared CRI state so image deletion can respect container references.
-    pub fn with_cri_store(mut self, store: Arc<PersistentCriStore>) -> Self {
-        self.cri_store = Some(store);
-        self
+    /// Resolve a CRI image reference to its stored content digest (the image
+    /// id used by ListImages / ImageStatus).
+    ///
+    /// CRI may address an image by its exact stored reference, by its image id
+    /// (digest), or by an unnormalized name (e.g. without a tag, which
+    /// defaults to `:latest`).
+    async fn resolve_digest(&self, image: &str) -> Option<String> {
+        self.image_store.resolve(image).await.map(|img| img.digest)
     }
-
-    async fn find_image(&self, image: &str) -> Option<StoredImage> {
-        self.image_store.find(image).await
-    }
-
-    async fn image_in_use(&self, requested: &str, stored: &StoredImage) -> Option<String> {
-        let store = self.cri_store.as_ref()?;
-        store
-            .containers
-            .list(None, None)
-            .await
-            .into_iter()
-            .find(|container| image_ref_matches(&container.image_ref, requested, stored))
-            .map(|container| container.id)
-    }
-}
-
-fn image_ref_matches(container_ref: &str, requested: &str, stored: &StoredImage) -> bool {
-    let stored_repo_digest = format!("{}@{}", stored.reference, stored.digest);
-    let container_digest = container_ref
-        .split_once('@')
-        .map(|(_, digest)| digest)
-        .or_else(|| {
-            container_ref
-                .starts_with("sha256:")
-                .then_some(container_ref)
-        });
-    let requested_digest = requested
-        .split_once('@')
-        .map(|(_, digest)| digest)
-        .or_else(|| requested.starts_with("sha256:").then_some(requested));
-
-    container_ref == requested
-        || container_ref == stored.reference
-        || container_ref == stored.digest
-        || container_ref == stored_repo_digest
-        || container_digest == Some(stored.digest.as_str())
-        || requested_digest.is_some_and(|digest| container_digest == Some(digest))
 }
 
 #[tonic::async_trait]
 impl ImageService for BoxImageService {
+    type StreamImagesStream = CriImageResponseStream<StreamImagesResponse>;
+
     async fn list_images(
         &self,
         request: Request<ListImagesRequest>,
     ) -> Result<Response<ListImagesResponse>, Status> {
         let req = request.into_inner();
-        let image_filter = req
+        let filter = req
             .filter
-            .as_ref()
-            .and_then(|filter| filter.image.as_ref())
-            .map(|image| image.image.as_str())
+            .and_then(|filter| filter.image)
+            .map(|image| image.image)
             .filter(|image| !image.is_empty());
 
-        let stored_images = self.image_store.list().await;
-
-        let images: Vec<Image> = stored_images
-            .into_iter()
-            .filter(|img| {
-                image_filter
-                    .map(|filter| stored_image_matches(filter, img))
-                    .unwrap_or(true)
-            })
-            .map(|img| Image {
-                id: img.digest.clone(),
-                repo_tags: vec![img.reference.clone()],
-                repo_digests: vec![format!("{}@{}", img.reference, img.digest)],
-                size: img.size_bytes,
-                uid: None,
-                username: String::new(),
-                spec: Some(ImageSpec {
-                    image: img.reference,
-                    annotations: Default::default(),
-                }),
-                pinned: false,
-            })
-            .collect();
+        let mut images = coalesce_images(self.image_store.list().await);
+        if let Some(filter) = filter {
+            images.retain(|image| image_matches_filter(image, &filter));
+        }
 
         Ok(Response::new(ListImagesResponse { images }))
+    }
+
+    async fn stream_images(
+        &self,
+        request: Request<StreamImagesRequest>,
+    ) -> Result<Response<Self::StreamImagesStream>, Status> {
+        let req = request.into_inner();
+        let image_filter = req
+            .filter
+            .and_then(|filter| filter.image)
+            .map(|image| image.image)
+            .filter(|image| !image.is_empty());
+
+        let mut images = coalesce_images(self.image_store.list().await);
+        if let Some(image_filter) = image_filter {
+            images.retain(|image| image_matches_filter(image, &image_filter));
+        }
+
+        let stream: Self::StreamImagesStream =
+            Box::pin(tokio_stream::iter(vec![Ok(StreamImagesResponse {
+                images,
+            })]));
+        Ok(Response::new(stream))
     }
 
     async fn image_status(
@@ -125,62 +225,36 @@ impl ImageService for BoxImageService {
         let image_spec = req
             .image
             .ok_or_else(|| Status::invalid_argument("image spec required"))?;
-
-        let stored = self.find_image(&image_spec.image).await;
-
-        let image = stored.as_ref().map(|img| Image {
-            id: img.digest.clone(),
-            repo_tags: vec![img.reference.clone()],
-            repo_digests: vec![format!("{}@{}", img.reference, img.digest)],
-            size: img.size_bytes,
-            uid: None,
-            username: String::new(),
-            spec: Some(ImageSpec {
-                image: img.reference.clone(),
-                annotations: Default::default(),
-            }),
-            pinned: false,
-        });
-        let mut info: HashMap<String, String> = Default::default();
-        if req.verbose {
-            if let Some(img) = &stored {
-                info.insert("a3s.digest".to_string(), img.digest.clone());
-                info.insert(
-                    "a3s.path".to_string(),
-                    img.path.to_string_lossy().to_string(),
-                );
-                match OciImage::from_path(&img.path) {
-                    Ok(oci_image) => {
-                        let config = oci_image.config();
-                        info.insert(
-                            "a3s.entrypoint".to_string(),
-                            serde_json::to_string(&config.entrypoint).unwrap_or_default(),
-                        );
-                        info.insert(
-                            "a3s.cmd".to_string(),
-                            serde_json::to_string(&config.cmd).unwrap_or_default(),
-                        );
-                        info.insert(
-                            "a3s.env".to_string(),
-                            serde_json::to_string(&config.env).unwrap_or_default(),
-                        );
-                        info.insert(
-                            "a3s.working_dir".to_string(),
-                            config.working_dir.clone().unwrap_or_default(),
-                        );
-                        info.insert(
-                            "a3s.labels".to_string(),
-                            serde_json::to_string(&config.labels).unwrap_or_default(),
-                        );
-                    }
-                    Err(error) => {
-                        info.insert("a3s.config_error".to_string(), error.to_string());
-                    }
-                }
-            }
+        if image_spec.image.trim().is_empty() {
+            // Reject an empty reference up front; otherwise it fails deep in
+            // reference parsing with a confusing error.
+            return Err(Status::invalid_argument(
+                "image reference must not be empty",
+            ));
         }
 
-        Ok(Response::new(ImageStatusResponse { image, info }))
+        let digest = self.resolve_digest(&image_spec.image).await;
+
+        // Coalesce every reference sharing the digest into one image so
+        // `repo_tags` reflects all tags (CRI identifies images by digest).
+        let image = match digest {
+            Some(digest) => {
+                let group: Vec<StoredImage> = self
+                    .image_store
+                    .list()
+                    .await
+                    .into_iter()
+                    .filter(|img| img.digest == digest)
+                    .collect();
+                (!group.is_empty()).then(|| coalesced_image(&group))
+            }
+            None => None,
+        };
+
+        Ok(Response::new(ImageStatusResponse {
+            image,
+            info: Default::default(),
+        }))
     }
 
     async fn pull_image(
@@ -191,34 +265,43 @@ impl ImageService for BoxImageService {
         let image_spec = req
             .image
             .ok_or_else(|| Status::invalid_argument("image spec required"))?;
-
-        tracing::info!(image = %image_spec.image, "CRI PullImage");
-
-        let config = a3s_box_core::A3sConfig::load_default().map_err(box_error_to_status)?;
-        let default_registry = config.registry.default_image_registry();
-        let reference =
-            ImageReference::parse_with_default_registry(&image_spec.image, &default_registry)
-                .map_err(box_error_to_status)?;
-        let auth = registry_auth_for_pull(req.auth.as_ref(), &reference.registry)?;
-        let mut puller = ImagePuller::new(self.image_store.clone(), auth)
-            .with_default_registry(&default_registry);
-
-        if let Some(platform) = image_platform_annotation(&image_spec.annotations) {
-            puller = puller
-                .with_platform(platform)
-                .map_err(box_error_to_status)?;
+        if image_spec.image.trim().is_empty() {
+            // Reject an empty reference up front; otherwise it fails deep in
+            // reference parsing with a confusing error.
+            return Err(Status::invalid_argument(
+                "image reference must not be empty",
+            ));
         }
 
-        let full_reference = reference.full_reference();
-        let _oci_image = puller
-            .pull(&full_reference)
-            .await
-            .map_err(box_error_to_status)?;
+        // Honor kubelet's per-request credentials (imagePullSecrets). When the
+        // request carries usable auth, pull with a one-off puller built from it;
+        // otherwise fall back to the service-default registry credential.
+        match req.auth.as_ref().and_then(auth_config_to_registry_auth) {
+            Some(auth) => {
+                tracing::info!(image = %image_spec.image, "CRI PullImage (request auth)");
+                ImagePuller::new(self.image_store.clone(), auth)
+                    .pull(&image_spec.image)
+                    .await
+                    .map_err(box_error_to_status)?;
+            }
+            None => {
+                tracing::info!(image = %image_spec.image, "CRI PullImage");
+                self.image_puller
+                    .pull(&image_spec.image)
+                    .await
+                    .map_err(box_error_to_status)?;
+            }
+        }
 
-        // Return the image reference as the image_ref
-        Ok(Response::new(PullImageResponse {
-            image_ref: full_reference,
-        }))
+        // CRI uses the content-addressable image id (digest) as the canonical
+        // image_ref, so callers can dedupe different tags of the same image.
+        // Fall back to the requested reference if the digest can't be resolved.
+        let image_ref = self
+            .resolve_digest(&image_spec.image)
+            .await
+            .unwrap_or(image_spec.image);
+
+        Ok(Response::new(PullImageResponse { image_ref }))
     }
 
     async fn remove_image(
@@ -229,22 +312,30 @@ impl ImageService for BoxImageService {
         let image_spec = req
             .image
             .ok_or_else(|| Status::invalid_argument("image spec required"))?;
+        if image_spec.image.trim().is_empty() {
+            // Reject an empty reference up front; otherwise it fails deep in
+            // reference parsing with a confusing error.
+            return Err(Status::invalid_argument(
+                "image reference must not be empty",
+            ));
+        }
 
         tracing::info!(image = %image_spec.image, "CRI RemoveImage");
 
-        let stored = self
-            .find_image(&image_spec.image)
+        // Resolve the reference to its digest the same way ImageStatus does, so
+        // `rmi <short-tag>` matches an image stored under its fully-qualified name
+        // (ImageStatus resolved it but RemoveImage previously passed the raw ref to
+        // store.remove, which only exact-matches a key or digest). Removing by the
+        // resolved digest drops every reference to the image — the CRI
+        // "remove the image" semantic. Fall back to the raw ref (a bare digest/id,
+        // or an unknown image) so store.remove still handles it / errors as before.
+        let target = self
+            .resolve_digest(&image_spec.image)
             .await
-            .ok_or_else(|| Status::not_found(format!("Image not found: {}", image_spec.image)))?;
-        if let Some(container_id) = self.image_in_use(&image_spec.image, &stored).await {
-            return Err(Status::failed_precondition(format!(
-                "Image {} is used by container {}",
-                image_spec.image, container_id
-            )));
-        }
+            .unwrap_or_else(|| image_spec.image.clone());
 
         self.image_store
-            .remove(&stored.reference)
+            .remove(&target)
             .await
             .map_err(box_error_to_status)?;
 
@@ -272,97 +363,11 @@ impl ImageService for BoxImageService {
     }
 }
 
-fn registry_auth_for_pull(
-    auth: Option<&AuthConfig>,
-    registry: &str,
-) -> Result<RegistryAuth, Status> {
-    let Some(auth) = auth else {
-        return Ok(RegistryAuth::from_credential_store(registry));
-    };
-
-    if !auth.username.is_empty() || !auth.password.is_empty() {
-        if auth.username.is_empty() || auth.password.is_empty() {
-            return Err(Status::invalid_argument(
-                "CRI PullImage auth requires both username and password",
-            ));
-        }
-        return Ok(RegistryAuth::basic(&auth.username, &auth.password));
-    }
-
-    if !auth.auth.is_empty() {
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(auth.auth.trim())
-            .map_err(|e| Status::invalid_argument(format!("invalid CRI auth field: {e}")))?;
-        let decoded = String::from_utf8(decoded)
-            .map_err(|e| Status::invalid_argument(format!("invalid CRI auth UTF-8: {e}")))?;
-        let Some((username, password)) = decoded.split_once(':') else {
-            return Err(Status::invalid_argument(
-                "invalid CRI auth field: expected base64(username:password)",
-            ));
-        };
-        if username.is_empty() || password.is_empty() {
-            return Err(Status::invalid_argument(
-                "invalid CRI auth field: username and password are required",
-            ));
-        }
-        return Ok(RegistryAuth::basic(username, password));
-    }
-
-    Ok(RegistryAuth::from_credential_store(registry))
-}
-
-fn image_platform_annotation(annotations: &HashMap<String, String>) -> Option<&str> {
-    [
-        "io.kubernetes.cri.image-platform",
-        "io.kubernetes.cri.platform",
-        "io.cri-containerd.image-platform",
-        "a3s.io/platform",
-    ]
-    .iter()
-    .find_map(|key| annotations.get(*key).map(String::as_str))
-    .filter(|value| !value.trim().is_empty())
-}
-
-fn stored_image_matches(query: &str, stored: &StoredImage) -> bool {
-    let stored_repo_digest = format!("{}@{}", stored.reference, stored.digest);
-
-    if query == stored.reference
-        || query == stored.digest
-        || query == stored_repo_digest
-        || query.starts_with("sha256:") && query == stored.digest
-    {
-        return true;
-    }
-
-    let Ok(query_ref) = ImageReference::parse(query) else {
-        return false;
-    };
-    if query_ref.full_reference() == stored.reference {
-        return true;
-    }
-
-    let Ok(stored_ref) = ImageReference::parse(&stored.reference) else {
-        return false;
-    };
-
-    if let Some(query_digest) = query_ref.digest.as_deref() {
-        stored.digest == query_digest
-            && stored_ref.registry == query_ref.registry
-            && stored_ref.repository == query_ref.repository
-            && (query_ref.tag.is_none() || query_ref.tag == stored_ref.tag)
-    } else {
-        stored_ref.registry == query_ref.registry
-            && stored_ref.repository == query_ref.repository
-            && stored_ref.tag == query_ref.tag
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::container::{Container, ContainerState};
-    use crate::state::NoopStateStore;
     use a3s_box_runtime::oci::ImageStore;
+    use futures::StreamExt;
 
     /// Create a test ImageStore backed by a temp directory.
     fn make_test_store() -> (Arc<ImageStore>, tempfile::TempDir) {
@@ -377,40 +382,6 @@ mod tests {
         let (store, tmp) = make_test_store();
         let svc = BoxImageService::new(store, RegistryAuth::anonymous());
         (svc, tmp)
-    }
-
-    fn make_test_service_with_cri_store(
-        cri_store: Arc<PersistentCriStore>,
-    ) -> (BoxImageService, tempfile::TempDir) {
-        let (store, tmp) = make_test_store();
-        let svc = BoxImageService::new(store, RegistryAuth::anonymous()).with_cri_store(cri_store);
-        (svc, tmp)
-    }
-
-    fn test_container(id: &str, image_ref: &str) -> Container {
-        Container {
-            id: id.to_string(),
-            sandbox_id: "sb-1".to_string(),
-            name: format!("container-{}", id),
-            image_ref: image_ref.to_string(),
-            state: ContainerState::Created,
-            created_at: 1_000_000_000,
-            started_at: 0,
-            finished_at: 0,
-            exit_code: 0,
-            labels: HashMap::new(),
-            annotations: HashMap::new(),
-            log_path: String::new(),
-            mounts: vec![],
-            devices: vec![],
-            linux: None,
-            command: vec!["true".to_string()],
-            args: vec![],
-            envs: vec![],
-            working_dir: None,
-            stdin: false,
-            tty: false,
-        }
     }
 
     /// Put a fake image into the store for testing.
@@ -429,83 +400,19 @@ mod tests {
         store.put(reference, digest, tmp.path()).await.unwrap();
     }
 
-    async fn put_test_image_with_config(store: &ImageStore, reference: &str, digest: &str) {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(tmp.path().join("blobs/sha256")).unwrap();
-        std::fs::write(
-            tmp.path().join("oci-layout"),
-            r#"{"imageLayoutVersion":"1.0.0"}"#,
-        )
-        .unwrap();
-
-        let config_content = r#"{
-            "architecture": "amd64",
-            "os": "linux",
-            "config": {
-                "Entrypoint": ["/bin/server"],
-                "Cmd": ["--port", "8080"],
-                "Env": ["PATH=/usr/bin:/bin", "APP_ENV=test"],
-                "WorkingDir": "/srv/app",
-                "Labels": {"org.opencontainers.image.title": "test-image"}
-            },
-            "rootfs": {"type": "layers", "diff_ids": ["sha256:layer1hash"]},
-            "history": []
-        }"#;
-        let config_hash = "configabc123";
-        std::fs::write(
-            tmp.path().join("blobs/sha256").join(config_hash),
-            config_content,
-        )
-        .unwrap();
-
-        let layer_hash = "layerdef456";
-        std::fs::write(tmp.path().join("blobs/sha256").join(layer_hash), b"layer").unwrap();
-
-        let manifest_content = format!(
-            r#"{{
-                "schemaVersion": 2,
-                "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                "config": {{
-                    "mediaType": "application/vnd.oci.image.config.v1+json",
-                    "digest": "sha256:{}",
-                    "size": {}
-                }},
-                "layers": [{{
-                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
-                    "digest": "sha256:{}",
-                    "size": 5
-                }}]
-            }}"#,
-            config_hash,
-            config_content.len(),
-            layer_hash
-        );
-        let manifest_hash = "manifestxyz789";
-        std::fs::write(
-            tmp.path().join("blobs/sha256").join(manifest_hash),
-            &manifest_content,
-        )
-        .unwrap();
-
-        let index_content = format!(
-            r#"{{
-                "schemaVersion": 2,
-                "mediaType": "application/vnd.oci.image.index.v1+json",
-                "manifests": [{{
-                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                    "digest": "sha256:{}",
-                    "size": {}
-                }}]
-            }}"#,
-            manifest_hash,
-            manifest_content.len()
-        );
-        std::fs::write(tmp.path().join("index.json"), index_content).unwrap();
-
-        store.put(reference, digest, tmp.path()).await.unwrap();
-    }
-
     // ── ListImages ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_image_user() {
+        assert_eq!(parse_image_user("1002"), (Some(1002), String::new()));
+        assert_eq!(parse_image_user("1002:1002"), (Some(1002), String::new()));
+        assert_eq!(parse_image_user("nobody"), (None, "nobody".to_string()));
+        assert_eq!(
+            parse_image_user("nobody:nogroup"),
+            (None, "nobody".to_string())
+        );
+        assert_eq!(parse_image_user(""), (None, String::new()));
+    }
 
     #[tokio::test]
     async fn test_list_images_empty() {
@@ -543,39 +450,142 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_images_filter_by_tag() {
+    async fn test_list_images_coalesces_tags_by_digest() {
+        // Three tags of one digest must collapse into a single image whose
+        // repo_tags lists all three (CRI identifies images by digest).
         let (svc, _tmp) = make_test_service();
-        put_test_image(&svc.image_store, "nginx:latest", "sha256:aaa111").await;
-        put_test_image(&svc.image_store, "alpine:3.18", "sha256:bbb222").await;
+        put_test_image(&svc.image_store, "img:1", "sha256:same").await;
+        put_test_image(&svc.image_store, "img:2", "sha256:same").await;
+        put_test_image(&svc.image_store, "img:3", "sha256:same").await;
 
         let resp = svc
-            .list_images(Request::new(ListImagesRequest {
-                filter: Some(ImageFilter {
-                    image: Some(ImageSpec {
-                        image: "nginx:latest".to_string(),
-                        annotations: Default::default(),
-                    }),
-                }),
-            }))
+            .list_images(Request::new(ListImagesRequest { filter: None }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(resp.images.len(), 1, "one digest => one image");
+        let mut tags = resp.images[0].repo_tags.clone();
+        tags.sort();
+        assert_eq!(tags, vec!["img:1", "img:2", "img:3"]);
+        assert_eq!(resp.images[0].id, "sha256:same");
+    }
+
+    #[tokio::test]
+    async fn test_list_images_digest_pin_is_repo_digest_not_tag() {
+        // An image pulled by digest (`repo@sha256:...`) has no repo tag; the
+        // pinned reference must be reported as a repo digest.
+        let (svc, _tmp) = make_test_service();
+        put_test_image(
+            &svc.image_store,
+            "gcr.io/x/img@sha256:pinned",
+            "sha256:pinned",
+        )
+        .await;
+
+        let resp = svc
+            .list_images(Request::new(ListImagesRequest { filter: None }))
             .await
             .unwrap()
             .into_inner();
 
         assert_eq!(resp.images.len(), 1);
-        assert_eq!(resp.images[0].repo_tags, vec!["nginx:latest"]);
+        assert!(
+            resp.images[0].repo_tags.is_empty(),
+            "no tag for a digest pin"
+        );
+        assert!(resp.images[0]
+            .repo_digests
+            .contains(&"gcr.io/x/img@sha256:pinned".to_string()));
     }
 
     #[tokio::test]
-    async fn test_list_images_filter_by_digest() {
+    async fn test_image_status_resolves_untagged_name() {
+        // CRI ImageStatus may be queried by an untagged name; it must resolve
+        // to the stored `:latest` reference and report it in repo_tags.
+        let (svc, _tmp) = make_test_service();
+        put_test_image(
+            &svc.image_store,
+            "docker.io/library/nginx:latest",
+            "sha256:n1",
+        )
+        .await;
+
+        let resp = svc
+            .image_status(Request::new(ImageStatusRequest {
+                image: Some(ImageSpec {
+                    image: "nginx".to_string(),
+                    annotations: Default::default(),
+                }),
+                verbose: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let image = resp.image.expect("untagged name should resolve");
+        assert_eq!(image.id, "sha256:n1");
+        assert!(image
+            .repo_tags
+            .contains(&"docker.io/library/nginx:latest".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_image_status_resolves_by_digest() {
+        // ImageStatus queried by image id (digest) must return the image.
+        let (svc, _tmp) = make_test_service();
+        put_test_image(&svc.image_store, "redis:7", "sha256:r7").await;
+
+        let resp = svc
+            .image_status(Request::new(ImageStatusRequest {
+                image: Some(ImageSpec {
+                    image: "sha256:r7".to_string(),
+                    annotations: Default::default(),
+                }),
+                verbose: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let image = resp.image.expect("digest should resolve");
+        assert_eq!(image.id, "sha256:r7");
+        assert!(image.repo_tags.contains(&"redis:7".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_image_status_resolves_by_name_at_digest() {
+        // ImageStatus queried by a `name@sha256:...` digest pin must resolve.
+        let (svc, _tmp) = make_test_service();
+        put_test_image(&svc.image_store, "busybox:1.36", "sha256:bb36").await;
+
+        let resp = svc
+            .image_status(Request::new(ImageStatusRequest {
+                image: Some(ImageSpec {
+                    image: "busybox@sha256:bb36".to_string(),
+                    annotations: Default::default(),
+                }),
+                verbose: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let image = resp.image.expect("name@digest should resolve");
+        assert_eq!(image.id, "sha256:bb36");
+    }
+
+    #[tokio::test]
+    async fn test_stream_images_with_filter() {
         let (svc, _tmp) = make_test_service();
         put_test_image(&svc.image_store, "nginx:latest", "sha256:aaa111").await;
         put_test_image(&svc.image_store, "alpine:3.18", "sha256:bbb222").await;
 
-        let resp = svc
-            .list_images(Request::new(ListImagesRequest {
+        let mut stream = svc
+            .stream_images(Request::new(StreamImagesRequest {
                 filter: Some(ImageFilter {
                     image: Some(ImageSpec {
-                        image: "sha256:bbb222".to_string(),
+                        image: "alpine:3.18".to_string(),
                         annotations: Default::default(),
                     }),
                 }),
@@ -584,52 +594,13 @@ mod tests {
             .unwrap()
             .into_inner();
 
-        assert_eq!(resp.images.len(), 1);
-        assert_eq!(resp.images[0].repo_tags, vec!["alpine:3.18"]);
-    }
-
-    #[tokio::test]
-    async fn test_list_images_filter_by_repo_digest() {
-        let (svc, _tmp) = make_test_service();
-        put_test_image(&svc.image_store, "nginx:latest", "sha256:aaa111").await;
-        put_test_image(&svc.image_store, "alpine:3.18", "sha256:bbb222").await;
-
-        let resp = svc
-            .list_images(Request::new(ListImagesRequest {
-                filter: Some(ImageFilter {
-                    image: Some(ImageSpec {
-                        image: "library/nginx@sha256:aaa111".to_string(),
-                        annotations: Default::default(),
-                    }),
-                }),
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-
-        assert_eq!(resp.images.len(), 1);
-        assert_eq!(resp.images[0].repo_tags, vec!["nginx:latest"]);
-    }
-
-    #[tokio::test]
-    async fn test_list_images_filter_by_repo_digest_requires_matching_repository() {
-        let (svc, _tmp) = make_test_service();
-        put_test_image(&svc.image_store, "nginx:latest", "sha256:aaa111").await;
-
-        let resp = svc
-            .list_images(Request::new(ListImagesRequest {
-                filter: Some(ImageFilter {
-                    image: Some(ImageSpec {
-                        image: "library/redis@sha256:aaa111".to_string(),
-                        annotations: Default::default(),
-                    }),
-                }),
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-
-        assert!(resp.images.is_empty());
+        let response = stream.next().await.unwrap().unwrap();
+        assert_eq!(response.images.len(), 1);
+        assert_eq!(
+            response.images[0].spec.as_ref().unwrap().image,
+            "alpine:3.18"
+        );
+        assert!(stream.next().await.is_none());
     }
 
     // ── ImageStatus ──────────────────────────────────────────────────
@@ -686,101 +657,6 @@ mod tests {
         assert!(image.repo_tags.contains(&"nginx:latest".to_string()));
     }
 
-    #[tokio::test]
-    async fn test_image_status_found_by_digest() {
-        let (svc, _tmp) = make_test_service();
-        put_test_image(&svc.image_store, "nginx:latest", "sha256:aaa111").await;
-
-        let resp = svc
-            .image_status(Request::new(ImageStatusRequest {
-                image: Some(ImageSpec {
-                    image: "sha256:aaa111".to_string(),
-                    annotations: Default::default(),
-                }),
-                verbose: false,
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-
-        let image = resp.image.unwrap();
-        assert_eq!(image.id, "sha256:aaa111");
-        assert!(image.repo_tags.contains(&"nginx:latest".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_image_status_found_by_repo_digest() {
-        let (svc, _tmp) = make_test_service();
-        put_test_image(&svc.image_store, "nginx:latest", "sha256:aaa111").await;
-
-        let resp = svc
-            .image_status(Request::new(ImageStatusRequest {
-                image: Some(ImageSpec {
-                    image: "nginx@sha256:aaa111".to_string(),
-                    annotations: Default::default(),
-                }),
-                verbose: false,
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-
-        let image = resp.image.unwrap();
-        assert_eq!(image.id, "sha256:aaa111");
-        assert!(image.repo_tags.contains(&"nginx:latest".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_image_status_repo_digest_prefers_matching_reference() {
-        let (svc, _tmp) = make_test_service();
-        put_test_image(&svc.image_store, "nginx:latest", "sha256:aaa111").await;
-        put_test_image(&svc.image_store, "alpine:3.18", "sha256:aaa111").await;
-
-        let resp = svc
-            .image_status(Request::new(ImageStatusRequest {
-                image: Some(ImageSpec {
-                    image: "alpine:3.18@sha256:aaa111".to_string(),
-                    annotations: Default::default(),
-                }),
-                verbose: false,
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-
-        let image = resp.image.unwrap();
-        assert_eq!(image.id, "sha256:aaa111");
-        assert_eq!(image.repo_tags, vec!["alpine:3.18"]);
-    }
-
-    #[tokio::test]
-    async fn test_image_status_verbose_includes_oci_config() {
-        let (svc, _tmp) = make_test_service();
-        put_test_image_with_config(&svc.image_store, "nginx:latest", "sha256:aaa111").await;
-
-        let resp = svc
-            .image_status(Request::new(ImageStatusRequest {
-                image: Some(ImageSpec {
-                    image: "nginx:latest".to_string(),
-                    annotations: Default::default(),
-                }),
-                verbose: true,
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-
-        assert_eq!(resp.info.get("a3s.digest").unwrap(), "sha256:aaa111");
-        assert_eq!(
-            resp.info.get("a3s.entrypoint").unwrap(),
-            r#"["/bin/server"]"#
-        );
-        assert_eq!(resp.info.get("a3s.cmd").unwrap(), r#"["--port","8080"]"#);
-        assert_eq!(resp.info.get("a3s.working_dir").unwrap(), "/srv/app");
-        assert!(resp.info.get("a3s.env").unwrap().contains("APP_ENV"));
-        assert!(resp.info.get("a3s.labels").unwrap().contains("test-image"));
-    }
-
     // ── RemoveImage ──────────────────────────────────────────────────
 
     #[tokio::test]
@@ -826,194 +702,6 @@ mod tests {
         assert!(svc.image_store.get("nginx:latest").await.is_none());
     }
 
-    #[tokio::test]
-    async fn test_remove_image_by_digest_success() {
-        let (svc, _tmp) = make_test_service();
-        put_test_image(&svc.image_store, "nginx:latest", "sha256:aaa111").await;
-
-        svc.remove_image(Request::new(RemoveImageRequest {
-            image: Some(ImageSpec {
-                image: "sha256:aaa111".to_string(),
-                annotations: Default::default(),
-            }),
-        }))
-        .await
-        .unwrap();
-
-        assert!(svc.image_store.get("nginx:latest").await.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_remove_image_repo_digest_removes_matching_reference() {
-        let (svc, _tmp) = make_test_service();
-        put_test_image(&svc.image_store, "nginx:latest", "sha256:aaa111").await;
-        put_test_image(&svc.image_store, "alpine:3.18", "sha256:aaa111").await;
-
-        svc.remove_image(Request::new(RemoveImageRequest {
-            image: Some(ImageSpec {
-                image: "alpine:3.18@sha256:aaa111".to_string(),
-                annotations: Default::default(),
-            }),
-        }))
-        .await
-        .unwrap();
-
-        assert!(svc.image_store.get("alpine:3.18").await.is_none());
-        assert!(svc.image_store.get("nginx:latest").await.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_remove_image_rejects_container_reference() {
-        let cri_store = Arc::new(PersistentCriStore::new(Arc::new(NoopStateStore)));
-        cri_store
-            .add_container(test_container("c-1", "nginx:latest"))
-            .await;
-
-        let (svc, _tmp) = make_test_service_with_cri_store(cri_store);
-        put_test_image(&svc.image_store, "nginx:latest", "sha256:aaa111").await;
-
-        let result = svc
-            .remove_image(Request::new(RemoveImageRequest {
-                image: Some(ImageSpec {
-                    image: "nginx:latest".to_string(),
-                    annotations: Default::default(),
-                }),
-            }))
-            .await;
-
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
-        assert!(svc.image_store.get("nginx:latest").await.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_remove_image_by_digest_rejects_container_reference() {
-        let cri_store = Arc::new(PersistentCriStore::new(Arc::new(NoopStateStore)));
-        cri_store
-            .add_container(test_container("c-1", "sha256:aaa111"))
-            .await;
-
-        let (svc, _tmp) = make_test_service_with_cri_store(cri_store);
-        put_test_image(&svc.image_store, "nginx:latest", "sha256:aaa111").await;
-
-        let result = svc
-            .remove_image(Request::new(RemoveImageRequest {
-                image: Some(ImageSpec {
-                    image: "sha256:aaa111".to_string(),
-                    annotations: Default::default(),
-                }),
-            }))
-            .await;
-
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
-        assert!(svc.image_store.get("nginx:latest").await.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_remove_image_rejects_repo_digest_container_reference() {
-        let cri_store = Arc::new(PersistentCriStore::new(Arc::new(NoopStateStore)));
-        cri_store
-            .add_container(test_container("c-1", "nginx@sha256:aaa111"))
-            .await;
-
-        let (svc, _tmp) = make_test_service_with_cri_store(cri_store);
-        put_test_image(&svc.image_store, "nginx:latest", "sha256:aaa111").await;
-
-        let result = svc
-            .remove_image(Request::new(RemoveImageRequest {
-                image: Some(ImageSpec {
-                    image: "sha256:aaa111".to_string(),
-                    annotations: Default::default(),
-                }),
-            }))
-            .await;
-
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
-        assert!(svc.image_store.get("nginx:latest").await.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_remove_repo_digest_rejects_digest_container_reference() {
-        let cri_store = Arc::new(PersistentCriStore::new(Arc::new(NoopStateStore)));
-        cri_store
-            .add_container(test_container("c-1", "sha256:aaa111"))
-            .await;
-
-        let (svc, _tmp) = make_test_service_with_cri_store(cri_store);
-        put_test_image(&svc.image_store, "nginx:latest", "sha256:aaa111").await;
-
-        let result = svc
-            .remove_image(Request::new(RemoveImageRequest {
-                image: Some(ImageSpec {
-                    image: "nginx@sha256:aaa111".to_string(),
-                    annotations: Default::default(),
-                }),
-            }))
-            .await;
-
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
-        assert!(svc.image_store.get("nginx:latest").await.is_some());
-    }
-
-    #[test]
-    fn test_registry_auth_for_pull_accepts_username_password() {
-        let auth = AuthConfig {
-            username: "alice".to_string(),
-            password: "secret".to_string(),
-            auth: String::new(),
-            server_address: "registry.example.com".to_string(),
-            identity_token: String::new(),
-            registry_token: String::new(),
-        };
-
-        assert!(registry_auth_for_pull(Some(&auth), "registry.example.com").is_ok());
-    }
-
-    #[test]
-    fn test_registry_auth_for_pull_accepts_encoded_auth() {
-        let auth = AuthConfig {
-            username: String::new(),
-            password: String::new(),
-            auth: "YWxpY2U6c2VjcmV0".to_string(),
-            server_address: "registry.example.com".to_string(),
-            identity_token: String::new(),
-            registry_token: String::new(),
-        };
-
-        assert!(registry_auth_for_pull(Some(&auth), "registry.example.com").is_ok());
-    }
-
-    #[test]
-    fn test_registry_auth_for_pull_rejects_partial_basic_auth() {
-        let auth = AuthConfig {
-            username: "alice".to_string(),
-            password: String::new(),
-            auth: String::new(),
-            server_address: "registry.example.com".to_string(),
-            identity_token: String::new(),
-            registry_token: String::new(),
-        };
-
-        let err = registry_auth_for_pull(Some(&auth), "registry.example.com").unwrap_err();
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
-    }
-
-    #[test]
-    fn test_image_platform_annotation_prefers_cri_key() {
-        let annotations = HashMap::from([
-            ("a3s.io/platform".to_string(), "linux/amd64".to_string()),
-            (
-                "io.kubernetes.cri.image-platform".to_string(),
-                "linux/arm64".to_string(),
-            ),
-        ]);
-
-        assert_eq!(image_platform_annotation(&annotations), Some("linux/arm64"));
-    }
-
     // ── ImageFsInfo ──────────────────────────────────────────────────
 
     #[tokio::test]
@@ -1045,5 +733,38 @@ mod tests {
         let fs = &resp.image_filesystems[0];
         assert!(fs.used_bytes.as_ref().unwrap().value > 0);
         assert!(fs.fs_id.is_some());
+    }
+
+    #[test]
+    fn test_auth_config_to_registry_auth() {
+        // username/password (the common imagePullSecrets shape) -> basic
+        let ra = auth_config_to_registry_auth(&AuthConfig {
+            username: "alice".into(),
+            password: "secret".into(),
+            ..Default::default()
+        });
+        assert!(ra.is_some());
+        let dbg = format!("{ra:?}");
+        assert!(dbg.contains("alice") && dbg.contains("secret"), "got {dbg}");
+
+        // Docker-config base64 "user:pass" auth field -> basic
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode("bob:pw123");
+        let ra = auth_config_to_registry_auth(&AuthConfig {
+            auth: encoded,
+            ..Default::default()
+        });
+        let dbg = format!("{ra:?}");
+        assert!(dbg.contains("bob") && dbg.contains("pw123"), "got {dbg}");
+
+        // Bearer-token-only AuthConfig -> None (no RegistryAuth bearer support yet)
+        assert!(auth_config_to_registry_auth(&AuthConfig {
+            identity_token: "tok".into(),
+            ..Default::default()
+        })
+        .is_none());
+
+        // Empty -> None (caller falls back to the service-default credential)
+        assert!(auth_config_to_registry_auth(&AuthConfig::default()).is_none());
     }
 }

@@ -117,6 +117,13 @@ pub struct PoolConfig {
     /// Autoscaling policy for dynamic min_idle adjustment
     #[serde(default)]
     pub scaling: ScalingPolicy,
+
+    /// Fill the pool by snapshot-fork instead of cold boot: boot ONE template VM
+    /// once, snapshot it, then replenish every other slot by restoring that snapshot
+    /// (MAP_PRIVATE CoW) — turning per-VM fill from a full cold boot (~1.7s) into a
+    /// restore (~tens of ms). All same-image pool VMs share one RAM image.
+    #[serde(default)]
+    pub snapshot_fork: bool,
 }
 
 /// Autoscaling policy for dynamic warm pool sizing.
@@ -199,6 +206,7 @@ impl Default for PoolConfig {
             max_size: 5,
             idle_ttl_secs: 300,
             scaling: ScalingPolicy::default(),
+            snapshot_fork: false,
         }
     }
 }
@@ -280,6 +288,20 @@ pub struct BoxConfig {
     #[serde(default)]
     pub entrypoint_override: Option<Vec<String>>,
 
+    /// User override for the initial container process.
+    ///
+    /// Supported runtime format is a numeric `uid` or `uid:gid`.
+    #[serde(default)]
+    pub user: Option<String>,
+
+    /// Working directory override for the initial container process.
+    #[serde(default)]
+    pub workdir: Option<String>,
+
+    /// Hostname to apply inside the box.
+    #[serde(default)]
+    pub hostname: Option<String>,
+
     /// Extra volume mounts (host_path:guest_path or host_path:guest_path:ro)
     #[serde(default)]
     pub volumes: Vec<String>,
@@ -296,6 +318,36 @@ pub struct BoxConfig {
     #[serde(default)]
     pub pool: PoolConfig,
 
+    /// Boot the VM IDLE — do not spawn the container main at boot; instead the
+    /// main is started later by a `spawn-main` control frame. Used by the pool so a
+    /// pre-warmed sandbox runs a per-request command as its real main, with full box
+    /// semantics (exit code + json-file console logs) and no cold boot.
+    #[serde(default)]
+    pub deferred_main: bool,
+
+    /// Mark guest memory KSM-mergeable so the host kernel dedups identical pages
+    /// across same-image VMs (Linux 6.4+; needs /sys/kernel/mm/ksm/run=1 on the
+    /// host). Most valuable for pools of same-image sandboxes.
+    #[serde(default)]
+    pub ksm: bool,
+
+    /// Snapshot-fork (per-VM): file-backed guest RAM path for a snapshot TEMPLATE
+    /// (paired with `snapshot_sock`), or the RAM file to MAP_PRIVATE CoW-restore
+    /// from (paired with `restore_from`).
+    #[serde(default)]
+    pub snapshot_mem_file: Option<String>,
+
+    /// Snapshot-fork (per-VM): unix socket on which libkrun serves snapshot
+    /// requests for a template VM.
+    #[serde(default)]
+    pub snapshot_sock: Option<String>,
+
+    /// Snapshot-fork (per-VM): state file to RESTORE from — this VM resumes the
+    /// snapshotted template (CoW of `snapshot_mem_file`) instead of cold-booting.
+    /// The per-VM seam that lets one process (pool / fork daemon) fork many VMs.
+    #[serde(default)]
+    pub restore_from: Option<String>,
+
     /// Port mappings: "host_port:guest_port" (e.g., "8080:80")
     /// Maps host ports to guest ports via TSI (Transparent Socket Impersonation).
     #[serde(default)]
@@ -305,6 +357,10 @@ pub struct BoxConfig {
     /// If empty, reads from host /etc/resolv.conf, falling back to 8.8.8.8.
     #[serde(default)]
     pub dns: Vec<String>,
+
+    /// Static host-to-IP mappings for `/etc/hosts` (`HOST:IP`).
+    #[serde(default)]
+    pub add_hosts: Vec<String>,
 
     /// Network mode: TSI (default), bridge (passt-based), or none.
     #[serde(default)]
@@ -330,6 +386,13 @@ pub struct BoxConfig {
     /// Security options (e.g., "seccomp=unconfined", "no-new-privileges")
     #[serde(default)]
     pub security_opt: Vec<String>,
+
+    /// Kernel sysctls (name → value) applied in the guest at boot.
+    ///
+    /// Pod-level sysctls from the CRI `PodSandboxConfig`; the guest writes each
+    /// to `/proc/sys/<name with '.' as '/'>` once the VM is up.
+    #[serde(default)]
+    pub sysctls: Vec<(String, String)>,
 
     /// Run in privileged mode (disables all security restrictions)
     #[serde(default)]
@@ -375,18 +438,28 @@ impl Default for BoxConfig {
             tee: TeeConfig::default(),
             cmd: vec![],
             entrypoint_override: None,
+            user: None,
+            workdir: None,
+            hostname: None,
             volumes: vec![],
             extra_env: vec![],
             cache: CacheConfig::default(),
             pool: PoolConfig::default(),
+            deferred_main: false,
+            ksm: false,
+            snapshot_mem_file: None,
+            snapshot_sock: None,
+            restore_from: None,
             port_map: vec![],
             dns: vec![],
+            add_hosts: vec![],
             network: NetworkMode::default(),
             tmpfs: vec![],
             resource_limits: ResourceLimits::default(),
             cap_add: vec![],
             cap_drop: vec![],
             security_opt: vec![],
+            sysctls: vec![],
             privileged: false,
             read_only: false,
             sidecar: None,
@@ -498,6 +571,10 @@ mod tests {
         assert_eq!(config.resources.vcpus, 2);
         assert!(!config.debug_grpc);
         assert!(!config.read_only);
+        assert!(config.user.is_none());
+        assert!(config.workdir.is_none());
+        assert!(config.hostname.is_none());
+        assert!(config.add_hosts.is_empty());
     }
 
     #[test]
@@ -521,6 +598,36 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: BoxConfig = serde_json::from_str(&json).unwrap();
         assert!(deserialized.read_only);
+    }
+
+    #[test]
+    fn test_box_config_user_workdir_serde() {
+        let config = BoxConfig {
+            user: Some("1000:1000".to_string()),
+            workdir: Some("/app".to_string()),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: BoxConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.user.as_deref(), Some("1000:1000"));
+        assert_eq!(parsed.workdir.as_deref(), Some("/app"));
+    }
+
+    #[test]
+    fn test_box_config_hostname_add_hosts_serde() {
+        let config = BoxConfig {
+            hostname: Some("web".to_string()),
+            add_hosts: vec!["db.local:10.88.0.10".to_string()],
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: BoxConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.hostname.as_deref(), Some("web"));
+        assert_eq!(parsed.add_hosts, vec!["db.local:10.88.0.10"]);
     }
 
     #[test]

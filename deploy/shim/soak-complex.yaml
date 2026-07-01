@@ -1,0 +1,83 @@
+# Complex containers exercised in-place via UNIX sockets (TSI networking cannot
+# reach a container's own TCP loopback, so clients use local sockets, which TSI
+# does not intercept). redis + postgres run continuous verified load; nginx +
+# python run as complex multi-process services.
+---
+apiVersion: v1
+kind: Pod
+metadata: { name: cplx-redis, namespace: default, labels: { soak: cplx } }
+spec:
+  runtimeClassName: a3s-box
+  nodeName: worker-5
+  tolerations: [{ key: node.kubernetes.io/unschedulable, operator: Exists, effect: NoSchedule }]
+  restartPolicy: Never
+  containers:
+  - name: c
+    image: docker.m.daocloud.io/library/redis:7-alpine
+    command:
+    - sh
+    - -c
+    - |
+      redis-server --unixsocket /tmp/r.sock --port 0 --save "" --appendonly no &
+      sleep 4
+      n=0; ok=0; bad=0
+      while true; do
+        redis-cli -s /tmp/r.sock set k$((n%500)) v$n >/dev/null 2>&1
+        v=$(redis-cli -s /tmp/r.sock get k$((n%500)) 2>/dev/null)
+        if [ "$v" = "v$n" ]; then ok=$((ok+1)); else bad=$((bad+1)); fi
+        n=$((n+1))
+        [ $((n%1000)) -eq 0 ] && echo "REDIS_SOAK ops=$n ok=$ok bad=$bad"
+      done
+---
+apiVersion: v1
+kind: Pod
+metadata: { name: cplx-postgres, namespace: default, labels: { soak: cplx } }
+spec:
+  runtimeClassName: a3s-box
+  nodeName: worker-5
+  tolerations: [{ key: node.kubernetes.io/unschedulable, operator: Exists, effect: NoSchedule }]
+  restartPolicy: Never
+  containers:
+  - name: c
+    image: docker.m.daocloud.io/library/postgres:16-alpine
+    env: [{ name: POSTGRES_PASSWORD, value: soaktest }]
+    command:
+    - sh
+    - -c
+    - |
+      docker-entrypoint.sh postgres &
+      for i in $(seq 1 90); do pg_isready -q && break; sleep 1; done
+      psql -U postgres -c "CREATE TABLE IF NOT EXISTS t(id serial primary key, v text)"
+      n=0
+      while true; do
+        psql -U postgres -c "INSERT INTO t(v) VALUES ('soak'||$n)" >/dev/null 2>&1
+        c=$(psql -U postgres -tAc "SELECT count(*) FROM t" 2>/dev/null)
+        n=$((n+1))
+        [ $((n%200)) -eq 0 ] && echo "PG_SOAK inserts=$n rows=$c"
+      done
+---
+apiVersion: v1
+kind: Pod
+metadata: { name: cplx-nginx, namespace: default, labels: { soak: cplx } }
+spec:
+  runtimeClassName: a3s-box
+  nodeName: worker-5
+  tolerations: [{ key: node.kubernetes.io/unschedulable, operator: Exists, effect: NoSchedule }]
+  restartPolicy: Never
+  containers:
+  - name: c
+    image: docker.m.daocloud.io/library/nginx:1.27-alpine
+    command: ["nginx", "-g", "daemon off;"]
+---
+apiVersion: v1
+kind: Pod
+metadata: { name: cplx-python, namespace: default, labels: { soak: cplx } }
+spec:
+  runtimeClassName: a3s-box
+  nodeName: worker-5
+  tolerations: [{ key: node.kubernetes.io/unschedulable, operator: Exists, effect: NoSchedule }]
+  restartPolicy: Never
+  containers:
+  - name: c
+    image: docker.m.daocloud.io/library/python:3.12-alpine
+    command: ["python3", "-c", "import http.server,socketserver,threading,time; threading.Thread(target=lambda:socketserver.TCPServer(('127.0.0.1',8080),http.server.SimpleHTTPRequestHandler).serve_forever(),daemon=True).start(); i=0\nwhile True:\n i+=1; time.sleep(2)\n if i%30==0: print('PY_SOAK alive=%ds'%(i*2),flush=True)"]

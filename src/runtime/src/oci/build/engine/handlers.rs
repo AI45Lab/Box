@@ -5,25 +5,136 @@ use std::path::{Path, PathBuf};
 use a3s_box_core::error::{BoxError, Result};
 
 use super::super::dockerfile::Instruction;
-use super::super::layer::{create_layer, create_layer_from_dir, LayerInfo};
+use super::super::dockerignore::DockerIgnore;
+use super::super::layer::{
+    create_layer_from_dir_with_chown, create_layer_with_chown, create_layer_with_deletions,
+    LayerInfo,
+};
 use super::utils::{
-    copy_dir_recursive, expand_args, extract_tar_to_dst, is_tar_archive, resolve_path,
+    assert_within, copy_dir_filtered, expand_args, extract_tar_to_dst, is_tar_archive,
+    reject_path_traversal, resolve_chown, resolve_path,
 };
 use super::BuildState;
 
+#[cfg(target_os = "macos")]
+const UNSAFE_HOST_RUN_ENV: &str = "A3S_BOX_UNSAFE_HOST_RUN";
+
+/// Whether a COPY/ADD source contains shell glob metacharacters.
+fn has_glob_meta(s: &str) -> bool {
+    s.contains('*') || s.contains('?') || s.contains('[')
+}
+
+/// Match a single path-segment glob (`*` = any run, `?` = one char) against a
+/// name. Used for COPY/ADD wildcard expansion (the final segment of the source).
+fn glob_segment_match(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    // Classic two-pointer wildcard match with `*` backtracking.
+    let (mut pi, mut ni) = (0usize, 0usize);
+    let (mut star, mut mark) = (None, 0usize);
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            mark = ni;
+            pi += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            mark += 1;
+            ni = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// Expand a COPY/ADD source pattern against `base_dir` into concrete relative
+/// paths. Globs are honored in the final path segment (the common Docker case,
+/// e.g. `*.conf` or `src/*.txt`). Returns the matches sorted; empty if none.
+fn expand_glob_sources(base_dir: &Path, pattern: &str) -> Vec<String> {
+    let p = pattern.trim_start_matches('/');
+    let (dir_part, name_pat) = match p.rsplit_once('/') {
+        Some((d, n)) => (d, n),
+        None => ("", p),
+    };
+    let search_dir = if dir_part.is_empty() {
+        base_dir.to_path_buf()
+    } else {
+        base_dir.join(dir_part)
+    };
+    let mut matches = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&search_dir) {
+        for entry in entries.flatten() {
+            let fname = entry.file_name();
+            let fname = fname.to_string_lossy();
+            if glob_segment_match(name_pat, &fname) {
+                matches.push(if dir_part.is_empty() {
+                    fname.into_owned()
+                } else {
+                    format!("{}/{}", dir_part, fname)
+                });
+            }
+        }
+    }
+    matches.sort();
+    matches
+}
+
+/// Resolve COPY/ADD source patterns, expanding any globs against `base_dir`.
+/// A non-glob source is passed through verbatim; a glob with no matches errors
+/// like Docker ("no source files were specified").
+fn resolve_source_patterns(base_dir: &Path, src_patterns: &[String]) -> Result<Vec<String>> {
+    let mut resolved = Vec::new();
+    for src in src_patterns {
+        if src.starts_with("http://") || src.starts_with("https://") {
+            // Remote ADD sources are never globbed (and may contain `?` query
+            // strings); pass them through untouched.
+            resolved.push(src.clone());
+        } else if has_glob_meta(src) {
+            let matches = expand_glob_sources(base_dir, src);
+            if matches.is_empty() {
+                return Err(BoxError::BuildError(format!(
+                    "COPY/ADD source not found: no matches for pattern '{}'",
+                    src
+                )));
+            }
+            resolved.extend(matches);
+        } else {
+            resolved.push(src.clone());
+        }
+    }
+    Ok(resolved)
+}
+
 /// Handle COPY: copy files from build context into rootfs, create a layer.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn handle_copy(
     src_patterns: &[String],
     dst: &str,
+    chown: Option<&str>,
     context_dir: &Path,
     rootfs_dir: &Path,
     layers_dir: &Path,
     workdir: &str,
     layer_index: usize,
+    ignore: Option<&DockerIgnore>,
 ) -> Result<LayerInfo> {
+    // Expand any glob source patterns against the context (Docker semantics).
+    let src_patterns = &resolve_source_patterns(context_dir, src_patterns)?;
+
     // Resolve destination path
     let resolved_dst = resolve_path(workdir, dst);
+    reject_path_traversal(&resolved_dst)?;
     let dst_in_rootfs = rootfs_dir.join(resolved_dst.trim_start_matches('/'));
+    // The destination must not escape the rootfs via `..` or a base-image
+    // symlink whose target leaves it (a write would land on the host).
+    assert_within(rootfs_dir, &dst_in_rootfs)?;
 
     // Ensure destination directory exists
     if dst.ends_with('/') || src_patterns.len() > 1 {
@@ -42,7 +153,18 @@ pub(super) fn handle_copy(
 
     // Copy each source
     for src in src_patterns {
-        let src_path = context_dir.join(src);
+        // Resolve the source relative to the context (or, for COPY --from, the
+        // source stage's rootfs). A leading "/" must NOT be treated as a host
+        // absolute path: `Path::join` discards the base for an absolute arg, so
+        // `rootfs.join("/run.sh")` would wrongly become "/run.sh". COPY --from
+        // sources are conventionally absolute, so strip the leading slash.
+        reject_path_traversal(src)?;
+        let rel = PathBuf::from(if src == "." {
+            ""
+        } else {
+            src.trim_start_matches('/')
+        });
+        let src_path = context_dir.join(src.trim_start_matches('/'));
         if !src_path.exists() {
             return Err(BoxError::BuildError(format!(
                 "COPY source not found: {} (in context {})",
@@ -50,9 +172,22 @@ pub(super) fn handle_copy(
                 context_dir.display()
             )));
         }
+        // A source must resolve inside the build context (no `..`/symlink escape
+        // that would bake a host file outside the context into the image).
+        assert_within(context_dir, &src_path)?;
+
+        // A single source excluded by .dockerignore is not in the build context.
+        if let Some(ign) = ignore {
+            if !rel.as_os_str().is_empty() && src_path.is_file() && ign.is_excluded(&rel) {
+                return Err(BoxError::BuildError(format!(
+                    "COPY source not found: {} (excluded by .dockerignore)",
+                    src
+                )));
+            }
+        }
 
         if src_path.is_dir() {
-            copy_dir_recursive(&src_path, &dst_in_rootfs)?;
+            copy_dir_filtered(&src_path, &dst_in_rootfs, &rel, ignore)?;
         } else {
             // If dst ends with / or is a directory, copy into it
             let target = if dst_in_rootfs.is_dir() {
@@ -75,22 +210,26 @@ pub(super) fn handle_copy(
         }
     }
 
-    // Create a layer from the copied files
-    // We use create_layer_from_dir approach: snapshot the destination
-    let layer_path = layers_dir.join(format!("layer_{}.tar.gz", layer_index));
+    // Resolve --chown uid/gid (header-level, no host filesystem ownership change
+    // required — Docker BuildKit sets tar headers rather than calling chown).
+    let chown_ids = if let Some(spec) = chown {
+        Some(resolve_chown(spec, rootfs_dir)?)
+    } else {
+        None
+    };
 
-    // For COPY, create a layer containing just the destination files
+    // Create a layer from the copied files
+    let layer_path = layers_dir.join(format!("layer_{}.tar.gz", layer_index));
     let target_prefix = Path::new(resolved_dst.trim_start_matches('/'));
     if dst_in_rootfs.is_dir() {
-        create_layer_from_dir(&dst_in_rootfs, target_prefix, &layer_path)
+        create_layer_from_dir_with_chown(&dst_in_rootfs, target_prefix, &layer_path, chown_ids)
     } else if dst_in_rootfs.parent().is_some() {
-        // Single file copy: create layer with just that file
         let changed = vec![PathBuf::from(
             dst_in_rootfs
                 .strip_prefix(rootfs_dir)
                 .unwrap_or(target_prefix),
         )];
-        create_layer(rootfs_dir, &changed, &layer_path)
+        create_layer_with_chown(rootfs_dir, &changed, &[], &layer_path, chown_ids)
     } else {
         Err(BoxError::BuildError("Invalid COPY destination".to_string()))
     }
@@ -98,15 +237,14 @@ pub(super) fn handle_copy(
 
 /// Handle RUN: execute a command in the rootfs.
 ///
-/// On Linux, uses chroot. On macOS, host execution is disabled unless explicitly
-/// opted in for development because it cannot match Linux container semantics.
+/// On Linux, uses chroot. On macOS, isolated RUN execution is not implemented yet.
 /// Returns Some(LayerInfo) if a layer was created, None if skipped.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn handle_run(
     command: &str,
     rootfs_dir: &Path,
     layers_dir: &Path,
-    #[allow(unused_variables)] workdir: &str,
+    workdir: &str,
     env: &[(String, String)],
     shell: &[String],
     layer_index: usize,
@@ -114,8 +252,15 @@ pub(super) fn handle_run(
 ) -> Result<Option<LayerInfo>> {
     #[cfg(target_os = "macos")]
     {
-        // On macOS, use a3s-box MicroVM to execute RUN commands
-        handle_run_via_microvm(
+        if !unsafe_host_run_enabled() {
+            return Err(BoxError::BuildError(format!(
+                "Dockerfile RUN is not supported on macOS yet because isolated Linux build \
+                 execution is not implemented. Re-run on Linux or set {UNSAFE_HOST_RUN_ENV}=1 \
+                 to opt into unsafe host-side execution for local experiments."
+            )));
+        }
+
+        handle_run_on_host_unsafe(
             command,
             rootfs_dir,
             layers_dir,
@@ -131,6 +276,9 @@ pub(super) fn handle_run(
     #[cfg(target_os = "linux")]
     {
         use super::super::layer::DirSnapshot;
+
+        validate_linux_run_preconditions(rootfs_dir, shell, linux_effective_uid())?;
+        let workdir_path = ensure_linux_run_workdir(rootfs_dir, workdir)?;
 
         let before = DirSnapshot::capture(rootfs_dir)?;
 
@@ -149,6 +297,7 @@ pub(super) fn handle_run(
             cmd.arg("-c");
         }
         cmd.arg(command);
+        cmd.current_dir(&workdir_path);
 
         // Set environment
         cmd.env_clear();
@@ -184,13 +333,14 @@ pub(super) fn handle_run(
         // Capture diff
         let after = DirSnapshot::capture(rootfs_dir)?;
         let changed = before.diff(&after);
+        let deleted = before.deletions(&after);
 
-        if changed.is_empty() {
+        if changed.is_empty() && deleted.is_empty() {
             return Ok(None);
         }
 
         let layer_path = layers_dir.join(format!("layer_{}.tar.gz", layer_index));
-        let layer_info = create_layer(rootfs_dir, &changed, &layer_path)?;
+        let layer_info = create_layer_with_deletions(rootfs_dir, &changed, &deleted, &layer_path)?;
         Ok(Some(layer_info))
     }
 
@@ -198,7 +348,6 @@ pub(super) fn handle_run(
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = (
-            command,
             rootfs_dir,
             layers_dir,
             workdir,
@@ -207,18 +356,93 @@ pub(super) fn handle_run(
             layer_index,
             quiet,
         );
-        Ok(None)
+        Err(BoxError::BuildError(format!(
+            "Dockerfile RUN is not supported on this platform yet because isolated Linux build execution is not implemented: {}",
+            command
+        )))
     }
 }
 
-/// Execute RUN command directly on host (macOS development fallback).
+#[cfg(any(target_os = "linux", test))]
+fn linux_run_shell_path(shell: &[String]) -> &str {
+    shell.first().map(String::as_str).unwrap_or("/bin/sh")
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn validate_linux_run_preconditions(
+    rootfs_dir: &Path,
+    shell: &[String],
+    effective_uid: u32,
+) -> Result<()> {
+    if effective_uid != 0 {
+        return Err(BoxError::BuildError(
+            "Dockerfile RUN on Linux requires root privileges because the current isolated build path uses chroot. Re-run as root or build on a root-capable builder.".to_string(),
+        ));
+    }
+
+    let shell_path = linux_run_shell_path(shell);
+    if !shell_path.starts_with('/') {
+        return Err(BoxError::BuildError(format!(
+            "Dockerfile RUN shell '{}' is not absolute; SHELL must name an absolute in-rootfs executable",
+            shell_path
+        )));
+    }
+    let shell_in_rootfs = rootfs_dir.join(shell_path.trim_start_matches('/'));
+    if !shell_in_rootfs.exists() {
+        return Err(BoxError::BuildError(format!(
+            "Dockerfile RUN shell '{}' was not found in rootfs at {}; the base image must contain the configured shell",
+            shell_path,
+            shell_in_rootfs.display()
+        )));
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_effective_uid() -> u32 {
+    unsafe { libc::geteuid() }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn ensure_linux_run_workdir(rootfs_dir: &Path, workdir: &str) -> Result<PathBuf> {
+    let workdir = if workdir.trim().is_empty() {
+        "/"
+    } else {
+        workdir
+    };
+    if !workdir.starts_with('/') {
+        return Err(BoxError::BuildError(format!(
+            "Dockerfile RUN workdir '{}' is not absolute",
+            workdir
+        )));
+    }
+
+    let workdir_path = rootfs_dir.join(workdir.trim_start_matches('/'));
+    std::fs::create_dir_all(&workdir_path).map_err(|e| {
+        BoxError::BuildError(format!(
+            "Failed to create RUN workdir {}: {}",
+            workdir_path.display(),
+            e
+        ))
+    })?;
+    Ok(workdir_path)
+}
+
+#[cfg(target_os = "macos")]
+fn unsafe_host_run_enabled() -> bool {
+    std::env::var(UNSAFE_HOST_RUN_ENV)
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+/// Execute RUN command directly on host (unsafe macOS escape hatch).
 ///
-/// This is intentionally opt-in. Running Dockerfile `RUN` instructions on the
-/// Darwin host can produce layers that do not behave like Linux container
-/// layers, so normal builds fail clearly until the MicroVM build executor lands.
+/// This does not provide container/Linux build semantics. It exists only for
+/// explicit local experiments while isolated macOS build execution is pending.
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
-fn handle_run_via_microvm(
+fn handle_run_on_host_unsafe(
     command: &str,
     rootfs_dir: &Path,
     layers_dir: &Path,
@@ -230,15 +454,8 @@ fn handle_run_via_microvm(
 ) -> Result<Option<LayerInfo>> {
     use super::super::layer::DirSnapshot;
 
-    if std::env::var("A3S_BOX_ALLOW_HOST_RUN").as_deref() != Ok("1") {
-        return Err(BoxError::BuildError(
-            "Dockerfile RUN is not supported on macOS yet because the MicroVM build executor is not implemented. Set A3S_BOX_ALLOW_HOST_RUN=1 to use the unsafe host-execution fallback for development."
-                .to_string(),
-        ));
-    }
-
     if !quiet {
-        println!("→ Executing RUN command on host (A3S_BOX_ALLOW_HOST_RUN=1)");
+        println!("→ Executing RUN command on host (unsafe)");
     }
 
     // Capture filesystem state before execution
@@ -300,20 +517,25 @@ fn handle_run_via_microvm(
     // Capture filesystem state after execution
     let after = DirSnapshot::capture(rootfs_dir)?;
     let changed = before.diff(&after);
+    let deleted = before.deletions(&after);
 
-    if changed.is_empty() {
+    if changed.is_empty() && deleted.is_empty() {
         if !quiet {
             println!("→ No filesystem changes detected");
         }
         return Ok(None);
     }
 
-    // Create layer from changes
+    // Create layer from changes (and OCI whiteouts for deletions)
     let layer_path = layers_dir.join(format!("layer_{}.tar.gz", layer_index));
-    let layer_info = create_layer(rootfs_dir, &changed, &layer_path)?;
+    let layer_info = create_layer_with_deletions(rootfs_dir, &changed, &deleted, &layer_path)?;
 
     if !quiet {
-        println!("→ Created layer with {} changes", changed.len());
+        println!(
+            "→ Created layer with {} changes, {} deletions",
+            changed.len(),
+            deleted.len()
+        );
     }
 
     Ok(Some(layer_info))
@@ -324,15 +546,29 @@ fn handle_run_via_microvm(
 pub(super) fn handle_add(
     src_patterns: &[String],
     dst: &str,
-    _chown: Option<&str>,
+    chown: Option<&str>,
     context_dir: &Path,
     rootfs_dir: &Path,
     layers_dir: &Path,
     workdir: &str,
     layer_index: usize,
+    ignore: Option<&DockerIgnore>,
 ) -> Result<LayerInfo> {
+    let chown_ids = if let Some(spec) = chown {
+        Some(resolve_chown(spec, rootfs_dir)?)
+    } else {
+        None
+    };
+
+    // Expand any glob source patterns against the context (Docker semantics);
+    // remote URL sources pass through untouched.
+    let src_patterns = &resolve_source_patterns(context_dir, src_patterns)?;
+
     let resolved_dst = resolve_path(workdir, dst);
+    reject_path_traversal(&resolved_dst)?;
     let dst_in_rootfs = rootfs_dir.join(resolved_dst.trim_start_matches('/'));
+    // The destination must not escape the rootfs via `..` or a base-image symlink.
+    assert_within(rootfs_dir, &dst_in_rootfs)?;
 
     // Ensure destination directory exists
     if dst.ends_with('/') || src_patterns.len() > 1 {
@@ -378,7 +614,15 @@ pub(super) fn handle_add(
             continue;
         }
 
-        let src_path = context_dir.join(src);
+        // See handle_copy: strip a leading slash so an absolute src resolves
+        // within the context rather than discarding the base in `Path::join`.
+        reject_path_traversal(src)?;
+        let rel = PathBuf::from(if src == "." {
+            ""
+        } else {
+            src.trim_start_matches('/')
+        });
+        let src_path = context_dir.join(src.trim_start_matches('/'));
         if !src_path.exists() {
             return Err(BoxError::BuildError(format!(
                 "ADD source not found: {} (in context {})",
@@ -386,12 +630,23 @@ pub(super) fn handle_add(
                 context_dir.display()
             )));
         }
+        // A source must resolve inside the build context (no `..`/symlink escape).
+        assert_within(context_dir, &src_path)?;
+
+        if let Some(ign) = ignore {
+            if !rel.as_os_str().is_empty() && src_path.is_file() && ign.is_excluded(&rel) {
+                return Err(BoxError::BuildError(format!(
+                    "ADD source not found: {} (excluded by .dockerignore)",
+                    src
+                )));
+            }
+        }
 
         // Check if it's a tar archive that should be auto-extracted
         if is_tar_archive(src) && !src_path.is_dir() {
             extract_tar_to_dst(&src_path, &dst_in_rootfs)?;
         } else if src_path.is_dir() {
-            copy_dir_recursive(&src_path, &dst_in_rootfs)?;
+            copy_dir_filtered(&src_path, &dst_in_rootfs, &rel, ignore)?;
         } else {
             let target = if dst_in_rootfs.is_dir() {
                 dst_in_rootfs.join(
@@ -413,18 +668,18 @@ pub(super) fn handle_add(
         }
     }
 
-    // Create a layer from the destination
+    // Create a layer from the destination, stamping --chown into tar headers.
     let layer_path = layers_dir.join(format!("layer_{}.tar.gz", layer_index));
     let target_prefix = Path::new(resolved_dst.trim_start_matches('/'));
     if dst_in_rootfs.is_dir() {
-        create_layer_from_dir(&dst_in_rootfs, target_prefix, &layer_path)
+        create_layer_from_dir_with_chown(&dst_in_rootfs, target_prefix, &layer_path, chown_ids)
     } else if dst_in_rootfs.parent().is_some() {
         let changed = vec![PathBuf::from(
             dst_in_rootfs
                 .strip_prefix(rootfs_dir)
                 .unwrap_or(target_prefix),
         )];
-        create_layer(rootfs_dir, &changed, &layer_path)
+        create_layer_with_chown(rootfs_dir, &changed, &[], &layer_path, chown_ids)
     } else {
         Err(BoxError::BuildError("Invalid ADD destination".to_string()))
     }
@@ -446,31 +701,39 @@ pub(super) fn execute_onbuild_trigger(
     // Only handle metadata instructions in ONBUILD triggers for now
     // (RUN/COPY would need full execution context)
     match &instruction {
-        Instruction::Env { key, value } => {
-            let expanded = expand_args(value, &state.build_args);
-            if let Some(existing) = state.env.iter_mut().find(|(k, _)| k == key) {
-                existing.1 = expanded;
-            } else {
-                state.env.push((key.clone(), expanded));
+        Instruction::Env { vars } => {
+            for (key, value) in vars {
+                let expanded = expand_args(value, &state.build_args);
+                if let Some(existing) = state.env.iter_mut().find(|(k, _)| k == key) {
+                    existing.1 = expanded;
+                } else {
+                    state.env.push((key.clone(), expanded));
+                }
             }
         }
-        Instruction::Label { key, value } => {
-            state.labels.insert(key.clone(), value.clone());
+        Instruction::Label { pairs } => {
+            for (key, value) in pairs {
+                state.labels.insert(key.clone(), value.clone());
+            }
         }
         Instruction::Workdir { path } => {
             state.workdir = resolve_path(&state.workdir, path);
         }
-        Instruction::Expose { port } => {
-            state.exposed_ports.push(port.clone());
+        Instruction::Expose { ports } => {
+            for port in ports {
+                if !state.exposed_ports.contains(port) {
+                    state.exposed_ports.push(port.clone());
+                }
+            }
         }
         Instruction::User { user } => {
             state.user = Some(user.clone());
         }
         _ => {
-            tracing::warn!(
-                trigger = trigger,
-                "ONBUILD trigger requires execution context, skipping"
-            );
+            return Err(BoxError::BuildError(format!(
+                "ONBUILD trigger '{}' is not supported yet because it requires build execution context",
+                trigger
+            )));
         }
     }
 
@@ -486,12 +749,20 @@ pub(super) fn execute_onbuild_trigger(
 pub(super) fn instruction_to_string(instr: &Instruction) -> String {
     match instr {
         Instruction::Run { command } => format!("RUN {}", command),
-        Instruction::Copy { src, dst, from } => {
+        Instruction::Copy {
+            src,
+            dst,
+            from,
+            chown,
+        } => {
+            let mut prefix = String::from("COPY");
             if let Some(f) = from {
-                format!("COPY --from={} {} {}", f, src.join(" "), dst)
-            } else {
-                format!("COPY {} {}", src.join(" "), dst)
+                prefix.push_str(&format!(" --from={}", f));
             }
+            if let Some(c) = chown {
+                prefix.push_str(&format!(" --chown={}", c));
+            }
+            format!("{} {} {}", prefix, src.join(" "), dst)
         }
         Instruction::Add { src, dst, chown } => {
             if let Some(c) = chown {
@@ -501,11 +772,21 @@ pub(super) fn instruction_to_string(instr: &Instruction) -> String {
             }
         }
         Instruction::Workdir { path } => format!("WORKDIR {}", path),
-        Instruction::Env { key, value } => format!("ENV {}={}", key, value),
+        Instruction::Env { vars } => {
+            let pairs: Vec<String> = vars.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+            format!("ENV {}", pairs.join(" "))
+        }
         Instruction::Entrypoint { exec } => format!("ENTRYPOINT {:?}", exec),
         Instruction::Cmd { exec } => format!("CMD {:?}", exec),
-        Instruction::Expose { port } => format!("EXPOSE {}", port),
-        Instruction::Label { key, value } => format!("LABEL {}={}", key, value),
+        Instruction::Expose { ports } => format!("EXPOSE {}", ports.join(" ")),
+        Instruction::Label { pairs } => format!(
+            "LABEL {}",
+            pairs
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
         Instruction::User { user } => format!("USER {}", user),
         Instruction::Arg { name, default } => {
             if let Some(d) = default {
@@ -574,12 +855,12 @@ fn download_url(url: &str) -> std::result::Result<Vec<u8>, String> {
     tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async {
             let client = reqwest::Client::builder()
-                .no_proxy()
                 .timeout(std::time::Duration::from_secs(60))
+                .no_proxy()
                 .build()
                 .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
-            let response = client
+            let mut response = client
                 .get(url)
                 .send()
                 .await
@@ -589,11 +870,32 @@ fn download_url(url: &str) -> std::result::Result<Vec<u8>, String> {
                 return Err(format!("HTTP {} for {}", response.status(), url));
             }
 
-            response
-                .bytes()
+            // Cap the download so a hostile/huge URL cannot OOM the build host:
+            // `bytes()` buffers the WHOLE body with no limit. Reject an oversized
+            // advertised length early, then stream with a hard cap (the length
+            // header may be absent or lie).
+            const MAX_ADD_URL_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB
+            if let Some(len) = response.content_length() {
+                if len > MAX_ADD_URL_BYTES {
+                    return Err(format!(
+                        "ADD URL body too large: {len} bytes (max {MAX_ADD_URL_BYTES})"
+                    ));
+                }
+            }
+            let mut buf: Vec<u8> = Vec::new();
+            while let Some(chunk) = response
+                .chunk()
                 .await
-                .map(|b| b.to_vec())
-                .map_err(|e| format!("Failed to read response body: {}", e))
+                .map_err(|e| format!("Failed to read response body: {}", e))?
+            {
+                if buf.len() as u64 + chunk.len() as u64 > MAX_ADD_URL_BYTES {
+                    return Err(format!(
+                        "ADD URL body exceeds max {MAX_ADD_URL_BYTES} bytes"
+                    ));
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            Ok(buf)
         })
     })
 }
@@ -601,7 +903,38 @@ fn download_url(url: &str) -> std::result::Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::super::super::dockerfile::Instruction;
-    use super::instruction_to_string;
+    use super::{
+        execute_onbuild_trigger, expand_glob_sources, glob_segment_match, handle_add,
+        instruction_to_string,
+    };
+    use crate::oci::build::engine::{BuildConfig, BuildState};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_glob_segment_match() {
+        assert!(glob_segment_match("*.conf", "alpha.conf"));
+        assert!(glob_segment_match("*.conf", ".conf"));
+        assert!(!glob_segment_match("*.conf", "skip.txt"));
+        assert!(glob_segment_match("a?c", "abc"));
+        assert!(!glob_segment_match("a?c", "ac"));
+        assert!(glob_segment_match("*", "anything"));
+        assert!(glob_segment_match("pre*post", "pre_middle_post"));
+        assert!(!glob_segment_match("pre*post", "pre_middle"));
+    }
+
+    #[test]
+    fn test_expand_glob_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("alpha.conf"), "1").unwrap();
+        std::fs::write(dir.path().join("beta.conf"), "2").unwrap();
+        std::fs::write(dir.path().join("skip.txt"), "x").unwrap();
+        let mut got = expand_glob_sources(dir.path(), "*.conf");
+        got.sort();
+        assert_eq!(got, vec!["alpha.conf".to_string(), "beta.conf".to_string()]);
+        // Non-matching glob yields no entries.
+        assert!(expand_glob_sources(dir.path(), "*.md").is_empty());
+    }
 
     #[test]
     fn test_instruction_to_string_run() {
@@ -617,6 +950,7 @@ mod tests {
             src: vec!["file1.txt".to_string(), "file2.txt".to_string()],
             dst: "/app/".to_string(),
             from: None,
+            chown: None,
         };
         assert_eq!(
             instruction_to_string(&instr),
@@ -630,6 +964,7 @@ mod tests {
             src: vec!["app".to_string()],
             dst: "/usr/local/bin/".to_string(),
             from: Some("builder".to_string()),
+            chown: None,
         };
         assert_eq!(
             instruction_to_string(&instr),
@@ -663,8 +998,7 @@ mod tests {
     #[test]
     fn test_instruction_to_string_env() {
         let instr = Instruction::Env {
-            key: "PATH".to_string(),
-            value: "/usr/local/bin:/usr/bin".to_string(),
+            vars: vec![("PATH".to_string(), "/usr/local/bin:/usr/bin".to_string())],
         };
         assert_eq!(
             instruction_to_string(&instr),
@@ -705,7 +1039,7 @@ mod tests {
     #[test]
     fn test_instruction_to_string_expose() {
         let instr = Instruction::Expose {
-            port: "8080/tcp".to_string(),
+            ports: vec!["8080/tcp".to_string()],
         };
         assert_eq!(instruction_to_string(&instr), "EXPOSE 8080/tcp");
     }
@@ -713,8 +1047,7 @@ mod tests {
     #[test]
     fn test_instruction_to_string_label() {
         let instr = Instruction::Label {
-            key: "version".to_string(),
-            value: "1.0.0".to_string(),
+            pairs: vec![("version".to_string(), "1.0.0".to_string())],
         };
         assert_eq!(instruction_to_string(&instr), "LABEL version=1.0.0");
     }
@@ -830,5 +1163,158 @@ mod tests {
             instruction: Box::new(inner),
         };
         assert_eq!(instruction_to_string(&instr), "ONBUILD RUN echo triggered");
+    }
+
+    #[test]
+    fn test_handle_add_chown_numeric_uid_gid() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        let layers = tmp.path().join("layers");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        std::fs::create_dir_all(&layers).unwrap();
+        // Write the file so ADD can find it
+        std::fs::write(tmp.path().join("file.txt"), "data").unwrap();
+
+        // Numeric uid:gid — resolves without /etc/passwd, should succeed.
+        let result = handle_add(
+            &["file.txt".to_string()],
+            "/tmp/file.txt",
+            Some("1000:1000"),
+            tmp.path(),
+            &rootfs,
+            &layers,
+            "/",
+            0,
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "ADD --chown with numeric uid:gid should succeed: {:?}",
+            result.err()
+        );
+        // Checking that the layer was created is sufficient for unit coverage.
+        assert!(result.unwrap().path.exists());
+    }
+
+    #[test]
+    fn test_execute_onbuild_trigger_rejects_execution_instruction() {
+        let mut state = BuildState::new(HashMap::new());
+        let config = BuildConfig {
+            context_dir: PathBuf::from("/tmp/context"),
+            dockerfile_path: PathBuf::from("/tmp/context/Dockerfile"),
+            tag: None,
+            build_args: HashMap::new(),
+            quiet: true,
+            platforms: vec![],
+            target: None,
+            no_cache: false,
+            metrics: None,
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let err = execute_onbuild_trigger(
+            "RUN echo trigger",
+            &mut state,
+            &config,
+            tmp.path(),
+            tmp.path(),
+            &[],
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("ONBUILD trigger 'RUN echo trigger' is not supported yet"));
+    }
+
+    #[test]
+    fn test_linux_run_shell_path_defaults_to_bin_sh() {
+        assert_eq!(super::linux_run_shell_path(&[]), "/bin/sh");
+        assert_eq!(
+            super::linux_run_shell_path(&["/bin/bash".to_string(), "-c".to_string()]),
+            "/bin/bash"
+        );
+    }
+
+    #[test]
+    fn test_linux_run_preconditions_reject_non_root() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        std::fs::create_dir_all(rootfs.join("bin")).unwrap();
+        std::fs::write(rootfs.join("bin/sh"), "fake shell").unwrap();
+
+        let err = super::validate_linux_run_preconditions(&rootfs, &[], 1000)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("requires root privileges"));
+    }
+
+    #[test]
+    fn test_linux_run_preconditions_reject_missing_shell() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+
+        let err = super::validate_linux_run_preconditions(&rootfs, &[], 0)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("was not found in rootfs"));
+    }
+
+    #[test]
+    fn test_linux_run_preconditions_reject_relative_shell() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+
+        let err = super::validate_linux_run_preconditions(&rootfs, &["sh".to_string()], 0)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("is not absolute"));
+    }
+
+    #[test]
+    fn test_ensure_linux_run_workdir_creates_absolute_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+
+        let workdir = super::ensure_linux_run_workdir(&rootfs, "/app/build").unwrap();
+
+        assert_eq!(workdir, rootfs.join("app/build"));
+        assert!(workdir.is_dir());
+    }
+
+    #[test]
+    fn test_ensure_linux_run_workdir_rejects_relative_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+
+        let err = super::ensure_linux_run_workdir(&rootfs, "app")
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("is not absolute"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_handle_run_rejects_macos_without_unsafe_opt_in() {
+        std::env::remove_var(super::UNSAFE_HOST_RUN_ENV);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        let layers = tmp.path().join("layers");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        std::fs::create_dir_all(&layers).unwrap();
+
+        let result = super::handle_run("echo unsafe", &rootfs, &layers, "/", &[], &[], 0, true);
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Dockerfile RUN is not supported on macOS yet"));
+        assert!(err.contains(super::UNSAFE_HOST_RUN_ENV));
     }
 }

@@ -244,6 +244,46 @@ impl RaTlsAttestationClient {
             failures: vec![],
         })
     }
+
+    /// Fetch the raw attestation report over RA-TLS, without applying a
+    /// verification policy.
+    ///
+    /// The guest attestation server speaks RA-TLS + framed messages (not plain
+    /// HTTP); the signed report is carried in the server's TLS certificate and
+    /// is extracted here after the handshake.
+    pub async fn fetch_report(&self, allow_simulated: bool) -> Result<AttestationReport> {
+        use a3s_box_core::tee::{AttestRequest, AttestRoute};
+
+        let mut tls_stream = connect_ratls(
+            &self.socket_path,
+            crate::tee::AttestationPolicy::default(),
+            allow_simulated,
+        )
+        .await?;
+
+        // Exchange a Status frame so the handshake (and report extraction)
+        // completes against a live server.
+        let req = AttestRequest {
+            route: AttestRoute::Status,
+            payload: serde_json::Value::Null,
+        };
+        let payload = serde_json::to_vec(&req).map_err(|e| {
+            BoxError::AttestationError(format!("Failed to serialize status request: {}", e))
+        })?;
+        write_tls_frame(&mut tls_stream, 0x01, &payload).await?;
+        let _ = read_tls_frame(&mut tls_stream).await?;
+
+        let (_, tls_conn) = tls_stream.get_ref();
+        let cert = tls_conn
+            .peer_certificates()
+            .and_then(|certs| certs.first())
+            .ok_or_else(|| {
+                BoxError::AttestationError(
+                    "RA-TLS server presented no certificate to extract a report from".to_string(),
+                )
+            })?;
+        crate::tee::ratls::extract_report_from_cert(cert.as_ref())
+    }
 }
 
 /// A secret to inject into the TEE.
@@ -570,28 +610,18 @@ mod tests {
     use super::*;
     use tokio::net::UnixListener;
 
-    fn socket_tempdir() -> tempfile::TempDir {
-        #[cfg(target_os = "macos")]
-        {
-            tempfile::Builder::new()
-                .prefix("a3s-attest-test-")
-                .tempdir_in("/private/tmp")
-                .unwrap()
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            tempfile::TempDir::new().unwrap()
-        }
-    }
-
     fn bind_test_listener(path: &Path) -> Option<UnixListener> {
         match UnixListener::bind(path) {
             Ok(listener) => Some(listener),
-            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
-                eprintln!("skipping Unix socket test: {}", err);
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!(
+                    "skipping Unix socket test; sandbox denied bind at {}: {}",
+                    path.display(),
+                    e
+                );
                 None
             }
-            Err(err) => panic!("failed to bind test socket {}: {}", path.display(), err),
+            Err(e) => panic!("failed to bind test socket {}: {}", path.display(), e),
         }
     }
 
@@ -606,7 +636,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_attestation_connect_and_socket_path() {
-        let tmp = socket_tempdir();
+        let tmp = tempfile::TempDir::new().unwrap();
         let sock_path = tmp.path().join("attest.sock");
         let Some(_listener) = bind_test_listener(&sock_path) else {
             return;

@@ -5,28 +5,27 @@ PackageIdentifier: A3SLab.Box
 PackageVersion: 0.8.0
 PackageLocale: en-US
 Publisher: A3S Lab
-PublisherUrl: https://github.com/A3S-Lab
-PublisherSupportUrl: https://github.com/A3S-Lab/Box/issues
+PublisherUrl: https://github.com/AI45Lab
+PublisherSupportUrl: https://github.com/AI45Lab/Box/issues
 PackageName: a3s-box
-PackageUrl: https://github.com/A3S-Lab/Box
+PackageUrl: https://github.com/AI45Lab/Box
 License: MIT
-LicenseUrl: https://github.com/A3S-Lab/Box/blob/main/LICENSE
-ShortDescription: MicroVM sandbox runtime with Windows WHPX backend support
+LicenseUrl: https://github.com/AI45Lab/Box/blob/main/LICENSE
+ShortDescription: MicroVM sandbox runtime with native Windows WHPX support
 Description: |-
-  a3s-box is a lightweight microVM sandbox runtime that provides secure container execution
-  using hardware virtualization. It supports multiple platforms including Linux (KVM),
-  macOS (Hypervisor.framework), and Windows (WHPX - Windows Hypervisor Platform).
+  a3s-box is a Docker-like MicroVM runtime for Linux OCI workloads. The Windows
+  package runs natively on Windows through libkrun's Windows Hypervisor Platform
+  (WHPX) backend; it does not require WSL.
 
   Key features:
-  - Windows Hypervisor Platform (WHPX) backend
-  - virtiofs passthrough filesystem
-  - virtio-net TCP backend for networking
-  - virtio-blk block device support
-  - virtio-console for serial I/O
-  - TSI (Transparent Socket Impersonation) for vsock
+  - Native Windows Hypervisor Platform (WHPX) backend
+  - Bundled a3s-box CLI, shim, Linux guest init, and krun.dll
+  - Docker-like run/create/start/logs/image workflows on Windows
+  - Named-pipe host/guest control channel for WHPX guests
+  - Windows CRI is not supported
 
   Requirements:
-  - Windows 10/11 with Hyper-V Platform enabled
+  - Windows 10/11 x64 with Windows Hypervisor Platform enabled
   - Run: Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform
 Moniker: a3s-box
 Tags:
@@ -38,28 +37,14 @@ Tags:
 - sandbox
 - libkrun
 ReleaseNotes: |-
-  Release v0.8.0 - Windows WHPX Backend Support
+  Windows packaging uses the native WHPX backend. The package includes the
+  Windows a3s-box CLI, the Windows shim, the Linux guest-init binary that runs
+  inside the MicroVM, and krun.dll.
 
-  Major new feature: Full Windows Hypervisor Platform (WHPX) backend support!
-
-  New Features:
-  - Complete Windows Hypervisor Platform integration
-  - virtiofs passthrough filesystem on Windows
-  - virtio-net with TCP backend
-  - virtio-blk block device support
-  - virtio-console with Windows stdin/stdout
-  - TSI (Transparent Socket Impersonation) for vsock
-
-  Platform Support:
-  - Linux x86_64 (KVM)
-  - Linux aarch64 (KVM)
-  - macOS arm64 (Hypervisor.framework)
-  - Windows x86_64 (WHPX) - NEW!
-
-  Requirements (Windows):
-  Enable Windows Hypervisor Platform:
-  Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform
-  Restart-Computer
-ReleaseNotesUrl: https://github.com/A3S-Lab/Box/releases/tag/v0.8.0
+  Windows boundaries:
+  - Requires Windows Hypervisor Platform.
+  - Does not require WSL.
+  - Windows CRI is unsupported.
+ReleaseNotesUrl: https://github.com/AI45Lab/Box/releases/tag/v0.8.0
 ManifestType: defaultLocale
 ManifestVersion: 1.6.0

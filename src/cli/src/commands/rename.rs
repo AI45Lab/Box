@@ -15,17 +15,17 @@ pub struct RenameArgs {
 }
 
 pub async fn execute(args: RenameArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let mut state = StateFile::load_default()?;
-
-    // Check that the new name is not already taken
-    if state.find_by_name(&args.new_name).is_some() {
-        return Err(format!("Name \"{}\" is already in use", args.new_name).into());
-    }
-
-    let record = resolve::resolve_mut(&mut state, &args.r#box)?;
-    let old_name = record.name.clone();
-    record.name = args.new_name.clone();
-    state.save()?;
+    // Do the name-conflict check and the rename atomically under the state lock
+    // (load-fresh + mutate + save) so a concurrent writer cannot be clobbered.
+    let old_name = StateFile::modify(|state| -> Result<String, Box<dyn std::error::Error>> {
+        if state.find_by_name(&args.new_name).is_some() {
+            return Err(format!("Name \"{}\" is already in use", args.new_name).into());
+        }
+        let record = resolve::resolve_mut(state, &args.r#box)?;
+        let old_name = record.name.clone();
+        record.name = args.new_name.clone();
+        Ok(old_name)
+    })?;
 
     println!("Renamed {} → {}", old_name, args.new_name);
     Ok(())
@@ -48,6 +48,7 @@ mod tests {
             image: "alpine:latest".to_string(),
             status: "created".to_string(),
             pid: None,
+            pid_start_time: None,
             cpus: 2,
             memory_mb: 512,
             volumes: vec![],
@@ -74,6 +75,7 @@ mod tests {
             max_restart_count: 0,
             exit_code: None,
             health_check: None,
+            healthcheck_disabled: false,
             health_status: "none".to_string(),
             health_retries: 0,
             health_last_check: None,

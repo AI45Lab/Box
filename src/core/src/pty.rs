@@ -41,7 +41,10 @@ pub struct PtyRequest {
     /// Working directory for the command.
     #[serde(default)]
     pub working_dir: Option<String>,
-    /// User to run the command as.
+    /// Optional guest-visible rootfs path to chroot into before executing.
+    #[serde(default)]
+    pub rootfs: Option<String>,
+    /// User to run the command as (supported: "root", "1000", "1000:1000").
     #[serde(default)]
     pub user: Option<String>,
     /// Terminal width in columns.
@@ -222,6 +225,7 @@ mod tests {
             cmd: vec!["/bin/sh".to_string()],
             env: vec!["TERM=xterm".to_string()],
             working_dir: Some("/home".to_string()),
+            rootfs: Some("/run/a3s/cri/container-rootfs/sb/c/rootfs".to_string()),
             user: None,
             cols: 80,
             rows: 24,
@@ -239,6 +243,10 @@ mod tests {
             other => panic!("Expected Request, got {:?}", other),
         };
         assert_eq!(parsed.cmd, vec!["/bin/sh"]);
+        assert_eq!(
+            parsed.rootfs,
+            Some("/run/a3s/cri/container-rootfs/sb/c/rootfs".to_string())
+        );
         assert_eq!(parsed.cols, 80);
         assert_eq!(parsed.rows, 24);
     }
@@ -330,6 +338,7 @@ mod tests {
         let req: PtyRequest = serde_json::from_str(json).unwrap();
         assert!(req.env.is_empty());
         assert!(req.working_dir.is_none());
+        assert!(req.rootfs.is_none());
         assert!(req.user.is_none());
     }
 

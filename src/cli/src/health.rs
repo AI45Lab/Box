@@ -12,6 +12,8 @@
 
 use std::path::PathBuf;
 
+#[cfg(any(not(windows), test))]
+use crate::state::BoxRecord;
 use crate::state::HealthCheck;
 #[cfg(not(windows))]
 use crate::state::StateFile;
@@ -44,21 +46,13 @@ pub fn spawn_health_checker(
 async fn run_health_loop(box_id: String, exec_socket_path: PathBuf, hc: HealthCheck) {
     use std::time::Duration;
 
-    // Set initial status to "starting" during start_period
+    // Honour start_period before the first probe
     if hc.start_period_secs > 0 {
-        if let Ok(mut state) = StateFile::load_default() {
-            if let Some(record) = state.find_by_id_mut(&box_id) {
-                record.health_status = "starting".to_string();
-                let _ = state.save();
-            }
-        }
         tokio::time::sleep(Duration::from_secs(hc.start_period_secs)).await;
     }
 
     let interval = Duration::from_secs(hc.interval_secs.max(1));
-    let timeout_ns = hc.timeout_secs.saturating_mul(1_000_000_000);
-    let mut consecutive_failures = 0u32;
-    let mut was_unhealthy = false;
+    let timeout_ns = probe_timeout_ns(&hc);
 
     loop {
         tokio::time::sleep(interval).await;
@@ -70,103 +64,32 @@ async fn run_health_loop(box_id: String, exec_socket_path: PathBuf, hc: HealthCh
 
         let healthy = run_probe(&exec_socket_path, &hc.cmd, timeout_ns).await;
 
-        let Ok(mut state) = StateFile::load_default() else {
-            continue;
-        };
-        let Some(record) = state.find_by_id_mut(&box_id) else {
-            break; // Box removed from state
-        };
-
-        let previous_status = record.health_status.clone();
-
-        if healthy {
-            record.health_status = "healthy".to_string();
-            consecutive_failures = 0;
-            record.health_retries = 0;
-
-            // Log recovery from unhealthy state
-            if was_unhealthy {
-                tracing::info!(
-                    box_id = %box_id,
-                    box_name = %record.name,
-                    "Container recovered from unhealthy state"
-                );
-                was_unhealthy = false;
+        // Reload fresh under the state lock and apply ONLY this box's health
+        // fields, so concurrent monitor/CLI writers are not clobbered.
+        let keep_going = StateFile::modify(|state| {
+            let Some(record) = state.find_by_id_mut(&box_id) else {
+                return Ok::<bool, std::io::Error>(false); // box removed
+            };
+            if record.status != "running" {
+                return Ok(false); // box stopped
             }
-        } else {
-            consecutive_failures += 1;
-            record.health_retries = consecutive_failures;
-
-            if consecutive_failures >= hc.retries {
-                let newly_unhealthy = record.health_status != "unhealthy";
-                record.health_status = "unhealthy".to_string();
-                was_unhealthy = true;
-
-                if newly_unhealthy {
-                    tracing::warn!(
-                        box_id = %box_id,
-                        box_name = %record.name,
-                        consecutive_failures = consecutive_failures,
-                        "Container marked as unhealthy after {} consecutive failures",
-                        consecutive_failures
-                    );
-
-                    // Check if we should restart the container based on restart policy
-                    if should_restart_on_unhealthy(&record.restart_policy) {
-                        tracing::info!(
-                            box_id = %box_id,
-                            box_name = %record.name,
-                            restart_policy = %record.restart_policy,
-                            "Triggering container restart due to unhealthy status"
-                        );
-
-                        // Notify the monitor to restart the container
-                        // The monitor will handle the actual restart logic
-                        crate::monitor_global::notify_container_stopped(&box_id).await;
-                    }
-                }
-            } else {
-                tracing::debug!(
-                    box_id = %box_id,
-                    box_name = %record.name,
-                    consecutive_failures = consecutive_failures,
-                    retries_threshold = hc.retries,
-                    "Health check failed ({}/{})",
-                    consecutive_failures,
-                    hc.retries
-                );
-            }
+            apply_probe_result(record, healthy, chrono::Utc::now());
+            Ok(true)
+        });
+        match keep_going {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(_) => continue,
         }
-
-        record.health_last_check = Some(chrono::Utc::now());
-
-        // Log status transitions
-        if previous_status != record.health_status {
-            tracing::info!(
-                box_id = %box_id,
-                box_name = %record.name,
-                previous_status = %previous_status,
-                new_status = %record.health_status,
-                "Health status changed: {} → {}",
-                previous_status,
-                record.health_status
-            );
-        }
-
-        let _ = state.save();
     }
 }
 
-/// Check if the container should be restarted when it becomes unhealthy.
-///
-/// Containers with "always" or "unless-stopped" restart policies should be
-/// restarted when they become unhealthy.
-fn should_restart_on_unhealthy(restart_policy: &str) -> bool {
-    matches!(restart_policy, "always" | "unless-stopped")
-}
-
 #[cfg(not(windows))]
-async fn run_probe(exec_socket_path: &std::path::Path, cmd: &[String], timeout_ns: u64) -> bool {
+pub(crate) async fn run_probe(
+    exec_socket_path: &std::path::Path,
+    cmd: &[String],
+    timeout_ns: u64,
+) -> bool {
     use a3s_box_core::exec::ExecRequest;
     use a3s_box_runtime::ExecClient;
 
@@ -180,7 +103,9 @@ async fn run_probe(exec_socket_path: &std::path::Path, cmd: &[String], timeout_n
         timeout_ns,
         env: vec![],
         working_dir: None,
+        rootfs: None,
         stdin: None,
+        stdin_streaming: false,
         user: None,
         streaming: false,
     };
@@ -189,6 +114,63 @@ async fn run_probe(exec_socket_path: &std::path::Path, cmd: &[String], timeout_n
         Ok(output) => output.exit_code == 0,
         Err(_) => false,
     }
+}
+
+#[cfg(any(not(windows), test))]
+pub(crate) fn probe_timeout_ns(hc: &HealthCheck) -> u64 {
+    hc.timeout_secs.saturating_mul(1_000_000_000)
+}
+
+#[cfg(any(not(windows), test))]
+pub(crate) fn should_probe(record: &BoxRecord, now: chrono::DateTime<chrono::Utc>) -> bool {
+    let Some(hc) = record.health_check.as_ref() else {
+        return false;
+    };
+    if record.status != "running" {
+        return false;
+    }
+
+    if let Some(started_at) = record.started_at {
+        let start_period = bounded_chrono_seconds(hc.start_period_secs);
+        if now < started_at + start_period {
+            return false;
+        }
+    }
+
+    let Some(last_check) = record.health_last_check else {
+        return true;
+    };
+
+    now >= last_check + bounded_chrono_seconds(hc.interval_secs.max(1))
+}
+
+#[cfg(any(not(windows), test))]
+pub(crate) fn apply_probe_result(
+    record: &mut BoxRecord,
+    healthy: bool,
+    checked_at: chrono::DateTime<chrono::Utc>,
+) {
+    if record.status != "running" {
+        return;
+    }
+
+    if healthy {
+        record.health_status = "healthy".to_string();
+        record.health_retries = 0;
+    } else {
+        record.health_retries = record.health_retries.saturating_add(1);
+        if let Some(hc) = record.health_check.as_ref() {
+            if record.health_retries >= hc.retries {
+                record.health_status = "unhealthy".to_string();
+            }
+        }
+    }
+    record.health_last_check = Some(checked_at);
+}
+
+#[cfg(any(not(windows), test))]
+fn bounded_chrono_seconds(seconds: u64) -> chrono::Duration {
+    chrono::Duration::seconds(seconds.min(i64::MAX as u64) as i64)
 }
 
 #[cfg(test)]
@@ -212,37 +194,101 @@ mod tests {
     #[test]
     fn test_timeout_ns_overflow_safe() {
         // Large timeout_secs must not overflow u64
-        let timeout_ns = 5u64.saturating_mul(1_000_000_000);
-        assert_eq!(timeout_ns, 5_000_000_000);
+        let hc = HealthCheck {
+            cmd: vec!["true".to_string()],
+            interval_secs: 30,
+            timeout_secs: 5,
+            retries: 3,
+            start_period_secs: 0,
+        };
+        assert_eq!(probe_timeout_ns(&hc), 5_000_000_000);
 
-        let big_timeout_ns = u64::MAX.saturating_mul(1_000_000_000);
-        assert_eq!(big_timeout_ns, u64::MAX); // saturates instead of overflowing
+        let big_hc = HealthCheck {
+            timeout_secs: u64::MAX,
+            ..hc
+        };
+        assert_eq!(probe_timeout_ns(&big_hc), u64::MAX); // saturates instead of overflowing
     }
 
     #[test]
-    fn test_should_restart_on_unhealthy_always() {
-        assert!(should_restart_on_unhealthy("always"));
+    fn test_should_probe_respects_start_period() {
+        let now = chrono::Utc::now();
+        let mut record =
+            crate::test_helpers::fixtures::make_record("health-id", "health", "running", Some(1));
+        record.started_at = Some(now);
+        record.health_check = Some(HealthCheck {
+            cmd: vec!["true".to_string()],
+            interval_secs: 30,
+            timeout_secs: 5,
+            retries: 3,
+            start_period_secs: 10,
+        });
+
+        assert!(!should_probe(&record, now + chrono::Duration::seconds(9)));
+        assert!(should_probe(&record, now + chrono::Duration::seconds(10)));
     }
 
     #[test]
-    fn test_should_restart_on_unhealthy_unless_stopped() {
-        assert!(should_restart_on_unhealthy("unless-stopped"));
+    fn test_should_probe_respects_interval() {
+        let now = chrono::Utc::now();
+        let mut record =
+            crate::test_helpers::fixtures::make_record("health-id", "health", "running", Some(1));
+        record.started_at = Some(now - chrono::Duration::seconds(60));
+        record.health_last_check = Some(now);
+        record.health_check = Some(HealthCheck {
+            cmd: vec!["true".to_string()],
+            interval_secs: 30,
+            timeout_secs: 5,
+            retries: 3,
+            start_period_secs: 0,
+        });
+
+        assert!(!should_probe(&record, now + chrono::Duration::seconds(29)));
+        assert!(should_probe(&record, now + chrono::Duration::seconds(30)));
     }
 
     #[test]
-    fn test_should_restart_on_unhealthy_no() {
-        assert!(!should_restart_on_unhealthy("no"));
+    fn test_apply_probe_result_tracks_retries_and_recovery() {
+        let now = chrono::Utc::now();
+        let mut record =
+            crate::test_helpers::fixtures::make_record("health-id", "health", "running", Some(1));
+        record.health_status = "starting".to_string();
+        record.health_check = Some(HealthCheck {
+            cmd: vec!["false".to_string()],
+            interval_secs: 30,
+            timeout_secs: 5,
+            retries: 2,
+            start_period_secs: 0,
+        });
+
+        apply_probe_result(&mut record, false, now);
+        assert_eq!(record.health_status, "starting");
+        assert_eq!(record.health_retries, 1);
+
+        apply_probe_result(&mut record, false, now);
+        assert_eq!(record.health_status, "unhealthy");
+        assert_eq!(record.health_retries, 2);
+
+        apply_probe_result(&mut record, true, now);
+        assert_eq!(record.health_status, "healthy");
+        assert_eq!(record.health_retries, 0);
     }
 
     #[test]
-    fn test_should_restart_on_unhealthy_on_failure() {
-        // on-failure policy should NOT restart on unhealthy status
-        // It only restarts on non-zero exit codes
-        assert!(!should_restart_on_unhealthy("on-failure"));
-    }
+    fn test_apply_probe_result_ignores_stopped_records() {
+        let now = chrono::Utc::now();
+        let mut record =
+            crate::test_helpers::fixtures::make_record("health-id", "health", "stopped", None);
+        record.health_check = Some(HealthCheck {
+            cmd: vec!["true".to_string()],
+            interval_secs: 30,
+            timeout_secs: 5,
+            retries: 1,
+            start_period_secs: 0,
+        });
 
-    #[test]
-    fn test_should_restart_on_unhealthy_unknown() {
-        assert!(!should_restart_on_unhealthy("unknown-policy"));
+        apply_probe_result(&mut record, true, now);
+        assert_eq!(record.health_status, "none");
+        assert!(record.health_last_check.is_none());
     }
 }

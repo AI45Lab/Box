@@ -3,9 +3,9 @@
 //! Optionally signs the image after push using a cosign-compatible
 //! ECDSA P-256 private key (`--sign-key`).
 
-use std::sync::Arc;
-
 use clap::Args;
+
+use crate::image_usage;
 
 #[derive(Args)]
 pub struct PushArgs {
@@ -22,29 +22,21 @@ pub struct PushArgs {
 }
 
 pub async fn execute(args: PushArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let store = Arc::new(super::open_image_store()?);
-    let config = a3s_box_core::A3sConfig::load_default()?;
-    let default_registry = config.registry.default_image_registry();
-
-    // Parse the target reference
-    let reference = a3s_box_runtime::ImageReference::parse_with_default_registry(
-        &args.image,
-        &default_registry,
-    )?;
+    let store = super::open_image_store()?;
+    let images = store.list().await;
 
     // Look up the image in the local store
-    let stored = match store.find(&reference.full_reference()).await {
-        Some(stored) => stored,
-        None => store.find(&args.image).await.ok_or_else(|| {
-            format!(
-                "Image '{}' not found locally. Pull or build it first.",
-                args.image
-            )
-        })?,
-    };
+    let stored = image_usage::resolve_stored_image(&images, &args.image)?.ok_or_else(|| {
+        format!(
+            "Image '{}' not found locally. Pull or build it first.",
+            args.image
+        )
+    })?;
+    let push_reference = push_reference_for_query(&args.image, &stored.reference)?;
+    let reference = a3s_box_runtime::ImageReference::parse(&push_reference)?;
 
     if !args.quiet {
-        println!("Pushing {}...", args.image);
+        println!("Pushing {push_reference}...");
     }
 
     // Load auth from credential store (falls back to env vars, then anonymous)
@@ -56,13 +48,13 @@ pub async fn execute(args: PushArgs) -> Result<(), Box<dyn std::error::Error>> {
     if args.quiet {
         println!("{}", result.manifest_url);
     } else {
-        println!("Pushed: {} ({})", args.image, result.manifest_url);
+        println!("Pushed: {} ({})", push_reference, result.manifest_url);
     }
 
     // Sign the image if --sign-key is provided
     if let Some(ref key_path) = args.sign_key {
         if !args.quiet {
-            println!("Signing {}...", args.image);
+            println!("Signing {push_reference}...");
         }
 
         let sign_result = a3s_box_runtime::oci::signing::sign_image(
@@ -70,16 +62,31 @@ pub async fn execute(args: PushArgs) -> Result<(), Box<dyn std::error::Error>> {
             &reference.registry,
             &reference.repository,
             &result.manifest_digest,
-            &args.image,
+            &push_reference,
         )
         .await?;
 
         if !args.quiet {
-            println!("Signed: {} ({})", args.image, sign_result.signature_tag);
+            println!("Signed: {} ({})", push_reference, sign_result.signature_tag);
         }
     }
 
     Ok(())
+}
+
+fn push_reference_for_query(query: &str, resolved_reference: &str) -> Result<String, String> {
+    let query = query.trim();
+    if image_usage::is_dangling_reference(query) {
+        if image_usage::is_dangling_reference(resolved_reference) {
+            return Err(
+                "Cannot push a digest-only image reference. Tag it first with `a3s-box tag`."
+                    .to_string(),
+            );
+        }
+        return Ok(resolved_reference.to_string());
+    }
+
+    Ok(query.to_string())
 }
 
 #[cfg(test)]
@@ -105,5 +112,28 @@ mod tests {
             sign_key: Some("/path/to/cosign.key".to_string()),
         };
         assert_eq!(args.sign_key.as_deref(), Some("/path/to/cosign.key"));
+    }
+
+    #[test]
+    fn test_push_reference_for_named_query_uses_query() {
+        assert_eq!(
+            push_reference_for_query("alpine:latest", "docker.io/library/alpine:latest").unwrap(),
+            "alpine:latest"
+        );
+    }
+
+    #[test]
+    fn test_push_reference_for_digest_query_uses_resolved_reference() {
+        assert_eq!(
+            push_reference_for_query("sha256:abc", "example.com/app:latest").unwrap(),
+            "example.com/app:latest"
+        );
+    }
+
+    #[test]
+    fn test_push_reference_rejects_digest_only_resolved_reference() {
+        let error = push_reference_for_query("sha256:abc", "sha256:abc").unwrap_err();
+
+        assert!(error.contains("Tag it first"));
     }
 }

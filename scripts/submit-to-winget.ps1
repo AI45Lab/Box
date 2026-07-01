@@ -25,7 +25,7 @@ if (-not $GitHubToken) {
 }
 
 $Tag = "v$Version"
-$AssetUrl = "https://github.com/A3S-Lab/Box/releases/download/$Tag/a3s-box-$Tag-windows-x86_64.zip"
+$AssetUrl = "https://github.com/AI45Lab/Box/releases/download/$Tag/a3s-box-$Tag-windows-x86_64.zip"
 
 Write-Host "=== Submitting a3s-box $Version to winget ===" -ForegroundColor Cyan
 Write-Host ""

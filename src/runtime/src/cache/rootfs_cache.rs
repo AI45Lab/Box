@@ -122,24 +122,23 @@ impl RootfsCache {
         let rootfs_dir = self.cache_dir.join(key);
         let meta_path = self.cache_dir.join(format!("{}.meta.json", key));
 
-        // Remove existing entry if present
-        if rootfs_dir.exists() {
-            std::fs::remove_dir_all(&rootfs_dir).map_err(|e| {
-                BoxError::CacheError(format!(
-                    "Failed to remove existing rootfs cache entry {}: {}",
-                    rootfs_dir.display(),
-                    e
-                ))
-            })?;
+        // Already fully cached: nothing to do. `put` is only ever called on a
+        // cache MISS, so the only way an entry already exists here is a
+        // concurrent miss of the SAME image — identical content — which makes
+        // the skip correct and the two pulls idempotent.
+        if rootfs_dir.is_dir() && meta_path.is_file() {
+            return Ok(rootfs_dir);
         }
 
-        // Copy source rootfs to cache
-        super::layer_cache::copy_dir_recursive(source_rootfs, &rootfs_dir)?;
+        // Atomically publish (staging dir + rename) so two concurrent builds of
+        // the same image cannot corrupt the cache by removing/interleaving a
+        // half-copied directory (same bug as the layer cache, #85).
+        super::layer_cache::publish_dir_atomically(source_rootfs, &rootfs_dir, &self.cache_dir)?;
 
-        // Calculate size
+        // Calculate size (from whichever copy landed — they are identical).
         let size_bytes = super::layer_cache::dir_size(&rootfs_dir).unwrap_or(0);
 
-        // Write metadata
+        // Write metadata atomically (unique temp + rename).
         let now = chrono::Utc::now().timestamp();
         let meta = RootfsMeta {
             key: key.to_string(),
@@ -148,13 +147,10 @@ impl RootfsCache {
             cached_at: now,
             last_accessed: now,
         };
-        std::fs::write(&meta_path, serde_json::to_string_pretty(&meta)?).map_err(|e| {
-            BoxError::CacheError(format!(
-                "Failed to write rootfs metadata {}: {}",
-                meta_path.display(),
-                e
-            ))
-        })?;
+        super::layer_cache::write_meta_atomically(
+            &meta_path,
+            &serde_json::to_string_pretty(&meta)?,
+        )?;
 
         tracing::debug!(
             key = %key,
@@ -194,11 +190,27 @@ impl RootfsCache {
         Ok(())
     }
 
-    /// Prune the cache to stay within the given entry count limit.
+    /// Prune the cache to stay within the given entry count / byte limit.
     ///
-    /// Evicts least-recently-accessed entries first.
-    /// Returns the number of entries evicted.
+    /// Evicts least-recently-accessed entries first. Returns the number evicted.
     pub fn prune(&self, max_entries: usize, max_bytes: u64) -> Result<usize> {
+        self.prune_protecting(max_entries, max_bytes, &std::collections::HashSet::new())
+    }
+
+    /// Like [`RootfsCache::prune`], but never evicts an entry whose key is in
+    /// `protected`. Such an entry is currently serving as a box's overlayfs
+    /// **lowerdir**, and `remove_dir_all`-ing it out from under a concurrent box's
+    /// `mount(2)` makes the mount fail with ENOENT ("No such file or directory").
+    /// This is the same in-use guard [`crate::SnapshotStore::prune`] applies to
+    /// live copy-on-write lowers — without it, two pipelines built from the same
+    /// image (one cache-hit overlay box, one cache-miss box that prunes after its
+    /// put) can race and corrupt each other.
+    pub fn prune_protecting(
+        &self,
+        max_entries: usize,
+        max_bytes: u64,
+        protected: &std::collections::HashSet<String>,
+    ) -> Result<usize> {
         let mut entries = self.list_entries()?;
 
         if entries.len() <= max_entries {
@@ -218,6 +230,11 @@ impl RootfsCache {
         for entry in &entries {
             if current_count <= max_entries && current_size <= max_bytes {
                 break;
+            }
+            // Never evict an entry in use as a live overlay lower — deleting the
+            // lowerdir under a concurrent box's mount(2) is the bug this guards.
+            if protected.contains(&entry.key) {
+                continue;
             }
             self.invalidate(&entry.key)?;
             current_count -= 1;
@@ -500,6 +517,52 @@ mod tests {
     }
 
     #[test]
+    fn prune_protecting_never_evicts_in_use_key() {
+        let tmp = TempDir::new().unwrap();
+        let cache = RootfsCache::new(tmp.path()).unwrap();
+        for i in 0..4 {
+            let src = tmp.path().join(format!("s{i}"));
+            create_test_rootfs(&src, &[("f", "x")]);
+            cache.put(&format!("k{i}"), &src, &format!("e{i}")).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // k0 is the OLDEST (normally evicted first) but is in use as an overlay lower.
+        let mut protected = std::collections::HashSet::new();
+        protected.insert("k0".to_string());
+        // keep=2 over 4 entries evicts two; the protected k0 is never one of them.
+        // (last_accessed is second-resolution, so WHICH two unprotected entries go
+        // is not asserted — only that the in-use lower survives.)
+        let evicted = cache.prune_protecting(2, u64::MAX, &protected).unwrap();
+        assert_eq!(evicted, 2, "two unprotected entries evicted to meet keep=2");
+        assert!(
+            cache.get("k0").unwrap().is_some(),
+            "the in-use (protected) lower must survive prune"
+        );
+        assert_eq!(
+            cache.entry_count().unwrap(),
+            2,
+            "k0 + one unprotected remain"
+        );
+    }
+
+    #[test]
+    fn prune_protecting_keeps_all_when_all_in_use() {
+        let tmp = TempDir::new().unwrap();
+        let cache = RootfsCache::new(tmp.path()).unwrap();
+        for i in 0..2 {
+            let src = tmp.path().join(format!("s{i}"));
+            create_test_rootfs(&src, &[("f", "x")]);
+            cache.put(&format!("k{i}"), &src, "e").unwrap();
+        }
+        let protected: std::collections::HashSet<String> =
+            ["k0", "k1"].iter().map(|s| s.to_string()).collect();
+        // Even asked to keep 0, nothing is evicted — every entry is a live lower.
+        let evicted = cache.prune_protecting(0, 0, &protected).unwrap();
+        assert_eq!(evicted, 0, "all in-use -> nothing evicted");
+        assert_eq!(cache.entry_count().unwrap(), 2);
+    }
+
+    #[test]
     fn test_rootfs_cache_metadata_persists() {
         let tmp = TempDir::new().unwrap();
         let cache = RootfsCache::new(tmp.path()).unwrap();
@@ -722,29 +785,61 @@ mod tests {
     }
 
     #[test]
-    fn test_rootfs_cache_put_overwrites_existing() {
+    fn test_rootfs_cache_put_same_key_is_idempotent() {
+        // `put` is only ever called on a cache miss, so an existing entry can
+        // only come from a concurrent miss of the SAME image (identical
+        // content). Re-putting must keep the first entry, not remove-and-recopy
+        // (which corrupts the cache when two builds of the same image race).
         let tmp = TempDir::new().unwrap();
         let cache = RootfsCache::new(tmp.path()).unwrap();
-        let key = "overwrite";
+        let key = "idempotent";
 
-        // Put first version
         let s1 = tmp.path().join("v1");
         create_test_rootfs(&s1, &[("v1.txt", "version 1")]);
-        cache.put(key, &s1, "first").unwrap();
+        let first = cache.put(key, &s1, "first").unwrap();
 
-        // Put second version
         let s2 = tmp.path().join("v2");
         create_test_rootfs(&s2, &[("v2.txt", "version 2")]);
-        let cached = cache.put(key, &s2, "second").unwrap();
+        let second = cache.put(key, &s2, "second").unwrap();
 
-        assert!(!cached.join("v1.txt").exists());
-        assert!(cached.join("v2.txt").is_file());
-
-        // Metadata should reflect second put
+        // Same path, first content + metadata preserved (idempotent, no overwrite).
+        assert_eq!(first, second);
+        assert!(second.join("v1.txt").is_file());
+        assert!(!second.join("v2.txt").exists());
         let meta_path = tmp.path().join(format!("{}.meta.json", key));
-        let content = std::fs::read_to_string(&meta_path).unwrap();
-        let meta: RootfsMeta = serde_json::from_str(&content).unwrap();
-        assert_eq!(meta.description, "second");
+        let meta: RootfsMeta =
+            serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+        assert_eq!(meta.description, "first");
+    }
+
+    #[test]
+    fn test_rootfs_cache_concurrent_put_same_key_no_corruption() {
+        use std::sync::Arc;
+
+        let tmp = TempDir::new().unwrap();
+        let cache = Arc::new(RootfsCache::new(tmp.path()).unwrap());
+        let key = "concurrent";
+        let files: &[(&str, &str)] = &[("a.txt", "alpha"), ("sub/b.txt", "beta")];
+
+        let handles: Vec<_> = (0..12)
+            .map(|i| {
+                let cache = Arc::clone(&cache);
+                let src = tmp.path().join(format!("src{i}"));
+                create_test_rootfs(&src, files);
+                std::thread::spawn(move || cache.put(key, &src, "race").unwrap())
+            })
+            .collect();
+        let paths: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        for p in &paths {
+            assert_eq!(p, &paths[0]);
+            assert_eq!(std::fs::read_to_string(p.join("a.txt")).unwrap(), "alpha");
+            assert_eq!(
+                std::fs::read_to_string(p.join("sub/b.txt")).unwrap(),
+                "beta"
+            );
+        }
+        assert!(cache.get(key).unwrap().is_some());
     }
 
     #[test]

@@ -81,6 +81,11 @@ pub struct NetworkEndpoint {
     /// Box name (for DNS resolution).
     pub box_name: String,
 
+    /// Additional DNS names that also resolve to this endpoint's IP (e.g. the
+    /// bare Compose service name alongside the `{project}-{service}` box name).
+    #[serde(default)]
+    pub aliases: Vec<String>,
+
     /// Assigned IPv4 address.
     pub ip_address: Ipv4Addr,
 
@@ -253,16 +258,20 @@ impl Ipam {
             .parse()
             .map_err(|e| format!("invalid prefix length '{}': {}", parts[1], e))?;
 
-        if prefix_len > 30 {
+        if prefix_len == 0 || prefix_len > 30 {
             return Err(format!(
-                "prefix length {} too large (max 30 for usable hosts)",
+                "prefix length {} out of range (must be 1-30 for a usable subnet)",
                 prefix_len
             ));
         }
 
-        // Gateway is network + 1
+        // Gateway is network + 1. Use checked arithmetic so a network address of
+        // 255.255.255.255 cannot overflow (panic in debug / wrap in release).
         let net_u32 = u32::from(network);
-        let gateway = Ipv4Addr::from(net_u32 + 1);
+        let gateway =
+            Ipv4Addr::from(net_u32.checked_add(1).ok_or_else(|| {
+                format!("network address '{}' has no room for a gateway", network)
+            })?);
 
         Ok(Self {
             network,
@@ -302,8 +311,13 @@ impl Ipam {
         let broadcast_u32 = u32::from(self.broadcast());
         let gateway_u32 = u32::from(self.gateway);
 
-        // Start from network + 2 (skip network and gateway)
-        let mut candidate = net_u32 + 2;
+        // Start from network + 2 (skip network and gateway). Checked arithmetic:
+        // a subnet near the top of the u32 range must report exhaustion, not
+        // overflow-panic (debug) or wrap to a garbage IP (release).
+        let mut candidate = match net_u32.checked_add(2) {
+            Some(c) => c,
+            None => return Err("no available IP addresses in subnet".to_string()),
+        };
         while candidate < broadcast_u32 {
             if candidate != gateway_u32 {
                 let ip = Ipv4Addr::from(candidate);
@@ -311,7 +325,10 @@ impl Ipam {
                     return Ok(ip);
                 }
             }
-            candidate += 1;
+            candidate = match candidate.checked_add(1) {
+                Some(c) => c,
+                None => break,
+            };
         }
 
         Err("no available IP addresses in subnet".to_string())
@@ -428,6 +445,17 @@ impl NetworkConfig {
 
     /// Allocate an IP and register a new endpoint for a box.
     pub fn connect(&mut self, box_id: &str, box_name: &str) -> Result<NetworkEndpoint, String> {
+        self.connect_with_aliases(box_id, box_name, &[])
+    }
+
+    /// Connect a box, also registering extra DNS aliases that resolve to its IP
+    /// (e.g. the bare Compose service name in addition to the box name).
+    pub fn connect_with_aliases(
+        &mut self,
+        box_id: &str,
+        box_name: &str,
+        aliases: &[String],
+    ) -> Result<NetworkEndpoint, String> {
         if self.endpoints.contains_key(box_id) {
             return Err(format!(
                 "box '{}' is already connected to network '{}'",
@@ -443,6 +471,11 @@ impl NetworkConfig {
         let endpoint = NetworkEndpoint {
             box_id: box_id.to_string(),
             box_name: box_name.to_string(),
+            aliases: aliases
+                .iter()
+                .filter(|a| !a.is_empty() && *a != box_name)
+                .cloned()
+                .collect(),
             ip_address: ip,
             mac_address: mac,
         };
@@ -483,7 +516,13 @@ impl NetworkConfig {
         self.endpoints
             .values()
             .filter(|ep| ep.box_id != exclude_box_id)
-            .map(|ep| (ep.ip_address.to_string(), ep.box_name.clone()))
+            .flat_map(|ep| {
+                let ip = ep.ip_address.to_string();
+                // The box name plus any aliases (e.g. the bare service name) all
+                // resolve to this peer's IP.
+                std::iter::once((ip.clone(), ep.box_name.clone()))
+                    .chain(ep.aliases.iter().map(move |a| (ip.clone(), a.clone())))
+            })
             .collect()
     }
 
@@ -583,6 +622,23 @@ mod tests {
     }
 
     #[test]
+    fn test_ipam_rejects_zero_and_oversized_prefix() {
+        // /0 previously caused a shift-overflow panic in broadcast()/capacity().
+        assert!(Ipam::new("0.0.0.0/0").is_err());
+        assert!(Ipam::new("10.0.0.0/31").is_err());
+        assert!(Ipam::new("10.0.0.0/32").is_err());
+        // Valid bounds still parse.
+        assert!(Ipam::new("10.0.0.0/1").is_ok());
+        assert!(Ipam::new("10.0.0.0/30").is_ok());
+    }
+
+    #[test]
+    fn test_ipam_gateway_overflow_is_rejected_not_panic() {
+        // 255.255.255.255 + 1 would overflow; must error, not panic.
+        assert!(Ipam::new("255.255.255.255/30").is_err());
+    }
+
+    #[test]
     fn test_ipam_capacity() {
         let ipam = Ipam::new("10.88.0.0/24").unwrap();
         // /24 = 256 total, minus network(1) minus gateway(1) minus broadcast(1) = 253
@@ -631,6 +687,17 @@ mod tests {
 
         let result = ipam.allocate(&[ip1]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_ipam_allocate_top_of_range_no_overflow() {
+        // A subnet at the very top of the u32 range must report exhaustion via
+        // checked arithmetic, not overflow-panic (debug) or a wrapped garbage IP.
+        let ipam = Ipam::new("255.255.255.252/30").unwrap();
+        // net=...252, gateway=...253, host=...254, broadcast=...255 -> 1 usable.
+        let ip1 = ipam.allocate(&[]).unwrap();
+        assert_eq!(ip1, Ipv4Addr::new(255, 255, 255, 254));
+        assert!(ipam.allocate(&[ip1]).is_err());
     }
 
     #[test]
@@ -763,6 +830,35 @@ mod tests {
     }
 
     #[test]
+    fn test_connect_with_aliases_resolvable_as_peer() {
+        let mut net = NetworkConfig::new("mynet", "10.88.0.0/24").unwrap();
+        // Compose-style: box name is "proj-db", bare service name "db" is an alias.
+        let ep = net
+            .connect_with_aliases("box-db", "proj-db", &["db".to_string()])
+            .unwrap();
+        assert_eq!(ep.aliases, vec!["db".to_string()]);
+        net.connect("box-web", "proj-web").unwrap();
+
+        let peers = net.peer_endpoints("box-web");
+        let db_ip = ep.ip_address.to_string();
+        // Both the box name AND the bare alias resolve to db's IP.
+        assert!(peers
+            .iter()
+            .any(|(ip, name)| ip == &db_ip && name == "proj-db"));
+        assert!(peers.iter().any(|(ip, name)| ip == &db_ip && name == "db"));
+    }
+
+    #[test]
+    fn test_connect_alias_skips_empty_and_self_duplicate() {
+        let mut net = NetworkConfig::new("mynet", "10.88.0.0/24").unwrap();
+        // An alias equal to the box name or empty is dropped.
+        let ep = net
+            .connect_with_aliases("b", "web", &["".to_string(), "web".to_string()])
+            .unwrap();
+        assert!(ep.aliases.is_empty());
+    }
+
+    #[test]
     fn test_peer_endpoints_empty_when_alone() {
         let mut net = NetworkConfig::new("mynet", "10.88.0.0/24").unwrap();
         net.connect("box-1", "web").unwrap();
@@ -800,6 +896,7 @@ mod tests {
         let ep = NetworkEndpoint {
             box_id: "abc123".to_string(),
             box_name: "web".to_string(),
+            aliases: vec!["app".to_string()],
             ip_address: Ipv4Addr::new(10, 88, 0, 2),
             mac_address: "02:42:0a:58:00:02".to_string(),
         };
@@ -807,6 +904,11 @@ mod tests {
         let json = serde_json::to_string(&ep).unwrap();
         let parsed: NetworkEndpoint = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, ep);
+
+        // Backward compat: older stored endpoints without `aliases` deserialize.
+        let legacy = r#"{"box_id":"x","box_name":"web","ip_address":"10.88.0.3","mac_address":"02:42:0a:58:00:03"}"#;
+        let parsed_legacy: NetworkEndpoint = serde_json::from_str(legacy).unwrap();
+        assert!(parsed_legacy.aliases.is_empty());
     }
 
     // --- NetworkPolicy tests ---

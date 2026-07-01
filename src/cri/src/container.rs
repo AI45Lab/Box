@@ -8,6 +8,8 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
+use a3s_box_core::exec::ExecRequest;
+
 /// Container lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ContainerState {
@@ -19,76 +21,14 @@ pub enum ContainerState {
     Exited,
 }
 
-/// CRI mount captured from ContainerConfig.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// A CRI mount persisted with container metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContainerMount {
-    /// Path inside the container/session.
     pub container_path: String,
-    /// Host path backing the mount.
     pub host_path: String,
-    /// Whether the mount should be read-only.
     pub readonly: bool,
-    /// Whether SELinux relabel was requested.
-    #[serde(default)]
     pub selinux_relabel: bool,
-    /// CRI mount propagation enum value.
-    #[serde(default)]
     pub propagation: i32,
-}
-
-/// CRI device captured from ContainerConfig.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ContainerDevice {
-    /// Path inside the container/session.
-    pub container_path: String,
-    /// Host path backing the device.
-    pub host_path: String,
-    /// Device permissions string.
-    pub permissions: String,
-}
-
-/// Linux resources captured from CRI ContainerConfig.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ContainerLinuxResources {
-    pub cpu_period: i64,
-    pub cpu_quota: i64,
-    pub cpu_shares: i64,
-    pub memory_limit_in_bytes: i64,
-    pub oom_score_adj: i64,
-    pub cpuset_cpus: String,
-    pub cpuset_mems: String,
-    pub unified: HashMap<String, String>,
-    pub memory_swap_limit_in_bytes: i64,
-}
-
-/// Linux security context captured from CRI ContainerConfig.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ContainerLinuxSecurityContext {
-    pub namespace_network: i32,
-    pub namespace_pid: i32,
-    pub namespace_ipc: i32,
-    pub namespace_user: i32,
-    pub namespace_target_id: String,
-    pub selinux_user: String,
-    pub selinux_role: String,
-    pub selinux_type: String,
-    pub selinux_level: String,
-    pub run_as_user: Option<i64>,
-    pub run_as_username: String,
-    pub run_as_group: Option<i64>,
-    pub readonly_rootfs: bool,
-    pub supplemental_groups: Vec<i64>,
-    pub privileged: bool,
-    pub no_new_privs: bool,
-}
-
-/// Linux config captured from CRI ContainerConfig.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ContainerLinuxConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resources: Option<ContainerLinuxResources>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub security_context: Option<ContainerLinuxSecurityContext>,
 }
 
 /// Represents a container (session) within a pod sandbox (Box).
@@ -100,8 +40,45 @@ pub struct Container {
     pub sandbox_id: String,
     /// Container name.
     pub name: String,
+    /// CRI metadata `attempt` (restart generation). kubelet correlates restarts
+    /// by `(name, attempt)`, so it must round-trip back in status/list responses.
+    #[serde(default)]
+    pub attempt: u32,
     /// Image reference used to create this container.
     pub image_ref: String,
+    /// Content digest resolved from the local image store during CreateContainer.
+    #[serde(default)]
+    pub resolved_image_digest: String,
+    /// Local OCI image layout path resolved during CreateContainer.
+    #[serde(default)]
+    pub resolved_image_path: String,
+    /// Container entrypoint override from CRI.
+    #[serde(default)]
+    pub command: Vec<String>,
+    /// Container command arguments from CRI.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Container environment variables from CRI.
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
+    /// Container working directory from CRI.
+    #[serde(default)]
+    pub working_dir: String,
+    /// User override from CRI Linux security context.
+    #[serde(default)]
+    pub user: Option<String>,
+    /// Whether stdin should be attached.
+    #[serde(default)]
+    pub stdin: bool,
+    /// Whether stdin is closed after the first attach.
+    #[serde(default)]
+    pub stdin_once: bool,
+    /// Whether this container requires a TTY.
+    #[serde(default)]
+    pub tty: bool,
+    /// CRI mounts accepted during CreateContainer.
+    #[serde(default)]
+    pub mounts: Vec<ContainerMount>,
     /// Current state.
     pub state: ContainerState,
     /// Creation timestamp in nanoseconds.
@@ -112,55 +89,74 @@ pub struct Container {
     pub finished_at: i64,
     /// Exit code (0 if not exited).
     pub exit_code: i32,
+    /// Whether the container was killed by the out-of-memory killer (its
+    /// memory cgroup exceeded `memory.max`). Drives the `OOMKilled` exit reason.
+    #[serde(default)]
+    pub oom_killed: bool,
     /// Container labels.
     pub labels: HashMap<String, String>,
     /// Container annotations.
     pub annotations: HashMap<String, String>,
     /// Log file path.
     pub log_path: String,
-    /// Mounts captured from CRI ContainerConfig.
+    /// Host path of the prepared container rootfs.
     #[serde(default)]
-    pub mounts: Vec<ContainerMount>,
-    /// Devices captured from CRI ContainerConfig.
+    pub rootfs_path: String,
+    /// Guest-visible path of the prepared container rootfs.
     #[serde(default)]
-    pub devices: Vec<ContainerDevice>,
-    /// Linux config captured from CRI ContainerConfig.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub linux: Option<ContainerLinuxConfig>,
-    /// Entrypoint command captured from CRI ContainerConfig.
-    #[serde(default)]
-    pub command: Vec<String>,
-    /// Arguments captured from CRI ContainerConfig.
-    #[serde(default)]
-    pub args: Vec<String>,
-    /// Environment variables captured from CRI ContainerConfig.
-    #[serde(default)]
-    pub envs: Vec<(String, String)>,
-    /// Working directory captured from CRI ContainerConfig.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub working_dir: Option<String>,
-    /// Whether stdin was requested.
-    #[serde(default)]
-    pub stdin: bool,
-    /// Whether TTY was requested.
-    #[serde(default)]
-    pub tty: bool,
+    pub rootfs_guest_path: String,
 }
 
 impl Container {
-    /// Return the command line that can be executed inside the sandbox VM.
-    pub fn session_command(&self) -> Vec<String> {
-        let mut cmd = self.command.clone();
-        cmd.extend(self.args.iter().cloned());
-        cmd
+    /// Return the stable image identity reported through CRI status surfaces.
+    pub fn status_image_ref(&self) -> &str {
+        if self.resolved_image_digest.is_empty() {
+            &self.image_ref
+        } else {
+            &self.resolved_image_digest
+        }
     }
 
-    /// Return environment variables in guest exec format.
-    pub fn exec_env(&self) -> Vec<String> {
-        self.envs
+    /// Convert the stored CRI command configuration into a guest exec request.
+    ///
+    /// This is the execution payload `StartContainer` will use once independent
+    /// CRI container workloads are wired to the guest process supervisor.
+    pub fn to_exec_request(&self, timeout_ns: u64) -> Result<ExecRequest, String> {
+        let mut cmd = self.command.clone();
+        cmd.extend(self.args.clone());
+
+        if cmd.is_empty() {
+            return Err(
+                "resolved container command is empty; set CRI command/args or use an image with ENTRYPOINT/CMD"
+                    .to_string(),
+            );
+        }
+
+        let env = self
+            .env
             .iter()
-            .map(|(key, value)| format!("{}={}", key, value))
-            .collect()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect();
+
+        Ok(ExecRequest {
+            cmd,
+            timeout_ns,
+            env,
+            working_dir: if self.working_dir.is_empty() {
+                None
+            } else {
+                Some(self.working_dir.clone())
+            },
+            rootfs: if self.rootfs_guest_path.is_empty() {
+                None
+            } else {
+                Some(self.rootfs_guest_path.clone())
+            },
+            stdin: None,
+            stdin_streaming: self.stdin,
+            user: self.user.clone(),
+            streaming: false,
+        })
     }
 }
 
@@ -244,6 +240,22 @@ impl ContainerStore {
         }
     }
 
+    /// Mark a container started only if it is still in the created state.
+    pub async fn mark_started_if_created(&self, id: &str, started_at: i64) -> bool {
+        let mut store = self.containers.write().await;
+        if let Some(c) = store.get_mut(id) {
+            if c.state != ContainerState::Created {
+                return false;
+            }
+
+            c.state = ContainerState::Running;
+            c.started_at = started_at;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Update container timestamps and exit code when exited.
     pub async fn mark_exited(&self, id: &str, finished_at: i64, exit_code: i32) -> bool {
         let mut store = self.containers.write().await;
@@ -251,6 +263,30 @@ impl ContainerStore {
             c.state = ContainerState::Exited;
             c.finished_at = finished_at;
             c.exit_code = exit_code;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Mark a container exited only if it is still running.
+    pub async fn mark_exited_if_running(
+        &self,
+        id: &str,
+        finished_at: i64,
+        exit_code: i32,
+        oom_killed: bool,
+    ) -> bool {
+        let mut store = self.containers.write().await;
+        if let Some(c) = store.get_mut(id) {
+            if c.state != ContainerState::Running {
+                return false;
+            }
+
+            c.state = ContainerState::Exited;
+            c.finished_at = finished_at;
+            c.exit_code = exit_code;
+            c.oom_killed = oom_killed;
             true
         } else {
             false
@@ -285,24 +321,30 @@ mod tests {
             id: id.to_string(),
             sandbox_id: sandbox_id.to_string(),
             name: format!("container-{}", id),
+            attempt: 0,
             image_ref: "nginx:latest".to_string(),
+            resolved_image_digest: "sha256:test".to_string(),
+            resolved_image_path: "/".to_string(),
+            command: vec!["nginx".to_string()],
+            args: vec!["-g".to_string(), "daemon off;".to_string()],
+            env: vec![("ENV".to_string(), "test".to_string())],
+            working_dir: "/".to_string(),
+            user: Some("1000:1001".to_string()),
+            stdin: false,
+            stdin_once: false,
+            tty: false,
+            mounts: vec![],
             state: ContainerState::Created,
             created_at: 1000000000,
             started_at: 0,
             finished_at: 0,
             exit_code: 0,
+            oom_killed: false,
             labels: HashMap::from([("app".to_string(), "test".to_string())]),
             annotations: HashMap::new(),
             log_path: format!("/var/log/pods/{}.log", id),
-            mounts: vec![],
-            devices: vec![],
-            linux: None,
-            command: vec!["echo".to_string()],
-            args: vec!["hello".to_string()],
-            envs: vec![("KEY".to_string(), "VALUE".to_string())],
-            working_dir: Some("/workspace".to_string()),
-            stdin: false,
-            tty: false,
+            rootfs_path: "/".to_string(),
+            rootfs_guest_path: format!("/run/a3s/cri/container-rootfs/{sandbox_id}/{id}/rootfs"),
         }
     }
 
@@ -314,38 +356,6 @@ mod tests {
         let c = store.get("c1").await.unwrap();
         assert_eq!(c.name, "container-c1");
         assert_eq!(c.state, ContainerState::Created);
-        assert_eq!(c.session_command(), vec!["echo", "hello"]);
-        assert_eq!(c.exec_env(), vec!["KEY=VALUE"]);
-    }
-
-    #[test]
-    fn test_deserialize_legacy_container_defaults_session_fields() {
-        let json = r#"{
-            "id": "c1",
-            "sandbox_id": "sb1",
-            "name": "container-c1",
-            "image_ref": "nginx:latest",
-            "state": "Created",
-            "created_at": 1000000000,
-            "started_at": 0,
-            "finished_at": 0,
-            "exit_code": 0,
-            "labels": {},
-            "annotations": {},
-            "log_path": "/var/log/pods/c1.log"
-        }"#;
-
-        let container: Container = serde_json::from_str(json).unwrap();
-
-        assert!(container.command.is_empty());
-        assert!(container.mounts.is_empty());
-        assert!(container.devices.is_empty());
-        assert!(container.linux.is_none());
-        assert!(container.args.is_empty());
-        assert!(container.envs.is_empty());
-        assert_eq!(container.working_dir, None);
-        assert!(!container.stdin);
-        assert!(!container.tty);
     }
 
     #[tokio::test]
@@ -405,6 +415,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_mark_started_if_created() {
+        let store = ContainerStore::new();
+        store.add(test_container("c1", "sb1")).await;
+
+        assert!(store.mark_started_if_created("c1", 2000000000).await);
+        let c = store.get("c1").await.unwrap();
+        assert_eq!(c.state, ContainerState::Running);
+        assert_eq!(c.started_at, 2000000000);
+    }
+
+    #[tokio::test]
+    async fn test_mark_started_if_created_rejects_non_created_state() {
+        let store = ContainerStore::new();
+        store.add(test_container("c1", "sb1")).await;
+        store.mark_exited("c1", 3000000000, 7).await;
+
+        assert!(!store.mark_started_if_created("c1", 2000000000).await);
+        let c = store.get("c1").await.unwrap();
+        assert_eq!(c.state, ContainerState::Exited);
+        assert_eq!(c.started_at, 0);
+        assert_eq!(c.finished_at, 3000000000);
+        assert_eq!(c.exit_code, 7);
+    }
+
+    #[tokio::test]
     async fn test_mark_exited() {
         let store = ContainerStore::new();
         store.add(test_container("c1", "sb1")).await;
@@ -415,6 +450,57 @@ mod tests {
         assert_eq!(c.state, ContainerState::Exited);
         assert_eq!(c.finished_at, 3000000000);
         assert_eq!(c.exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn test_mark_exited_if_running() {
+        let store = ContainerStore::new();
+        store.add(test_container("c1", "sb1")).await;
+        store.mark_started("c1", 2000000000).await;
+
+        assert!(
+            store
+                .mark_exited_if_running("c1", 3000000000, 42, false)
+                .await
+        );
+        let c = store.get("c1").await.unwrap();
+        assert_eq!(c.state, ContainerState::Exited);
+        assert_eq!(c.finished_at, 3000000000);
+        assert_eq!(c.exit_code, 42);
+    }
+
+    #[tokio::test]
+    async fn test_mark_exited_if_running_rejects_non_running_state() {
+        let store = ContainerStore::new();
+        store.add(test_container("c1", "sb1")).await;
+
+        assert!(
+            !store
+                .mark_exited_if_running("c1", 3000000000, 42, false)
+                .await
+        );
+        let c = store.get("c1").await.unwrap();
+        assert_eq!(c.state, ContainerState::Created);
+        assert_eq!(c.finished_at, 0);
+        assert_eq!(c.exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn test_mark_exited_if_running_preserves_existing_exit() {
+        let store = ContainerStore::new();
+        store.add(test_container("c1", "sb1")).await;
+        store.mark_started("c1", 2000000000).await;
+        store.mark_exited("c1", 3000000000, 7).await;
+
+        assert!(
+            !store
+                .mark_exited_if_running("c1", 4000000000, 42, false)
+                .await
+        );
+        let c = store.get("c1").await.unwrap();
+        assert_eq!(c.state, ContainerState::Exited);
+        assert_eq!(c.finished_at, 3000000000);
+        assert_eq!(c.exit_code, 7);
     }
 
     #[tokio::test]
@@ -429,5 +515,73 @@ mod tests {
         assert!(store.get("c1").await.is_none());
         assert!(store.get("c2").await.is_none());
         assert!(store.get("c3").await.is_some());
+    }
+
+    #[test]
+    fn test_to_exec_request() {
+        let c = test_container("c1", "sb1");
+        let req = c.to_exec_request(1_000).unwrap();
+
+        assert_eq!(
+            req.cmd,
+            vec![
+                "nginx".to_string(),
+                "-g".to_string(),
+                "daemon off;".to_string()
+            ]
+        );
+        assert_eq!(req.timeout_ns, 1_000);
+        assert_eq!(req.env, vec!["ENV=test".to_string()]);
+        assert_eq!(req.working_dir, Some("/".to_string()));
+        assert_eq!(
+            req.rootfs,
+            Some("/run/a3s/cri/container-rootfs/sb1/c1/rootfs".to_string())
+        );
+        assert_eq!(req.user, Some("1000:1001".to_string()));
+        assert!(req.stdin.is_none());
+        assert!(!req.streaming);
+    }
+
+    #[test]
+    fn test_to_exec_request_rejects_empty_command() {
+        let mut c = test_container("c1", "sb1");
+        c.command.clear();
+        c.args.clear();
+
+        let err = c.to_exec_request(0).unwrap_err();
+        assert!(err.contains("resolved container command is empty"));
+    }
+
+    #[test]
+    fn test_container_deserializes_legacy_image_metadata_defaults() {
+        let json = r#"{
+            "id": "c1",
+            "sandbox_id": "sb1",
+            "name": "legacy",
+            "image_ref": "nginx:latest",
+            "command": ["nginx"],
+            "args": [],
+            "env": [],
+            "working_dir": "/",
+            "user": null,
+            "stdin": false,
+            "stdin_once": false,
+            "tty": false,
+            "state": "Created",
+            "created_at": 1000000000,
+            "started_at": 0,
+            "finished_at": 0,
+            "exit_code": 0,
+            "labels": {},
+            "annotations": {},
+            "log_path": ""
+        }"#;
+
+        let container: Container = serde_json::from_str(json).unwrap();
+        assert_eq!(container.resolved_image_digest, "");
+        assert_eq!(container.resolved_image_path, "");
+        assert_eq!(container.rootfs_path, "");
+        assert_eq!(container.rootfs_guest_path, "");
+        assert_eq!(container.status_image_ref(), "nginx:latest");
     }
 }

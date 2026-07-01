@@ -8,36 +8,76 @@ use super::images_dir;
 
 #[derive(Args)]
 pub struct ImagesArgs {
-    /// Show all images (accepted for Docker compatibility)
-    #[arg(short, long)]
-    pub all: bool,
-
     /// Only show image references (one per line)
     #[arg(short, long)]
     pub quiet: bool,
-
-    /// Show digests (accepted for Docker compatibility; digests are shown by default)
-    #[arg(long)]
-    pub digests: bool,
-
-    /// Do not truncate digests
-    #[arg(long)]
-    pub no_trunc: bool,
-
-    /// Filter output using Docker-style KEY=VALUE filters
-    ///
-    /// Supported keys: reference, digest, dangling.
-    #[arg(short = 'f', long = "filter", value_name = "KEY=VALUE")]
-    pub filters: Vec<String>,
 
     /// Format output using placeholders: {{.Repository}}, {{.Tag}}, {{.Digest}},
     /// {{.Size}}, {{.Pulled}}, {{.Reference}}
     #[arg(long)]
     pub format: Option<String>,
+
+    /// Filter output: `reference=<pattern>` (glob on repo[:tag]) or
+    /// `label=<key>[=<value>]`. Can be repeated (all must match).
+    #[arg(long = "filter")]
+    pub filter: Vec<String>,
+}
+
+/// A parsed `--filter` predicate.
+enum ImageFilter {
+    Reference(String),
+    Label(String, Option<String>),
+}
+
+impl ImageFilter {
+    fn parse(spec: &str) -> Result<Self, String> {
+        let (key, value) = spec
+            .split_once('=')
+            .ok_or_else(|| format!("Invalid --filter (expected key=value): {spec}"))?;
+        match key {
+            "reference" => Ok(ImageFilter::Reference(value.to_string())),
+            "label" => {
+                let (lk, lv) = match value.split_once('=') {
+                    Some((k, v)) => (k.to_string(), Some(v.to_string())),
+                    None => (value.to_string(), None),
+                };
+                Ok(ImageFilter::Label(lk, lv))
+            }
+            other => Err(format!(
+                "Unsupported image filter '{other}' (supported: reference, label)"
+            )),
+        }
+    }
+}
+
+/// Glob match where `*` matches any run of characters. Used for `reference=`.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let pat: Vec<char> = pattern.chars().collect();
+    let txt: Vec<char> = text.chars().collect();
+    let (mut p, mut t, mut star, mut mark) = (0usize, 0usize, None, 0usize);
+    while t < txt.len() {
+        if p < pat.len() && (pat[p] == '?' || pat[p] == txt[t]) {
+            p += 1;
+            t += 1;
+        } else if p < pat.len() && pat[p] == '*' {
+            star = Some(p);
+            mark = t;
+            p += 1;
+        } else if let Some(sp) = star {
+            p = sp + 1;
+            mark += 1;
+            t = mark;
+        } else {
+            return false;
+        }
+    }
+    while p < pat.len() && pat[p] == '*' {
+        p += 1;
+    }
+    p == pat.len()
 }
 
 pub async fn execute(args: ImagesArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let filters = parse_image_filters(&args.filters)?;
     let images_dir = images_dir();
     if !images_dir.exists() {
         if !args.quiet && args.format.is_none() {
@@ -48,12 +88,17 @@ pub async fn execute(args: ImagesArgs) -> Result<(), Box<dyn std::error::Error>>
     }
 
     let store = super::open_image_store()?;
-    let images: Vec<_> = store
-        .list()
-        .await
-        .into_iter()
-        .filter(|image| image_matches_filters(image, &filters))
-        .collect();
+    let mut images = store.list().await;
+
+    // --filter: keep only images matching every predicate.
+    if !args.filter.is_empty() {
+        let filters: Vec<ImageFilter> = args
+            .filter
+            .iter()
+            .map(|f| ImageFilter::parse(f))
+            .collect::<Result<_, _>>()?;
+        images.retain(|img| filters.iter().all(|f| image_matches(img, f)));
+    }
 
     // --quiet: print only references
     if args.quiet {
@@ -64,10 +109,7 @@ pub async fn execute(args: ImagesArgs) -> Result<(), Box<dyn std::error::Error>>
     }
 
     // Pre-compute display fields for each image
-    let rows: Vec<ImageRow> = images
-        .iter()
-        .map(|image| ImageRow::from_stored(image, args.no_trunc))
-        .collect();
+    let rows: Vec<ImageRow> = images.iter().map(ImageRow::from_stored).collect();
 
     // --format: custom template output
     if let Some(ref fmt) = args.format {
@@ -93,163 +135,35 @@ pub async fn execute(args: ImagesArgs) -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ImageFilter {
-    Reference(String),
-    Digest(String),
-    Dangling(bool),
-}
-
-fn parse_image_filters(filters: &[String]) -> Result<Vec<ImageFilter>, String> {
-    filters
-        .iter()
-        .map(|filter| {
-            let (key, value) = filter
-                .split_once('=')
-                .ok_or_else(|| format!("Invalid image filter '{filter}': expected KEY=VALUE"))?;
-            match key {
-                "reference" => Ok(ImageFilter::Reference(value.to_string())),
-                "digest" => Ok(ImageFilter::Digest(value.to_string())),
-                "dangling" => match value {
-                    "true" => Ok(ImageFilter::Dangling(true)),
-                    "false" => Ok(ImageFilter::Dangling(false)),
-                    _ => Err(format!(
-                        "Invalid dangling filter value '{value}': expected true or false"
-                    )),
-                },
-                _ => Err(format!(
-                    "Unsupported image filter '{key}': supported filters are reference, digest, dangling"
-                )),
+/// Whether a stored image satisfies one `--filter` predicate.
+fn image_matches(image: &a3s_box_runtime::StoredImage, filter: &ImageFilter) -> bool {
+    match filter {
+        ImageFilter::Reference(pattern) => {
+            // Match the glob against several name forms so `alpine`,
+            // `alpine:3.19`, and `docker.io/library/alpine:3.19` all work.
+            let mut candidates = vec![image.reference.clone()];
+            if let Ok(r) = a3s_box_runtime::ImageReference::parse(&image.reference) {
+                let tag = r.tag.clone().unwrap_or_else(|| "latest".to_string());
+                candidates.push(format!("{}/{}:{}", r.registry, r.repository, tag));
+                candidates.push(format!("{}:{}", r.repository, tag));
+                candidates.push(r.repository.clone());
+                // bare repo leaf, e.g. "alpine" from "library/alpine"
+                if let Some(leaf) = r.repository.rsplit('/').next() {
+                    candidates.push(leaf.to_string());
+                    candidates.push(format!("{leaf}:{tag}"));
+                }
             }
-        })
-        .collect()
-}
-
-fn image_matches_filters(image: &a3s_box_runtime::StoredImage, filters: &[ImageFilter]) -> bool {
-    if filters.is_empty() {
-        return true;
-    }
-
-    let reference_filters: Vec<&str> = filters
-        .iter()
-        .filter_map(|filter| match filter {
-            ImageFilter::Reference(value) => Some(value.as_str()),
-            _ => None,
-        })
-        .collect();
-    if !reference_filters.is_empty()
-        && !reference_filters
-            .iter()
-            .any(|pattern| image_matches_reference_filter(image, pattern))
-    {
-        return false;
-    }
-
-    let digest_filters: Vec<&str> = filters
-        .iter()
-        .filter_map(|filter| match filter {
-            ImageFilter::Digest(value) => Some(value.as_str()),
-            _ => None,
-        })
-        .collect();
-    if !digest_filters.is_empty()
-        && !digest_filters
-            .iter()
-            .any(|digest| image.digest == *digest || image.digest.starts_with(*digest))
-    {
-        return false;
-    }
-
-    let dangling_filters: Vec<bool> = filters
-        .iter()
-        .filter_map(|filter| match filter {
-            ImageFilter::Dangling(value) => Some(*value),
-            _ => None,
-        })
-        .collect();
-    if !dangling_filters.is_empty()
-        && !dangling_filters
-            .iter()
-            .any(|expected| image_is_dangling(image) == *expected)
-    {
-        return false;
-    }
-
-    true
-}
-
-fn image_matches_reference_filter(image: &a3s_box_runtime::StoredImage, pattern: &str) -> bool {
-    image_reference_candidates(image)
-        .iter()
-        .any(|candidate| wildcard_match(pattern, candidate))
-}
-
-fn image_reference_candidates(image: &a3s_box_runtime::StoredImage) -> Vec<String> {
-    let mut candidates = vec![
-        image.reference.clone(),
-        image.digest.clone(),
-        format!("{}@{}", image.reference, image.digest),
-    ];
-
-    if let Ok(reference) = a3s_box_runtime::ImageReference::parse(&image.reference) {
-        let full = reference.full_reference();
-        let repository = format!("{}/{}", reference.registry, reference.repository);
-        let short_repository = reference
-            .repository
-            .strip_prefix("library/")
-            .unwrap_or(&reference.repository);
-
-        candidates.push(full.clone());
-        candidates.push(repository.clone());
-        candidates.push(reference.repository.clone());
-        candidates.push(short_repository.to_string());
-        candidates.push(format!("{}@{}", full, image.digest));
-        candidates.push(format!("{}@{}", repository, image.digest));
-        candidates.push(format!("{}@{}", reference.repository, image.digest));
-        candidates.push(format!("{}@{}", short_repository, image.digest));
-
-        if let Some(tag) = reference.tag {
-            candidates.push(format!("{repository}:{tag}"));
-            candidates.push(format!("{}:{tag}", reference.repository));
-            candidates.push(format!("{short_repository}:{tag}"));
+            candidates.iter().any(|c| glob_match(pattern, c))
         }
-    }
-
-    candidates.sort();
-    candidates.dedup();
-    candidates
-}
-
-fn image_is_dangling(image: &a3s_box_runtime::StoredImage) -> bool {
-    image.reference == "<none>"
-        || image.reference.contains("<none>:<none>")
-        || a3s_box_runtime::ImageReference::parse(&image.reference)
-            .map(|reference| reference.tag.is_none() && reference.digest.is_none())
-            .unwrap_or(false)
-}
-
-fn wildcard_match(pattern: &str, value: &str) -> bool {
-    if !pattern.contains('*') && !pattern.contains('?') {
-        return value == pattern;
-    }
-    wildcard_match_inner(pattern.as_bytes(), value.as_bytes())
-}
-
-fn wildcard_match_inner(pattern: &[u8], value: &[u8]) -> bool {
-    match pattern.split_first() {
-        None => value.is_empty(),
-        Some((b'*', rest)) => {
-            wildcard_match_inner(rest, value)
-                || value
-                    .split_first()
-                    .is_some_and(|(_, value_rest)| wildcard_match_inner(pattern, value_rest))
+        ImageFilter::Label(key, value) => {
+            let Ok(oci) = a3s_box_runtime::OciImage::from_path(&image.path) else {
+                return false;
+            };
+            match oci.config().labels.get(key) {
+                Some(v) => value.as_ref().is_none_or(|want| want == v),
+                None => false,
+            }
         }
-        Some((b'?', rest)) => value
-            .split_first()
-            .is_some_and(|(_, value_rest)| wildcard_match_inner(rest, value_rest)),
-        Some((expected, rest)) => value.split_first().is_some_and(|(actual, value_rest)| {
-            actual == expected && wildcard_match_inner(rest, value_rest)
-        }),
     }
 }
 
@@ -264,19 +178,24 @@ struct ImageRow {
 }
 
 impl ImageRow {
-    fn from_stored(image: &a3s_box_runtime::StoredImage, no_trunc: bool) -> Self {
-        let (repository, tag) = match a3s_box_runtime::ImageReference::parse(&image.reference) {
-            Ok(r) => {
-                let repo = format!("{}/{}", r.registry, r.repository);
-                let tag = r.tag.unwrap_or_else(|| "<none>".to_string());
-                (repo, tag)
+    fn from_stored(image: &a3s_box_runtime::StoredImage) -> Self {
+        let (repository, tag) = if crate::image_usage::is_dangling_reference(&image.reference) {
+            // Dangling image (digest-keyed, no repo:tag) — Docker renders it as
+            // `<none> <none>` rather than splitting the digest into repo + tag.
+            ("<none>".to_string(), "<none>".to_string())
+        } else {
+            match a3s_box_runtime::ImageReference::parse(&image.reference) {
+                Ok(r) => {
+                    let repo = format!("{}/{}", r.registry, r.repository);
+                    let tag = r.tag.unwrap_or_else(|| "<none>".to_string());
+                    (repo, tag)
+                }
+                Err(_) => (image.reference.clone(), "<none>".to_string()),
             }
-            Err(_) => (image.reference.clone(), "<none>".to_string()),
         };
 
-        let digest = if no_trunc {
-            image.digest.clone()
-        } else if let Some(hex) = image.digest.strip_prefix("sha256:") {
+        // Format digest: "sha256:" prefix + first 12 hex chars
+        let digest = if let Some(hex) = image.digest.strip_prefix("sha256:") {
             let truncated = if hex.len() > 12 { &hex[..12] } else { hex };
             format!("sha256:{truncated}")
         } else {
@@ -327,12 +246,60 @@ mod tests {
         }
     }
 
+    // --- filter tests ---
+
+    #[test]
+    fn test_glob_match() {
+        assert!(glob_match("webapp", "webapp"));
+        assert!(glob_match("web*", "webapp"));
+        assert!(glob_match("web*:2", "webapp:2"));
+        assert!(!glob_match("web*:2", "webapp:1"));
+        assert!(glob_match("*", "anything"));
+        assert!(!glob_match("db", "webapp"));
+    }
+
+    #[test]
+    fn test_image_filter_parse() {
+        assert!(matches!(
+            ImageFilter::parse("reference=alpine").unwrap(),
+            ImageFilter::Reference(p) if p == "alpine"
+        ));
+        assert!(matches!(
+            ImageFilter::parse("label=tier=web").unwrap(),
+            ImageFilter::Label(k, Some(v)) if k == "tier" && v == "web"
+        ));
+        assert!(matches!(
+            ImageFilter::parse("label=tier").unwrap(),
+            ImageFilter::Label(k, None) if k == "tier"
+        ));
+        assert!(ImageFilter::parse("nocolon").is_err());
+        assert!(ImageFilter::parse("dangling=true").is_err());
+    }
+
+    #[test]
+    fn test_image_matches_reference() {
+        let img = sample_stored("docker.io/library/webapp:2", "sha256:abc", 100);
+        assert!(image_matches(
+            &img,
+            &ImageFilter::Reference("webapp".into())
+        ));
+        assert!(image_matches(
+            &img,
+            &ImageFilter::Reference("web*:2".into())
+        ));
+        assert!(image_matches(
+            &img,
+            &ImageFilter::Reference("docker.io/library/webapp:2".into())
+        ));
+        assert!(!image_matches(&img, &ImageFilter::Reference("db".into())));
+    }
+
     // --- ImageRow::from_stored tests ---
 
     #[test]
     fn test_from_stored_simple_name() {
         let stored = sample_stored("nginx:1.25", "sha256:abcdef1234567890abcdef", 1024);
-        let row = ImageRow::from_stored(&stored, false);
+        let row = ImageRow::from_stored(&stored);
 
         assert_eq!(row.repository, "docker.io/library/nginx");
         assert_eq!(row.tag, "1.25");
@@ -347,7 +314,7 @@ mod tests {
             "sha256:aabbccdd11223344aabbccdd",
             2048,
         );
-        let row = ImageRow::from_stored(&stored, false);
+        let row = ImageRow::from_stored(&stored);
 
         assert_eq!(row.repository, "ghcr.io/a3s-box/code");
         assert_eq!(row.tag, "v0.1.0");
@@ -357,7 +324,7 @@ mod tests {
     #[test]
     fn test_from_stored_no_tag_defaults_latest() {
         let stored = sample_stored("alpine", "sha256:1234567890ab", 512);
-        let row = ImageRow::from_stored(&stored, false);
+        let row = ImageRow::from_stored(&stored);
 
         assert_eq!(row.repository, "docker.io/library/alpine");
         assert_eq!(row.tag, "latest");
@@ -366,7 +333,7 @@ mod tests {
     #[test]
     fn test_from_stored_digest_short() {
         let stored = sample_stored("nginx:latest", "sha256:abcd", 100);
-        let row = ImageRow::from_stored(&stored, false);
+        let row = ImageRow::from_stored(&stored);
 
         // Short digest should not be truncated
         assert_eq!(row.digest, "sha256:abcd");
@@ -375,7 +342,7 @@ mod tests {
     #[test]
     fn test_from_stored_digest_no_prefix() {
         let stored = sample_stored("nginx:latest", "abcdef1234567890", 100);
-        let row = ImageRow::from_stored(&stored, false);
+        let row = ImageRow::from_stored(&stored);
 
         // Without sha256: prefix, truncate to 12 chars
         assert_eq!(row.digest, "abcdef123456");
@@ -384,125 +351,35 @@ mod tests {
     #[test]
     fn test_from_stored_digest_exactly_12() {
         let stored = sample_stored("nginx:latest", "sha256:abcdef123456", 100);
-        let row = ImageRow::from_stored(&stored, false);
+        let row = ImageRow::from_stored(&stored);
 
         assert_eq!(row.digest, "sha256:abcdef123456");
     }
 
     #[test]
-    fn test_from_stored_no_trunc_keeps_full_digest() {
-        let stored = sample_stored("nginx:latest", "sha256:abcdef1234567890", 100);
-        let row = ImageRow::from_stored(&stored, true);
-
-        assert_eq!(row.digest, "sha256:abcdef1234567890");
-    }
-
-    #[test]
     fn test_from_stored_invalid_reference_fallback() {
-        // Empty reference should fail to parse, falling back to raw reference
+        // An empty reference is treated as dangling and rendered `<none> <none>`,
+        // matching Docker's display for untagged images.
         let stored = sample_stored("", "sha256:abc", 100);
-        let row = ImageRow::from_stored(&stored, false);
+        let row = ImageRow::from_stored(&stored);
 
-        assert_eq!(row.repository, "");
+        assert_eq!(row.repository, "<none>");
         assert_eq!(row.tag, "<none>");
     }
 
-    // --- Image filter tests ---
-
     #[test]
-    fn test_parse_image_filter_reference() {
-        let filters = parse_image_filters(&["reference=nginx".to_string()]).unwrap();
-        assert_eq!(filters, vec![ImageFilter::Reference("nginx".to_string())]);
-    }
-
-    #[test]
-    fn test_parse_image_filter_rejects_invalid_form() {
-        let err = parse_image_filters(&["reference".to_string()]).unwrap_err();
-        assert!(err.contains("expected KEY=VALUE"));
-    }
-
-    #[test]
-    fn test_parse_image_filter_rejects_unsupported_key() {
-        let err = parse_image_filters(&["label=app".to_string()]).unwrap_err();
-        assert!(err.contains("Unsupported image filter"));
-    }
-
-    #[test]
-    fn test_reference_filter_matches_docker_short_name() {
+    fn test_from_stored_digest_keyed_dangling_renders_none_none() {
+        // A digest-keyed dangling image (displaced by a re-tag) renders as
+        // `<none> <none>`, not repository="sha256" / tag=<64-char hex>.
         let stored = sample_stored(
-            "docker.io/library/nginx:latest",
-            "sha256:abcdef1234567890",
+            "sha256:6c3a24f143efe95ba48765929f1cf75cef0eb96c784f85d588660440796fccbb",
+            "sha256:6c3a24f143efe95ba48765929f1cf75cef0eb96c784f85d588660440796fccbb",
             100,
         );
+        let row = ImageRow::from_stored(&stored);
 
-        assert!(image_matches_filters(
-            &stored,
-            &[ImageFilter::Reference("nginx".to_string())]
-        ));
-        assert!(image_matches_filters(
-            &stored,
-            &[ImageFilter::Reference("nginx:latest".to_string())]
-        ));
-        assert!(!image_matches_filters(
-            &stored,
-            &[ImageFilter::Reference("redis".to_string())]
-        ));
-    }
-
-    #[test]
-    fn test_reference_filter_supports_globs() {
-        let stored = sample_stored("ghcr.io/acme/api:v1", "sha256:abcdef1234567890", 100);
-
-        assert!(image_matches_filters(
-            &stored,
-            &[ImageFilter::Reference("ghcr.io/acme/*:v1".to_string())]
-        ));
-        assert!(image_matches_filters(
-            &stored,
-            &[ImageFilter::Reference("*/api:v?".to_string())]
-        ));
-    }
-
-    #[test]
-    fn test_repeated_reference_filters_are_or_matched() {
-        let stored = sample_stored("nginx:latest", "sha256:abcdef1234567890", 100);
-
-        assert!(image_matches_filters(
-            &stored,
-            &[
-                ImageFilter::Reference("redis".to_string()),
-                ImageFilter::Reference("nginx".to_string())
-            ]
-        ));
-    }
-
-    #[test]
-    fn test_digest_filter_matches_prefix() {
-        let stored = sample_stored("nginx:latest", "sha256:abcdef1234567890", 100);
-
-        assert!(image_matches_filters(
-            &stored,
-            &[ImageFilter::Digest("sha256:abcdef".to_string())]
-        ));
-        assert!(!image_matches_filters(
-            &stored,
-            &[ImageFilter::Digest("sha256:999999".to_string())]
-        ));
-    }
-
-    #[test]
-    fn test_dangling_filter_matches_none_reference() {
-        let dangling = sample_stored("<none>:<none>", "sha256:abcdef1234567890", 100);
-        let tagged = sample_stored("nginx:latest", "sha256:abcdef1234567890", 100);
-
-        assert!(image_matches_filters(
-            &dangling,
-            &[ImageFilter::Dangling(true)]
-        ));
-        assert!(image_matches_filters(
-            &tagged,
-            &[ImageFilter::Dangling(false)]
-        ));
+        assert_eq!(row.repository, "<none>");
+        assert_eq!(row.tag, "<none>");
     }
 
     // --- ImageRow::apply_format tests ---

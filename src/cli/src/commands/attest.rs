@@ -13,10 +13,7 @@ use crate::resolve;
 use crate::state::StateFile;
 
 #[cfg(not(windows))]
-use a3s_box_runtime::{
-    verify_attestation, AttestationClient, AttestationPolicy, AttestationRequest,
-    RaTlsAttestationClient,
-};
+use a3s_box_runtime::{verify_attestation, AttestationPolicy, RaTlsAttestationClient};
 
 #[derive(Args)]
 pub struct AttestArgs {
@@ -87,32 +84,18 @@ pub async fn execute(args: AttestArgs) -> Result<(), Box<dyn std::error::Error>>
     let state = StateFile::load_default()?;
     let record = resolve::resolve(&state, &args.r#box)?;
 
-    if record.status != "running" {
-        return Err(format!("Box {} is not running", record.name).into());
-    }
-
     // Generate or parse nonce
     let nonce_bytes = match &args.nonce {
         Some(hex_nonce) => hex_to_bytes(hex_nonce)?,
         None => generate_random_nonce(),
     };
 
-    // Build attestation request
-    let request = AttestationRequest {
-        nonce: nonce_bytes.clone(),
-        user_data: None,
-    };
-
-    let attest_socket_path = crate::socket_paths::attest(record);
+    let attest_socket_path = crate::socket_paths::require_runtime_socket(
+        record,
+        crate::socket_paths::RuntimeSocket::Attest,
+    )
+    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     let socket_path = &attest_socket_path;
-    if !socket_path.exists() {
-        return Err(format!(
-            "Attestation socket not found for box {} at {}",
-            record.name,
-            socket_path.display()
-        )
-        .into());
-    }
 
     // RA-TLS mode: verify attestation via TLS handshake
     if args.ratls {
@@ -159,10 +142,19 @@ pub async fn execute(args: AttestArgs) -> Result<(), Box<dyn std::error::Error>>
         return Ok(());
     }
 
-    // Legacy mode: fetch raw report and verify manually
+    // Non-RA-TLS modes still obtain the report over RA-TLS: the guest
+    // attestation server speaks RA-TLS + framed messages (not plain HTTP) and
+    // carries the signed report in its TLS certificate.
+    let client = RaTlsAttestationClient::new(socket_path);
+    let report = client.fetch_report(args.allow_simulated).await?;
 
-    let client = AttestationClient::connect(socket_path).await?;
-    let report = client.get_report(&request).await?;
+    // Under RA-TLS the report's nonce is bound to the server's TLS public key,
+    // so verification and output use that embedded nonce.
+    let report_nonce: Vec<u8> = if report.report.len() >= 0x90 {
+        report.report[0x50..0x90].to_vec()
+    } else {
+        nonce_bytes.clone()
+    };
 
     // If --raw, output the report without verification
     if args.raw {
@@ -171,7 +163,7 @@ pub async fn execute(args: AttestArgs) -> Result<(), Box<dyn std::error::Error>>
             box_name: record.name.clone(),
             verified: None,
             platform: a3s_box_runtime::tee::parse_platform_info(&report.report),
-            nonce: bytes_to_hex(&nonce_bytes),
+            nonce: bytes_to_hex(&report_nonce),
             report_hex: Some(bytes_to_hex(&report.report)),
             failures: vec![],
         };
@@ -191,7 +183,7 @@ pub async fn execute(args: AttestArgs) -> Result<(), Box<dyn std::error::Error>>
     };
 
     // Verify the report
-    let result = verify_attestation(&report, &nonce_bytes, &policy, args.allow_simulated)?;
+    let result = verify_attestation(&report, &report_nonce, &policy, args.allow_simulated)?;
 
     if args.quiet {
         if result.verified {
@@ -212,7 +204,7 @@ pub async fn execute(args: AttestArgs) -> Result<(), Box<dyn std::error::Error>>
         box_name: record.name.clone(),
         verified: Some(result.verified),
         platform: Some(result.platform),
-        nonce: bytes_to_hex(&nonce_bytes),
+        nonce: bytes_to_hex(&report_nonce),
         report_hex: Some(bytes_to_hex(&report.report)),
         failures: result.failures,
     };

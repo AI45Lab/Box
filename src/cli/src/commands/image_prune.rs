@@ -1,9 +1,8 @@
-//! `a3s-box image-prune` command — remove unused images.
-
-use std::collections::HashSet;
+//! `a3s-box image-prune` command — remove dangling or unused images.
 
 use clap::Args;
 
+use crate::image_usage::{self, ImagePruneMode, ImageReferenceScope};
 use crate::output;
 use crate::state::StateFile;
 
@@ -21,11 +20,12 @@ pub struct ImagePruneArgs {
 pub async fn execute(args: ImagePruneArgs) -> Result<(), Box<dyn std::error::Error>> {
     let store = super::open_image_store()?;
 
-    // Collect image references used by existing boxes
-    let used_images: HashSet<String> = match StateFile::load_default() {
-        Ok(state) => state.records().iter().map(|r| r.image.clone()).collect(),
-        Err(_) => HashSet::new(),
+    // `image-prune` never removes images referenced by any existing box.
+    let protected_images = match StateFile::load_default() {
+        Ok(state) => image_usage::referenced_images(&state, ImageReferenceScope::AllBoxes),
+        Err(_) => Default::default(),
     };
+    let prune_mode = prune_mode(args.all);
 
     let all_images = store.list().await;
 
@@ -33,20 +33,12 @@ pub async fn execute(args: ImagePruneArgs) -> Result<(), Box<dyn std::error::Err
     let to_remove: Vec<_> = all_images
         .iter()
         .filter(|img| {
-            if args.all {
-                // Remove all images not referenced by any box
-                !used_images.contains(&img.reference)
-            } else {
-                // Without --all, only remove images not referenced by any box
-                // (same behavior for now — Docker distinguishes dangling vs unused,
-                // but our store doesn't track parent/child image relationships)
-                !used_images.contains(&img.reference)
-            }
+            image_usage::is_prunable_reference(&img.reference, &protected_images, prune_mode)
         })
         .collect();
 
     if to_remove.is_empty() {
-        println!("No unused images to remove.");
+        println!("{}", empty_message(prune_mode));
         return Ok(());
     }
 
@@ -95,4 +87,42 @@ pub async fn execute(args: ImagePruneArgs) -> Result<(), Box<dyn std::error::Err
     }
 
     Ok(())
+}
+
+fn prune_mode(all: bool) -> ImagePruneMode {
+    if all {
+        ImagePruneMode::Unused
+    } else {
+        ImagePruneMode::Dangling
+    }
+}
+
+fn empty_message(mode: ImagePruneMode) -> &'static str {
+    match mode {
+        ImagePruneMode::Dangling => "No dangling images to remove.",
+        ImagePruneMode::Unused => "No unused images to remove.",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_prune_mode_defaults_to_dangling() {
+        assert_eq!(prune_mode(false), ImagePruneMode::Dangling);
+        assert_eq!(prune_mode(true), ImagePruneMode::Unused);
+    }
+
+    #[test]
+    fn test_empty_message_matches_mode() {
+        assert_eq!(
+            empty_message(ImagePruneMode::Dangling),
+            "No dangling images to remove."
+        );
+        assert_eq!(
+            empty_message(ImagePruneMode::Unused),
+            "No unused images to remove."
+        );
+    }
 }

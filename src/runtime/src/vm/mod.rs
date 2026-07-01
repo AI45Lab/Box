@@ -3,6 +3,7 @@
 mod layout;
 mod network;
 mod ready;
+pub mod reap;
 mod spec;
 
 use std::path::{Path, PathBuf};
@@ -58,6 +59,8 @@ pub(crate) struct BoxLayout {
     pub(crate) pty_socket_path: PathBuf,
     /// Path to the attestation Unix socket
     pub(crate) attest_socket_path: PathBuf,
+    /// Path to the CRI port-forward Unix socket
+    pub(crate) port_forward_socket_path: PathBuf,
     /// Path to the workspace directory
     pub(crate) workspace_path: PathBuf,
     /// Path to console output file (optional)
@@ -102,6 +105,15 @@ pub struct VmManager {
     /// Anonymous volume names created during boot (from OCI VOLUME directives)
     pub(crate) anonymous_volumes: Vec<String>,
 
+    /// Anonymous volumes newly created by the current boot attempt.
+    ///
+    /// Reused anonymous volumes must survive failed restarts because they may
+    /// contain data from an existing stopped box.
+    pub(crate) created_anonymous_volumes: Vec<String>,
+
+    /// OCI image config resolved during the last successful boot.
+    pub(crate) image_config: Option<crate::oci::OciImageConfig>,
+
     /// TEE extension (attestation, sealing, secret injection)
     #[cfg(unix)]
     pub(crate) tee: Option<Box<dyn TeeExtension>>,
@@ -115,6 +127,9 @@ pub struct VmManager {
     /// Path to the PTY Unix socket (set after boot)
     pub(crate) pty_socket_path: Option<PathBuf>,
 
+    /// Path to the CRI port-forward Unix socket (set after boot)
+    pub(crate) port_forward_socket_path: Option<PathBuf>,
+
     /// Prometheus metrics (optional, for instrumented deployments).
     pub(crate) prom: Option<crate::prom::RuntimeMetrics>,
 
@@ -123,6 +138,11 @@ pub struct VmManager {
 
     /// Optional progress callback for image pulls: `(current, total, digest, size_bytes)`.
     pub(crate) pull_progress_fn: Option<PullProgressFn>,
+
+    /// Logging driver config, threaded into the InstanceSpec so the shim runs
+    /// the log processor for the box's lifetime (set by the CLI via
+    /// [`VmManager::set_log_config`]).
+    pub(crate) log_config: a3s_box_core::log::LogConfig,
 }
 
 impl VmManager {
@@ -143,14 +163,18 @@ impl VmManager {
             net_manager: None,
             home_dir,
             anonymous_volumes: Vec::new(),
+            created_anonymous_volumes: Vec::new(),
+            image_config: None,
             #[cfg(unix)]
             tee: None,
             rootfs_provider: crate::rootfs::default_provider(),
             exec_socket_path: None,
             pty_socket_path: None,
+            port_forward_socket_path: None,
             prom: None,
             shim_exit_code: None,
             pull_progress_fn: None,
+            log_config: a3s_box_core::log::LogConfig::default(),
         }
     }
 
@@ -170,41 +194,117 @@ impl VmManager {
             net_manager: None,
             home_dir,
             anonymous_volumes: Vec::new(),
+            created_anonymous_volumes: Vec::new(),
+            image_config: None,
             #[cfg(unix)]
             tee: None,
             rootfs_provider: crate::rootfs::default_provider(),
             exec_socket_path: None,
             pty_socket_path: None,
+            port_forward_socket_path: None,
             prom: None,
             shim_exit_code: None,
             pull_progress_fn: None,
+            log_config: a3s_box_core::log::LogConfig::default(),
         }
     }
 
+    /// Remove host-side boot artifacts after a failed boot attempt.
+    async fn cleanup_boot_failure(&mut self) {
+        if let Some(mut handler) = self.handler.write().await.take() {
+            if let Err(error) = handler.stop(default_stop_signal(), DEFAULT_SHUTDOWN_TIMEOUT_MS) {
+                tracing::warn!(
+                    box_id = %self.box_id,
+                    error = %error,
+                    "Failed to stop VM handler after boot failure"
+                );
+            }
+            self.shim_exit_code = handler.exit_code();
+        }
+
+        if let Some(mut net_manager) = self.net_manager.take() {
+            net_manager.stop();
+        }
+
+        self.cleanup_created_anonymous_volumes();
+        self.cleanup_box_dir();
+    }
+
+    fn cleanup_created_anonymous_volumes(&mut self) {
+        if self.created_anonymous_volumes.is_empty() {
+            return;
+        }
+
+        let created = std::mem::take(&mut self.created_anonymous_volumes);
+        let created_set: std::collections::HashSet<_> = created.iter().cloned().collect();
+        let store = crate::volume::VolumeStore::new(
+            self.home_dir.join("volumes.json"),
+            self.home_dir.join("volumes"),
+        );
+
+        for volume_name in &created {
+            if let Err(error) = store.remove(volume_name, true) {
+                tracing::debug!(
+                    box_id = %self.box_id,
+                    volume = volume_name,
+                    error = %error,
+                    "Failed to remove anonymous volume after boot failure"
+                );
+            }
+        }
+
+        self.anonymous_volumes
+            .retain(|name| !created_set.contains(name));
+    }
+
     /// Remove the box directory on the host.
-    ///
-    /// Called when boot fails after `prepare_layout` succeeded to avoid leaving
-    /// orphaned directories on disk.
     fn cleanup_box_dir(&self) {
         let box_dir = self.home_dir.join("boxes").join(&self.box_id);
-        if let Err(e) = std::fs::remove_dir_all(&box_dir) {
+
+        // Reap the box's passt daemon (Linux bridge mode) BEFORE removing its
+        // socket dir. A boot that fails after passt spawned but before
+        // `self.net_manager` was assigned leaves `net_manager.stop()` a no-op, so
+        // passt would otherwise survive holding the published port — the
+        // "Address already in use" on the next start. terminate_passt reads
+        // `socket_dir/passt.pid` and is a no-op when there is no passt.
+        #[cfg(target_os = "linux")]
+        crate::network::terminate_passt(&self.socket_dir());
+
+        if let Err(error) = self.rootfs_provider.cleanup(&box_dir, false) {
             tracing::warn!(
                 box_id = %self.box_id,
                 path = %box_dir.display(),
-                error = %e,
-                "Failed to cleanup box directory after boot failure"
+                error = %error,
+                "Failed to cleanup rootfs provider after boot failure"
             );
+        }
+
+        match std::fs::remove_dir_all(&box_dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(
+                    box_id = %self.box_id,
+                    path = %box_dir.display(),
+                    error = %error,
+                    "Failed to cleanup box directory after boot failure"
+                );
+            }
         }
 
         let socket_dir = self.socket_dir();
         if socket_dir != box_dir.join("sockets") {
-            if let Err(e) = std::fs::remove_dir_all(&socket_dir) {
-                tracing::debug!(
-                    box_id = %self.box_id,
-                    path = %socket_dir.display(),
-                    error = %e,
-                    "Failed to cleanup socket directory after boot failure"
-                );
+            match std::fs::remove_dir_all(&socket_dir) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::debug!(
+                        box_id = %self.box_id,
+                        path = %socket_dir.display(),
+                        error = %error,
+                        "Failed to cleanup socket directory after boot failure"
+                    );
+                }
             }
         }
     }
@@ -229,14 +329,18 @@ impl VmManager {
             net_manager: None,
             home_dir,
             anonymous_volumes: Vec::new(),
+            created_anonymous_volumes: Vec::new(),
+            image_config: None,
             #[cfg(unix)]
             tee: None,
             rootfs_provider: crate::rootfs::default_provider(),
             exec_socket_path: None,
             pty_socket_path: None,
+            port_forward_socket_path: None,
             prom: None,
             shim_exit_code: None,
             pull_progress_fn: None,
+            log_config: a3s_box_core::log::LogConfig::default(),
         }
     }
 
@@ -256,6 +360,46 @@ impl VmManager {
         self.exec_client.as_ref()
     }
 
+    /// Attach this manager to an already-running shim process.
+    ///
+    /// This is useful for crash recovery or control-plane restart flows where
+    /// the workload VM is still alive and only the host-side manager state
+    /// needs to be reconstructed.
+    #[cfg(unix)]
+    pub async fn attach_running_process(
+        &mut self,
+        pid: u32,
+        exec_socket_path: PathBuf,
+        pty_socket_path: Option<PathBuf>,
+    ) -> Result<()> {
+        let port_forward_socket_path = exec_socket_path.with_file_name("portfwd.sock");
+        let handler = crate::vmm::ShimHandler::from_pid(pid, self.box_id.clone());
+        if !handler.is_running() {
+            return Err(BoxError::StateError(format!(
+                "Cannot attach to non-running VM process {pid}"
+            )));
+        }
+
+        self.exec_client = match ExecClient::connect(&exec_socket_path).await {
+            Ok(client) => Some(client),
+            Err(error) => {
+                tracing::debug!(
+                    box_id = %self.box_id,
+                    socket_path = %exec_socket_path.display(),
+                    error = %error,
+                    "Failed to reconnect exec client while attaching to running VM"
+                );
+                None
+            }
+        };
+        self.exec_socket_path = Some(exec_socket_path);
+        self.pty_socket_path = pty_socket_path;
+        self.port_forward_socket_path = Some(port_forward_socket_path);
+        *self.handler.write().await = Some(Box::new(handler));
+        *self.state.write().await = BoxState::Ready;
+        Ok(())
+    }
+
     /// Get the exec socket path, if the VM has been booted.
     pub fn exec_socket_path(&self) -> Option<&Path> {
         self.exec_socket_path.as_deref()
@@ -264,6 +408,11 @@ impl VmManager {
     /// Get the PTY socket path, if the VM has been booted.
     pub fn pty_socket_path(&self) -> Option<&Path> {
         self.pty_socket_path.as_deref()
+    }
+
+    /// Get the CRI port-forward socket path, if the VM has been booted.
+    pub fn port_forward_socket_path(&self) -> Option<&Path> {
+        self.port_forward_socket_path.as_deref()
     }
 
     /// Inject a custom VMM provider (e.g., a VmController with a known shim path).
@@ -298,6 +447,12 @@ impl VmManager {
         self.prom = Some(metrics);
     }
 
+    /// Set the logging driver config. Threaded into the InstanceSpec so the shim
+    /// runs the log processor for the box's lifetime.
+    pub fn set_log_config(&mut self, log_config: a3s_box_core::log::LogConfig) {
+        self.log_config = log_config;
+    }
+
     /// Get the attached Prometheus metrics (if any).
     pub fn metrics_prom(&self) -> Option<&crate::prom::RuntimeMetrics> {
         self.prom.as_ref()
@@ -309,6 +464,11 @@ impl VmManager {
     /// for cleanup when the box is removed.
     pub fn anonymous_volumes(&self) -> &[String] {
         &self.anonymous_volumes
+    }
+
+    /// Get the OCI image config resolved during boot.
+    pub fn image_config(&self) -> Option<&crate::oci::OciImageConfig> {
+        self.image_config.as_ref()
     }
 
     /// Get the exit code of the container, if it has exited.
@@ -339,39 +499,112 @@ impl VmManager {
         Ok(None)
     }
 
+    /// Run a command as the container MAIN in an IDLE-booted (deferred-main) VM.
+    ///
+    /// Sends the `spawn-main` control frame carrying `spec_json` (the command),
+    /// waits for the main to exit (which halts the VM), and returns its real exit
+    /// code + the box's json-file console logs split by stream. This is the full-
+    /// box-semantics counterpart to [`Self::exec_command`] (whose output is piped
+    /// over the exec stream, not the json-file logs).
+    #[cfg(unix)]
+    pub async fn run_deferred_main(
+        &mut self,
+        spec_json: &[u8],
+        timeout: std::time::Duration,
+    ) -> Result<a3s_box_core::exec::ExecOutput> {
+        let acked = {
+            let client = self
+                .exec_client
+                .as_ref()
+                .ok_or_else(|| BoxError::ExecError("Exec client not connected".to_string()))?;
+            client.spawn_main(Some(spec_json)).await?
+        };
+        if !acked {
+            return Err(BoxError::ExecError(
+                "spawn-main was not acknowledged by the guest".to_string(),
+            ));
+        }
+
+        // Wait for the main to exit — guest-init persists the code and halts the VM.
+        let start = std::time::Instant::now();
+        let exit_code = loop {
+            if let Some(code) = self.try_wait_exit().await? {
+                break code;
+            }
+            if start.elapsed() >= timeout {
+                return Err(BoxError::ExecError(
+                    "deferred main did not exit within the timeout".to_string(),
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+
+        // Let the shim's log processor finish draining console.log into the json
+        // file (it flushes as the VM halts): poll until container.json stops
+        // growing for one interval (bounded at 1s) instead of a fixed sleep —
+        // fast when the drain is already done, safe when it lags.
+        let json_path = self
+            .home_dir
+            .join("boxes")
+            .join(&self.box_id)
+            .join("logs")
+            .join("container.json");
+        let drain_start = std::time::Instant::now();
+        let mut last_len = u64::MAX;
+        loop {
+            let len = std::fs::metadata(&json_path).map(|m| m.len()).unwrap_or(0);
+            if len == last_len || drain_start.elapsed() >= std::time::Duration::from_secs(1) {
+                break;
+            }
+            last_len = len;
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        }
+        let (stdout, stderr) = self.read_container_logs();
+        Ok(a3s_box_core::exec::ExecOutput {
+            stdout,
+            stderr,
+            exit_code,
+        })
+    }
+
+    /// Read the box's json-file console logs, split into stdout/stderr by stream.
+    fn read_container_logs(&self) -> (Vec<u8>, Vec<u8>) {
+        let path = self
+            .home_dir
+            .join("boxes")
+            .join(&self.box_id)
+            .join("logs")
+            .join("container.json");
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            for line in content.lines() {
+                if let Ok(entry) = serde_json::from_str::<a3s_box_core::log::LogEntry>(line) {
+                    if entry.stream == "stderr" {
+                        err.extend_from_slice(entry.log.as_bytes());
+                    } else {
+                        out.extend_from_slice(entry.log.as_bytes());
+                    }
+                }
+            }
+        }
+        (out, err)
+    }
+
     /// Execute a command in the guest VM.
     ///
     /// Requires the VM to be in Ready, Busy, or Compacting state.
     #[cfg(unix)]
-    #[tracing::instrument(skip(self, cmd), fields(box_id = %self.box_id))]
-    pub async fn exec_command(
-        &self,
-        cmd: Vec<String>,
-        timeout_ns: u64,
-    ) -> Result<a3s_box_core::exec::ExecOutput> {
-        let request = a3s_box_core::exec::ExecRequest {
-            cmd,
-            timeout_ns,
-            env: vec![],
-            working_dir: None,
-            stdin: None,
-            user: None,
-            streaming: false,
-        };
-
-        self.exec_request(request).await
-    }
-
-    /// Execute a fully-specified command request in the guest VM.
-    ///
-    /// This is used by CRI and SDK paths that need to pass env, working dir,
-    /// stdin, or user metadata through to guest-init's exec server.
-    #[cfg(unix)]
     #[tracing::instrument(skip(self, request), fields(box_id = %self.box_id))]
     pub async fn exec_request(
         &self,
-        request: a3s_box_core::exec::ExecRequest,
+        request: &a3s_box_core::exec::ExecRequest,
     ) -> Result<a3s_box_core::exec::ExecOutput> {
+        if request.cmd.is_empty() {
+            return Err(BoxError::ExecError(
+                "Exec request requires a non-empty command".to_string(),
+            ));
+        }
+
         let state = self.state.read().await;
         match *state {
             BoxState::Ready | BoxState::Busy | BoxState::Compacting => {}
@@ -390,7 +623,7 @@ impl VmManager {
             .ok_or_else(|| BoxError::ExecError("Exec client not connected".to_string()))?;
 
         let exec_start = std::time::Instant::now();
-        let result = client.exec_command(&request).await;
+        let result = client.exec_command(request).await;
 
         // Record Prometheus metrics
         if let Some(ref prom) = self.prom {
@@ -406,26 +639,28 @@ impl VmManager {
     }
 
     /// Execute a command in the guest VM.
-    #[cfg(not(unix))]
+    ///
+    /// Requires the VM to be in Ready, Busy, or Compacting state.
+    #[cfg(unix)]
+    #[tracing::instrument(skip(self, cmd), fields(box_id = %self.box_id))]
     pub async fn exec_command(
         &self,
-        _cmd: Vec<String>,
-        _timeout_ns: u64,
+        cmd: Vec<String>,
+        timeout_ns: u64,
     ) -> Result<a3s_box_core::exec::ExecOutput> {
-        Err(BoxError::ExecError(
-            "guest exec is not supported on this host platform yet".to_string(),
-        ))
-    }
+        let request = a3s_box_core::exec::ExecRequest {
+            cmd,
+            timeout_ns,
+            env: vec![],
+            working_dir: None,
+            rootfs: None,
+            stdin: None,
+            stdin_streaming: false,
+            user: None,
+            streaming: false,
+        };
 
-    /// Execute a fully-specified command request in the guest VM.
-    #[cfg(not(unix))]
-    pub async fn exec_request(
-        &self,
-        _request: a3s_box_core::exec::ExecRequest,
-    ) -> Result<a3s_box_core::exec::ExecOutput> {
-        Err(BoxError::ExecError(
-            "guest exec is not supported on this host platform yet".to_string(),
-        ))
+        self.exec_request(&request).await
     }
 
     /// Boot the VM.
@@ -444,25 +679,43 @@ impl VmManager {
         tracing::info!(parent: &boot_span, box_id = %self.box_id, "Booting VM");
 
         // 1. Prepare filesystem layout
-        let layout = self
+        let layout = match self
             .prepare_layout()
             .instrument(tracing::info_span!(parent: &boot_span, "prepare_layout"))
-            .await?;
+            .await
+        {
+            Ok(layout) => layout,
+            Err(error) => {
+                self.cleanup_boot_failure().await;
+                return Err(error);
+            }
+        };
+        self.image_config = layout.oci_config.clone();
 
         // 1.5. Override /etc/resolv.conf with configured DNS
         let resolv_content = a3s_box_core::dns::generate_resolv_conf(&self.config.dns);
         let resolv_path = layout.rootfs_path.join("etc/resolv.conf");
         if let Err(e) = tokio::fs::write(&resolv_path, &resolv_content).await {
-            self.cleanup_box_dir();
+            self.cleanup_boot_failure().await;
             return Err(BoxError::IoError(e));
         }
         tracing::debug!(parent: &boot_span, dns = %resolv_content.trim(), "Configured guest DNS");
+
+        // 1.6. Apply hostname and static hosts entries before the VM starts.
+        if let Err(e) = self.write_hostname_file(&layout) {
+            self.cleanup_boot_failure().await;
+            return Err(e);
+        }
+        if let Err(e) = self.write_standalone_hosts_file(&layout) {
+            self.cleanup_boot_failure().await;
+            return Err(e);
+        }
 
         // 2. Build InstanceSpec
         let mut spec = match self.build_instance_spec(&layout) {
             Ok(s) => s,
             Err(e) => {
-                self.cleanup_box_dir();
+                self.cleanup_boot_failure().await;
                 return Err(e);
             }
         };
@@ -476,7 +729,7 @@ impl VmManager {
             let net_config = match self.setup_bridge_network(&network_name) {
                 Ok(n) => n,
                 Err(e) => {
-                    self.cleanup_box_dir();
+                    self.cleanup_boot_failure().await;
                     return Err(e);
                 }
             };
@@ -485,7 +738,7 @@ impl VmManager {
             match self.write_hosts_file(&layout, &network_name) {
                 Ok(()) => (),
                 Err(e) => {
-                    self.cleanup_box_dir();
+                    self.cleanup_boot_failure().await;
                     return Err(e);
                 }
             };
@@ -518,14 +771,14 @@ impl VmManager {
             let shim_path = match VmController::find_shim() {
                 Ok(p) => p,
                 Err(e) => {
-                    self.cleanup_box_dir();
+                    self.cleanup_boot_failure().await;
                     return Err(e);
                 }
             };
             let controller = match VmController::new(shim_path) {
                 Ok(c) => c,
                 Err(e) => {
-                    self.cleanup_box_dir();
+                    self.cleanup_boot_failure().await;
                     return Err(e);
                 }
             };
@@ -548,7 +801,7 @@ impl VmManager {
             {
                 Ok(h) => h,
                 Err(e) => {
-                    self.cleanup_box_dir();
+                    self.cleanup_boot_failure().await;
                     return Err(e);
                 }
             }
@@ -563,23 +816,55 @@ impl VmManager {
             if let Err(e) = async {
                 self.wait_for_vm_running().await?;
 
-                // 5b. Wait for exec server to become ready (Heartbeat health check)
+                // 5b. Become ready. A snapshot-restore boot resumes an already-booted
+                // guest whose exec server won't re-signal readiness, so the cold-boot
+                // wait would stall registration on its safety cap — do one best-effort
+                // probe instead. A normal boot waits for the Heartbeat health check.
                 #[cfg(unix)]
-                self.wait_for_exec_ready(&layout.exec_socket_path).await?;
+                if is_restore_mode(&self.config) {
+                    self.probe_exec_ready_once(&layout.exec_socket_path).await;
+                } else {
+                    self.wait_for_exec_ready(&layout.exec_socket_path).await?;
+                }
                 Ok::<(), BoxError>(())
             }
             .instrument(wait_span)
             .await
             {
-                // Cleanup box_dir but leave handler for caller to destroy via destroy()
-                self.cleanup_box_dir();
+                self.cleanup_boot_failure().await;
                 return Err(e);
+            }
+        }
+
+        // Prototype: deferred-main-spawn. The guest booted IDLE (BOX_DEFERRED_MAIN);
+        // now that the exec server is ready, tell it to spawn the container command
+        // (already passed via BOX_EXEC_*) as the MAIN process — full box semantics
+        // (exit code + json-file console logs) without a cold boot.
+        // Auto-trigger spawn-main only for the env-driven `run` path, where the
+        // command is known at boot. The pool sets config.deferred_main to boot the
+        // VM IDLE but drives spawn-main EXPLICITLY per request (the per-request
+        // command isn't known at pre-warm), so a pool VM must NOT auto-trigger here.
+        // A restored guest's main is ALREADY running (captured in the snapshot), so
+        // it must never re-spawn — doing so would start a duplicate main.
+        #[cfg(unix)]
+        if !is_restore_mode(&self.config)
+            && std::env::var("BOX_DEFERRED_MAIN")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+        {
+            if let Some(client) = self.exec_client.as_ref() {
+                match client.spawn_main(None).await {
+                    Ok(true) => tracing::info!("deferred container main spawned"),
+                    Ok(false) => tracing::warn!("deferred spawn-main not acknowledged"),
+                    Err(e) => tracing::warn!(error = %e, "deferred spawn-main failed"),
+                }
             }
         }
 
         // 5b2. Store socket paths for CRI streaming access
         self.exec_socket_path = Some(layout.exec_socket_path.clone());
         self.pty_socket_path = Some(layout.pty_socket_path.clone());
+        self.port_forward_socket_path = Some(layout.port_forward_socket_path.clone());
 
         // 5c. Initialize TEE extension for TEE environments
         #[cfg(unix)]
@@ -638,11 +923,15 @@ impl VmManager {
         *state = BoxState::Stopped;
 
         // Stop the VM handler and capture its exit code before it's dropped.
+        // A stop failure must NOT skip the host-resource teardown below (network
+        // backend, overlay unmount, socket + box dirs) — those are already
+        // best-effort and would otherwise leak on every wedged stop. Capture the
+        // error and surface it after teardown instead of returning early.
+        let mut stop_error = None;
         if let Some(mut handler) = self.handler.write().await.take() {
             if let Err(e) = handler.stop(signal, timeout_ms) {
-                tracing::error!(box_id = %self.box_id, error = %e, "Failed to stop VM handler");
-                self.shim_exit_code = handler.exit_code();
-                return Err(e);
+                tracing::error!(box_id = %self.box_id, error = %e, "Failed to stop VM handler; continuing teardown");
+                stop_error = Some(e);
             }
             self.shim_exit_code = handler.exit_code();
         }
@@ -676,6 +965,27 @@ impl VmManager {
             );
         }
 
+        // Remove the box working directory itself (overlay upper/work, logs,
+        // leftover metadata) for non-persistent boxes. Without this, ephemeral
+        // CRI pods leak their `boxes/<id>` directory on every destroy; the
+        // accumulation slows later RunPodSandbox calls until they time out
+        // (observed: pod #21 after churning 20). Persistent boxes keep their
+        // dir intentionally.
+        if !self.config.persistent {
+            match std::fs::remove_dir_all(&box_dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!(
+                        box_id = %self.box_id,
+                        path = %box_dir.display(),
+                        error = %e,
+                        "Failed to remove box directory on destroy"
+                    );
+                }
+            }
+        }
+
         // Record Prometheus metrics
         if let Some(ref prom) = self.prom {
             prom.vm_destroyed_total.inc();
@@ -685,7 +995,12 @@ impl VmManager {
         // Emit stopped event
         self.event_emitter.emit(BoxEvent::empty("box.stopped"));
 
-        Ok(())
+        // Host teardown above is complete; surface a handler-stop failure now so
+        // the caller still learns the stop was imperfect.
+        match stop_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Transition to busy state.
@@ -927,6 +1242,21 @@ impl VmManager {
     }
 }
 
+/// Whether this boot is a snapshot-fork restore (the guest is resumed already-booted
+/// rather than cold-booted). PER-VM: a pool / fork daemon sets `config.restore_from`
+/// so one process can restore different VMs; the single-VM `run` path uses the
+/// `KRUN_RESTORE_FROM` env. Either source means restore mode.
+#[cfg(unix)]
+fn is_restore_mode(config: &BoxConfig) -> bool {
+    config
+        .restore_from
+        .as_deref()
+        .is_some_and(|s| !s.is_empty())
+        || std::env::var("KRUN_RESTORE_FROM")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+}
+
 /// Simple FNV-1a hash for generating short deterministic hashes from strings.
 pub(crate) fn fnv1a_hash(input: &str) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
@@ -945,4 +1275,162 @@ fn default_stop_signal() -> i32 {
 #[cfg(windows)]
 fn default_stop_signal() -> i32 {
     15
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use a3s_box_core::event::EventEmitter;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    struct RecordingHandler {
+        stopped: Arc<AtomicBool>,
+    }
+
+    impl VmHandler for RecordingHandler {
+        fn stop(&mut self, _signal: i32, _timeout_ms: u64) -> Result<()> {
+            self.stopped.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn metrics(&self) -> crate::vmm::VmMetrics {
+            crate::vmm::VmMetrics::default()
+        }
+
+        fn is_running(&self) -> bool {
+            true
+        }
+
+        fn pid(&self) -> u32 {
+            42
+        }
+    }
+
+    /// A handler whose `stop` always fails — models a wedged VM that won't halt.
+    struct FailingHandler;
+
+    impl VmHandler for FailingHandler {
+        fn stop(&mut self, _signal: i32, _timeout_ms: u64) -> Result<()> {
+            Err(BoxError::StateError("simulated stop failure".to_string()))
+        }
+
+        fn metrics(&self) -> crate::vmm::VmMetrics {
+            crate::vmm::VmMetrics::default()
+        }
+
+        fn is_running(&self) -> bool {
+            true
+        }
+
+        fn pid(&self) -> u32 {
+            42
+        }
+    }
+
+    // Regression: a handler-stop failure must still run the host teardown
+    // (overlay unmount, socket + box dirs). Pre-fix, destroy_with_options
+    // returned early on the stop error and leaked the box directory on every
+    // wedged stop.
+    #[tokio::test]
+    async fn test_destroy_runs_host_teardown_even_when_handler_stop_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let box_id = "box-stopfail".to_string();
+        // persistent=false (the default) → the box dir is removed on destroy.
+        let mut vm =
+            VmManager::with_box_id(BoxConfig::default(), EventEmitter::new(16), box_id.clone());
+        vm.home_dir = tmp.path().to_path_buf();
+        *vm.handler.write().await = Some(Box::new(FailingHandler));
+
+        let box_dir = tmp.path().join("boxes").join(&box_id);
+        std::fs::create_dir_all(box_dir.join("logs")).unwrap();
+
+        let result = vm.destroy_with_options(default_stop_signal(), 100).await;
+
+        // The stop failure is still surfaced to the caller...
+        assert!(
+            result.is_err(),
+            "a handler-stop failure must still be reported"
+        );
+        // ...but the host teardown ran anyway: handler taken + box dir removed.
+        assert!(vm.handler.read().await.is_none());
+        assert!(
+            !box_dir.exists(),
+            "non-persistent box dir must be removed even when the stop failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_boot_failure_stops_handler_and_removes_created_volumes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let box_id = "box-test".to_string();
+        let mut vm =
+            VmManager::with_box_id(BoxConfig::default(), EventEmitter::new(16), box_id.clone());
+        vm.home_dir = tmp.path().to_path_buf();
+        vm.anonymous_volumes = vec!["created-volume".to_string(), "reused-volume".to_string()];
+        vm.created_anonymous_volumes = vec!["created-volume".to_string()];
+
+        let stopped = Arc::new(AtomicBool::new(false));
+        *vm.handler.write().await = Some(Box::new(RecordingHandler {
+            stopped: stopped.clone(),
+        }));
+
+        let box_dir = tmp.path().join("boxes").join(&box_id);
+        std::fs::create_dir_all(box_dir.join("logs")).unwrap();
+
+        let store = crate::volume::VolumeStore::new(
+            tmp.path().join("volumes.json"),
+            tmp.path().join("volumes"),
+        );
+        store
+            .create(a3s_box_core::volume::VolumeConfig::new(
+                "created-volume",
+                "",
+            ))
+            .unwrap();
+        store
+            .create(a3s_box_core::volume::VolumeConfig::new("reused-volume", ""))
+            .unwrap();
+
+        vm.cleanup_boot_failure().await;
+
+        assert!(stopped.load(Ordering::SeqCst));
+        assert!(vm.handler.read().await.is_none());
+        assert!(vm.created_anonymous_volumes.is_empty());
+        assert_eq!(vm.anonymous_volumes, vec!["reused-volume".to_string()]);
+        assert!(store.get("created-volume").unwrap().is_none());
+        assert!(store.get("reused-volume").unwrap().is_some());
+        assert!(!box_dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_attach_running_process_infers_port_forward_socket_path() {
+        let mut vm = VmManager::with_box_id(
+            BoxConfig::default(),
+            EventEmitter::new(16),
+            "box-test".to_string(),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let exec_socket_path = tmp.path().join("exec.sock");
+        let pty_socket_path = Some(tmp.path().join("pty.sock"));
+
+        vm.attach_running_process(
+            std::process::id(),
+            exec_socket_path.clone(),
+            pty_socket_path.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(vm.exec_socket_path(), Some(exec_socket_path.as_path()));
+        assert_eq!(vm.pty_socket_path(), pty_socket_path.as_deref());
+        assert_eq!(
+            vm.port_forward_socket_path(),
+            Some(exec_socket_path.with_file_name("portfwd.sock").as_path())
+        );
+        assert_eq!(vm.state().await, BoxState::Ready);
+    }
 }

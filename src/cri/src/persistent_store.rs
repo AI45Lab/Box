@@ -14,6 +14,9 @@ pub struct PersistentCriStore {
     pub sandboxes: Arc<SandboxStore>,
     pub containers: Arc<ContainerStore>,
     state_store: Arc<dyn StateStore>,
+    /// Serializes `persist()` so the on-disk snapshot order matches the write
+    /// order — see [`PersistentCriStore::persist`].
+    persist_lock: tokio::sync::Mutex<()>,
 }
 
 impl PersistentCriStore {
@@ -23,6 +26,7 @@ impl PersistentCriStore {
             sandboxes: Arc::new(SandboxStore::new()),
             containers: Arc::new(ContainerStore::new()),
             state_store,
+            persist_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -39,7 +43,14 @@ impl PersistentCriStore {
     }
 
     /// Snapshot current in-memory state to disk.
+    ///
+    /// The snapshot + write run under `persist_lock` so the rename order matches
+    /// the snapshot order. Without it, two concurrent mutations could snapshot
+    /// S_A then S_B but have S_A's rename land AFTER S_B's, persisting a STALE
+    /// S_A that — on an ungraceful crash before the next persist — drops a
+    /// just-created sandbox from recovery and leaks its microVM + overlay.
     async fn persist(&self) -> std::io::Result<()> {
+        let _guard = self.persist_lock.lock().await;
         let state = PersistedState {
             sandboxes: self.sandboxes.list(None).await,
             containers: self.containers.list(None, None).await,
@@ -61,24 +72,6 @@ impl PersistentCriStore {
         if updated {
             if let Err(e) = self.persist().await {
                 tracing::warn!(error = %e, "Failed to persist CRI state after update_sandbox_state");
-            }
-        }
-        updated
-    }
-
-    pub async fn update_sandbox_network(
-        &self,
-        id: &str,
-        network_name: Option<String>,
-        ip_address: Option<String>,
-    ) -> bool {
-        let updated = self
-            .sandboxes
-            .update_network(id, network_name, ip_address)
-            .await;
-        if updated {
-            if let Err(e) = self.persist().await {
-                tracing::warn!(error = %e, "Failed to persist CRI state after update_sandbox_network");
             }
         }
         updated
@@ -113,6 +106,22 @@ impl PersistentCriStore {
         updated
     }
 
+    pub async fn mark_container_started_if_created(&self, id: &str, started_at: i64) -> bool {
+        let updated = self
+            .containers
+            .mark_started_if_created(id, started_at)
+            .await;
+        if updated {
+            if let Err(e) = self.persist().await {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to persist CRI state after mark_container_started_if_created"
+                );
+            }
+        }
+        updated
+    }
+
     pub async fn mark_container_exited(&self, id: &str, finished_at: i64, exit_code: i32) -> bool {
         let updated = self
             .containers
@@ -121,6 +130,28 @@ impl PersistentCriStore {
         if updated {
             if let Err(e) = self.persist().await {
                 tracing::warn!(error = %e, "Failed to persist CRI state after mark_container_exited");
+            }
+        }
+        updated
+    }
+
+    pub async fn mark_container_exited_if_running(
+        &self,
+        id: &str,
+        finished_at: i64,
+        exit_code: i32,
+        oom_killed: bool,
+    ) -> bool {
+        let updated = self
+            .containers
+            .mark_exited_if_running(id, finished_at, exit_code, oom_killed)
+            .await;
+        if updated {
+            if let Err(e) = self.persist().await {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to persist CRI state after mark_container_exited_if_running"
+                );
             }
         }
         updated
@@ -160,14 +191,17 @@ mod tests {
             name: format!("pod-{}", id),
             namespace: "default".to_string(),
             uid: format!("uid-{}", id),
+            attempt: 0,
             state: SandboxState::Ready,
             created_at: 1_000_000_000,
             labels: HashMap::new(),
             annotations: HashMap::new(),
             log_directory: "/var/log/pods".to_string(),
             runtime_handler: "a3s".to_string(),
-            network_name: None,
-            ip_address: None,
+            network_ip: String::new(),
+            additional_ips: vec![],
+            dns: crate::sandbox::SandboxDns::default(),
+            container_ports: vec![],
         }
     }
 
@@ -176,24 +210,30 @@ mod tests {
             id: id.to_string(),
             sandbox_id: sandbox_id.to_string(),
             name: format!("container-{}", id),
+            attempt: 0,
             image_ref: "alpine:latest".to_string(),
+            resolved_image_digest: "sha256:test".to_string(),
+            resolved_image_path: "/".to_string(),
+            command: vec!["sleep".to_string()],
+            args: vec!["3600".to_string()],
+            env: vec![("ENV".to_string(), "test".to_string())],
+            working_dir: "/".to_string(),
+            user: Some("1000:1001".to_string()),
+            stdin: false,
+            stdin_once: false,
+            tty: false,
+            mounts: vec![],
             state: ContainerState::Running,
             created_at: 1_000_000_000,
             started_at: 2_000_000_000,
             finished_at: 0,
             exit_code: 0,
+            oom_killed: false,
             labels: HashMap::new(),
             annotations: HashMap::new(),
             log_path: String::new(),
-            mounts: vec![],
-            devices: vec![],
-            linux: None,
-            command: vec!["true".to_string()],
-            args: vec![],
-            envs: vec![],
-            working_dir: None,
-            stdin: false,
-            tty: false,
+            rootfs_path: "/".to_string(),
+            rootfs_guest_path: format!("/run/a3s/cri/container-rootfs/{sandbox_id}/{id}/rootfs"),
         }
     }
 
@@ -250,29 +290,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_sandbox_network_persists() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.json");
-        let store = PersistentCriStore::new(Arc::new(JsonStateStore::new(&path)));
-
-        store.add_sandbox(sample_sandbox("sb1")).await;
-        store
-            .update_sandbox_network(
-                "sb1",
-                Some("k8s-pods".to_string()),
-                Some("10.88.0.2".to_string()),
-            )
-            .await;
-
-        let store2 = PersistentCriStore::new(Arc::new(JsonStateStore::new(&path)));
-        store2.load().await.unwrap();
-
-        let sb = store2.sandboxes.get("sb1").await.unwrap();
-        assert_eq!(sb.network_name.as_deref(), Some("k8s-pods"));
-        assert_eq!(sb.ip_address.as_deref(), Some("10.88.0.2"));
-    }
-
-    #[tokio::test]
     async fn test_remove_sandbox_persists() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
@@ -305,6 +322,115 @@ mod tests {
         let c = store2.containers.get("c1").await.unwrap();
         assert_eq!(c.state, ContainerState::Exited);
         assert_eq!(c.exit_code, 42);
+        assert_eq!(c.finished_at, 3_000_000_000);
+    }
+
+    #[tokio::test]
+    async fn test_mark_container_started_if_created_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let store = PersistentCriStore::new(Arc::new(JsonStateStore::new(&path)));
+
+        store.add_sandbox(sample_sandbox("sb1")).await;
+        let mut container = sample_container("c1", "sb1");
+        container.state = ContainerState::Created;
+        container.started_at = 0;
+        store.add_container(container).await;
+        store
+            .mark_container_started_if_created("c1", 2_000_000_000)
+            .await;
+
+        let store2 = PersistentCriStore::new(Arc::new(JsonStateStore::new(&path)));
+        store2.load().await.unwrap();
+
+        let c = store2.containers.get("c1").await.unwrap();
+        assert_eq!(c.state, ContainerState::Running);
+        assert_eq!(c.started_at, 2_000_000_000);
+    }
+
+    #[tokio::test]
+    async fn test_mark_container_started_if_created_loses_cas_after_concurrent_stop() {
+        // Regression for the StartContainer orphan fix (#72): StartContainer
+        // starts the workload, then does this CAS. If a concurrent Stop/Remove
+        // flipped the container out of Created first, the CAS must LOSE — that
+        // is what lets StartContainer cancel the just-started workload instead
+        // of spawning an orphaned supervisor with no stop handle.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let store = PersistentCriStore::new(Arc::new(JsonStateStore::new(&path)));
+
+        store.add_sandbox(sample_sandbox("sb1")).await;
+        let mut container = sample_container("c1", "sb1");
+        container.state = ContainerState::Created;
+        store.add_container(container).await;
+
+        // Concurrent Stop wins the race and moves it out of Created.
+        store.mark_container_exited("c1", 1_000_000_000, 0).await;
+
+        let won = store
+            .mark_container_started_if_created("c1", 2_000_000_000)
+            .await;
+        assert!(!won, "CAS must fail once the container has left Created");
+
+        let c = store.containers.get("c1").await.unwrap();
+        assert_ne!(c.state, ContainerState::Created);
+        assert_ne!(
+            c.state,
+            ContainerState::Running,
+            "a lost CAS must NOT flip the container to Running"
+        );
+
+        // An unknown container also loses the CAS.
+        assert!(
+            !store
+                .mark_container_started_if_created("does-not-exist", 3_000_000_000)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mark_container_exited_if_running_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let store = PersistentCriStore::new(Arc::new(JsonStateStore::new(&path)));
+
+        store.add_sandbox(sample_sandbox("sb1")).await;
+        store.add_container(sample_container("c1", "sb1")).await;
+        store
+            .mark_container_exited_if_running("c1", 3_000_000_000, 17, false)
+            .await;
+
+        let store2 = PersistentCriStore::new(Arc::new(JsonStateStore::new(&path)));
+        store2.load().await.unwrap();
+
+        let c = store2.containers.get("c1").await.unwrap();
+        assert_eq!(c.state, ContainerState::Exited);
+        assert_eq!(c.exit_code, 17);
+        assert_eq!(c.finished_at, 3_000_000_000);
+    }
+
+    #[tokio::test]
+    async fn test_mark_container_exited_if_running_preserves_existing_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let store = PersistentCriStore::new(Arc::new(JsonStateStore::new(&path)));
+
+        store.add_sandbox(sample_sandbox("sb1")).await;
+        store.add_container(sample_container("c1", "sb1")).await;
+        store.mark_container_exited("c1", 3_000_000_000, 7).await;
+
+        assert!(
+            !store
+                .mark_container_exited_if_running("c1", 4_000_000_000, 17, false)
+                .await
+        );
+
+        let store2 = PersistentCriStore::new(Arc::new(JsonStateStore::new(&path)));
+        store2.load().await.unwrap();
+
+        let c = store2.containers.get("c1").await.unwrap();
+        assert_eq!(c.state, ContainerState::Exited);
+        assert_eq!(c.exit_code, 7);
         assert_eq!(c.finished_at, 3_000_000_000);
     }
 
@@ -389,5 +515,54 @@ mod tests {
         let c = store2.containers.get("c1").await.unwrap();
         assert_eq!(c.state, ContainerState::Running);
         assert_eq!(c.started_at, 5_000_000_000);
+    }
+
+    // persist() must serialize the snapshot+write so a stale snapshot can never
+    // overwrite a newer one (which would orphan a just-created sandbox on a crash).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn persist_is_serialized() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // A StateStore that records the peak number of concurrent save() calls.
+        struct ConcurrencyProbe {
+            in_flight: Arc<AtomicUsize>,
+            max_in_flight: Arc<AtomicUsize>,
+        }
+        impl StateStore for ConcurrencyProbe {
+            fn save(&self, _state: &PersistedState) -> std::io::Result<()> {
+                let cur = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_in_flight.fetch_max(cur, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn load(&self) -> std::io::Result<PersistedState> {
+                Ok(PersistedState::default())
+            }
+        }
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let store = Arc::new(PersistentCriStore::new(Arc::new(ConcurrencyProbe {
+            in_flight: Arc::clone(&in_flight),
+            max_in_flight: Arc::clone(&max_in_flight),
+        })));
+
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let store = Arc::clone(&store);
+            handles.push(tokio::spawn(async move {
+                store.add_sandbox(sample_sandbox(&format!("sb-{i}"))).await;
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        assert_eq!(
+            max_in_flight.load(Ordering::SeqCst),
+            1,
+            "persist() must serialize state writes (no overlapping save)"
+        );
     }
 }

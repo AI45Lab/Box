@@ -3,6 +3,7 @@
 use clap::Args;
 use oci_spec::image::{History, ImageConfiguration};
 
+use crate::image_usage;
 use crate::output;
 
 #[derive(Args)]
@@ -16,10 +17,8 @@ pub struct HistoryArgs {
 
 pub async fn execute(args: HistoryArgs) -> Result<(), Box<dyn std::error::Error>> {
     let store = super::open_image_store()?;
-    let stored = store
-        .find(&args.image)
-        .await
-        .ok_or_else(|| format!("Image not found: {}", args.image))?;
+    let images = store.list().await;
+    let stored = image_usage::resolve_required_stored_image(&images, &args.image)?;
     let oci_config = load_image_configuration(&stored.path)?;
     let history: &Vec<History> = oci_config.history();
 
@@ -145,6 +144,9 @@ fn format_timestamp(ts: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use a3s_box_runtime::StoredImage;
+    use chrono::Utc;
+    use std::path::PathBuf;
 
     #[test]
     fn test_truncate_str_short() {
@@ -177,6 +179,22 @@ mod tests {
             blob_path(root, "abc123"),
             std::path::PathBuf::from("/images/test/blobs/sha256/abc123")
         );
+    }
+
+    #[test]
+    fn test_history_resolution_accepts_normalized_alias() {
+        let images = vec![StoredImage {
+            reference: "docker.io/library/alpine:latest".to_string(),
+            digest: "sha256:abc".to_string(),
+            size_bytes: 1024,
+            pulled_at: Utc::now(),
+            last_used: Utc::now(),
+            path: PathBuf::from("/tmp/image"),
+        }];
+
+        let stored = image_usage::resolve_required_stored_image(&images, "alpine:latest").unwrap();
+
+        assert_eq!(stored.reference, "docker.io/library/alpine:latest");
     }
     #[test]
     fn test_format_timestamp_valid() {

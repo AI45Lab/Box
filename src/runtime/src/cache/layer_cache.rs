@@ -81,24 +81,21 @@ impl LayerCache {
         let layer_dir = self.cache_dir.join(&safe_name);
         let meta_path = self.cache_dir.join(format!("{}.meta.json", safe_name));
 
-        // Remove existing entry if present
-        if layer_dir.exists() {
-            std::fs::remove_dir_all(&layer_dir).map_err(|e| {
-                BoxError::CacheError(format!(
-                    "Failed to remove existing cache entry {}: {}",
-                    layer_dir.display(),
-                    e
-                ))
-            })?;
+        // Already fully cached (content-addressed ⇒ identical): nothing to do.
+        // Returning early also makes concurrent puts of the same layer idempotent.
+        if layer_dir.is_dir() && meta_path.is_file() {
+            return Ok(layer_dir);
         }
 
-        // Copy source directory to cache
-        copy_dir_recursive(source_dir, &layer_dir)?;
+        // Atomically publish the extracted layer (staging dir + rename) so a
+        // concurrent pull of the same layer cannot corrupt the cache by
+        // removing/interleaving a half-copied directory.
+        publish_dir_atomically(source_dir, &layer_dir, &self.cache_dir)?;
 
-        // Calculate size
+        // Calculate size (from whichever copy landed — they are identical).
         let size_bytes = dir_size(&layer_dir).unwrap_or(0);
 
-        // Write metadata
+        // Write metadata atomically (unique temp + rename).
         let now = chrono::Utc::now().timestamp();
         let meta = LayerMeta {
             digest: digest.to_string(),
@@ -106,13 +103,7 @@ impl LayerCache {
             cached_at: now,
             last_accessed: now,
         };
-        std::fs::write(&meta_path, serde_json::to_string_pretty(&meta)?).map_err(|e| {
-            BoxError::CacheError(format!(
-                "Failed to write layer metadata {}: {}",
-                meta_path.display(),
-                e
-            ))
-        })?;
+        write_meta_atomically(&meta_path, &serde_json::to_string_pretty(&meta)?)?;
 
         tracing::debug!(
             digest = %digest,
@@ -239,6 +230,30 @@ impl LayerCache {
 }
 
 /// Recursively copy a directory and its contents.
+/// Copy `src`'s uid/gid onto `dst` (no symlink follow), best-effort, root only.
+///
+/// `std::fs::copy`/`create_dir_all` do not carry ownership, so a rootfs copied
+/// from extracted layers would collapse to root and lose `COPY --chown` (and
+/// base-image) ownership. Only root can chown to arbitrary ids, so this is a
+/// no-op otherwise.
+#[cfg(unix)]
+fn preserve_owner(meta: &std::fs::Metadata, dst: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    if unsafe { libc::geteuid() } != 0 {
+        return;
+    }
+    if let Ok(c_path) = std::ffi::CString::new(dst.as_os_str().as_bytes()) {
+        // lchown so a symlink's own ownership is set, not its target's.
+        unsafe {
+            libc::lchown(c_path.as_ptr(), meta.uid(), meta.gid());
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn preserve_owner(_meta: &std::fs::Metadata, _dst: &Path) {}
+
 pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     std::fs::create_dir_all(dst).map_err(|e| {
         BoxError::CacheError(format!(
@@ -247,6 +262,10 @@ pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
             e
         ))
     })?;
+    // Mirror the source directory's ownership onto the destination (root only).
+    if let Ok(src_meta) = std::fs::symlink_metadata(src) {
+        preserve_owner(&src_meta, dst);
+    }
 
     for entry in std::fs::read_dir(src).map_err(|e| {
         BoxError::CacheError(format!("Failed to read directory {}: {}", src.display(), e))
@@ -283,6 +302,7 @@ pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
                         e
                     ))
                 })?;
+                preserve_owner(&meta, &dst_path);
             }
             #[cfg(not(unix))]
             {
@@ -294,7 +314,7 @@ pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
         } else if meta.is_dir() {
             copy_dir_recursive(&src_path, &dst_path)?;
         } else {
-            std::fs::copy(&src_path, &dst_path).map_err(|e| {
+            copy_file_cow(&src_path, &dst_path).map_err(|e| {
                 BoxError::CacheError(format!(
                     "Failed to copy {} to {}: {}",
                     src_path.display(),
@@ -302,9 +322,108 @@ pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
                     e
                 ))
             })?;
+            preserve_owner(&meta, &dst_path);
         }
     }
 
+    Ok(())
+}
+
+/// Copy a regular file, preferring a copy-on-write reflink (`FICLONE`) so a new
+/// box's rootfs shares blocks with the cached image — instant, no extra disk — on
+/// reflink-capable filesystems (btrfs, XFS `reflink=1`, bcachefs). Falls back to a
+/// plain byte copy when reflink is unsupported (e.g. ext4) or the source and
+/// destination are on different filesystems. Overlay is preferred on Linux, so
+/// this only runs on the `CopyProvider` fallback path.
+fn copy_file_cow(src: &Path, dst: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        // FICLONE = _IOW(0x94, 9, int)
+        const FICLONE: libc::c_ulong = 0x4004_9409;
+        let reflinked = (|| -> std::io::Result<bool> {
+            let s = std::fs::File::open(src)?;
+            let d = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(dst)?;
+            // SAFETY: FICLONE's argument is the source fd; both fds are valid for
+            // the call. A non-zero return (unsupported FS / cross-device) just
+            // means "fall back to a byte copy".
+            let rc = unsafe { libc::ioctl(d.as_raw_fd(), FICLONE, s.as_raw_fd()) };
+            if rc != 0 {
+                return Ok(false);
+            }
+            // FICLONE clones data only — copy the permission bits like fs::copy.
+            if let Ok(perm) = s.metadata().map(|m| m.permissions()) {
+                let _ = d.set_permissions(perm);
+            }
+            Ok(true)
+        })()
+        .unwrap_or(false);
+        if reflinked {
+            return Ok(());
+        }
+    }
+    std::fs::copy(src, dst).map(|_| ())
+}
+
+/// Atomically publish `source_dir`'s contents as the content-addressed cache
+/// entry `dest_dir`. Returns `true` if THIS call created the entry, `false` if
+/// an entry was already present (a concurrent put of the same key won).
+///
+/// Copying straight into `dest_dir` (and `remove_dir_all`-ing a pre-existing
+/// one) corrupts the cache when two processes pull the same layer at once: one
+/// deletes the other's half-copied directory, or both interleave files into the
+/// same path. Instead, copy into a unique staging dir under `staging_parent`,
+/// then `rename` it into place. Because both writers use the same key (a
+/// content digest), an entry that already exists is byte-identical, so a lost
+/// rename race is harmless — we keep the winner and drop our staging copy. The
+/// rename is atomic on the same filesystem, so `dest_dir` is only ever absent or
+/// fully populated, never partial.
+pub(crate) fn publish_dir_atomically(
+    source_dir: &Path,
+    dest_dir: &Path,
+    staging_parent: &Path,
+) -> Result<bool> {
+    if dest_dir.exists() {
+        return Ok(false);
+    }
+    let staging = tempfile::Builder::new()
+        .prefix(".staging-")
+        .tempdir_in(staging_parent)
+        .map_err(|e| BoxError::CacheError(format!("Failed to create staging dir: {e}")))?;
+    // copy_dir_recursive create_dir_all's its destination, so copy into a fresh
+    // subpath of the (already-existing) staging dir, then rename that subpath.
+    let staged = staging.path().join("d");
+    copy_dir_recursive(source_dir, &staged)?;
+
+    match std::fs::rename(&staged, dest_dir) {
+        Ok(()) => Ok(true),
+        // Lost the race: a concurrent put populated dest_dir first. Same key ⇒
+        // identical content, so keep the winner (staging auto-removes on drop).
+        Err(_) if dest_dir.exists() => Ok(false),
+        Err(e) => Err(BoxError::CacheError(format!(
+            "Failed to publish cache entry {}: {e}",
+            dest_dir.display()
+        ))),
+    }
+}
+
+/// Atomically write `json` to `meta_path` (unique temp + rename), so a
+/// concurrent reader never sees a half-written metadata file.
+pub(crate) fn write_meta_atomically(meta_path: &Path, json: &str) -> Result<()> {
+    let parent = meta_path.parent().ok_or_else(|| {
+        BoxError::CacheError(format!("meta path has no parent: {}", meta_path.display()))
+    })?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|e| BoxError::CacheError(format!("Failed to stage metadata: {e}")))?;
+    use std::io::Write as _;
+    tmp.write_all(json.as_bytes())
+        .map_err(|e| BoxError::CacheError(format!("Failed to write metadata: {e}")))?;
+    tmp.persist(meta_path)
+        .map_err(|e| BoxError::CacheError(format!("Failed to persist metadata: {e}")))?;
     Ok(())
 }
 
@@ -420,24 +539,62 @@ mod tests {
     }
 
     #[test]
-    fn test_layer_cache_put_overwrites_existing() {
+    fn test_layer_cache_put_same_digest_is_idempotent() {
+        // A layer digest IS the hash of its content, so the same digest can only
+        // ever map to identical content — re-putting it must be a no-op that
+        // keeps the first entry, not a remove-and-recopy (which corrupts the
+        // cache when two pulls of the same layer race). The "different content"
+        // below is an impossible-in-reality stand-in to prove the first write wins.
         let tmp = TempDir::new().unwrap();
         let cache = LayerCache::new(tmp.path()).unwrap();
-        let digest = "sha256:overwrite_test";
+        let digest = "sha256:idempotent_test";
 
-        // Put first version
         let source1 = tmp.path().join("v1");
         create_test_layer(&source1, &[("v1.txt", "version 1")]);
-        cache.put(digest, &source1).unwrap();
+        let first = cache.put(digest, &source1).unwrap();
 
-        // Put second version (overwrites)
         let source2 = tmp.path().join("v2");
         create_test_layer(&source2, &[("v2.txt", "version 2")]);
-        let cached_path = cache.put(digest, &source2).unwrap();
+        let second = cache.put(digest, &source2).unwrap();
 
-        // Should have v2 content, not v1
-        assert!(!cached_path.join("v1.txt").exists());
-        assert!(cached_path.join("v2.txt").is_file());
+        // Same cache path, first content preserved (idempotent, no overwrite).
+        assert_eq!(first, second);
+        assert!(second.join("v1.txt").is_file());
+        assert!(!second.join("v2.txt").exists());
+    }
+
+    #[test]
+    fn test_layer_cache_concurrent_put_same_digest_no_corruption() {
+        use std::sync::Arc;
+
+        let tmp = TempDir::new().unwrap();
+        let cache = Arc::new(LayerCache::new(tmp.path()).unwrap());
+        let digest = "sha256:concurrent_test";
+
+        // Several identical source layers (like the same layer extracted by N
+        // racing pulls), each with the same multi-file content.
+        let files: &[(&str, &str)] = &[("a.txt", "alpha"), ("sub/b.txt", "beta")];
+        let handles: Vec<_> = (0..12)
+            .map(|i| {
+                let cache = Arc::clone(&cache);
+                let src = tmp.path().join(format!("src{i}"));
+                create_test_layer(&src, files);
+                std::thread::spawn(move || cache.put(digest, &src).unwrap())
+            })
+            .collect();
+        let paths: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        // Every put returns the same cache dir, and it is COMPLETE (no half-copied
+        // / interleaved layer): all files present with the right content.
+        for p in &paths {
+            assert_eq!(p, &paths[0]);
+            assert_eq!(std::fs::read_to_string(p.join("a.txt")).unwrap(), "alpha");
+            assert_eq!(
+                std::fs::read_to_string(p.join("sub/b.txt")).unwrap(),
+                "beta"
+            );
+        }
+        assert!(cache.get(digest).unwrap().is_some());
     }
 
     #[test]
@@ -869,5 +1026,42 @@ mod tests {
 
         cache.invalidate(digest).unwrap();
         assert!(cache.get(digest).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_copy_file_cow_preserves_content_and_mode() {
+        // Works whether the FS supports reflink (FICLONE) or falls back to a byte
+        // copy — both must preserve content and the permission bits.
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src.bin");
+        let dst = tmp.path().join("dst.bin");
+        std::fs::write(&src, b"hello copy-on-write").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        copy_file_cow(&src, &dst).unwrap();
+
+        assert_eq!(std::fs::read(&dst).unwrap(), b"hello copy-on-write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dst).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o755, "executable bit must survive the copy");
+        }
+    }
+
+    #[test]
+    fn test_copy_file_cow_overwrites_existing_dst() {
+        // FICLONE and the fs::copy fallback both truncate the destination.
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        std::fs::write(&src, b"new").unwrap();
+        std::fs::write(&dst, b"old-and-longer").unwrap();
+        copy_file_cow(&src, &dst).unwrap();
+        assert_eq!(std::fs::read(&dst).unwrap(), b"new");
     }
 }

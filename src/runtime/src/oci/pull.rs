@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use a3s_box_core::error::{BoxError, Result};
+use a3s_box_core::StoredImage;
 
 use super::image::OciImage;
 use super::reference::ImageReference;
@@ -21,29 +22,67 @@ pub struct ImagePuller {
     store: Arc<ImageStore>,
     puller: RegistryPuller,
     metrics: Option<crate::prom::RuntimeMetrics>,
-    default_registry: String,
+    /// Registry mirror map (original host → mirror host). Pulls fetch layers and
+    /// manifests from the mirror while the image keeps its canonical reference
+    /// for storage and identity. Parsed from `A3S_REGISTRY_MIRRORS`
+    /// (`host=mirror,host=mirror`) — lets a3s-box pull in registry-restricted
+    /// environments, like containerd's registry mirrors.
+    mirrors: std::collections::HashMap<String, String>,
+}
+
+/// Parse `A3S_REGISTRY_MIRRORS=host=mirror,host=mirror` into a map.
+fn parse_registry_mirrors() -> std::collections::HashMap<String, String> {
+    std::env::var("A3S_REGISTRY_MIRRORS")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .filter_map(|pair| pair.split_once('='))
+                .map(|(host, mirror)| (host.trim().to_string(), mirror.trim().to_string()))
+                .filter(|(host, mirror)| !host.is_empty() && !mirror.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 impl ImagePuller {
     /// Create a new image puller.
     pub fn new(store: Arc<ImageStore>, auth: RegistryAuth) -> Self {
+        Self::with_platform(store, auth, None)
+    }
+
+    /// Create an image puller that resolves multi-arch images to an explicit
+    /// platform (e.g. "linux/arm64") instead of the host architecture. `None`
+    /// keeps the host-architecture default.
+    pub fn with_platform(
+        store: Arc<ImageStore>,
+        auth: RegistryAuth,
+        platform: Option<String>,
+    ) -> Self {
         Self {
             store,
-            puller: RegistryPuller::with_auth(auth),
+            puller: RegistryPuller::with_auth_and_platform(auth, platform),
             metrics: None,
-            default_registry: configured_default_registry(),
+            mirrors: parse_registry_mirrors(),
         }
     }
 
-    /// Set the default registry for short image references.
-    pub fn with_default_registry(mut self, registry: impl Into<String>) -> Self {
-        let registry = registry.into();
-        self.default_registry = if a3s_box_core::is_docker_hub_registry(&registry) {
-            a3s_box_core::DOCKER_HUB_IMAGE_REGISTRY.to_string()
-        } else {
-            a3s_box_core::normalize_registry_server(&registry)
-        };
-        self
+    /// Resolve a reference to its fetch target, applying a configured registry
+    /// mirror. The returned reference is used only for the registry HTTP
+    /// fetch — storage and identity always use the original canonical reference.
+    fn mirror_reference(&self, reference: &ImageReference) -> ImageReference {
+        match self.mirrors.get(&reference.registry) {
+            Some(mirror) if !mirror.is_empty() => {
+                tracing::info!(
+                    registry = %reference.registry,
+                    mirror = %mirror,
+                    "Pulling via configured registry mirror"
+                );
+                let mut mirrored = reference.clone();
+                mirror.clone_into(&mut mirrored.registry);
+                mirrored
+            }
+            _ => reference.clone(),
+        }
     }
 
     /// Attach Prometheus metrics to this puller.
@@ -58,13 +97,6 @@ impl ImagePuller {
         self
     }
 
-    /// Select the target platform for multi-architecture image pulls.
-    pub fn with_platform(mut self, platform: &str) -> Result<Self> {
-        let platform = a3s_box_core::Platform::parse(platform).map_err(BoxError::ConfigError)?;
-        self.puller = self.puller.with_platform(platform);
-        Ok(self)
-    }
-
     /// Set a layer progress callback: `(current, total, digest, size_bytes)`.
     pub fn with_progress_fn(mut self, f: PullProgressFn) -> Self {
         self.puller = self.puller.with_progress_fn(f);
@@ -75,31 +107,57 @@ impl ImagePuller {
     ///
     /// Returns the loaded OCI image from the store.
     pub async fn pull(&self, reference: &str) -> Result<OciImage> {
-        let parsed = self.parse_reference(reference)?;
-        let full_ref = parsed.full_reference();
+        self.pull_resolved(reference).await.map(|(image, _)| image)
+    }
 
-        // Check cache first
-        if let Some(stored) = self.store.find(&full_ref).await {
+    async fn pull_resolved(&self, reference: &str) -> Result<(OciImage, String)> {
+        let reference = reference.trim();
+        if is_digest_reference(reference) {
+            let Some((matched_reference, stored)) = self.cached_digest_image(reference).await?
+            else {
+                return Err(BoxError::OciImageError(format!(
+                    "Image digest not found in local cache: {reference}"
+                )));
+            };
             tracing::info!(
-                reference = %reference,
+                requested_reference = %reference,
+                matched_reference = %matched_reference,
                 digest = %stored.digest,
-                stored_reference = %stored.reference,
-                "Using cached image"
+                "Using cached image by digest"
             );
-            return OciImage::from_path(&stored.path);
+            return Ok((OciImage::from_path(&stored.path)?, matched_reference));
         }
 
-        self.pull_and_store(&parsed).await
+        let parsed = ImageReference::parse(reference)?;
+
+        if let Some((matched_reference, stored)) = self.cached_image(reference, &parsed).await? {
+            tracing::info!(
+                requested_reference = %reference,
+                matched_reference = %matched_reference,
+                digest = %stored.digest,
+                "Using cached image"
+            );
+            return Ok((OciImage::from_path(&stored.path)?, matched_reference));
+        }
+
+        Ok((self.pull_and_store(&parsed).await?, parsed.full_reference()))
     }
 
     /// Pull an image, bypassing the local cache.
     pub async fn force_pull(&self, reference: &str) -> Result<OciImage> {
-        let parsed = self.parse_reference(reference)?;
+        let reference = reference.trim();
+        if is_digest_reference(reference) {
+            return Err(BoxError::OciImageError(format!(
+                "Cannot force-pull digest-only reference {reference}; use a tagged registry reference"
+            )));
+        }
 
-        // Remove from cache if present
-        let full_ref = parsed.full_reference();
-        if self.store.find(&full_ref).await.is_some() {
-            let _ = self.store.remove_resolved(&full_ref).await;
+        let parsed = ImageReference::parse(reference)?;
+
+        for candidate in cache_reference_candidates(reference, &parsed) {
+            if self.store.get(&candidate).await.is_some() {
+                let _ = self.store.remove(&candidate).await;
+            }
         }
 
         self.pull_and_store(&parsed).await
@@ -107,19 +165,32 @@ impl ImagePuller {
 
     /// Check if an image is already cached.
     pub async fn is_cached(&self, reference: &str) -> bool {
-        let parsed = match self.parse_reference(reference) {
+        let reference = reference.trim();
+        if is_digest_reference(reference) {
+            return matches!(self.cached_digest_image(reference).await, Ok(Some(_)));
+        }
+
+        let parsed = match ImageReference::parse(reference) {
             Ok(p) => p,
             Err(_) => return false,
         };
-        self.store.find(&parsed.full_reference()).await.is_some()
+        matches!(self.cached_image(reference, &parsed).await, Ok(Some(_)))
     }
 
     /// Remove a cached image by reference.
     pub async fn remove_cached(&self, reference: &str) -> Result<bool> {
-        let parsed = self.parse_reference(reference)?;
-        let full_ref = parsed.full_reference();
-        if self.store.find(&full_ref).await.is_some() {
-            self.store.remove_resolved(&full_ref).await?;
+        let reference = reference.trim();
+        if is_digest_reference(reference) {
+            if let Some((matched_reference, _)) = self.cached_digest_image(reference).await? {
+                self.store.remove(&matched_reference).await?;
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+
+        let parsed = ImageReference::parse(reference)?;
+        if let Some((matched_reference, _)) = self.cached_image(reference, &parsed).await? {
+            self.store.remove(&matched_reference).await?;
             Ok(true)
         } else {
             Ok(false)
@@ -137,16 +208,21 @@ impl ImagePuller {
             .collect())
     }
 
-    fn parse_reference(&self, reference: &str) -> Result<ImageReference> {
-        ImageReference::parse_with_default_registry(reference, &self.default_registry)
-    }
-
     /// Pull from registry and store locally.
     async fn pull_and_store(&self, reference: &ImageReference) -> Result<OciImage> {
         let full_ref = reference.full_reference();
 
-        // Get the manifest digest for storage key
-        let digest = self.puller.pull_manifest_digest(reference).await?;
+        // Fetch from a configured registry mirror when one applies; the image
+        // keeps its canonical reference (full_ref) for storage and identity.
+        let fetch = self.mirror_reference(reference);
+
+        // Get the manifest digest for storage key. The registry returns it
+        // verbatim (the Docker-Content-Digest header), so validate it before it is
+        // used to build any on-disk path below (the temp dir that gets
+        // remove_dir_all'd, the store key) — a `sha256:../../x` value would
+        // otherwise be a path-traversal arbitrary-dir-delete / store-escape.
+        let digest = self.puller.pull_manifest_digest(&fetch).await?;
+        super::registry::validated_digest_hex(&digest)?;
 
         // Check if we already have this digest (different tag, same content)
         if let Some(stored) = self.store.get_by_digest(&digest).await {
@@ -176,7 +252,14 @@ impl ImagePuller {
         }
 
         let pull_start = std::time::Instant::now();
-        self.puller.pull(reference, &tmp_dir).await?;
+        // Remove the partially-written temp directory on ANY failure so aborted
+        // pulls (network error, signature failure, disk error) don't accumulate
+        // under store_dir/tmp — each can be hundreds of MB and is never counted
+        // toward the cache size or evicted by the LRU.
+        if let Err(e) = self.puller.pull(&fetch, &tmp_dir).await {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return Err(e);
+        }
         if let Some(ref m) = self.metrics {
             m.image_pull_total.inc();
             m.image_pull_duration
@@ -184,7 +267,13 @@ impl ImagePuller {
         }
 
         // Store in the image store
-        let stored = self.store.put(&full_ref, &digest, &tmp_dir).await?;
+        let stored = match self.store.put(&full_ref, &digest, &tmp_dir).await {
+            Ok(stored) => stored,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                return Err(e);
+            }
+        };
 
         // Clean up temp directory
         if let Err(e) = std::fs::remove_dir_all(&tmp_dir) {
@@ -203,23 +292,138 @@ impl ImagePuller {
 
         OciImage::from_path(&stored.path)
     }
+
+    async fn cached_image(
+        &self,
+        reference: &str,
+        parsed: &ImageReference,
+    ) -> Result<Option<(String, StoredImage)>> {
+        for candidate in cache_reference_candidates(reference, parsed) {
+            if let Some(stored) = self.store.get(&candidate).await {
+                return Ok(Some((candidate, stored)));
+            }
+        }
+        if let Some(digest) = parsed.digest.as_deref() {
+            return self.cached_digest_image(digest).await;
+        }
+        Ok(None)
+    }
+
+    async fn cached_digest_image(&self, digest: &str) -> Result<Option<(String, StoredImage)>> {
+        let images = self.store.list().await;
+        let mut matches = Vec::new();
+
+        for image in images {
+            let already_matched = matches
+                .iter()
+                .any(|matched: &StoredImage| matched.reference == image.reference);
+            if (digest_matches(&image.digest, digest) || image.reference == digest)
+                && !already_matched
+            {
+                matches.push(image);
+            }
+        }
+
+        match matches.len() {
+            0 => Ok(None),
+            1 => {
+                let stored = matches.pop().expect("checked one match");
+                let stored = self.store.get(&stored.reference).await.unwrap_or(stored);
+                Ok(Some((stored.reference.clone(), stored)))
+            }
+            _ => Err(BoxError::OciImageError(ambiguous_digest_error(
+                digest, &matches,
+            ))),
+        }
+    }
+}
+
+fn ambiguous_digest_error(query: &str, matches: &[StoredImage]) -> String {
+    let mut references: Vec<_> = matches
+        .iter()
+        .map(|image| image.reference.as_str())
+        .collect();
+    references.sort_unstable();
+    format!(
+        "Image digest '{query}' is ambiguous; it matches: {}",
+        references.join(", ")
+    )
+}
+
+fn is_digest_reference(reference: &str) -> bool {
+    reference.starts_with("sha256:")
+}
+
+fn digest_matches(stored_digest: &str, query: &str) -> bool {
+    if stored_digest == query {
+        return true;
+    }
+    let Some(query_hex) = query.strip_prefix("sha256:") else {
+        return false;
+    };
+    !query_hex.is_empty() && stored_digest.starts_with(query)
+}
+
+fn cache_reference_candidates(reference: &str, parsed: &ImageReference) -> Vec<String> {
+    let mut candidates = Vec::new();
+    push_unique(&mut candidates, reference.trim().to_string());
+    push_unique(&mut candidates, parsed.full_reference());
+
+    if parsed.registry == "docker.io" {
+        let repository = parsed
+            .repository
+            .strip_prefix("library/")
+            .unwrap_or(&parsed.repository);
+        push_unique(
+            &mut candidates,
+            reference_from_repository(repository, parsed.tag.as_deref(), parsed.digest.as_deref()),
+        );
+
+        if parsed.digest.is_none() && parsed.tag.as_deref() == Some("latest") {
+            push_unique(&mut candidates, repository.to_string());
+        }
+    }
+
+    if let Some(digest) = &parsed.digest {
+        push_unique(&mut candidates, digest.clone());
+    }
+
+    candidates
+}
+
+fn reference_from_repository(repository: &str, tag: Option<&str>, digest: Option<&str>) -> String {
+    let mut reference = repository.to_string();
+    if let Some(tag) = tag {
+        reference.push(':');
+        reference.push_str(tag);
+    }
+    if let Some(digest) = digest {
+        reference.push('@');
+        reference.push_str(digest);
+    }
+    reference
+}
+
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !value.is_empty() && !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
 }
 
 #[async_trait::async_trait]
 impl a3s_box_core::traits::ImageRegistry for ImagePuller {
     async fn pull(&self, reference: &str) -> Result<a3s_box_core::traits::PulledImage> {
-        let image = self.pull(reference).await?;
-        let parsed = self.parse_reference(reference)?;
+        let (image, resolved_reference) = self.pull_resolved(reference).await?;
         Ok(a3s_box_core::traits::PulledImage {
             path: image.root_dir().to_path_buf(),
             digest: image.manifest_digest().to_string(),
-            reference: parsed.full_reference(),
+            reference: resolved_reference,
         })
     }
 
     async fn force_pull(&self, reference: &str) -> Result<a3s_box_core::traits::PulledImage> {
         let image = self.force_pull(reference).await?;
-        let parsed = self.parse_reference(reference)?;
+        let parsed = ImageReference::parse(reference)?;
         Ok(a3s_box_core::traits::PulledImage {
             path: image.root_dir().to_path_buf(),
             digest: image.manifest_digest().to_string(),
@@ -240,16 +444,11 @@ impl a3s_box_core::traits::ImageRegistry for ImagePuller {
     }
 }
 
-fn configured_default_registry() -> String {
-    a3s_box_core::A3sConfig::load_default()
-        .map(|config| config.registry.default_image_registry())
-        .unwrap_or_else(|_| a3s_box_core::DOCKER_HUB_IMAGE_REGISTRY.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::oci::store::ImageStore;
+    use std::path::Path;
     use tempfile::TempDir;
 
     #[test]
@@ -275,6 +474,129 @@ mod tests {
         assert!(!puller.is_cached("").await);
     }
 
+    #[tokio::test]
+    async fn test_is_cached_matches_docker_hub_aliases() {
+        let tmp = TempDir::new().unwrap();
+        let source = TempDir::new().unwrap();
+        create_complete_oci_image(source.path());
+        let store = Arc::new(ImageStore::new(tmp.path(), 10 * 1024 * 1024).unwrap());
+        store
+            .put("alpine:latest", "sha256:manifestxyz789", source.path())
+            .await
+            .unwrap();
+
+        let puller = ImagePuller::new(store, RegistryAuth::anonymous());
+
+        assert!(puller.is_cached("alpine:latest").await);
+        assert!(puller.is_cached("docker.io/library/alpine:latest").await);
+        assert!(puller.is_cached("alpine").await);
+    }
+
+    #[tokio::test]
+    async fn test_pull_uses_cached_short_alias_for_full_reference() {
+        let tmp = TempDir::new().unwrap();
+        let source = TempDir::new().unwrap();
+        create_complete_oci_image(source.path());
+        let store = Arc::new(ImageStore::new(tmp.path(), 10 * 1024 * 1024).unwrap());
+        store
+            .put("alpine:latest", "sha256:manifestxyz789", source.path())
+            .await
+            .unwrap();
+        let puller = ImagePuller::new(store, RegistryAuth::anonymous());
+
+        let image = puller
+            .pull("docker.io/library/alpine:latest")
+            .await
+            .unwrap();
+
+        assert_eq!(image.manifest_digest(), "sha256:manifestxyz789");
+    }
+
+    #[tokio::test]
+    async fn test_pull_uses_cached_digest_reference_without_registry_parse() {
+        let tmp = TempDir::new().unwrap();
+        let source = TempDir::new().unwrap();
+        create_complete_oci_image(source.path());
+        let store = Arc::new(ImageStore::new(tmp.path(), 10 * 1024 * 1024).unwrap());
+        store
+            .put("alpine:latest", "sha256:manifestxyz789", source.path())
+            .await
+            .unwrap();
+        let puller = ImagePuller::new(store, RegistryAuth::anonymous());
+
+        let image = puller.pull("sha256:manifestxyz789").await.unwrap();
+
+        assert_eq!(image.manifest_digest(), "sha256:manifestxyz789");
+    }
+
+    #[tokio::test]
+    async fn test_is_cached_matches_digest_prefix() {
+        let tmp = TempDir::new().unwrap();
+        let source = TempDir::new().unwrap();
+        create_complete_oci_image(source.path());
+        let store = Arc::new(ImageStore::new(tmp.path(), 10 * 1024 * 1024).unwrap());
+        store
+            .put("alpine:latest", "sha256:manifestxyz789", source.path())
+            .await
+            .unwrap();
+        let puller = ImagePuller::new(store, RegistryAuth::anonymous());
+
+        assert!(puller.is_cached("sha256:manifest").await);
+    }
+
+    #[tokio::test]
+    async fn test_pull_reports_missing_digest_reference_as_local_cache_miss() {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(ImageStore::new(tmp.path(), 10 * 1024 * 1024).unwrap());
+        let puller = ImagePuller::new(store, RegistryAuth::anonymous());
+
+        let error = puller.pull("sha256:notfound").await.unwrap_err();
+
+        assert!(error.to_string().contains("not found in local cache"));
+    }
+
+    #[tokio::test]
+    async fn test_pull_reports_ambiguous_digest_prefix() {
+        let tmp = TempDir::new().unwrap();
+        let source = TempDir::new().unwrap();
+        create_complete_oci_image(source.path());
+        let store = Arc::new(ImageStore::new(tmp.path(), 10 * 1024 * 1024).unwrap());
+        store
+            .put("alpine:latest", "sha256:manifestaaa", source.path())
+            .await
+            .unwrap();
+        store
+            .put("busybox:latest", "sha256:manifestbbb", source.path())
+            .await
+            .unwrap();
+        let puller = ImagePuller::new(store, RegistryAuth::anonymous());
+
+        let error = puller.pull("sha256:manifest").await.unwrap_err();
+
+        assert!(error.to_string().contains("ambiguous"));
+        assert!(error.to_string().contains("alpine:latest"));
+        assert!(error.to_string().contains("busybox:latest"));
+    }
+
+    #[tokio::test]
+    async fn test_remove_cached_matches_docker_hub_alias() {
+        let tmp = TempDir::new().unwrap();
+        let source = TempDir::new().unwrap();
+        create_complete_oci_image(source.path());
+        let store = Arc::new(ImageStore::new(tmp.path(), 10 * 1024 * 1024).unwrap());
+        store
+            .put("alpine:latest", "sha256:manifestxyz789", source.path())
+            .await
+            .unwrap();
+        let puller = ImagePuller::new(store.clone(), RegistryAuth::anonymous());
+
+        assert!(puller
+            .remove_cached("docker.io/library/alpine:latest")
+            .await
+            .unwrap());
+        assert!(store.get("alpine:latest").await.is_none());
+    }
+
     #[test]
     fn test_set_metrics_attaches_to_puller() {
         let tmp = TempDir::new().unwrap();
@@ -289,45 +611,96 @@ mod tests {
     }
 
     #[test]
-    fn test_with_default_registry_parses_short_references() {
-        let tmp = TempDir::new().unwrap();
-        let store = Arc::new(ImageStore::new(tmp.path(), 10 * 1024 * 1024).unwrap());
-        let puller = ImagePuller::new(store, RegistryAuth::anonymous())
-            .with_default_registry("registry.example.com");
+    fn test_cache_reference_candidates_include_short_docker_hub_aliases() {
+        let parsed = ImageReference::parse("docker.io/library/alpine:latest").unwrap();
+        let candidates = cache_reference_candidates("docker.io/library/alpine:latest", &parsed);
 
-        let parsed = puller.parse_reference("nginx:1.25").unwrap();
-        assert_eq!(parsed.registry, "registry.example.com");
-        assert_eq!(parsed.repository, "nginx");
-        assert_eq!(parsed.tag.as_deref(), Some("1.25"));
+        assert_eq!(
+            candidates,
+            vec![
+                "docker.io/library/alpine:latest".to_string(),
+                "alpine:latest".to_string(),
+                "alpine".to_string(),
+            ]
+        );
     }
 
     #[test]
-    fn test_with_docker_hub_default_keeps_library_namespace() {
-        let tmp = TempDir::new().unwrap();
-        let store = Arc::new(ImageStore::new(tmp.path(), 10 * 1024 * 1024).unwrap());
-        let puller =
-            ImagePuller::new(store, RegistryAuth::anonymous()).with_default_registry("docker.io");
-
-        let parsed = puller.parse_reference("nginx").unwrap();
-        assert_eq!(parsed.registry, "docker.io");
-        assert_eq!(parsed.repository, "library/nginx");
+    fn test_digest_matches_exact_and_prefix_queries() {
+        assert!(digest_matches("sha256:abcdef123456", "sha256:abcdef123456"));
+        assert!(digest_matches("sha256:abcdef123456", "sha256:abcdef"));
+        assert!(!digest_matches("sha256:abcdef123456", "sha256:"));
+        assert!(!digest_matches("sha256:abcdef123456", "abcdef"));
     }
 
-    #[test]
-    fn test_with_platform_accepts_docker_platform_string() {
-        let tmp = TempDir::new().unwrap();
-        let store = Arc::new(ImageStore::new(tmp.path(), 10 * 1024 * 1024).unwrap());
-        let puller = ImagePuller::new(store, RegistryAuth::anonymous());
+    fn create_complete_oci_image(path: &Path) {
+        std::fs::create_dir_all(path.join("blobs/sha256")).unwrap();
+        std::fs::write(path.join("oci-layout"), r#"{"imageLayoutVersion":"1.0.0"}"#).unwrap();
 
-        assert!(puller.with_platform("linux/arm64").is_ok());
-    }
+        let config_content = r#"{
+            "architecture": "amd64",
+            "os": "linux",
+            "config": {
+                "Entrypoint": ["/bin/sh"],
+                "Cmd": ["-c", "true"],
+                "Env": ["PATH=/usr/bin:/bin"],
+                "WorkingDir": "/"
+            },
+            "rootfs": {
+                "type": "layers",
+                "diff_ids": ["sha256:layerdiff"]
+            },
+            "history": []
+        }"#;
+        let config_hash = "configabc123";
+        std::fs::write(path.join("blobs/sha256").join(config_hash), config_content).unwrap();
 
-    #[test]
-    fn test_with_platform_rejects_invalid_platform_string() {
-        let tmp = TempDir::new().unwrap();
-        let store = Arc::new(ImageStore::new(tmp.path(), 10 * 1024 * 1024).unwrap());
-        let puller = ImagePuller::new(store, RegistryAuth::anonymous());
+        let layer_hash = "layerdef456";
+        std::fs::write(path.join("blobs/sha256").join(layer_hash), b"layer").unwrap();
 
-        assert!(puller.with_platform("linux").is_err());
+        let manifest_content = format!(
+            r#"{{
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {{
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": "sha256:{}",
+                "size": {}
+            }},
+            "layers": [
+                {{
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "digest": "sha256:{}",
+                    "size": 5
+                }}
+            ]
+        }}"#,
+            config_hash,
+            config_content.len(),
+            layer_hash
+        );
+        let manifest_hash = "manifestxyz789";
+        std::fs::write(
+            path.join("blobs/sha256").join(manifest_hash),
+            &manifest_content,
+        )
+        .unwrap();
+
+        let index_content = format!(
+            r#"{{
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [
+                {{
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": "sha256:{}",
+                    "size": {}
+                }}
+            ]
+        }}"#,
+            manifest_hash,
+            manifest_content.len()
+        );
+        std::fs::write(path.join("index.json"), index_content).unwrap();
     }
 }

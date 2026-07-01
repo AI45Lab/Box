@@ -1,10 +1,41 @@
 //! Command execution and streaming clients.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use a3s_box_core::error::{BoxError, Result};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
+use tokio::sync::Mutex;
+
+const EXEC_CONTROL_CANCEL: &[u8] = b"cancel";
+const EXEC_CONTROL_STDIN_CLOSE: &[u8] = b"stdin-close";
+/// Host→guest control: flush all buffered output and reply with a flush-ack.
+const EXEC_CONTROL_FLUSH: &[u8] = b"flush";
+/// Guest→host marker (carried in a Control frame) acknowledging a flush. Kept
+/// distinct from an `ExecExit` JSON payload so `next_event` can tell them apart.
+/// Must match the guest's `EXEC_FLUSH_ACK` in `guest/init/src/exec_server.rs`.
+const EXEC_FLUSH_ACK: &[u8] = b"flush-ack";
+/// Guest→host acknowledgement that a `signal-main:<N>` graceful-stop control was
+/// received and the signal delivered. Must match the guest's
+/// `EXEC_SIGNAL_MAIN_ACK` in `guest/init/src/exec_server.rs`.
+const EXEC_SIGNAL_MAIN_ACK: &[u8] = b"signal-main-ack";
+/// Guest→host acknowledgement that a `spawn-main` deferred-main control was
+/// received and the container main spawned. Matches the guest's
+/// `EXEC_SPAWN_MAIN_ACK` in `guest/init/src/exec_server.rs`.
+const EXEC_SPAWN_MAIN_ACK: &[u8] = b"spawn-main-ack";
+
+/// Host-side slack added to a one-shot exec's in-guest `timeout_ns` before the
+/// host gives up reading the reply. The in-guest timeout cannot fire if the
+/// guest is wedged, so the host needs its own ceiling.
+const EXEC_HOST_SLACK_SECS: u64 = 10;
+/// Host-side deadline for a `signal-main` ACK. Signal delivery + the ACK are
+/// fast; a wedged guest that never replies must not block the caller's
+/// force-kill fallback.
+const SIGNAL_MAIN_ACK_TIMEOUT_SECS: u64 = 10;
+
+type ExecFrameReader = a3s_transport::FrameReader<tokio::io::ReadHalf<tokio::net::UnixStream>>;
+type ExecFrameWriter = a3s_transport::FrameWriter<tokio::io::WriteHalf<tokio::net::UnixStream>>;
 
 /// Client for executing commands in the guest over Unix socket.
 ///
@@ -66,12 +97,23 @@ impl ExecClient {
             .await
             .map_err(|e| BoxError::ExecError(format!("Exec request write failed: {}", e)))?;
 
-        // Read response frame
+        // Read response frame, bounded by a HOST-side deadline of the request's
+        // timeout plus slack. The request's timeout_ns is only enforced INSIDE
+        // the guest; a wedged guest (kernel hang, OOM thrash, frozen VM) can
+        // still complete the host connect handshake but never reply, which would
+        // block this read forever and stall every caller (health probes, the
+        // monitor poll loop, CLI exec).
         let (r, _w) = tokio::io::split(stream);
         let mut reader = a3s_transport::FrameReader::new(r);
-        let frame = reader
-            .read_frame()
+        let host_deadline = std::time::Duration::from_nanos(request.timeout_ns)
+            .saturating_add(std::time::Duration::from_secs(EXEC_HOST_SLACK_SECS));
+        let frame = tokio::time::timeout(host_deadline, reader.read_frame())
             .await
+            .map_err(|_| {
+                BoxError::ExecError(format!(
+                    "Exec response timed out after {host_deadline:?} (guest may be wedged)"
+                ))
+            })?
             .map_err(|e| BoxError::ExecError(format!("Exec response read failed: {}", e)))?
             .ok_or_else(|| {
                 BoxError::ExecError("Exec server closed without response".to_string())
@@ -121,13 +163,10 @@ impl ExecClient {
             ))
         })?;
 
-        // Send request as Data frame
-        let (r, mut w) = tokio::io::split(stream);
-        let request_frame = a3s_transport::Frame::data(payload);
-        let encoded = request_frame.encode().map_err(|e| {
-            BoxError::ExecError(format!("Failed to encode exec request frame: {}", e))
-        })?;
-        w.write_all(&encoded)
+        let (r, w) = tokio::io::split(stream);
+        let mut writer = a3s_transport::FrameWriter::new(w);
+        writer
+            .write_data(&payload)
             .await
             .map_err(|e| BoxError::ExecError(format!("Exec request write failed: {}", e)))?;
 
@@ -136,6 +175,7 @@ impl ExecClient {
 
         Ok(StreamingExec {
             reader,
+            writer: Arc::new(Mutex::new(writer)),
             started,
             stdout_bytes: 0,
             stderr_bytes: 0,
@@ -225,6 +265,86 @@ impl ExecClient {
             _ => Ok(false),
         }
     }
+
+    /// Ask the guest to deliver `signal` (a signal number, e.g. 15 for SIGTERM)
+    /// to the main container process for graceful shutdown. The guest runs the
+    /// container's own stop handler; when it exits, guest init exits and the VM
+    /// stops cleanly. Returns `Ok(true)` if the guest acknowledged, `Ok(false)`
+    /// if it did not respond (caller should fall back to a hard stop).
+    pub async fn signal_main(&self, signal: i32) -> Result<bool> {
+        let mut stream = match UnixStream::connect(&self.socket_path).await {
+            Ok(s) => s,
+            Err(_) => return Ok(false),
+        };
+
+        let payload = format!("signal-main:{}", signal).into_bytes();
+        let frame = a3s_transport::Frame::control(payload);
+        let encoded = frame
+            .encode()
+            .map_err(|e| BoxError::ExecError(format!("signal-main frame encode failed: {}", e)))?;
+
+        if stream.write_all(&encoded).await.is_err() {
+            return Ok(false);
+        }
+
+        // Host-side deadline: a wedged guest can complete the connect handshake
+        // (listen backlog) but never write the ACK, which would hang this read
+        // forever — and stop/restart deliver the signal through here BEFORE their
+        // force-kill fallback, so the fallback would never run. On timeout report
+        // not-acknowledged so the caller force-kills.
+        let (r, _w) = tokio::io::split(stream);
+        let mut reader = a3s_transport::FrameReader::new(r);
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(SIGNAL_MAIN_ACK_TIMEOUT_SECS),
+            reader.read_frame(),
+        )
+        .await;
+        match read {
+            Ok(Ok(Some(f)))
+                if f.frame_type == a3s_transport::FrameType::Control
+                    && f.payload == EXEC_SIGNAL_MAIN_ACK =>
+            {
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Ask a guest that booted IDLE (`BOX_DEFERRED_MAIN=1`) to spawn its container
+    /// command — already known to the guest via BOX_EXEC_* — as the MAIN process.
+    /// The spawned main inherits the console (so its output reaches the json-file
+    /// logs) and drives the VM lifecycle. Returns `Ok(true)` if acknowledged.
+    pub async fn spawn_main(&self, spec_json: Option<&[u8]>) -> Result<bool> {
+        let mut stream = match UnixStream::connect(&self.socket_path).await {
+            Ok(s) => s,
+            Err(_) => return Ok(false),
+        };
+
+        let mut payload = b"spawn-main:".to_vec();
+        if let Some(json) = spec_json {
+            payload.extend_from_slice(json);
+        }
+        let frame = a3s_transport::Frame::control(payload);
+        let encoded = frame
+            .encode()
+            .map_err(|e| BoxError::ExecError(format!("spawn-main frame encode failed: {}", e)))?;
+
+        if stream.write_all(&encoded).await.is_err() {
+            return Ok(false);
+        }
+
+        let (r, _w) = tokio::io::split(stream);
+        let mut reader = a3s_transport::FrameReader::new(r);
+        match reader.read_frame().await {
+            Ok(Some(f))
+                if f.frame_type == a3s_transport::FrameType::Control
+                    && f.payload == EXEC_SPAWN_MAIN_ACK =>
+            {
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
 }
 
 /// Handle for reading streaming exec events.
@@ -232,14 +352,90 @@ impl ExecClient {
 /// Reads frames from the exec server: Data frames contain `ExecChunk` (stdout/stderr),
 /// Control frames contain `ExecExit` (final exit code).
 pub struct StreamingExec {
-    reader: a3s_transport::FrameReader<tokio::io::ReadHalf<tokio::net::UnixStream>>,
+    reader: ExecFrameReader,
+    writer: Arc<Mutex<ExecFrameWriter>>,
     started: std::time::Instant,
     stdout_bytes: u64,
     stderr_bytes: u64,
     done: bool,
 }
 
+/// Cloneable input side for a running streaming exec workload.
+#[derive(Clone, Debug)]
+pub struct StreamingExecInput {
+    writer: Arc<Mutex<ExecFrameWriter>>,
+}
+
+impl StreamingExecInput {
+    /// Write bytes to the running command's stdin.
+    pub async fn write_stdin(&self, data: &[u8]) -> Result<()> {
+        self.writer
+            .lock()
+            .await
+            .write_data(data)
+            .await
+            .map_err(|e| BoxError::ExecError(format!("Streaming exec stdin write failed: {}", e)))
+    }
+
+    /// Close the running command's stdin without stopping the process.
+    pub async fn close_stdin(&self) -> Result<()> {
+        self.writer
+            .lock()
+            .await
+            .write_control(EXEC_CONTROL_STDIN_CLOSE)
+            .await
+            .map_err(|e| {
+                BoxError::ExecError(format!("Streaming exec stdin close write failed: {}", e))
+            })
+    }
+
+    /// Request cancellation of the running command.
+    pub async fn cancel(&self) -> Result<()> {
+        self.writer
+            .lock()
+            .await
+            .write_control(EXEC_CONTROL_CANCEL)
+            .await
+            .map_err(|e| BoxError::ExecError(format!("Streaming exec cancel write failed: {}", e)))
+    }
+
+    /// Request a flush of the guest's buffered output. The guest replies with a
+    /// flush-ack (`ExecEvent::FlushAck`) once every chunk it had buffered at
+    /// flush time has been sent, establishing a clean log-rotation boundary.
+    pub async fn flush(&self) -> Result<()> {
+        self.writer
+            .lock()
+            .await
+            .write_control(EXEC_CONTROL_FLUSH)
+            .await
+            .map_err(|e| BoxError::ExecError(format!("Streaming exec flush write failed: {}", e)))
+    }
+}
+
 impl StreamingExec {
+    /// Return a cloneable input handle for this running stream.
+    pub fn input(&self) -> StreamingExecInput {
+        StreamingExecInput {
+            writer: self.writer.clone(),
+        }
+    }
+
+    /// Write bytes to the running command's stdin.
+    pub async fn write_stdin(&self, data: &[u8]) -> Result<()> {
+        self.input().write_stdin(data).await
+    }
+
+    /// Close the running command's stdin without stopping the process.
+    pub async fn close_stdin(&self) -> Result<()> {
+        self.input().close_stdin().await
+    }
+
+    /// Request a flush of the guest's buffered output (see
+    /// [`StreamingExecInput::flush`]).
+    pub async fn flush(&self) -> Result<()> {
+        self.input().flush().await
+    }
+
     /// Read the next event from the stream.
     ///
     /// Returns `None` when the command has exited and all output has been read.
@@ -282,7 +478,11 @@ impl StreamingExec {
                 Ok(Some(ExecEvent::Chunk(chunk)))
             }
             a3s_transport::FrameType::Control => {
-                // Control frame = ExecExit
+                // A Control frame is either a flush-ack marker or an ExecExit.
+                if frame.payload == EXEC_FLUSH_ACK {
+                    // Boundary marker for log rotation — the stream continues.
+                    return Ok(Some(ExecEvent::FlushAck));
+                }
                 let exit: ExecExit = serde_json::from_slice(&frame.payload).map_err(|e| {
                     BoxError::ExecError(format!("Failed to parse exec exit: {}", e))
                 })?;
@@ -302,6 +502,14 @@ impl StreamingExec {
                 frame.frame_type
             ))),
         }
+    }
+
+    /// Request cancellation of the running streaming exec workload.
+    ///
+    /// The guest exec server treats this as a best-effort container stop signal
+    /// and should emit a final exit frame after terminating the child process.
+    pub async fn cancel(&mut self) -> Result<()> {
+        self.input().cancel().await
     }
 
     /// Collect all remaining output and return the final result with metrics.
@@ -325,6 +533,7 @@ impl StreamingExec {
                     a3s_box_core::exec::StreamType::Stdout => stdout.extend_from_slice(&chunk.data),
                     a3s_box_core::exec::StreamType::Stderr => stderr.extend_from_slice(&chunk.data),
                 },
+                ExecEvent::FlushAck => {}
                 ExecEvent::Exit(exit) => {
                     exit_code = exit.exit_code;
                 }
@@ -379,28 +588,18 @@ mod tests {
     use tokio::io::AsyncReadExt;
     use tokio::net::UnixListener;
 
-    fn socket_tempdir() -> tempfile::TempDir {
-        #[cfg(target_os = "macos")]
-        {
-            tempfile::Builder::new()
-                .prefix("a3s-exec-test-")
-                .tempdir_in("/private/tmp")
-                .unwrap()
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            tempfile::TempDir::new().unwrap()
-        }
-    }
-
     fn bind_test_listener(path: &Path) -> Option<UnixListener> {
         match UnixListener::bind(path) {
             Ok(listener) => Some(listener),
-            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
-                eprintln!("skipping Unix socket test: {}", err);
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!(
+                    "skipping Unix socket test; sandbox denied bind at {}: {}",
+                    path.display(),
+                    e
+                );
                 None
             }
-            Err(err) => panic!("failed to bind test socket {}: {}", path.display(), err),
+            Err(e) => panic!("failed to bind test socket {}: {}", path.display(), e),
         }
     }
 
@@ -414,7 +613,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_exec_connect_and_socket_path() {
-        let tmp = socket_tempdir();
+        let tmp = tempfile::TempDir::new().unwrap();
         let sock_path = tmp.path().join("exec.sock");
         let Some(_listener) = bind_test_listener(&sock_path) else {
             return;
@@ -426,7 +625,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_exec_heartbeat_with_echo_server() {
-        let tmp = socket_tempdir();
+        let tmp = tempfile::TempDir::new().unwrap();
         let sock_path = tmp.path().join("hb_echo.sock");
         let Some(listener) = bind_test_listener(&sock_path) else {
             return;
@@ -461,7 +660,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_exec_heartbeat_no_response() {
-        let tmp = socket_tempdir();
+        let tmp = tempfile::TempDir::new().unwrap();
         let sock_path = tmp.path().join("hb_close.sock");
         let Some(listener) = bind_test_listener(&sock_path) else {
             return;
@@ -496,8 +695,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_exec_signal_main_round_trip() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sock_path = tmp.path().join("signal_main.sock");
+        let Some(listener) = bind_test_listener(&sock_path) else {
+            return;
+        };
+
+        tokio::spawn(async move {
+            // Accept connect verification
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+            // Accept signal-main connection: read the Control frame, ack it.
+            let (stream, _) = listener.accept().await.unwrap();
+            let (r, w) = tokio::io::split(stream);
+            let mut reader = a3s_transport::FrameReader::new(r);
+            let mut writer = a3s_transport::FrameWriter::new(w);
+
+            let frame = reader.read_frame().await.unwrap().unwrap();
+            assert_eq!(frame.frame_type, a3s_transport::FrameType::Control);
+            assert_eq!(frame.payload, b"signal-main:2");
+
+            writer.write_control(EXEC_SIGNAL_MAIN_ACK).await.unwrap();
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        let client = ExecClient::connect(&sock_path).await.unwrap();
+        // SIGINT = 2 (image STOPSIGNAL example)
+        let acked = client.signal_main(2).await.unwrap();
+        assert!(acked);
+    }
+
+    #[tokio::test]
+    async fn test_exec_signal_main_nonexistent_socket() {
+        // signal_main on a non-connectable socket returns false, not an error,
+        // so the caller can fall back to a hard stop.
+        let client = ExecClient {
+            socket_path: PathBuf::from("/tmp/nonexistent-signal-main-test.sock"),
+        };
+        let acked = client.signal_main(15).await.unwrap();
+        assert!(!acked);
+    }
+
+    #[tokio::test]
     async fn test_exec_client_exec_command() {
-        let tmp = socket_tempdir();
+        let tmp = tempfile::TempDir::new().unwrap();
         let sock_path = tmp.path().join("exec_cmd.sock");
         let Some(listener) = bind_test_listener(&sock_path) else {
             return;
@@ -533,8 +776,10 @@ mod tests {
             cmd: vec!["echo".to_string(), "hello".to_string()],
             env: vec![],
             working_dir: None,
+            rootfs: None,
             user: None,
             stdin: None,
+            stdin_streaming: false,
             timeout_ns: 0,
             streaming: false,
         };
@@ -545,8 +790,286 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_exec_client_exec_stream_collect() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sock_path = tmp.path().join("exec_stream.sock");
+        let Some(listener) = bind_test_listener(&sock_path) else {
+            return;
+        };
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+
+            let (stream, _) = listener.accept().await.unwrap();
+            let (r, w) = tokio::io::split(stream);
+            let mut reader = a3s_transport::FrameReader::new(r);
+            let mut writer = a3s_transport::FrameWriter::new(w);
+
+            let frame = reader.read_frame().await.unwrap().unwrap();
+            let request: a3s_box_core::exec::ExecRequest =
+                serde_json::from_slice(&frame.payload).unwrap();
+            assert!(request.streaming);
+
+            let stdout = a3s_box_core::exec::ExecChunk {
+                stream: a3s_box_core::exec::StreamType::Stdout,
+                data: b"hello ".to_vec(),
+            };
+            writer
+                .write_data(&serde_json::to_vec(&stdout).unwrap())
+                .await
+                .unwrap();
+
+            let stderr = a3s_box_core::exec::ExecChunk {
+                stream: a3s_box_core::exec::StreamType::Stderr,
+                data: b"warn".to_vec(),
+            };
+            writer
+                .write_data(&serde_json::to_vec(&stderr).unwrap())
+                .await
+                .unwrap();
+
+            let exit = a3s_box_core::exec::ExecExit {
+                exit_code: 17,
+                oom_killed: false,
+            };
+            writer
+                .write_control(&serde_json::to_vec(&exit).unwrap())
+                .await
+                .unwrap();
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        let client = ExecClient::connect(&sock_path).await.unwrap();
+        let req = a3s_box_core::exec::ExecRequest {
+            cmd: vec!["echo".to_string(), "hello".to_string()],
+            env: vec![],
+            working_dir: None,
+            rootfs: None,
+            user: None,
+            stdin: None,
+            stdin_streaming: false,
+            timeout_ns: 0,
+            streaming: false,
+        };
+
+        let stream = client.exec_stream(&req).await.unwrap();
+        let (output, metrics) = stream.collect().await.unwrap();
+        assert_eq!(output.stdout, b"hello ");
+        assert_eq!(output.stderr, b"warn");
+        assert_eq!(output.exit_code, 17);
+        assert_eq!(metrics.stdout_bytes, 6);
+        assert_eq!(metrics.stderr_bytes, 4);
+    }
+
+    #[tokio::test]
+    async fn test_exec_client_exec_stream_cancel_writes_control_frame() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sock_path = tmp.path().join("exec_stream_cancel.sock");
+        let Some(listener) = bind_test_listener(&sock_path) else {
+            return;
+        };
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+
+            let (stream, _) = listener.accept().await.unwrap();
+            let (r, w) = tokio::io::split(stream);
+            let mut reader = a3s_transport::FrameReader::new(r);
+            let mut writer = a3s_transport::FrameWriter::new(w);
+
+            let frame = reader.read_frame().await.unwrap().unwrap();
+            let request: a3s_box_core::exec::ExecRequest =
+                serde_json::from_slice(&frame.payload).unwrap();
+            assert!(request.streaming);
+
+            let cancel = reader.read_frame().await.unwrap().unwrap();
+            assert_eq!(cancel.frame_type, a3s_transport::FrameType::Control);
+            assert_eq!(cancel.payload, b"cancel");
+
+            let exit = a3s_box_core::exec::ExecExit {
+                exit_code: 137,
+                oom_killed: false,
+            };
+            writer
+                .write_control(&serde_json::to_vec(&exit).unwrap())
+                .await
+                .unwrap();
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        let client = ExecClient::connect(&sock_path).await.unwrap();
+        let req = a3s_box_core::exec::ExecRequest {
+            cmd: vec!["sleep".to_string(), "60".to_string()],
+            env: vec![],
+            working_dir: None,
+            rootfs: None,
+            user: None,
+            stdin: None,
+            stdin_streaming: false,
+            timeout_ns: 0,
+            streaming: false,
+        };
+
+        let mut stream = client.exec_stream(&req).await.unwrap();
+        stream.cancel().await.unwrap();
+        let event = stream.next_event().await.unwrap().unwrap();
+        match event {
+            a3s_box_core::exec::ExecEvent::Exit(exit) => assert_eq!(exit.exit_code, 137),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_exec_client_exec_stream_input_writes_stdin_and_close() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sock_path = tmp.path().join("exec_stream_stdin.sock");
+        let Some(listener) = bind_test_listener(&sock_path) else {
+            return;
+        };
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+
+            let (stream, _) = listener.accept().await.unwrap();
+            let (r, w) = tokio::io::split(stream);
+            let mut reader = a3s_transport::FrameReader::new(r);
+            let mut writer = a3s_transport::FrameWriter::new(w);
+
+            let frame = reader.read_frame().await.unwrap().unwrap();
+            let request: a3s_box_core::exec::ExecRequest =
+                serde_json::from_slice(&frame.payload).unwrap();
+            assert!(request.streaming);
+
+            let stdin = reader.read_frame().await.unwrap().unwrap();
+            assert_eq!(stdin.frame_type, a3s_transport::FrameType::Data);
+            assert_eq!(stdin.payload, b"hello stdin\n");
+
+            let close = reader.read_frame().await.unwrap().unwrap();
+            assert_eq!(close.frame_type, a3s_transport::FrameType::Control);
+            assert_eq!(close.payload, EXEC_CONTROL_STDIN_CLOSE);
+
+            let exit = a3s_box_core::exec::ExecExit {
+                exit_code: 0,
+                oom_killed: false,
+            };
+            writer
+                .write_control(&serde_json::to_vec(&exit).unwrap())
+                .await
+                .unwrap();
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        let client = ExecClient::connect(&sock_path).await.unwrap();
+        let req = a3s_box_core::exec::ExecRequest {
+            cmd: vec!["cat".to_string()],
+            env: vec![],
+            working_dir: None,
+            rootfs: None,
+            user: None,
+            stdin: None,
+            stdin_streaming: true,
+            timeout_ns: 0,
+            streaming: false,
+        };
+
+        let mut stream = client.exec_stream(&req).await.unwrap();
+        let input = stream.input();
+        input.write_stdin(b"hello stdin\n").await.unwrap();
+        input.close_stdin().await.unwrap();
+        let event = stream.next_event().await.unwrap().unwrap();
+        match event {
+            a3s_box_core::exec::ExecEvent::Exit(exit) => assert_eq!(exit.exit_code, 0),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_exec_client_flush_sends_control_and_parses_ack_then_exit() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sock_path = tmp.path().join("exec_stream_flush.sock");
+        let Some(listener) = bind_test_listener(&sock_path) else {
+            return;
+        };
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+
+            let (stream, _) = listener.accept().await.unwrap();
+            let (r, w) = tokio::io::split(stream);
+            let mut reader = a3s_transport::FrameReader::new(r);
+            let mut writer = a3s_transport::FrameWriter::new(w);
+
+            // Consume the streaming request, then the flush control frame.
+            let _req = reader.read_frame().await.unwrap().unwrap();
+            let flush = reader.read_frame().await.unwrap().unwrap();
+            assert_eq!(flush.frame_type, a3s_transport::FrameType::Control);
+            assert_eq!(flush.payload, EXEC_CONTROL_FLUSH);
+
+            // Reply: a buffered chunk, the flush-ack marker, then exit.
+            let chunk = a3s_box_core::exec::ExecChunk {
+                stream: a3s_box_core::exec::StreamType::Stdout,
+                data: b"pre-rotation\n".to_vec(),
+            };
+            writer
+                .write_data(&serde_json::to_vec(&chunk).unwrap())
+                .await
+                .unwrap();
+            writer.write_control(EXEC_FLUSH_ACK).await.unwrap();
+            let exit = a3s_box_core::exec::ExecExit {
+                exit_code: 0,
+                oom_killed: false,
+            };
+            writer
+                .write_control(&serde_json::to_vec(&exit).unwrap())
+                .await
+                .unwrap();
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        let client = ExecClient::connect(&sock_path).await.unwrap();
+        let req = a3s_box_core::exec::ExecRequest {
+            cmd: vec!["sh".to_string()],
+            env: vec![],
+            working_dir: None,
+            rootfs: None,
+            user: None,
+            stdin: None,
+            stdin_streaming: false,
+            timeout_ns: 0,
+            streaming: false,
+        };
+
+        let mut stream = client.exec_stream(&req).await.unwrap();
+        stream.flush().await.unwrap();
+
+        use a3s_box_core::exec::ExecEvent;
+        match stream.next_event().await.unwrap().unwrap() {
+            ExecEvent::Chunk(c) => assert_eq!(c.data, b"pre-rotation\n"),
+            other => panic!("expected chunk, got {other:?}"),
+        }
+        // The flush-ack must parse as FlushAck, NOT as an exit (which would
+        // wrongly end the stream).
+        match stream.next_event().await.unwrap().unwrap() {
+            ExecEvent::FlushAck => {}
+            other => panic!("expected flush-ack, got {other:?}"),
+        }
+        match stream.next_event().await.unwrap().unwrap() {
+            ExecEvent::Exit(exit) => assert_eq!(exit.exit_code, 0),
+            other => panic!("expected exit, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn test_exec_client_malformed_response() {
-        let tmp = socket_tempdir();
+        let tmp = tempfile::TempDir::new().unwrap();
         let sock_path = tmp.path().join("exec_bad.sock");
         let Some(listener) = bind_test_listener(&sock_path) else {
             return;
@@ -570,8 +1093,10 @@ mod tests {
             cmd: vec!["test".to_string()],
             env: vec![],
             working_dir: None,
+            rootfs: None,
             user: None,
             stdin: None,
+            stdin_streaming: false,
             timeout_ns: 0,
             streaming: false,
         };

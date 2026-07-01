@@ -20,6 +20,7 @@ a3s-transport = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }
+futures = { workspace = true }
 
 # CLI
 clap = { workspace = true }
@@ -27,6 +28,7 @@ clap = { workspace = true }
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
+hex = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }
