@@ -42,13 +42,7 @@ pub async fn execute(args: AttachArgs) -> Result<(), Box<dyn std::error::Error>>
     // Original behavior: tail console log
     let console_log = record.console_log.clone();
     if !console_log.exists() {
-        return Err(format!(
-            "Console log is missing for running box {} at {}. The box may still be starting or the state may be stale; try `a3s-box logs -f {}` or `a3s-box ps`.",
-            record.name,
-            console_log.display(),
-            record.name
-        )
-        .into());
+        return Err(missing_console_log_message(&record.name, &console_log).into());
     }
 
     println!("Attached to box {}. Press Ctrl-C to detach.", record.name);
@@ -67,6 +61,15 @@ pub async fn execute(args: AttachArgs) -> Result<(), Box<dyn std::error::Error>>
     log_handle.abort();
 
     Ok(())
+}
+
+fn missing_console_log_message(name: &str, console_log: &std::path::Path) -> String {
+    format!(
+        "Console log is missing for running box {} at {}. The box may still be starting or the state may be stale; try `a3s-box logs -f {}` or `a3s-box ps`.",
+        name,
+        console_log.display(),
+        name
+    )
 }
 
 /// Attach to a running box with an interactive PTY session.
@@ -112,4 +115,20 @@ async fn execute_pty_attach(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn missing_console_log_message_mentions_recovery_commands() {
+        let message = missing_console_log_message("web", Path::new("/tmp/a3s/web/console.log"));
+
+        assert!(message.contains("running box web"));
+        assert!(message.contains("/tmp/a3s/web/console.log"));
+        assert!(message.contains("a3s-box logs -f web"));
+        assert!(message.contains("a3s-box ps"));
+    }
 }

@@ -532,9 +532,73 @@ mod tests {
     }
 
     #[test]
+    fn test_get_or_create_preserves_existing_config() {
+        let (_dir, store) = temp_store();
+        let created = store
+            .get_or_create(VolumeConfig::with_size_limit("shared", "", 4096))
+            .unwrap();
+        let mut updated = created;
+        updated.attach("box-1");
+        store.update(&updated).unwrap();
+
+        let reused = store
+            .get_or_create(VolumeConfig::with_size_limit("shared", "/ignored", 8192))
+            .unwrap();
+
+        assert_eq!(reused.size_limit, 4096);
+        assert_eq!(reused.in_use_by, vec!["box-1"]);
+        assert!(PathBuf::from(&reused.mount_point).exists());
+    }
+
+    #[test]
     fn test_modify_missing_returns_false() {
         let (_dir, store) = temp_store();
         assert!(!store.modify("nope", |c| c.attach("box-1")).unwrap());
+    }
+
+    #[test]
+    fn test_modify_existing_returns_true_and_persists() {
+        let (_dir, store) = temp_store();
+        store.create(VolumeConfig::new("shared", "")).unwrap();
+
+        let modified = store.modify("shared", |c| c.attach("box-1")).unwrap();
+
+        assert!(modified);
+        assert_eq!(
+            store.get("shared").unwrap().unwrap().in_use_by,
+            vec!["box-1"]
+        );
+    }
+
+    #[test]
+    fn test_volume_dir_joins_name_under_base_directory() {
+        let (dir, store) = temp_store();
+        assert_eq!(
+            store.volume_dir("mydata"),
+            dir.path().join("volumes").join("mydata")
+        );
+    }
+
+    #[test]
+    fn test_volume_store_backend_trait_dispatch() {
+        let (_dir, store) = temp_store();
+        let backend: &dyn a3s_box_core::traits::VolumeStoreBackend = &store;
+
+        let created = backend.create(VolumeConfig::new("shared", "")).unwrap();
+        assert_eq!(created.name, "shared");
+        assert!(backend.get("shared").unwrap().is_some());
+
+        let mut updated = created;
+        updated.attach("box-1");
+        backend.update(&updated).unwrap();
+        assert_eq!(backend.list().unwrap().len(), 1);
+
+        let err = backend.remove("shared", false).unwrap_err().to_string();
+        assert!(err.contains("is in use"));
+
+        let removed = backend.remove("shared", true).unwrap();
+        assert_eq!(removed.name, "shared");
+        assert!(backend.list().unwrap().is_empty());
     }
 
     // The advisory lock is per-open-file-description, so separate

@@ -21,9 +21,14 @@ impl StateLock {
     /// Acquire the exclusive advisory lock, blocking until it is available.
     #[cfg(unix)]
     pub(crate) fn acquire() -> std::io::Result<Self> {
+        let path = a3s_box_core::dirs_home().join("boxes.json.lock");
+        Self::acquire_path(&path)
+    }
+
+    #[cfg(unix)]
+    fn acquire_path(path: &std::path::Path) -> std::io::Result<Self> {
         use std::os::unix::io::AsRawFd;
 
-        let path = a3s_box_core::dirs_home().join("boxes.json.lock");
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -32,7 +37,7 @@ impl StateLock {
             .write(true)
             .create(true)
             .truncate(false)
-            .open(&path)?;
+            .open(path)?;
         // Blocking exclusive advisory lock; released when `file` drops.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
             return Err(std::io::Error::last_os_error());
@@ -45,5 +50,49 @@ impl StateLock {
     #[cfg(not(unix))]
     pub(crate) fn acquire() -> std::io::Result<Self> {
         Ok(Self {})
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn acquire_path_creates_parent_and_releases_on_drop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lock_path = tmp.path().join("state").join("boxes.json.lock");
+
+        let guard = StateLock::acquire_path(&lock_path).unwrap();
+        assert!(lock_path.exists());
+        drop(guard);
+
+        // Re-acquiring after drop proves the fd-backed flock was released.
+        let _guard = StateLock::acquire_path(&lock_path).unwrap();
+    }
+
+    #[test]
+    fn exclusive_lock_blocks_other_file_descriptors_until_released() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lock_path = tmp.path().join("boxes.json.lock");
+        let guard = StateLock::acquire_path(&lock_path).unwrap();
+        let thread_lock_path = lock_path.clone();
+        let (tx, rx) = mpsc::channel();
+
+        let waiter = std::thread::spawn(move || {
+            let _guard = StateLock::acquire_path(&thread_lock_path).unwrap();
+            tx.send(()).unwrap();
+        });
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "second lock acquisition should block while the first guard is alive"
+        );
+
+        drop(guard);
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("second lock acquisition should proceed after drop");
+        waiter.join().unwrap();
     }
 }

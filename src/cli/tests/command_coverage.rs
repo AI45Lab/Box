@@ -374,6 +374,172 @@ CMD ["cat", "/opt/message.txt"]
 }
 
 #[test]
+fn test_create_persists_rich_runtime_options() {
+    let cli = CliTest::new();
+    let env_file = cli.home_path().join("rich.env");
+    std::fs::write(&env_file, "FROM_FILE=kept\nOVERRIDE=file\n").expect("write env file");
+    let env_file_arg = env_file.to_string_lossy().to_string();
+
+    cli.ok(&[
+        "create",
+        "--name",
+        "cov-rich",
+        "--cpus",
+        "4",
+        "--memory",
+        "768m",
+        "--volume",
+        "covrichdata:/data:ro",
+        "--env-file",
+        &env_file_arg,
+        "--env",
+        "OVERRIDE=cli",
+        "--env",
+        "INLINE=present",
+        "--entrypoint",
+        "/bin/sh -lc",
+        "--hostname",
+        "rich-box",
+        "--add-host",
+        "db.local:10.10.0.5",
+        "--user",
+        "1000:1001",
+        "--workdir",
+        "/work",
+        "--restart",
+        "on-failure:3",
+        "--label",
+        "purpose=coverage",
+        "--tmpfs",
+        "/tmp:size=64m",
+        "--health-cmd",
+        "test -f /tmp/healthy",
+        "--health-interval",
+        "10s",
+        "--health-timeout",
+        "2s",
+        "--health-retries",
+        "5",
+        "--health-start-period",
+        "3s",
+        "--pids-limit",
+        "128",
+        "--cpuset-cpus",
+        "0,1",
+        "--ulimit",
+        "nofile=1024:2048",
+        "--cpu-shares",
+        "1024",
+        "--cpu-quota",
+        "50000",
+        "--cpu-period",
+        "100000",
+        "--memory-reservation",
+        "256m",
+        "--memory-swap",
+        "2g",
+        "--platform",
+        "linux/amd64",
+        "--init",
+        "--read-only",
+        "--cap-add",
+        "NET_ADMIN",
+        "--cap-drop",
+        "MKNOD",
+        "--security-opt",
+        "no-new-privileges",
+        "--security-opt",
+        "seccomp=unconfined",
+        "--privileged",
+        "--shm-size",
+        "64m",
+        "--stop-signal",
+        "SIGTERM",
+        "--stop-timeout",
+        "12",
+        "--oom-kill-disable",
+        "--oom-score-adj",
+        "100",
+        "docker.io/library/alpine:latest",
+        "--",
+        "sleep",
+        "60",
+    ]);
+
+    let inspect = cli.ok(&["inspect", "cov-rich"]);
+    let inspect = parse_inspect(&inspect);
+    assert_eq!(inspect["name"], "cov-rich");
+    assert_eq!(inspect["status"], "created");
+    assert_eq!(inspect["cpus"], 4);
+    assert_eq!(inspect["memory_mb"], 768);
+    assert_eq!(inspect["cmd"], serde_json::json!(["sleep", "60"]));
+    assert_eq!(inspect["entrypoint"], serde_json::json!(["/bin/sh", "-lc"]));
+    assert_eq!(inspect["env"]["FROM_FILE"], "kept");
+    assert_eq!(inspect["env"]["OVERRIDE"], "cli");
+    assert_eq!(inspect["env"]["INLINE"], "present");
+    assert_eq!(inspect["hostname"], "rich-box");
+    assert_eq!(
+        inspect["add_host"],
+        serde_json::json!(["db.local:10.10.0.5"])
+    );
+    assert_eq!(inspect["user"], "1000:1001");
+    assert_eq!(inspect["workdir"], "/work");
+    assert_eq!(inspect["restart_policy"], "on-failure");
+    assert_eq!(inspect["max_restart_count"], 3);
+    assert_eq!(inspect["labels"]["purpose"], "coverage");
+    assert_eq!(inspect["tmpfs"], serde_json::json!(["/tmp:size=64m"]));
+    assert_eq!(inspect["volume_names"], serde_json::json!(["covrichdata"]));
+    assert!(
+        inspect["volumes"][0]
+            .as_str()
+            .expect("resolved volume spec")
+            .ends_with(":/data:ro"),
+        "resolved named volume should preserve guest target and mode: {}",
+        inspect["volumes"][0]
+    );
+    assert_eq!(
+        inspect["health_check"]["cmd"],
+        serde_json::json!(["sh", "-c", "test -f /tmp/healthy"])
+    );
+    assert_eq!(inspect["health_check"]["interval_secs"], 10);
+    assert_eq!(inspect["health_check"]["timeout_secs"], 2);
+    assert_eq!(inspect["health_check"]["retries"], 5);
+    assert_eq!(inspect["health_check"]["start_period_secs"], 3);
+    assert_eq!(inspect["resource_limits"]["pids_limit"], 128);
+    assert_eq!(inspect["resource_limits"]["cpuset_cpus"], "0,1");
+    assert_eq!(
+        inspect["resource_limits"]["ulimits"],
+        serde_json::json!(["nofile=1024:2048"])
+    );
+    assert_eq!(inspect["resource_limits"]["cpu_shares"], 1024);
+    assert_eq!(inspect["resource_limits"]["cpu_quota"], 50000);
+    assert_eq!(inspect["resource_limits"]["cpu_period"], 100000);
+    assert_eq!(inspect["resource_limits"]["memory_reservation"], 268435456);
+    assert_eq!(inspect["resource_limits"]["memory_swap"], 2147483648_i64);
+    assert_eq!(inspect["platform"], "linux/amd64");
+    assert_eq!(inspect["init"], true);
+    assert_eq!(inspect["read_only"], true);
+    assert_eq!(inspect["cap_add"], serde_json::json!(["NET_ADMIN"]));
+    assert_eq!(inspect["cap_drop"], serde_json::json!(["MKNOD"]));
+    assert_eq!(
+        inspect["security_opt"],
+        serde_json::json!(["no-new-privileges", "seccomp=unconfined"])
+    );
+    assert_eq!(inspect["privileged"], true);
+    assert_eq!(inspect["shm_size"], 67108864);
+    assert_eq!(inspect["stop_signal"], "SIGTERM");
+    assert_eq!(inspect["stop_timeout"], 12);
+    assert_eq!(inspect["oom_kill_disable"], true);
+    assert_eq!(inspect["oom_score_adj"], 100);
+
+    let volume = cli.ok(&["volume", "inspect", "covrichdata"]);
+    assert!(volume.contains("covrichdata"));
+
+    cli.ok(&["rm", "cov-rich"]);
+    cli.ok(&["volume", "rm", "covrichdata"]);
+}
+
+#[test]
 fn test_noninteractive_boundary_command_smoke() {
     let cli = CliTest::new();
 

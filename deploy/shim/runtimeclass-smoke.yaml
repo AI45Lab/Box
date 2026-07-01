@@ -1,0 +1,56 @@
+# RuntimeClass smoke DaemonSet for explicitly enrolled a3s-box validation nodes.
+#
+# This creates one long-lived smoke pod on each node labeled for production-soak
+# validation. Use it after installing the RuntimeClass and before longer soak
+# workloads so scheduling, logs, and kubectl exec are verified on every node.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: a3s-box-validation
+  labels:
+    a3s-box.io/validation: "true"
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: a3s-box-runtimeclass-smoke
+  namespace: a3s-box-validation
+  labels:
+    app: a3s-box-runtimeclass-smoke
+spec:
+  selector:
+    matchLabels:
+      app: a3s-box-runtimeclass-smoke
+  template:
+    metadata:
+      labels:
+        app: a3s-box-runtimeclass-smoke
+    spec:
+      runtimeClassName: a3s-box
+      nodeSelector:
+        a3s-box.io/runtime: "true"
+        a3s-box.io/test-tier: production-soak
+      tolerations:
+        - key: a3s-box.io/soak
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: smoke
+          image: docker.m.daocloud.io/library/alpine:latest
+          command:
+            - sh
+            - -c
+            - |
+              uname -a
+              echo A3S_BOX_SMOKE_OK
+              sleep 3600
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "1"
+              memory: "512Mi"

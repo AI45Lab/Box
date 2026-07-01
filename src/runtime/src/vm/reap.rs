@@ -93,6 +93,16 @@ fn wait_for_exit(pids: &[i32], timeout: std::time::Duration) {
 #[cfg(not(target_os = "linux"))]
 pub fn reap_orphaned_box(_box_id: &str) {}
 
+#[cfg(all(test, not(target_os = "linux")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reap_orphaned_box_is_noop_on_non_linux() {
+        reap_orphaned_box("non-linux-noop");
+    }
+}
+
 /// SIGKILL any `a3s-box-shim` process whose command line carries `box_id`.
 ///
 /// The shim is launched as `a3s-box-shim --config '{"box_id":"<id>",...}'`, so

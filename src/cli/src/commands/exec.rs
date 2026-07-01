@@ -16,6 +16,9 @@ use crate::resolve;
 #[cfg(not(windows))]
 use crate::state::StateFile;
 
+#[cfg(not(windows))]
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
+
 #[derive(Args)]
 pub struct ExecArgs {
     /// Box name or ID
@@ -88,7 +91,7 @@ pub async fn execute(_args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> 
 
 #[cfg(not(windows))]
 pub async fn execute(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
-    use a3s_box_core::exec::{ExecRequest, DEFAULT_EXEC_TIMEOUT_NS};
+    use a3s_box_core::exec::ExecRequest;
     use a3s_box_runtime::ExecClient;
 
     let user = common::normalize_user_option(args.user.as_deref())
@@ -115,14 +118,7 @@ pub async fn execute(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let client = ExecClient::connect(&exec_socket_path).await?;
 
-    let timeout_ns = if args.timeout == 0 {
-        DEFAULT_EXEC_TIMEOUT_NS
-    } else {
-        // saturating: an absurd --timeout (seconds) would otherwise overflow u64
-        // nanoseconds (panic in debug, wrap to a tiny timeout in release). Cap at
-        // u64::MAX ns instead — effectively unbounded, which is the intent.
-        args.timeout.saturating_mul(1_000_000_000)
-    };
+    let timeout_ns = timeout_secs_to_ns(args.timeout);
 
     // Read stdin if interactive mode
     let stdin_data = if args.interactive {
@@ -176,6 +172,17 @@ pub async fn execute(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn timeout_secs_to_ns(timeout_secs: u64) -> u64 {
+    if timeout_secs == 0 {
+        a3s_box_core::exec::DEFAULT_EXEC_TIMEOUT_NS
+    } else {
+        // Cap absurd values at u64::MAX ns instead of overflowing into a tiny
+        // timeout in release builds.
+        timeout_secs.saturating_mul(NANOS_PER_SECOND)
+    }
 }
 
 /// Execute a command with an interactive PTY session.
@@ -357,4 +364,27 @@ pub(crate) async fn run_pty_session(
     writer_task.abort();
 
     exit_code
+}
+
+#[cfg(all(test, not(windows)))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timeout_secs_to_ns_uses_default_for_zero() {
+        assert_eq!(
+            timeout_secs_to_ns(0),
+            a3s_box_core::exec::DEFAULT_EXEC_TIMEOUT_NS
+        );
+    }
+
+    #[test]
+    fn timeout_secs_to_ns_converts_seconds_to_nanoseconds() {
+        assert_eq!(timeout_secs_to_ns(7), 7_000_000_000);
+    }
+
+    #[test]
+    fn timeout_secs_to_ns_saturates_large_values() {
+        assert_eq!(timeout_secs_to_ns(u64::MAX), u64::MAX);
+    }
 }

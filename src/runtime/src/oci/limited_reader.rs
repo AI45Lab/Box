@@ -78,4 +78,63 @@ mod tests {
         std::io::copy(&mut r, &mut sink).unwrap();
         assert_eq!(sink, data);
     }
+
+    #[test]
+    fn passes_data_at_the_exact_limit() {
+        let data = b"exactly four bytes";
+        let mut r = LimitedReader::new(&data[..], data.len() as u64);
+        let mut sink = Vec::new();
+
+        std::io::copy(&mut r, &mut sink).unwrap();
+
+        assert_eq!(sink, data);
+    }
+
+    #[test]
+    fn zero_limit_allows_empty_stream_but_rejects_content() {
+        let mut empty = LimitedReader::new(std::io::empty(), 0);
+        let mut sink = Vec::new();
+        std::io::copy(&mut empty, &mut sink).unwrap();
+        assert!(sink.is_empty());
+
+        let mut non_empty = LimitedReader::new(&b"x"[..], 0);
+        let err = std::io::copy(&mut non_empty, &mut Vec::new()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert!(err.to_string().contains("0-byte limit"));
+    }
+
+    #[test]
+    fn cap_from_env_uses_positive_values_only() {
+        let var = format!(
+            "A3S_BOX_LIMITED_READER_TEST_POSITIVE_{}",
+            std::process::id()
+        );
+        std::env::set_var(&var, " 4096 ");
+
+        let cap = cap_from_env(&var, 1024);
+
+        std::env::remove_var(&var);
+        assert_eq!(cap, 4096);
+    }
+
+    #[test]
+    fn cap_from_env_falls_back_for_unset_zero_and_invalid_values() {
+        let base = format!(
+            "A3S_BOX_LIMITED_READER_TEST_FALLBACK_{}",
+            std::process::id()
+        );
+        let unset = format!("{base}_UNSET");
+        let zero = format!("{base}_ZERO");
+        let invalid = format!("{base}_INVALID");
+        std::env::remove_var(&unset);
+        std::env::set_var(&zero, "0");
+        std::env::set_var(&invalid, "not-a-number");
+
+        assert_eq!(cap_from_env(&unset, 2048), 2048);
+        assert_eq!(cap_from_env(&zero, 2048), 2048);
+        assert_eq!(cap_from_env(&invalid, 2048), 2048);
+
+        std::env::remove_var(&zero);
+        std::env::remove_var(&invalid);
+    }
 }

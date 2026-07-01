@@ -8,6 +8,8 @@ use a3s_box_core::event::EventEmitter;
 use a3s_box_core::vmm::{parse_signal_name, DEFAULT_SHUTDOWN_TIMEOUT_MS};
 use a3s_box_runtime::VmManager;
 use clap::Args;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use super::common::{self, CommonBoxArgs};
 use crate::output::parse_memory;
@@ -643,6 +645,10 @@ enum ForegroundStopReason {
     VmUnhealthy,
 }
 
+const FOREGROUND_LOG_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const FOREGROUND_LOG_DRAIN_QUIET: std::time::Duration = std::time::Duration::from_millis(300);
+const FOREGROUND_LOG_DRAIN_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
 impl ForegroundStopReason {
     fn stopped_by_user(self) -> bool {
         matches!(self, Self::UserInterrupted)
@@ -661,12 +667,18 @@ async fn run_foreground(
 
     let console_log = ctx.box_dir.join("logs").join("console.log");
     let console_err = ctx.box_dir.join("logs").join("console.err.log");
+    let stdout_pos = Arc::new(AtomicU64::new(0));
+    let stderr_pos = Arc::new(AtomicU64::new(0));
+    let tail_stdout_pos = Arc::clone(&stdout_pos);
+    let tail_stderr_pos = Arc::clone(&stderr_pos);
+    let tail_console_log = console_log.clone();
+    let tail_console_err = console_err.clone();
     let log_handle = tokio::spawn(async move {
         // Stream the container's stdout (console.log) and stderr
         // (console.err.log, split console) to the terminal's stdout/stderr.
         tokio::join!(
-            super::tail_file(&console_log),
-            super::tail_file_stream(&console_err, true),
+            super::tail_file_stream_positioned(&tail_console_log, false, Some(tail_stdout_pos)),
+            super::tail_file_stream_positioned(&tail_console_err, true, Some(tail_stderr_pos)),
         );
     });
 
@@ -688,6 +700,8 @@ async fn run_foreground(
         }
     };
 
+    wait_for_foreground_log_drain(&[(&console_log, &stdout_pos), (&console_err, &stderr_pos)])
+        .await;
     log_handle.abort();
 
     // Best-effort teardown: a stop failure (wedged VM, transient store error)
@@ -723,6 +737,46 @@ async fn run_foreground(
     }
 
     Ok(())
+}
+
+async fn wait_for_foreground_log_drain(paths: &[(&std::path::Path, &AtomicU64)]) {
+    let start = std::time::Instant::now();
+    let mut last_lens = foreground_log_lengths(paths);
+    let mut quiet_since = None;
+
+    loop {
+        let lens = foreground_log_lengths(paths);
+        let lengths_stable = lens == last_lens;
+        let tails_caught_up = paths
+            .iter()
+            .zip(lens.iter())
+            .all(|((_, pos), len)| pos.load(Ordering::Relaxed) >= *len);
+
+        if lengths_stable && tails_caught_up {
+            let now = std::time::Instant::now();
+            match quiet_since {
+                Some(since) if now.duration_since(since) >= FOREGROUND_LOG_DRAIN_QUIET => break,
+                Some(_) => {}
+                None => quiet_since = Some(now),
+            }
+        } else {
+            last_lens = lens;
+            quiet_since = None;
+        }
+
+        if start.elapsed() >= FOREGROUND_LOG_DRAIN_TIMEOUT {
+            break;
+        }
+
+        tokio::time::sleep(FOREGROUND_LOG_DRAIN_POLL).await;
+    }
+}
+
+fn foreground_log_lengths(paths: &[(&std::path::Path, &AtomicU64)]) -> Vec<u64> {
+    paths
+        .iter()
+        .map(|(path, _)| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0))
+        .collect()
 }
 
 fn foreground_exit_code(reason: ForegroundStopReason, vm_exit_code: Option<i32>) -> Option<i32> {

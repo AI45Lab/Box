@@ -199,6 +199,31 @@ mod tests {
     }
 
     #[test]
+    fn test_copy_provider_prepare_reuses_existing_rootfs_without_overwriting() {
+        let tmp = TempDir::new().unwrap();
+        let cache_dir = tmp.path().join("cache");
+        let box_dir = tmp.path().join("box");
+        let rootfs = box_dir.join("rootfs");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::create_dir_all(rootfs.join("etc")).unwrap();
+        make_sample_rootfs(&cache_dir);
+        std::fs::write(rootfs.join("etc/hostname"), "persistent-host").unwrap();
+
+        let provider = CopyProvider;
+        let prepared = provider.prepare(&box_dir, &cache_dir).unwrap();
+
+        assert_eq!(prepared, rootfs);
+        assert_eq!(
+            std::fs::read_to_string(prepared.join("etc/hostname")).unwrap(),
+            "persistent-host"
+        );
+        assert!(
+            !prepared.join("bin/hello").exists(),
+            "existing persistent rootfs must not be overwritten from cache"
+        );
+    }
+
+    #[test]
     fn test_copy_provider_cleanup() {
         let tmp = TempDir::new().unwrap();
         let cache_dir = tmp.path().join("cache");
@@ -213,6 +238,22 @@ mod tests {
 
         provider.cleanup(&box_dir, false).unwrap();
         assert!(!rootfs.exists());
+    }
+
+    #[test]
+    fn test_copy_provider_cleanup_persistent_keeps_rootfs() {
+        let tmp = TempDir::new().unwrap();
+        let box_dir = tmp.path().join("box");
+        let rootfs = box_dir.join("rootfs");
+        std::fs::create_dir_all(rootfs.join("etc")).unwrap();
+        std::fs::write(rootfs.join("etc/hostname"), "kept").unwrap();
+
+        CopyProvider.cleanup(&box_dir, true).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(rootfs.join("etc/hostname")).unwrap(),
+            "kept"
+        );
     }
 
     #[test]
@@ -231,6 +272,43 @@ mod tests {
     #[test]
     fn test_overlay_provider_name() {
         assert_eq!(OverlayProvider.name(), "overlay");
+    }
+
+    #[test]
+    fn test_overlay_provider_cleanup_persistent_keeps_upper_only() {
+        let tmp = TempDir::new().unwrap();
+        let box_dir = tmp.path().join("box");
+        for dir in ["upper", "work", "merged"] {
+            std::fs::create_dir_all(box_dir.join(dir)).unwrap();
+        }
+        std::fs::write(box_dir.join("upper/data.txt"), "state").unwrap();
+        std::fs::write(box_dir.join("work/scratch.txt"), "work").unwrap();
+        std::fs::write(box_dir.join("merged/view.txt"), "merged").unwrap();
+
+        OverlayProvider.cleanup(&box_dir, true).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(box_dir.join("upper/data.txt")).unwrap(),
+            "state"
+        );
+        assert!(!box_dir.join("work").exists());
+        assert!(!box_dir.join("merged").exists());
+    }
+
+    #[test]
+    fn test_overlay_provider_cleanup_nonpersistent_removes_all_overlay_dirs() {
+        let tmp = TempDir::new().unwrap();
+        let box_dir = tmp.path().join("box");
+        for dir in ["upper", "work", "merged"] {
+            std::fs::create_dir_all(box_dir.join(dir)).unwrap();
+            std::fs::write(box_dir.join(dir).join("file.txt"), "data").unwrap();
+        }
+
+        OverlayProvider.cleanup(&box_dir, false).unwrap();
+
+        assert!(!box_dir.join("upper").exists());
+        assert!(!box_dir.join("work").exists());
+        assert!(!box_dir.join("merged").exists());
     }
 
     #[test]

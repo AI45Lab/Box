@@ -140,3 +140,139 @@ impl InstanceRegistry {
         svcs
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn metadata(tier: &str) -> HashMap<String, String> {
+        HashMap::from([("tier".to_string(), tier.to_string())])
+    }
+
+    #[test]
+    fn register_indexes_instances_by_service_and_host() {
+        let mut registry = InstanceRegistry::new();
+
+        registry.register(
+            "box-1",
+            "search",
+            "http://10.0.0.1:8080",
+            "host-a",
+            metadata("blue"),
+        );
+        registry.register(
+            "box-2",
+            "search",
+            "http://10.0.0.2:8080",
+            "host-b",
+            metadata("green"),
+        );
+        registry.register(
+            "box-3",
+            "gateway",
+            "http://10.0.0.3:8080",
+            "host-a",
+            metadata("edge"),
+        );
+
+        assert_eq!(registry.len(), 3);
+
+        let mut search_endpoints = registry.endpoints("search");
+        search_endpoints.sort();
+        assert_eq!(
+            search_endpoints,
+            vec![
+                "http://10.0.0.1:8080".to_string(),
+                "http://10.0.0.2:8080".to_string()
+            ]
+        );
+
+        let mut host_a = registry.instances_on_host("host-a");
+        host_a.sort();
+        assert_eq!(host_a, vec!["box-1", "box-3"]);
+
+        let mut services = registry.services();
+        services.sort();
+        assert_eq!(services, vec!["gateway".to_string(), "search".to_string()]);
+    }
+
+    #[test]
+    fn register_replaces_existing_instance_record() {
+        let mut registry = InstanceRegistry::new();
+
+        registry.register(
+            "box-1",
+            "old",
+            "http://10.0.0.1:8080",
+            "host-a",
+            metadata("old"),
+        );
+        registry.register(
+            "box-1",
+            "new",
+            "http://10.0.0.9:9090",
+            "host-b",
+            metadata("new"),
+        );
+
+        assert_eq!(registry.len(), 1);
+        assert!(registry.endpoints("old").is_empty());
+        assert_eq!(
+            registry.endpoints("new"),
+            vec!["http://10.0.0.9:9090".to_string()]
+        );
+        assert_eq!(registry.instances_on_host("host-b"), vec!["box-1"]);
+        assert_eq!(
+            registry.entries["box-1"].metadata.get("tier"),
+            Some(&"new".to_string())
+        );
+    }
+
+    #[test]
+    fn heartbeat_and_deregister_report_whether_instance_exists() {
+        let mut registry = InstanceRegistry::new();
+        registry.register(
+            "box-1",
+            "search",
+            "http://10.0.0.1:8080",
+            "host-a",
+            metadata("blue"),
+        );
+        let before = registry.entries["box-1"].last_heartbeat;
+
+        assert!(registry.heartbeat("box-1"));
+        assert!(registry.entries["box-1"].last_heartbeat >= before);
+        assert!(!registry.heartbeat("missing"));
+
+        assert!(registry.deregister("box-1"));
+        assert!(registry.is_empty());
+        assert!(!registry.deregister("box-1"));
+    }
+
+    #[test]
+    fn evict_stale_removes_only_expired_entries() {
+        let mut registry = InstanceRegistry::new();
+        registry.register(
+            "fresh",
+            "search",
+            "http://10.0.0.1:8080",
+            "host-a",
+            metadata("fresh"),
+        );
+        registry.register(
+            "stale",
+            "search",
+            "http://10.0.0.2:8080",
+            "host-b",
+            metadata("stale"),
+        );
+        registry.entries.get_mut("stale").unwrap().last_heartbeat =
+            Utc::now() - chrono::Duration::minutes(10);
+
+        let evicted = registry.evict_stale(chrono::Duration::minutes(5));
+
+        assert_eq!(evicted, vec!["stale".to_string()]);
+        assert!(registry.entries.contains_key("fresh"));
+        assert!(!registry.entries.contains_key("stale"));
+    }
+}

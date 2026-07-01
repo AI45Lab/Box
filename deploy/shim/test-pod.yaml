@@ -1,24 +1,44 @@
-# Smoke pod: routed to a3s-box via RuntimeClass, pinned to the test node.
-# worker-5 is cordoned, so we tolerate the unschedulable taint and set nodeName
-# to land there directly. worker-5 must be labeled a3s-box.io/runtime=true
-# (the RuntimeClass scheduling.nodeSelector is injected into the pod).
+# RuntimeClass smoke pod for explicitly enrolled a3s-box validation nodes.
+#
+# Apply after creating the RuntimeClass and labeling the target nodes:
+#   kubectl label node <node> a3s-box.io/runtime=true
+#   kubectl label node <node> a3s-box.io/test-tier=production-soak
+#   kubectl taint node <node> a3s-box.io/soak=true:NoSchedule
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: a3s-box-validation
+  labels:
+    a3s-box.io/validation: "true"
+---
 apiVersion: v1
 kind: Pod
 metadata:
   name: a3s-box-smoke
-  namespace: default
+  namespace: a3s-box-validation
+  labels:
+    app: a3s-box-smoke
 spec:
   runtimeClassName: a3s-box
-  nodeName: worker-5
+  nodeSelector:
+    a3s-box.io/runtime: "true"
+    a3s-box.io/test-tier: production-soak
   tolerations:
-    - key: node.kubernetes.io/unschedulable
-      operator: Exists
+    - key: a3s-box.io/soak
+      operator: Equal
+      value: "true"
       effect: NoSchedule
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 30
   containers:
     - name: hello
       image: docker.io/library/alpine:latest
       command: ["sh", "-c", "echo HELLO_FROM_A3S_BOX; uname -a; sleep 3600"]
       resources:
-        requests: { cpu: "250m", memory: "128Mi" }
-        limits: { cpu: "1", memory: "512Mi" }
-  restartPolicy: Never
+        requests:
+          cpu: "250m"
+          memory: "128Mi"
+        limits:
+          cpu: "1"
+          memory: "512Mi"

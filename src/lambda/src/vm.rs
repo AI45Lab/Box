@@ -41,3 +41,75 @@ pub struct VmPoolStats {
     pub max_total: usize,
     pub available_permits: usize,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{BoxRuntimeSpec, RuntimeClass, WorkloadKind};
+    use std::sync::Arc;
+
+    struct MockVmExecutor;
+
+    #[async_trait]
+    impl VmExecutor for MockVmExecutor {
+        async fn execute_in_vm(
+            &self,
+            envelope: &BoxWorkloadEnvelope,
+            timeout: Duration,
+        ) -> VmResult {
+            Ok(serde_json::json!({
+                "runtime": envelope.runtime.runtime,
+                "timeout_ms": timeout.as_millis(),
+            }))
+        }
+
+        async fn pool_stats(&self) -> VmPoolStats {
+            VmPoolStats {
+                idle: 2,
+                active: 1,
+                max_total: 4,
+                available_permits: 1,
+            }
+        }
+    }
+
+    fn envelope() -> BoxWorkloadEnvelope {
+        BoxWorkloadEnvelope {
+            runtime_class: RuntimeClass::A3sBox,
+            workload_kind: WorkloadKind::ExecutionTask,
+            runtime: BoxRuntimeSpec::for_execution_adapter("http", "get"),
+            input: serde_json::json!({"url": "https://example.invalid"}),
+            labels: Default::default(),
+        }
+    }
+
+    #[test]
+    fn vm_pool_stats_default_clone_and_debug_are_stable() {
+        let stats = VmPoolStats::default();
+        assert_eq!(stats.idle, 0);
+        assert_eq!(stats.active, 0);
+        assert_eq!(stats.max_total, 0);
+        assert_eq!(stats.available_permits, 0);
+
+        let cloned = stats.clone();
+        assert!(format!("{cloned:?}").contains("available_permits"));
+    }
+
+    #[tokio::test]
+    async fn vm_executor_trait_object_executes_and_reports_stats() {
+        let executor: Arc<dyn VmExecutor> = Arc::new(MockVmExecutor);
+
+        let result = executor
+            .execute_in_vm(&envelope(), Duration::from_millis(250))
+            .await
+            .unwrap();
+        assert_eq!(result["runtime"], "a3s/executor/http");
+        assert_eq!(result["timeout_ms"], 250);
+
+        let stats = executor.pool_stats().await;
+        assert_eq!(stats.idle, 2);
+        assert_eq!(stats.active, 1);
+        assert_eq!(stats.max_total, 4);
+        assert_eq!(stats.available_permits, 1);
+    }
+}

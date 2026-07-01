@@ -608,6 +608,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tee::attestation::{CertificateChain, PlatformInfo};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixListener;
 
     fn bind_test_listener(path: &Path) -> Option<UnixListener> {
@@ -623,6 +625,32 @@ mod tests {
             }
             Err(e) => panic!("failed to bind test socket {}: {}", path.display(), e),
         }
+    }
+
+    fn test_report() -> AttestationReport {
+        AttestationReport {
+            report: vec![1, 2, 3, 4],
+            cert_chain: CertificateChain::default(),
+            platform: PlatformInfo::default(),
+        }
+    }
+
+    async fn spawn_attestation_http_server(listener: UnixListener, response: Vec<u8>) -> Vec<u8> {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            let n = stream.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            request.extend_from_slice(&buf[..n]);
+            if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        stream.write_all(&response).await.unwrap();
+        request
     }
 
     #[tokio::test]
@@ -644,5 +672,190 @@ mod tests {
 
         let client = AttestationClient::connect(&sock_path).await.unwrap();
         assert_eq!(client.socket_path(), sock_path);
+    }
+
+    #[tokio::test]
+    async fn test_attestation_get_report_parses_success_response() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sock_path = tmp.path().join("attest_success.sock");
+        let Some(listener) = bind_test_listener(&sock_path) else {
+            return;
+        };
+
+        let body = serde_json::to_vec(&test_report()).unwrap();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            String::from_utf8(body).unwrap()
+        )
+        .into_bytes();
+        let server = tokio::spawn(spawn_attestation_http_server(listener, response));
+
+        let client = AttestationClient {
+            socket_path: sock_path,
+        };
+        let report = client
+            .get_report(&AttestationRequest {
+                nonce: vec![9, 8, 7],
+                user_data: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(report.report, vec![1, 2, 3, 4]);
+        let request = server.await.unwrap();
+        let request = String::from_utf8_lossy(&request);
+        assert!(request.starts_with("POST /attest HTTP/1.1\r\n"));
+        assert!(request.contains("Content-Type: application/json\r\n"));
+        assert!(request.contains("Content-Length:"));
+    }
+
+    #[tokio::test]
+    async fn test_attestation_get_report_surfaces_http_error_body() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sock_path = tmp.path().join("attest_error.sock");
+        let Some(listener) = bind_test_listener(&sock_path) else {
+            return;
+        };
+
+        let response =
+            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 12\r\n\r\nbad hardware"
+                .to_vec();
+        let server = tokio::spawn(spawn_attestation_http_server(listener, response));
+
+        let client = AttestationClient {
+            socket_path: sock_path,
+        };
+        let err = client
+            .get_report(&AttestationRequest {
+                nonce: vec![],
+                user_data: None,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, BoxError::AttestationError(_)));
+        assert!(err.to_string().contains("bad hardware"));
+        let _ = server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_attestation_get_report_rejects_malformed_and_invalid_json() {
+        for (name, response, expected) in [
+            (
+                "no_body",
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n".to_vec(),
+                "no HTTP body",
+            ),
+            (
+                "bad_json",
+                b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nnot-json".to_vec(),
+                "Failed to parse attestation response",
+            ),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let sock_path = tmp.path().join(format!("{name}.sock"));
+            let Some(listener) = bind_test_listener(&sock_path) else {
+                return;
+            };
+            let server = tokio::spawn(spawn_attestation_http_server(listener, response));
+
+            let client = AttestationClient {
+                socket_path: sock_path,
+            };
+            let err = client
+                .get_report(&AttestationRequest {
+                    nonce: vec![],
+                    user_data: None,
+                })
+                .await
+                .unwrap_err();
+
+            assert!(err.to_string().contains(expected), "{err}");
+            let _ = server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tls_frame_write_and_read_roundtrip() {
+        let (mut client, mut server) = tokio::io::duplex(64);
+
+        let writer = tokio::spawn(async move {
+            write_tls_frame(&mut client, 0x03, b"payload")
+                .await
+                .unwrap();
+            write_tls_frame(&mut client, 0x02, b"").await.unwrap();
+        });
+
+        let (frame_type, payload) = read_tls_frame(&mut server).await.unwrap();
+        assert_eq!(frame_type, 0x03);
+        assert_eq!(payload, b"payload");
+
+        let (frame_type, payload) = read_tls_frame(&mut server).await.unwrap();
+        assert_eq!(frame_type, 0x02);
+        assert!(payload.is_empty());
+
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_tls_frame_read_unexpected_eof_is_empty_response() {
+        let (client, mut server) = tokio::io::duplex(8);
+        drop(client);
+
+        let (frame_type, payload) = read_tls_frame(&mut server).await.unwrap();
+        assert_eq!(frame_type, 0x01);
+        assert!(payload.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_tls_frame_read_truncated_payload_errors() {
+        let (mut client, mut server) = tokio::io::duplex(16);
+        client
+            .write_all(&[0x01, 0, 0, 0, 5, b'a', b'b'])
+            .await
+            .unwrap();
+        drop(client);
+
+        let err = read_tls_frame(&mut server).await.unwrap_err();
+        assert!(matches!(err, BoxError::AttestationError(_)));
+        assert!(err.to_string().contains("payload read failed"));
+    }
+
+    #[tokio::test]
+    async fn test_secret_injector_empty_secrets_returns_without_connecting() {
+        let injector = SecretInjector::new(Path::new("/tmp/nonexistent-empty-secrets.sock"));
+        let result = injector
+            .inject(&[], crate::tee::AttestationPolicy::default(), false)
+            .await
+            .unwrap();
+
+        assert_eq!(result.injected, 0);
+        assert!(result.errors.is_empty());
+    }
+
+    #[test]
+    fn test_attestation_client_constructors_and_serde_defaults() {
+        let path = Path::new("/tmp/a3s-attest.sock");
+        assert_eq!(RaTlsAttestationClient::new(path).socket_path(), path);
+        assert_eq!(SecretInjector::new(path).socket_path, path);
+        assert_eq!(SealClient::new(path).socket_path, path);
+
+        let secret: SecretEntry =
+            serde_json::from_str(r#"{"name":"TOKEN","value":"secret"}"#).unwrap();
+        assert!(secret.set_env);
+
+        let result: SecretInjectionResult = serde_json::from_str(r#"{"injected":2}"#).unwrap();
+        assert_eq!(result.injected, 2);
+        assert!(result.errors.is_empty());
+
+        let seal: SealResult =
+            serde_json::from_str(r#"{"blob":"abc","policy":"ChipOnly","context":"ctx"}"#).unwrap();
+        assert_eq!(seal.blob, "abc");
+        assert_eq!(seal.policy, "ChipOnly");
+        assert_eq!(seal.context, "ctx");
+
+        let unseal: UnsealResult = serde_json::from_str(r#"{"data":"c2VjcmV0"}"#).unwrap();
+        assert_eq!(unseal.data, "c2VjcmV0");
     }
 }

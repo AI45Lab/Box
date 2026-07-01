@@ -1,7 +1,7 @@
 //! `a3s-box logs` command — View box console logs.
 
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use clap::Args;
@@ -10,6 +10,9 @@ use a3s_box_core::log::{LogDriver, LogEntry};
 
 use crate::resolve;
 use crate::state::{BoxRecord, StateFile};
+
+const FOLLOW_POLL_MILLIS: u64 = 200;
+const FOLLOW_STOPPED_EOF_POLLS: u8 = 3;
 
 #[derive(Args)]
 pub struct LogsArgs {
@@ -46,6 +49,7 @@ struct LogSource {
 pub async fn execute(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> {
     let state = StateFile::load_default()?;
     let record = resolve::resolve(&state, &args.r#box)?;
+    let box_id = record.id.clone();
 
     // If logging is disabled, tell the user
     if record.log_config.driver == LogDriver::None {
@@ -61,18 +65,19 @@ pub async fn execute(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let Some(log_source) = resolve_log_source(record) else {
         if args.follow && record.status == "running" {
-            match wait_for_log_source(&record.id).await? {
-                Some(source) => return stream_logs(source, args, since, until).await,
+            match wait_for_log_source(&box_id).await? {
+                Some(source) => return stream_logs(&box_id, source, args, since, until).await,
                 None => return Ok(()),
             }
         }
         return Ok(());
     };
 
-    stream_logs(log_source, args, since, until).await
+    stream_logs(&box_id, log_source, args, since, until).await
 }
 
 async fn stream_logs(
+    box_id: &str,
     log_source: LogSource,
     args: LogsArgs,
     since: Option<DateTime<Utc>>,
@@ -81,11 +86,20 @@ async fn stream_logs(
     let use_json = log_source.structured;
     let log_path = log_source.path;
     let has_time_filter = since.is_some() || until.is_some();
+    let mut follow_start_pos = None;
 
     if let Some(tail_n) = args.tail {
         let file = std::fs::File::open(&log_path)?;
-        let reader = BufReader::new(file);
-        let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
+        let mut reader = BufReader::new(file);
+        let mut lines = Vec::new();
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line)? == 0 {
+                break;
+            }
+            lines.push(line.trim_end_matches(['\n', '\r']).to_string());
+        }
+        follow_start_pos = Some(reader.stream_position()?);
         let start = lines.len().saturating_sub(tail_n);
         for line in &lines[start..] {
             if use_json {
@@ -128,7 +142,12 @@ async fn stream_logs(
     if args.follow {
         let file = std::fs::File::open(&log_path)?;
         let mut reader = BufReader::new(file);
-        let mut pos = reader.seek(SeekFrom::End(0))?;
+        let mut pos = match follow_start_pos {
+            Some(offset) => reader.seek(SeekFrom::Start(offset))?,
+            None => reader.seek(SeekFrom::End(0))?,
+        };
+        let mut stopped_eof_len = None;
+        let mut stopped_eof_polls = 0;
 
         loop {
             let mut line = String::new();
@@ -150,17 +169,32 @@ async fn stream_logs(
                         if let Ok(f) = std::fs::File::open(&log_path) {
                             reader = BufReader::new(f);
                             pos = 0;
+                            stopped_eof_len = None;
+                            stopped_eof_polls = 0;
                         }
                     } else if let Ok(meta) = reader.get_ref().metadata() {
                         // Truncated in place (bounded console.log): re-read from start.
                         if pos > meta.len() {
                             pos = reader.seek(SeekFrom::Start(0)).unwrap_or(0);
+                            stopped_eof_len = None;
+                            stopped_eof_polls = 0;
                         }
                     }
-                    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                    if should_exit_follow_at_eof(
+                        box_id,
+                        &log_path,
+                        &mut stopped_eof_len,
+                        &mut stopped_eof_polls,
+                    ) {
+                        return Ok(());
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(FOLLOW_POLL_MILLIS))
+                        .await;
                 }
                 Ok(n) => {
                     pos += n as u64;
+                    stopped_eof_len = None;
+                    stopped_eof_polls = 0;
                     let trimmed = line.trim_end();
                     if use_json {
                         print_json_line(
@@ -208,6 +242,46 @@ fn file_rotated(open_meta: &std::fs::Metadata, path: &std::path::Path) -> bool {
 #[cfg(not(unix))]
 fn file_rotated(_open_meta: &std::fs::Metadata, _path: &std::path::Path) -> bool {
     false
+}
+
+fn should_exit_follow_at_eof(
+    box_id: &str,
+    log_path: &Path,
+    stopped_eof_len: &mut Option<u64>,
+    stopped_eof_polls: &mut u8,
+) -> bool {
+    let box_running = StateFile::load_default()
+        .ok()
+        .and_then(|state| {
+            state
+                .find_by_id(box_id)
+                .map(|record| record.status == "running")
+        })
+        .unwrap_or(false);
+    let len = std::fs::metadata(log_path).map(|m| m.len()).unwrap_or(0);
+    stopped_eof_is_stable(box_running, len, stopped_eof_len, stopped_eof_polls)
+}
+
+fn stopped_eof_is_stable(
+    box_running: bool,
+    len: u64,
+    stopped_eof_len: &mut Option<u64>,
+    stopped_eof_polls: &mut u8,
+) -> bool {
+    if box_running {
+        *stopped_eof_len = None;
+        *stopped_eof_polls = 0;
+        return false;
+    }
+
+    if *stopped_eof_len == Some(len) {
+        *stopped_eof_polls = stopped_eof_polls.saturating_add(1);
+    } else {
+        *stopped_eof_len = Some(len);
+        *stopped_eof_polls = 1;
+    }
+
+    *stopped_eof_polls >= FOLLOW_STOPPED_EOF_POLLS
 }
 
 fn resolve_log_source(record: &BoxRecord) -> Option<LogSource> {
@@ -394,6 +468,30 @@ mod tests {
 
         // Missing file → not rotated (no panic).
         assert!(!file_rotated(&open, &dir.path().join("gone")));
+    }
+
+    #[test]
+    fn test_stopped_eof_is_stable_after_bounded_polls() {
+        let mut len = None;
+        let mut polls = 0;
+
+        assert!(!stopped_eof_is_stable(false, 10, &mut len, &mut polls));
+        assert!(!stopped_eof_is_stable(false, 10, &mut len, &mut polls));
+        assert!(stopped_eof_is_stable(false, 10, &mut len, &mut polls));
+    }
+
+    #[test]
+    fn test_stopped_eof_stability_resets_while_running_or_growing() {
+        let mut len = None;
+        let mut polls = 0;
+
+        assert!(!stopped_eof_is_stable(false, 10, &mut len, &mut polls));
+        assert!(!stopped_eof_is_stable(false, 11, &mut len, &mut polls));
+        assert_eq!(polls, 1);
+
+        assert!(!stopped_eof_is_stable(true, 11, &mut len, &mut polls));
+        assert_eq!(len, None);
+        assert_eq!(polls, 0);
     }
 
     #[test]

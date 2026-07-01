@@ -445,6 +445,409 @@ pub(super) fn container_event_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    use tempfile::TempDir;
+
+    fn test_image_config() -> OciImageConfig {
+        OciImageConfig {
+            entrypoint: Some(vec!["/entrypoint".to_string()]),
+            cmd: Some(vec!["--serve".to_string()]),
+            env: vec![("PATH".to_string(), "/usr/bin".to_string())],
+            working_dir: Some("/app".to_string()),
+            user: Some("1000".to_string()),
+            exposed_ports: vec![],
+            labels: HashMap::new(),
+            volumes: vec![],
+            stop_signal: None,
+            health_check: None,
+            onbuild: vec![],
+        }
+    }
+
+    fn test_container(id: &str, state: ContainerState) -> Container {
+        Container {
+            id: id.to_string(),
+            sandbox_id: "sandbox-1".to_string(),
+            name: format!("container-{id}"),
+            attempt: 2,
+            image_ref: "example.com/app:latest".to_string(),
+            resolved_image_digest: "sha256:resolved".to_string(),
+            resolved_image_path: String::new(),
+            command: vec!["/entrypoint".to_string()],
+            args: vec!["--serve".to_string()],
+            env: vec![],
+            working_dir: String::new(),
+            user: None,
+            stdin: false,
+            stdin_once: false,
+            tty: false,
+            mounts: vec![],
+            state,
+            created_at: 100,
+            started_at: 0,
+            finished_at: 0,
+            exit_code: 0,
+            oom_killed: false,
+            labels: HashMap::from([("app".to_string(), "demo".to_string())]),
+            annotations: HashMap::from([("anno".to_string(), "value".to_string())]),
+            log_path: "/var/log/pods/container.log".to_string(),
+            rootfs_path: String::new(),
+            rootfs_guest_path: String::new(),
+        }
+    }
+
+    fn test_sandbox(state: SandboxState) -> PodSandbox {
+        PodSandbox {
+            id: "sandbox-1".to_string(),
+            name: "pod".to_string(),
+            namespace: "default".to_string(),
+            uid: "uid-1".to_string(),
+            attempt: 3,
+            state,
+            created_at: 200,
+            labels: HashMap::from([("tier".to_string(), "backend".to_string())]),
+            annotations: HashMap::from([("owner".to_string(), "tests".to_string())]),
+            log_directory: "/var/log/pods".to_string(),
+            runtime_handler: "a3s".to_string(),
+            network_ip: "10.0.0.2".to_string(),
+            additional_ips: vec![],
+            dns: Default::default(),
+            container_ports: vec![],
+        }
+    }
+
+    fn mount(container_path: &str, host_path: &str) -> Mount {
+        Mount {
+            container_path: container_path.to_string(),
+            host_path: host_path.to_string(),
+            readonly: true,
+            selinux_relabel: false,
+            propagation: crate::cri_api::mount::MountPropagation::PropagationPrivate as i32,
+        }
+    }
+
+    #[test]
+    fn test_sanitize_path_component_replaces_unsafe_chars_and_empty_values() {
+        assert_eq!(sanitize_path_component("pod-01_APP"), "pod-01_APP");
+        assert_eq!(sanitize_path_component("team/ns:pod.1"), "team_ns_pod_1");
+        assert_eq!(sanitize_path_component(""), "unknown");
+        assert_eq!(sanitize_path_component("///"), "___");
+    }
+
+    #[test]
+    fn test_container_user_numeric_and_missing_linux_config() {
+        use crate::cri_api::{Int64Value, LinuxContainerConfig, LinuxContainerSecurityContext};
+
+        assert_eq!(container_user_from_linux_config(None), None);
+        assert_eq!(
+            container_user_from_linux_config(Some(&LinuxContainerConfig::default())),
+            None
+        );
+
+        let numeric = LinuxContainerConfig {
+            security_context: Some(LinuxContainerSecurityContext {
+                run_as_user: Some(Int64Value { value: 1000 }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            container_user_from_linux_config(Some(&numeric)),
+            Some("1000".to_string())
+        );
+
+        let numeric_with_group = LinuxContainerConfig {
+            security_context: Some(LinuxContainerSecurityContext {
+                run_as_user: Some(Int64Value { value: 1000 }),
+                run_as_group: Some(Int64Value { value: 2000 }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            container_user_from_linux_config(Some(&numeric_with_group)),
+            Some("1000:2000".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_container_mounts_accepts_private_mounts_and_round_trips() {
+        let mounts = resolve_container_mounts(&[Mount {
+            readonly: false,
+            selinux_relabel: true,
+            ..mount("/data", "/host/data")
+        }])
+        .unwrap();
+
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].container_path, "/data");
+        assert_eq!(mounts[0].host_path, "/host/data");
+        assert!(!mounts[0].readonly);
+        assert!(mounts[0].selinux_relabel);
+
+        let cri_mount = container_mount_to_cri(&mounts[0]);
+        assert_eq!(cri_mount.container_path, "/data");
+        assert_eq!(cri_mount.host_path, "/host/data");
+        assert!(!cri_mount.readonly);
+        assert!(cri_mount.selinux_relabel);
+    }
+
+    #[test]
+    fn test_resolve_container_mounts_rejects_invalid_mounts() {
+        for bad_mount in [
+            mount("/data", " "),
+            mount("relative/path", "/host/data"),
+            mount(" ", "/host/data"),
+            Mount {
+                propagation: 99,
+                ..mount("/data", "/host/data")
+            },
+            Mount {
+                propagation: crate::cri_api::mount::MountPropagation::PropagationBidirectional
+                    as i32,
+                ..mount("/data", "/host/data")
+            },
+        ] {
+            assert!(resolve_container_mounts(&[bad_mount]).is_err());
+        }
+    }
+
+    #[test]
+    fn test_merge_env_overrides_image_values_and_keeps_order() {
+        let merged = merge_env(
+            &[
+                ("PATH".to_string(), "/usr/bin".to_string()),
+                ("MODE".to_string(), "prod".to_string()),
+            ],
+            &[
+                KeyValue {
+                    key: "MODE".to_string(),
+                    value: "debug".to_string(),
+                },
+                KeyValue {
+                    key: "NEW".to_string(),
+                    value: "1".to_string(),
+                },
+                KeyValue {
+                    key: "MODE".to_string(),
+                    value: "final".to_string(),
+                },
+            ],
+        );
+
+        assert_eq!(
+            merged,
+            vec![
+                ("PATH".to_string(), "/usr/bin".to_string()),
+                ("MODE".to_string(), "final".to_string()),
+                ("NEW".to_string(), "1".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_resolve_command_and_args_precedence() {
+        let image = test_image_config();
+
+        let explicit = ContainerConfig {
+            command: vec!["/override".to_string()],
+            args: vec!["--debug".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_command_and_args(&explicit, Some(&image)),
+            (vec!["/override".to_string()], vec!["--debug".to_string()])
+        );
+
+        let args_only = ContainerConfig {
+            args: vec!["--from-cri".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_command_and_args(&args_only, Some(&image)),
+            (
+                vec!["/entrypoint".to_string()],
+                vec!["--from-cri".to_string()]
+            )
+        );
+
+        assert_eq!(
+            resolve_command_and_args(&ContainerConfig::default(), Some(&image)),
+            (vec!["/entrypoint".to_string()], vec!["--serve".to_string()])
+        );
+        assert_eq!(
+            resolve_command_and_args(&ContainerConfig::default(), None),
+            (Vec::<String>::new(), Vec::<String>::new())
+        );
+    }
+
+    #[test]
+    fn test_precondition_helpers_return_failed_precondition_status() {
+        assert!(
+            ensure_container_running(&test_container("running", ContainerState::Running), "X")
+                .is_ok()
+        );
+        let container_err =
+            ensure_container_running(&test_container("created", ContainerState::Created), "Exec")
+                .unwrap_err();
+        assert_eq!(container_err.code(), tonic::Code::FailedPrecondition);
+        assert!(container_err
+            .message()
+            .contains("requires a running container"));
+
+        assert!(ensure_sandbox_ready(&test_sandbox(SandboxState::Ready), "X").is_ok());
+        let sandbox_err =
+            ensure_sandbox_ready(&test_sandbox(SandboxState::NotReady), "Create").unwrap_err();
+        assert_eq!(sandbox_err.code(), tonic::Code::FailedPrecondition);
+        assert!(sandbox_err.message().contains("requires a ready sandbox"));
+    }
+
+    #[tokio::test]
+    async fn test_ensure_container_image_available_preconditions() {
+        let mut no_image = test_container("scratch", ContainerState::Created);
+        no_image.image_ref.clear();
+        assert!(ensure_container_image_available(&no_image).await.is_ok());
+
+        let mut missing_metadata = test_container("missing-metadata", ContainerState::Created);
+        missing_metadata.resolved_image_digest.clear();
+        missing_metadata.resolved_image_path.clear();
+        let err = ensure_container_image_available(&missing_metadata)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("without resolved image metadata"));
+
+        let tmp = TempDir::new().unwrap();
+        let image_file = tmp.path().join("image-file");
+        std::fs::write(&image_file, b"not a dir").unwrap();
+        let mut file_image_path = test_container("file-image", ContainerState::Created);
+        file_image_path.resolved_image_path = image_file.to_string_lossy().to_string();
+        file_image_path.rootfs_path = tmp.path().join("rootfs").to_string_lossy().to_string();
+        file_image_path.rootfs_guest_path = "/run/a3s/rootfs".to_string();
+        let err = ensure_container_image_available(&file_image_path)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("is not a directory"));
+
+        let image_dir = tmp.path().join("image-dir");
+        std::fs::create_dir(&image_dir).unwrap();
+        let mut missing_rootfs = test_container("missing-rootfs", ContainerState::Created);
+        missing_rootfs.resolved_image_path = image_dir.to_string_lossy().to_string();
+        missing_rootfs.rootfs_path.clear();
+        missing_rootfs.rootfs_guest_path = "/run/a3s/rootfs".to_string();
+        let err = ensure_container_image_available(&missing_rootfs)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("without prepared rootfs metadata"));
+
+        let rootfs_dir = tmp.path().join("rootfs-dir");
+        std::fs::create_dir(&rootfs_dir).unwrap();
+        let mut available = test_container("available", ContainerState::Created);
+        available.resolved_image_path = image_dir.to_string_lossy().to_string();
+        available.rootfs_path = rootfs_dir.to_string_lossy().to_string();
+        available.rootfs_guest_path = "/run/a3s/rootfs".to_string();
+        assert!(ensure_container_image_available(&available).await.is_ok());
+    }
+
+    #[test]
+    fn test_state_labels_and_cri_state_mappings() {
+        assert_eq!(sandbox_state_label(SandboxState::Ready), "ready");
+        assert_eq!(sandbox_state_label(SandboxState::NotReady), "not_ready");
+        assert_eq!(sandbox_state_label(SandboxState::Removed), "removed");
+
+        assert_eq!(container_state_label(ContainerState::Created), "created");
+        assert_eq!(container_state_label(ContainerState::Running), "running");
+        assert_eq!(container_state_label(ContainerState::Exited), "exited");
+
+        assert_eq!(
+            container_state_to_cri(ContainerState::Created),
+            crate::cri_api::ContainerState::ContainerCreated
+        );
+        assert_eq!(
+            container_state_to_cri(ContainerState::Running),
+            crate::cri_api::ContainerState::ContainerRunning
+        );
+        assert_eq!(
+            container_state_to_cri(ContainerState::Exited),
+            crate::cri_api::ContainerState::ContainerExited
+        );
+    }
+
+    #[test]
+    fn test_container_and_sandbox_summaries_preserve_cri_fields() {
+        let container = container_summary(test_container("c1", ContainerState::Running));
+        assert_eq!(container.id, "c1");
+        assert_eq!(container.pod_sandbox_id, "sandbox-1");
+        assert_eq!(container.metadata.unwrap().name, "container-c1");
+        assert_eq!(container.image.unwrap().image, "example.com/app:latest");
+        assert_eq!(container.image_ref, "sha256:resolved");
+        assert_eq!(
+            crate::cri_api::ContainerState::try_from(container.state).unwrap(),
+            crate::cri_api::ContainerState::ContainerRunning
+        );
+        assert_eq!(container.created_at, 100);
+        assert_eq!(container.labels.get("app"), Some(&"demo".to_string()));
+        assert_eq!(
+            container.annotations.get("anno"),
+            Some(&"value".to_string())
+        );
+
+        let ready = sandbox_summary(test_sandbox(SandboxState::Ready));
+        assert_eq!(ready.id, "sandbox-1");
+        assert_eq!(ready.metadata.unwrap().attempt, 3);
+        assert_eq!(
+            PodSandboxState::try_from(ready.state).unwrap(),
+            PodSandboxState::SandboxReady
+        );
+        assert_eq!(ready.runtime_handler, "a3s");
+        assert_eq!(ready.labels.get("tier"), Some(&"backend".to_string()));
+        assert_eq!(ready.annotations.get("owner"), Some(&"tests".to_string()));
+
+        let removed = sandbox_summary(test_sandbox(SandboxState::Removed));
+        assert_eq!(
+            PodSandboxState::try_from(removed.state).unwrap(),
+            PodSandboxState::SandboxNotready
+        );
+    }
+
+    #[test]
+    fn test_stop_timeout_helpers_and_container_event_response() {
+        assert_eq!(stop_container_timeout_ms(0), None);
+        assert_eq!(stop_container_timeout_ms(-10), None);
+        assert_eq!(stop_container_timeout_ms(5), Some(5_000));
+        assert_eq!(stop_container_timeout_ms(i64::MAX), Some(u64::MAX));
+
+        assert_eq!(
+            stop_container_wait_duration(0),
+            tokio::time::Duration::from_secs(DEFAULT_STOP_CONTAINER_WAIT_SECS)
+        );
+        assert_eq!(
+            stop_container_wait_duration(7),
+            tokio::time::Duration::from_secs(7)
+        );
+
+        let event = container_event_response(
+            "c1",
+            "sb1",
+            ContainerEventType::ContainerStoppedEvent,
+            123,
+            "Stopped",
+            "done",
+        );
+        assert_eq!(event.container_id, "c1");
+        assert_eq!(event.pod_sandbox_id, "sb1");
+        assert_eq!(
+            event.container_event_type,
+            ContainerEventType::ContainerStoppedEvent as i32
+        );
+        assert_eq!(event.created_at, 123);
+        assert_eq!(event.reason, "Stopped");
+        assert_eq!(event.message, "done");
+    }
+
     use crate::cri_api::namespace_option::NamespaceMode;
     use crate::cri_api::NamespaceOption;
 

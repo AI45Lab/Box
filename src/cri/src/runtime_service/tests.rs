@@ -1012,6 +1012,40 @@ fn test_runtime_options_resolve_runtime_handler_agent_image() {
     assert_eq!(options.agent_image_for("a3s"), "ghcr.io/a3s-box/default:v1");
 }
 
+#[test]
+fn test_runtime_options_ignore_blank_runtime_handler_override() {
+    let options = CriRuntimeOptions {
+        default_agent_image: "ghcr.io/a3s-box/default:v1".to_string(),
+        runtime_handler_agent_images: HashMap::from([
+            ("blank".to_string(), "   ".to_string()),
+            (
+                "explicit".to_string(),
+                "ghcr.io/a3s-box/explicit:v1".to_string(),
+            ),
+        ]),
+    };
+
+    assert_eq!(
+        options.agent_image_for("explicit"),
+        "ghcr.io/a3s-box/explicit:v1"
+    );
+    assert_eq!(
+        options.agent_image_for("blank"),
+        "ghcr.io/a3s-box/default:v1"
+    );
+    assert_eq!(
+        options.agent_image_for("missing"),
+        "ghcr.io/a3s-box/default:v1"
+    );
+}
+
+#[test]
+fn test_apparmor_profile_loaded_returns_false_for_unknown_profile() {
+    assert!(!apparmor_profile_loaded(
+        "a3s-box-test-profile-that-should-not-exist"
+    ));
+}
+
 #[tokio::test]
 async fn test_runtime_config_reports_cgroupfs() {
     let svc = make_test_service();
@@ -1960,6 +1994,52 @@ fn test_parse_localhost_seccomp_deny_allow_default() {
 }
 
 #[test]
+fn test_parse_localhost_seccomp_deny_log_default_filters_only_deny_actions() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile_dir = dir.path().join("profiles");
+    std::fs::create_dir_all(&profile_dir).unwrap();
+    let path = profile_dir.join("mixed.json");
+    std::fs::write(
+        &path,
+        r#"{
+            "defaultAction": "SCMP_ACT_LOG",
+            "syscalls": [
+                {"names": ["chmod"], "action": "SCMP_ACT_ERRNO"},
+                {"names": ["mount"], "action": "SCMP_ACT_KILL"},
+                {"names": ["ptrace"], "action": "SCMP_ACT_KILL_THREAD"},
+                {"names": ["bpf"], "action": "SCMP_ACT_KILL_PROCESS"},
+                {"names": ["openat"], "action": "SCMP_ACT_ALLOW"},
+                {"names": ["clone3"], "action": "SCMP_ACT_TRACE"}
+            ]
+        }"#,
+    )
+    .unwrap();
+
+    let deny = super::parse_localhost_seccomp_deny("profiles/mixed.json", dir.path()).unwrap();
+
+    assert_eq!(
+        deny,
+        vec![
+            "chmod".to_string(),
+            "mount".to_string(),
+            "ptrace".to_string(),
+            "bpf".to_string()
+        ]
+    );
+}
+
+#[test]
+fn test_parse_localhost_seccomp_deny_defaults_missing_syscalls_to_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("empty.json");
+    std::fs::write(&path, r#"{"defaultAction":"SCMP_ACT_ALLOW"}"#).unwrap();
+
+    let deny = super::parse_localhost_seccomp_deny("empty.json", dir.path()).unwrap();
+
+    assert!(deny.is_empty());
+}
+
+#[test]
 fn test_parse_localhost_seccomp_deny_rejects_deny_by_default() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("deny-default.json");
@@ -1967,6 +2047,22 @@ fn test_parse_localhost_seccomp_deny_rejects_deny_by_default() {
     // Deny-by-default profiles need a full allow-list; not supported -> Err so
     // the caller falls back to RuntimeDefault rather than running unconfined.
     assert!(super::parse_localhost_seccomp_deny(path.to_str().unwrap(), dir.path()).is_err());
+}
+
+#[test]
+fn test_parse_localhost_seccomp_deny_reports_read_and_parse_errors() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let missing = super::parse_localhost_seccomp_deny("missing.json", dir.path()).unwrap_err();
+    assert!(missing.contains("read seccomp profile"));
+
+    let malformed_path = dir.path().join("malformed.json");
+    std::fs::write(&malformed_path, "{ not json").unwrap();
+    let malformed = super::parse_localhost_seccomp_deny("malformed.json", dir.path()).unwrap_err();
+    assert!(malformed.contains("parse seccomp profile"));
+
+    let escaped = super::parse_localhost_seccomp_deny("../escape.json", dir.path()).unwrap_err();
+    assert!(escaped.contains("contains '..'"));
 }
 
 #[tokio::test]

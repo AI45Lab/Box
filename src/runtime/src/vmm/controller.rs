@@ -510,3 +510,221 @@ impl VmmProvider for VmController {
         Ok(Box::new(handler))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    fn make_fake_shim(dir: &std::path::Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let shim_path = dir.join("fake-a3s-box-shim");
+        std::fs::write(
+            &shim_path,
+            r#"#!/bin/sh
+printf '%s\n' "$@" > "$A3S_TEST_ARGS_FILE"
+printf '%s\n' "$A3S_BOX_KSM" > "$A3S_TEST_KSM_FILE"
+printf '%s\n' "$KRUN_SNAPSHOT_MEM_FILE" > "$A3S_TEST_SNAPSHOT_MEM_FILE"
+printf '%s\n' "$KRUN_SNAPSHOT_SOCK" > "$A3S_TEST_SNAPSHOT_SOCK_FILE"
+printf '%s\n' "$KRUN_RESTORE_FROM" > "$A3S_TEST_RESTORE_FILE"
+printf shim-stdout
+printf shim-stderr >&2
+exec /bin/sleep 30
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        shim_path
+    }
+
+    #[cfg(unix)]
+    fn wait_for_file(path: &std::path::Path) {
+        for _ in 0..250 {
+            if path.exists() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!("expected file to appear: {}", path.display());
+    }
+
+    #[test]
+    fn new_reports_missing_shim_with_build_hint() {
+        let missing = tempfile::tempdir()
+            .unwrap()
+            .path()
+            .join("missing-a3s-box-shim");
+
+        let error = match VmController::new(missing.clone()) {
+            Ok(_) => panic!("missing shim should be rejected"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+
+        assert!(message.contains("Shim binary not found"));
+        assert!(message.contains(&missing.display().to_string()));
+        assert!(message.contains("cargo build -p a3s-box-shim"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn start_spawns_shim_with_config_env_and_stdio() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake_shim = make_fake_shim(temp.path());
+        let controller = VmController {
+            shim_path: fake_shim,
+        };
+
+        let args_file = temp.path().join("shim.args");
+        let ksm_file = temp.path().join("shim.ksm");
+        let snapshot_mem_file = temp.path().join("shim.snapshot_mem");
+        let snapshot_sock_file = temp.path().join("shim.snapshot_sock");
+        let restore_file = temp.path().join("shim.restore");
+
+        std::env::set_var("A3S_TEST_ARGS_FILE", &args_file);
+        std::env::set_var("A3S_TEST_KSM_FILE", &ksm_file);
+        std::env::set_var("A3S_TEST_SNAPSHOT_MEM_FILE", &snapshot_mem_file);
+        std::env::set_var("A3S_TEST_SNAPSHOT_SOCK_FILE", &snapshot_sock_file);
+        std::env::set_var("A3S_TEST_RESTORE_FILE", &restore_file);
+
+        let socket_dir = temp.path().join("runtime").join("sockets");
+        let spec = InstanceSpec {
+            box_id: "box-start".to_string(),
+            exec_socket_path: socket_dir.join("exec.sock"),
+            console_output: Some(temp.path().join("logs").join("console.log")),
+            ksm: true,
+            snapshot_mem_file: Some("/tmp/a3s-mem".to_string()),
+            snapshot_sock: Some("/tmp/a3s-snapshot.sock".to_string()),
+            restore_from: Some("/tmp/a3s-restore".to_string()),
+            ..Default::default()
+        };
+
+        let mut handler = controller.start(&spec).await.unwrap();
+        wait_for_file(&args_file);
+
+        assert!(socket_dir.exists());
+        let args = std::fs::read_to_string(&args_file).unwrap();
+        assert!(args.contains("--config"));
+        assert!(args.contains("\"box_id\":\"box-start\""));
+        assert_eq!(std::fs::read_to_string(&ksm_file).unwrap().trim(), "1");
+        assert_eq!(
+            std::fs::read_to_string(&snapshot_mem_file).unwrap().trim(),
+            "/tmp/a3s-mem"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&snapshot_sock_file).unwrap().trim(),
+            "/tmp/a3s-snapshot.sock"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&restore_file).unwrap().trim(),
+            "/tmp/a3s-restore"
+        );
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("logs").join("shim.stdout.log")).unwrap(),
+            "shim-stdout"
+        );
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("logs").join("shim.stderr.log")).unwrap(),
+            "shim-stderr"
+        );
+
+        handler.stop(libc::SIGTERM, 1_000).unwrap();
+
+        std::env::remove_var("A3S_TEST_ARGS_FILE");
+        std::env::remove_var("A3S_TEST_KSM_FILE");
+        std::env::remove_var("A3S_TEST_SNAPSHOT_MEM_FILE");
+        std::env::remove_var("A3S_TEST_SNAPSHOT_SOCK_FILE");
+        std::env::remove_var("A3S_TEST_RESTORE_FILE");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn start_reports_socket_directory_creation_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let controller = VmController {
+            shim_path: PathBuf::from("/bin/sh"),
+        };
+        let socket_dir = temp.path().join("socket-dir-is-file");
+        std::fs::write(&socket_dir, "not a directory").unwrap();
+        let spec = InstanceSpec {
+            box_id: "box-start-error".to_string(),
+            exec_socket_path: socket_dir.join("exec.sock"),
+            ..Default::default()
+        };
+
+        let err = match controller.start(&spec).await {
+            Ok(_) => panic!("socket directory creation should fail before spawning the shim"),
+            Err(err) => err,
+        };
+
+        assert!(err
+            .to_string()
+            .contains("Failed to create socket directory"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configure_shim_stdio_writes_per_box_stdout_and_stderr_logs() {
+        let temp = tempfile::tempdir().unwrap();
+        let controller = VmController {
+            shim_path: PathBuf::from("/bin/sh"),
+        };
+        let spec = InstanceSpec {
+            box_id: "box-stdio".to_string(),
+            console_output: Some(temp.path().join("logs").join("console.log")),
+            ..Default::default()
+        };
+
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("printf fresh-stdout; printf fresh-stderr >&2");
+
+        std::fs::create_dir_all(temp.path().join("logs")).unwrap();
+        std::fs::write(temp.path().join("logs").join("shim.stdout.log"), "stale").unwrap();
+        std::fs::write(temp.path().join("logs").join("shim.stderr.log"), "stale").unwrap();
+
+        controller.configure_shim_stdio(&mut cmd, &spec);
+        let status = cmd.status().unwrap();
+
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("logs").join("shim.stdout.log")).unwrap(),
+            "fresh-stdout"
+        );
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("logs").join("shim.stderr.log")).unwrap(),
+            "fresh-stderr"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configure_shim_stdio_creates_missing_log_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let controller = VmController {
+            shim_path: PathBuf::from("/bin/sh"),
+        };
+        let spec = InstanceSpec {
+            box_id: "box-stdio-dir".to_string(),
+            console_output: Some(temp.path().join("missing").join("console.log")),
+            ..Default::default()
+        };
+
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("printf out; printf err >&2");
+
+        controller.configure_shim_stdio(&mut cmd, &spec);
+        let status = cmd.status().unwrap();
+
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("missing").join("shim.stdout.log")).unwrap(),
+            "out"
+        );
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("missing").join("shim.stderr.log")).unwrap(),
+            "err"
+        );
+    }
+}

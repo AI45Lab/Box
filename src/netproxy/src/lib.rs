@@ -226,6 +226,17 @@ struct PortForward {
 
 // ── Proxy engine ──────────────────────────────────────────────────────────────
 
+struct ProxyEngineConfig {
+    socket: UnixDatagram,
+    gateway_ip: Ipv4Addr,
+    prefix_len: u8,
+    dns_servers: Vec<Ipv4Addr>,
+    port_forwards: Vec<PortForward>,
+    shutdown: Arc<AtomicBool>,
+    stats: Arc<NetStats>,
+    stats_path: Option<PathBuf>,
+}
+
 struct ProxyEngine {
     device: UnixgramDevice,
     iface: Interface,
@@ -241,16 +252,18 @@ struct ProxyEngine {
 }
 
 impl ProxyEngine {
-    fn new(
-        socket: UnixDatagram,
-        gateway_ip: Ipv4Addr,
-        prefix_len: u8,
-        dns_servers: Vec<Ipv4Addr>,
-        port_forwards: Vec<PortForward>,
-        shutdown: Arc<AtomicBool>,
-        stats: Arc<NetStats>,
-        stats_path: Option<PathBuf>,
-    ) -> Self {
+    fn new(config: ProxyEngineConfig) -> Self {
+        let ProxyEngineConfig {
+            socket,
+            gateway_ip,
+            prefix_len,
+            dns_servers,
+            port_forwards,
+            shutdown,
+            stats,
+            stats_path,
+        } = config;
+
         let mut device = UnixgramDevice {
             socket,
             rx_queue: VecDeque::new(),
@@ -653,16 +666,16 @@ pub fn spawn_inherited_netproxy(
                 return;
             }
 
-            let mut engine = ProxyEngine::new(
+            let mut engine = ProxyEngine::new(ProxyEngineConfig {
                 socket,
-                gateway,
+                gateway_ip: gateway,
                 prefix_len,
                 dns_servers,
                 port_forwards,
                 shutdown,
                 stats,
                 stats_path,
-            );
+            });
             engine.run();
             tracing::info!("NetProxy thread exiting");
         })
@@ -775,6 +788,21 @@ mod tests {
     }
 
     #[test]
+    fn test_net_stats_records_bytes_and_packets() {
+        let stats = NetStats::default();
+
+        stats.record_rx(64);
+        stats.record_rx(128);
+        stats.record_tx(512);
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.rx_bytes, 192);
+        assert_eq!(snapshot.rx_packets, 2);
+        assert_eq!(snapshot.tx_bytes, 512);
+        assert_eq!(snapshot.tx_packets, 1);
+    }
+
+    #[test]
     fn test_parse_port_forwards_empty_rules() {
         let guest = Ipv4Addr::new(10, 89, 0, 2);
         let fwds = parse_port_forwards(&[], guest).unwrap();
@@ -852,6 +880,30 @@ mod tests {
     }
 
     #[test]
+    fn test_netproxy_manager_spawn_creates_socketpair_fds_and_stop_closes_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = NetProxyManager::new(dir.path());
+
+        mgr.spawn(
+            Ipv4Addr::new(10, 89, 0, 2),
+            Ipv4Addr::new(10, 89, 0, 1),
+            24,
+            &[Ipv4Addr::new(8, 8, 8, 8)],
+            &[],
+        )
+        .unwrap();
+
+        assert!(mgr.is_running());
+        assert!(mgr.net_socket_fd().is_some());
+        assert!(mgr.net_proxy_fd().is_some());
+
+        mgr.stop();
+        assert!(!mgr.is_running());
+        assert!(mgr.net_socket_fd().is_none());
+        assert!(mgr.net_proxy_fd().is_none());
+    }
+
+    #[test]
     fn test_netproxy_manager_drop_cleans_up() {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("sockets").join("net.sock");
@@ -890,6 +942,32 @@ mod tests {
     }
 
     #[test]
+    fn test_write_stats_file_overwrites_existing_file_and_removes_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("net.stats.json");
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&path, "old").unwrap();
+        std::fs::write(&tmp, "stale temp").unwrap();
+
+        write_stats_file(
+            &path,
+            NetStatsSnapshot {
+                rx_bytes: 1,
+                tx_bytes: 2,
+                rx_packets: 3,
+                tx_packets: 4,
+            },
+        )
+        .unwrap();
+
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(json["rx_bytes"], 1);
+        assert_eq!(json["tx_bytes"], 2);
+        assert!(!tmp.exists());
+    }
+
+    #[test]
     fn test_parse_port_forwards_valid() {
         let guest = Ipv4Addr::new(10, 89, 0, 2);
         if !ports_are_bindable(&[19988, 19443]) {
@@ -922,6 +1000,20 @@ mod tests {
         assert!(parse_port_forwards(&["notaport".to_string()], guest).is_err());
         assert!(parse_port_forwards(&["abc:80".to_string()], guest).is_err());
         assert!(parse_port_forwards(&["80:xyz".to_string()], guest).is_err());
+    }
+
+    #[test]
+    fn test_parse_port_forwards_reports_bind_conflict() {
+        let guest = Ipv4Addr::new(10, 89, 0, 2);
+        let held = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        let port = held.local_addr().unwrap().port();
+
+        let error = match parse_port_forwards(&[format!("{port}:80")], guest) {
+            Ok(_) => panic!("port-forward bind conflict should return an error"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains(&format!("cannot bind 0.0.0.0:{port}")));
     }
 
     // Note: test_netproxy_manager_spawn_binds_and_releases_host_ports was removed

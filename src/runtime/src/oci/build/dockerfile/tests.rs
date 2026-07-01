@@ -135,6 +135,22 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_copy_rejects_empty_from_flag() {
+        let err = parsers::parse_copy("--from= app.py /workspace/", 1)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("COPY --from requires a stage name or index"));
+    }
+
+    #[test]
+    fn test_parse_copy_rejects_duplicate_from_flag() {
+        let err = parsers::parse_copy("--from=builder --from=runtime /app /out", 1)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("COPY specifies --from more than once"));
+    }
+
+    #[test]
     fn test_parse_copy_chown() {
         let result = parsers::parse_copy("--chown=1000:1000 app.py /workspace/", 1).unwrap();
         assert_eq!(
@@ -285,6 +301,11 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_parse_entrypoint_empty() {
+        assert!(parsers::parse_entrypoint("", 1).is_err());
+    }
+
     // --- parse_cmd ---
 
     #[test]
@@ -311,6 +332,11 @@ mod tests {
                 ],
             }
         );
+    }
+
+    #[test]
+    fn test_parse_cmd_empty() {
+        assert!(parsers::parse_cmd("", 1).is_err());
     }
 
     // --- parse_expose ---
@@ -353,6 +379,11 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_parse_expose_empty() {
+        assert!(parsers::parse_expose("", 1).is_err());
+    }
+
     // --- parse_label ---
 
     #[test]
@@ -392,6 +423,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_parse_label_rejects_invalid_kv_token() {
+        let err = parsers::parse_label("a=1 invalid-token", 1)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid LABEL token"));
+    }
+
+    #[test]
+    fn test_parse_label_empty() {
+        assert!(parsers::parse_label("", 1).is_err());
+    }
+
     // --- parse_user ---
 
     #[test]
@@ -414,6 +458,11 @@ mod tests {
                 user: "1000:1000".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn test_parse_user_empty() {
+        assert!(parsers::parse_user("", 1).is_err());
     }
 
     // --- parse_arg ---
@@ -440,6 +489,23 @@ mod tests {
                 default: Some("1.0.0".to_string()),
             }
         );
+    }
+
+    #[test]
+    fn test_parse_arg_quoted_default() {
+        let result = parsers::parse_arg(r#"GREETING="hello world""#, 1).unwrap();
+        assert_eq!(
+            result,
+            Instruction::Arg {
+                name: "GREETING".to_string(),
+                default: Some("hello world".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_arg_empty() {
+        assert!(parsers::parse_arg("", 1).is_err());
     }
 
     // --- Full Dockerfile parsing ---
@@ -576,6 +642,14 @@ CMD ["app.py"]
     }
 
     #[test]
+    fn test_parse_add_rejects_unsupported_flag() {
+        let err = parsers::parse_add("--checksum=sha256:abc file /tmp/", 1)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ADD flag '--checksum=sha256:abc' is not supported"));
+    }
+
+    #[test]
     fn test_parse_add_json_form_rejected() {
         let err = parsers::parse_add(r#"["file.txt", "/tmp/file.txt"]"#, 1)
             .unwrap_err()
@@ -616,6 +690,14 @@ CMD ["app.py"]
             Instruction::Label { pairs }
                 if pairs == &vec![("maintainer".to_string(), "ops@example.com".to_string())]
         )));
+    }
+
+    #[test]
+    fn test_parse_maintainer_empty_rejected() {
+        let err = Dockerfile::parse("FROM alpine\nMAINTAINER")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("MAINTAINER requires a value"));
     }
 
     // --- parse_shell ---
@@ -790,6 +872,30 @@ CMD ["app.py"]
         assert!(parsers::parse_healthcheck("--interval=10s", 1).is_err());
     }
 
+    #[test]
+    fn test_parse_healthcheck_cmd_requires_command() {
+        let err = parsers::parse_healthcheck("CMD", 1)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("HEALTHCHECK CMD requires a command"));
+    }
+
+    #[test]
+    fn test_parse_healthcheck_invalid_retries() {
+        let err = parsers::parse_healthcheck("--retries=bad CMD true", 1)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Invalid --retries value"));
+    }
+
+    #[test]
+    fn test_parse_healthcheck_invalid_duration() {
+        let err = parsers::parse_healthcheck("--interval=soon CMD true", 1)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Invalid duration"));
+    }
+
     // --- parse_onbuild ---
 
     #[test]
@@ -903,6 +1009,20 @@ CMD ["app.py"]
         assert_eq!(utils::parse_duration_secs("", 1).unwrap(), 0);
     }
 
+    #[test]
+    fn test_parse_duration_subseconds_round_to_seconds() {
+        assert_eq!(utils::parse_duration_secs("1500ms", 1).unwrap(), 2);
+        assert_eq!(utils::parse_duration_secs("500ms", 1).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_parse_duration_rejects_trailing_number() {
+        let err = utils::parse_duration_secs("1m30", 1)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Invalid duration"));
+    }
+
     // --- Dockerfile with new instructions ---
 
     #[test]
@@ -958,5 +1078,16 @@ CMD ["app.py"]
         let df = Dockerfile::parse(content).unwrap();
         assert_eq!(df.instructions.len(), 2);
         assert!(matches!(&df.instructions[1], Instruction::OnBuild { .. }));
+    }
+
+    #[test]
+    fn test_parse_single_instruction_trims_input() {
+        let instruction = parse_single_instruction("  RUN echo ready  ").unwrap();
+        assert_eq!(
+            instruction,
+            Instruction::Run {
+                command: "echo ready".to_string()
+            }
+        );
     }
 }

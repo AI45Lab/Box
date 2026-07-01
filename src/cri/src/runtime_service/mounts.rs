@@ -200,3 +200,125 @@ pub(super) fn materialize_container_mount(
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mount(host_path: &Path, container_path: &str, readonly: bool) -> ContainerMount {
+        ContainerMount {
+            container_path: container_path.to_string(),
+            host_path: host_path.to_string_lossy().to_string(),
+            readonly,
+            selinux_relabel: false,
+            propagation: 0,
+        }
+    }
+
+    #[test]
+    fn container_path_inside_rootfs_strips_root_and_curdir() {
+        let rootfs = Path::new("/tmp/rootfs");
+
+        let path = container_path_inside_rootfs(rootfs, "/var/./log/app.log").unwrap();
+
+        assert_eq!(path, rootfs.join("var").join("log").join("app.log"));
+    }
+
+    #[test]
+    fn container_path_inside_rootfs_rejects_relative_path() {
+        let err = container_path_inside_rootfs(Path::new("/tmp/rootfs"), "var/log")
+            .expect_err("relative container mount targets must be rejected");
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("must be absolute"));
+    }
+
+    #[test]
+    fn container_path_inside_rootfs_rejects_parent_escape() {
+        let err = container_path_inside_rootfs(Path::new("/tmp/rootfs"), "/var/../host")
+            .expect_err("parent traversal must be rejected");
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("must not escape"));
+    }
+
+    #[test]
+    fn container_path_inside_rootfs_rejects_root_mount() {
+        let err = container_path_inside_rootfs(Path::new("/tmp/rootfs"), "/")
+            .expect_err("mounting over the whole rootfs must be rejected");
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("must not be the rootfs"));
+    }
+
+    #[test]
+    fn materialize_container_mount_copies_file_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        let source = tmp.path().join("host").join("config.txt");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "hello from host\n").unwrap();
+
+        materialize_container_mount(&rootfs, &mount(&source, "/etc/config.txt", true)).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(rootfs.join("etc").join("config.txt")).unwrap(),
+            "hello from host\n"
+        );
+    }
+
+    #[test]
+    fn materialize_container_mount_copies_directory_source_recursively() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        let source = tmp.path().join("host").join("data");
+        std::fs::create_dir_all(source.join("nested")).unwrap();
+        std::fs::write(source.join("top.txt"), "top").unwrap();
+        std::fs::write(source.join("nested").join("leaf.txt"), "leaf").unwrap();
+
+        materialize_container_mount(&rootfs, &mount(&source, "/data", false)).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(rootfs.join("data").join("top.txt")).unwrap(),
+            "top"
+        );
+        assert_eq!(
+            std::fs::read_to_string(rootfs.join("data").join("nested").join("leaf.txt")).unwrap(),
+            "leaf"
+        );
+    }
+
+    #[test]
+    fn materialize_container_mount_replaces_wrong_target_kind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        let target = rootfs.join("var").join("lib").join("data");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "old file target").unwrap();
+
+        let source = tmp.path().join("host").join("data");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("new.txt"), "new dir source").unwrap();
+
+        materialize_container_mount(&rootfs, &mount(&source, "/var/lib/data", false)).unwrap();
+
+        assert!(target.is_dir());
+        assert_eq!(
+            std::fs::read_to_string(target.join("new.txt")).unwrap(),
+            "new dir source"
+        );
+    }
+
+    #[test]
+    fn materialize_container_mount_rejects_missing_host_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        let missing = tmp.path().join("missing");
+
+        let err = materialize_container_mount(&rootfs, &mount(&missing, "/data", false))
+            .expect_err("missing CRI host_path must fail closed");
+
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("host_path does not exist"));
+    }
+}

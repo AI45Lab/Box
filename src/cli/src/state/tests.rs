@@ -217,6 +217,25 @@ fn test_load_readonly_missing_file_is_empty_ok() {
 }
 
 #[test]
+fn test_load_readonly_valid_file_has_no_reconcile_side_effects() {
+    let tmp = TempDir::new().unwrap();
+    let path = test_state_path(&tmp);
+    let mut record = sample_record("stale-running-id", "stale_running", "running");
+    record.pid = None;
+    std::fs::write(&path, serde_json::to_string_pretty(&vec![record]).unwrap()).unwrap();
+
+    let sf = StateFile::load_readonly_from(path.clone()).unwrap();
+
+    let loaded = sf.find_by_id("stale-running-id").unwrap();
+    assert_eq!(loaded.status, "running");
+    assert!(loaded.pid.is_none());
+    assert!(
+        path.exists(),
+        "readonly load must not quarantine or rewrite"
+    );
+}
+
+#[test]
 fn test_add_and_find() {
     let tmp = TempDir::new().unwrap();
     let mut sf = StateFile::load(&test_state_path(&tmp)).unwrap();
@@ -299,6 +318,28 @@ fn test_remove_preserves_others() {
     assert!(sf.find_by_id("id3").is_some());
 }
 
+#[test]
+fn test_forget_removes_only_from_memory_without_persisting() {
+    let tmp = TempDir::new().unwrap();
+    let path = test_state_path(&tmp);
+
+    {
+        let mut sf = StateFile::load(&path).unwrap();
+        sf.add(sample_record("id1", "box1", "created")).unwrap();
+        sf.add(sample_record("id2", "box2", "created")).unwrap();
+        sf.forget("id1");
+        assert!(sf.find_by_id("id1").is_none());
+        assert!(sf.find_by_id("id2").is_some());
+    }
+
+    let sf = StateFile::load(&path).unwrap();
+    assert!(
+        sf.find_by_id("id1").is_some(),
+        "forget is intentionally in-memory only"
+    );
+    assert!(sf.find_by_id("id2").is_some());
+}
+
 // --- Prefix search tests ---
 
 #[test]
@@ -352,6 +393,20 @@ fn test_list_filter() {
 
     let all = sf.list(true);
     assert_eq!(all.len(), 2);
+}
+
+#[test]
+fn test_list_running_only_excludes_paused_and_created() {
+    let tmp = TempDir::new().unwrap();
+    let mut sf = StateFile::load(&test_state_path(&tmp)).unwrap();
+
+    sf.add(sample_record("id1", "created", "created")).unwrap();
+    sf.add(sample_record("id2", "running", "running")).unwrap();
+    sf.add(sample_record("id3", "paused", "paused")).unwrap();
+
+    let running = sf.list(false);
+    assert_eq!(running.len(), 1);
+    assert_eq!(running[0].name, "running");
 }
 
 #[test]
@@ -907,6 +962,18 @@ fn test_pending_restarts_stopped_not_included() {
     assert!(sf.pending_restarts().is_empty());
 }
 
+#[test]
+fn test_pending_restarts_on_failure_clean_exit_not_included() {
+    let tmp = TempDir::new().unwrap();
+    let mut sf = StateFile::load(&test_state_path(&tmp)).unwrap();
+    let mut record = sample_record("id-1", "box1", "dead");
+    record.restart_policy = "on-failure".to_string();
+    record.exit_code = Some(0);
+    sf.add(record).unwrap();
+
+    assert!(sf.pending_restarts().is_empty());
+}
+
 // --- Health check config tests ---
 
 #[test]
@@ -1198,4 +1265,10 @@ fn test_find_by_label() {
     let results = state.find_by_label("com.a3s.compose.service", "web");
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].name, "web");
+
+    let results = state.find_by_label("com.a3s.compose.service", "worker");
+    assert!(results.is_empty());
+
+    let results = state.find_by_label("missing", "myapp");
+    assert!(results.is_empty());
 }

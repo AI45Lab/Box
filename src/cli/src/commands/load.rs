@@ -125,4 +125,52 @@ mod tests {
             "sha256:abc"
         );
     }
+
+    #[test]
+    fn test_load_reference_trims_explicit_tag() {
+        let index = serde_json::json!({
+            "manifests": [{
+                "digest": "sha256:abc",
+                "annotations": {
+                    "org.opencontainers.image.ref.name": "from-index:latest"
+                }
+            }]
+        });
+
+        assert_eq!(
+            load_reference(&index, Some("  loaded:latest  "), "sha256:abc").unwrap(),
+            "loaded:latest"
+        );
+    }
+
+    #[test]
+    fn test_load_reference_rejects_empty_explicit_tag() {
+        let index = serde_json::json!({
+            "manifests": [{
+                "digest": "sha256:abc"
+            }]
+        });
+
+        assert_eq!(
+            load_reference(&index, Some("  "), "sha256:abc").unwrap_err(),
+            "Image tag cannot be empty"
+        );
+    }
+
+    #[test]
+    fn test_load_reference_ignores_blank_annotation() {
+        let index = serde_json::json!({
+            "manifests": [{
+                "digest": "sha256:abc",
+                "annotations": {
+                    "org.opencontainers.image.ref.name": "  "
+                }
+            }]
+        });
+
+        assert_eq!(
+            load_reference(&index, None, "sha256:abc").unwrap(),
+            "sha256:abc"
+        );
+    }
 }

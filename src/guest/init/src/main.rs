@@ -695,8 +695,6 @@ fn run_init() -> Result<(), Box<dyn std::error::Error>> {
         // setup_main_stdio_pipes) so it can re-open its own stdout/stderr by path.
         #[cfg(target_os = "linux")]
         let relay = setup_main_stdio_pipes();
-        #[cfg(not(target_os = "linux"))]
-        let relay: Option<()> = None;
         #[cfg(target_os = "linux")]
         let main_stdio = relay.as_ref().map(|r| (r.out_w, r.err_w));
         #[cfg(not(target_os = "linux"))]

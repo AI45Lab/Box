@@ -135,12 +135,7 @@ impl PasstManager {
         // what actually publishes `-p host:guest` in bridge mode. Auto-assigned
         // host ports (host_port == 0) cannot be forwarded by passt and are
         // skipped. passt accepts a comma-separated `host:guest,...` spec.
-        let tcp_specs: Vec<String> = port_map
-            .iter()
-            .filter_map(|m| a3s_box_core::parse_port_mapping(m).ok())
-            .filter(|m| m.host_port != 0)
-            .map(|m| format!("{}:{}", m.host_port, m.guest_port))
-            .collect();
+        let tcp_specs = passt_tcp_port_specs(port_map);
         if !tcp_specs.is_empty() {
             let spec = tcp_specs.join(",");
             tracing::info!(tcp_ports = %spec, "Configuring passt inbound TCP port forwarding");
@@ -341,6 +336,16 @@ impl super::NetworkBackend for PasstManager {
     }
 }
 
+/// Convert published ports to passt's inbound TCP forwarding spec entries.
+fn passt_tcp_port_specs(port_map: &[String]) -> Vec<String> {
+    port_map
+        .iter()
+        .filter_map(|m| a3s_box_core::parse_port_mapping(m).ok())
+        .filter(|m| m.host_port != 0)
+        .map(|m| format!("{}:{}", m.host_port, m.guest_port))
+        .collect()
+}
+
 /// Convert a prefix length to a dotted-decimal netmask string.
 fn prefix_to_netmask(prefix: u8) -> Ipv4Addr {
     if prefix == 0 {
@@ -365,11 +370,34 @@ mod tests {
     }
 
     #[test]
+    fn test_passt_tcp_port_specs_skips_invalid_and_auto_assigned_ports() {
+        let specs = passt_tcp_port_specs(&[
+            "8080:80".to_string(),
+            "0:443".to_string(),
+            "not-a-port-map".to_string(),
+            "9000:90/tcp".to_string(),
+        ]);
+
+        assert_eq!(specs, vec!["8080:80", "9000:90"]);
+    }
+
+    #[test]
     fn test_passt_manager_new() {
         let dir = tempfile::tempdir().unwrap();
         let mgr = PasstManager::new(dir.path());
         assert_eq!(mgr.socket_path(), dir.path().join("passt.sock"));
         assert_eq!(mgr.pcap_path(), dir.path().join("passt.pcap"));
+    }
+
+    #[test]
+    fn test_passt_manager_implements_network_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = PasstManager::new(dir.path());
+        let socket_path = dir.path().join("passt.sock");
+        let backend: &mut dyn crate::network::NetworkBackend = &mut mgr;
+
+        assert_eq!(backend.socket_path(), socket_path.as_path());
+        backend.stop();
     }
 
     #[test]
@@ -389,12 +417,104 @@ mod tests {
     }
 
     #[test]
+    fn test_passt_manager_stop_removes_artifacts_without_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = PasstManager::new(dir.path());
+        std::fs::write(&mgr.socket_path, "socket").unwrap();
+        std::fs::write(&mgr.pcap_path, "pcap").unwrap();
+        std::fs::write(&mgr.pid_file, "123").unwrap();
+
+        mgr.stop();
+
+        assert!(!mgr.socket_path.exists());
+        assert!(!mgr.pcap_path.exists());
+        assert!(!mgr.pid_file.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_passt_manager_stop_kills_child_and_removes_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = PasstManager::new(dir.path());
+        mgr.child = Some(
+            Command::new("sh")
+                .arg("-c")
+                .arg("sleep 30")
+                .spawn()
+                .unwrap(),
+        );
+        std::fs::write(&mgr.socket_path, "socket").unwrap();
+        std::fs::write(&mgr.pcap_path, "pcap").unwrap();
+        std::fs::write(&mgr.pid_file, "123").unwrap();
+
+        assert!(mgr.is_running());
+        mgr.stop();
+
+        assert!(!mgr.is_running());
+        assert!(!mgr.socket_path.exists());
+        assert!(!mgr.pcap_path.exists());
+        assert!(!mgr.pid_file.exists());
+    }
+
+    #[test]
     fn test_passt_manager_socket_path() {
         let dir = tempfile::tempdir().unwrap();
         let box_dir = dir.path().join("boxes").join("test-box-id");
         let mgr = PasstManager::new(&box_dir);
         assert_eq!(mgr.socket_path(), box_dir.join("passt.sock"));
         assert_eq!(mgr.pcap_path(), box_dir.join("passt.pcap"));
+    }
+
+    #[test]
+    fn test_spawn_returns_directory_creation_error_before_running_passt() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_dir = dir.path().join("socket-dir-is-file");
+        std::fs::write(&socket_dir, "not a directory").unwrap();
+        let mut mgr = PasstManager::new(&socket_dir);
+
+        let err = mgr
+            .spawn(
+                Ipv4Addr::new(10, 0, 2, 15),
+                Ipv4Addr::new(10, 0, 2, 2),
+                24,
+                &[Ipv4Addr::new(1, 1, 1, 1)],
+                &["8080:80".to_string()],
+            )
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("failed to create socket directory"));
+        assert!(!mgr.is_running());
+    }
+
+    #[test]
+    fn test_wait_for_socket_succeeds_when_socket_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = PasstManager::new(dir.path());
+        std::fs::write(&mgr.socket_path, "socket").unwrap();
+
+        mgr.wait_for_socket().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_wait_for_socket_reports_early_exit_with_stderr_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = PasstManager::new(dir.path());
+        std::fs::write(
+            dir.path().join("passt.stderr.log"),
+            "line1\nline2\nline3\nline4\nline5\n",
+        )
+        .unwrap();
+        mgr.child = Some(Command::new("sh").arg("-c").arg("exit 7").spawn().unwrap());
+
+        let err = mgr.wait_for_socket().unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("passt exited early"));
+        assert!(message.contains("line2; line3; line4; line5"));
+        assert!(!mgr.is_running());
     }
 
     #[test]
@@ -414,5 +534,30 @@ mod tests {
         assert!(!socket_path.exists());
         assert!(!pid_path.exists());
         assert!(!pcap_path.exists());
+    }
+
+    #[test]
+    fn test_terminate_passt_removes_artifacts_with_invalid_pid_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("passt.sock");
+        let pid_path = dir.path().join("passt.pid");
+        let pcap_path = dir.path().join("passt.pcap");
+
+        std::fs::write(&socket_path, "fake").unwrap();
+        std::fs::write(&pid_path, "not a pid").unwrap();
+        std::fs::write(&pcap_path, "fake pcap").unwrap();
+
+        terminate_passt(dir.path());
+
+        assert!(!socket_path.exists());
+        assert!(!pid_path.exists());
+        assert!(!pcap_path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_pid_is_passt_rejects_non_passt_processes() {
+        assert!(!pid_is_passt(std::process::id() as i32));
+        assert!(!pid_is_passt(2_147_483_647));
     }
 }

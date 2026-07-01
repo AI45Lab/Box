@@ -714,9 +714,40 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_pem_public_key_ec_public_key_raw_point() {
+        let (_sk, expected_pub, _pem) = generate_test_p256_key();
+        let pem = format!(
+            "-----BEGIN EC PUBLIC KEY-----\n{}\n-----END EC PUBLIC KEY-----\n",
+            base64_encode(&expected_pub)
+        );
+
+        let parsed = parse_pem_public_key(pem.as_bytes()).unwrap();
+        assert_eq!(parsed, expected_pub);
+    }
+
+    #[test]
     fn test_parse_pem_public_key_invalid() {
         let result = parse_pem_public_key(b"not a pem file");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_pem_public_key_rejects_invalid_utf8() {
+        let result = parse_pem_public_key(&[0xff, 0xfe]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not valid UTF-8"));
+    }
+
+    #[test]
+    fn test_parse_pem_public_key_rejects_bad_spki_der() {
+        let pem = format!(
+            "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n",
+            base64_encode(b"not der")
+        );
+
+        let result = parse_pem_public_key(pem.as_bytes());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Failed to parse SPKI"));
     }
 
     #[test]
@@ -789,6 +820,17 @@ mod tests {
         assert_eq!(sig.to_bytes().len(), 64);
         let result = verify_ecdsa_p256(&pub_bytes, message, &sig.to_bytes());
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_verify_ecdsa_p256_rejects_unknown_signature_length() {
+        let (_sk, pub_bytes, _pem) = generate_test_p256_key();
+        let result = verify_ecdsa_p256(&pub_bytes, b"message", b"short");
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("Unrecognized signature format"));
     }
 
     #[test]
@@ -882,10 +924,31 @@ mod tests {
     }
 
     #[test]
+    fn test_pem_to_der_accepts_crlf_and_inner_whitespace() {
+        let data = vec![0x30, 0x03, 0x01, 0x01, 0xFF];
+        let b64 = base64_encode_for_test(&data);
+        let pem = format!(
+            "-----BEGIN CERTIFICATE-----\r\n{}\r\n {}\r\n-----END CERTIFICATE-----\r\n",
+            &b64[..4],
+            &b64[4..]
+        );
+
+        let der = pem_to_der(&pem).unwrap();
+        assert_eq!(der, data);
+    }
+
+    #[test]
     fn test_pem_to_der_no_markers() {
         let result = pem_to_der("not a pem");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No PEM begin marker"));
+    }
+
+    #[test]
+    fn test_pem_to_der_missing_end_marker() {
+        let result = pem_to_der("-----BEGIN CERTIFICATE-----\nAQID\n");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("No PEM end marker"));
     }
 
     // --- Annotation constants tests ---
@@ -922,6 +985,75 @@ mod tests {
     }
 
     // --- Image signing tests ---
+
+    fn private_key_pem_for_signing_test() -> String {
+        use p256::ecdsa::SigningKey;
+        use p256::pkcs8::EncodePrivateKey;
+
+        let signing_key = SigningKey::random(&mut rand::thread_rng());
+        let pkcs8_der = p256::SecretKey::from(signing_key).to_pkcs8_der().unwrap();
+        let b64 = base64_encode(pkcs8_der.as_bytes());
+        format!(
+            "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+            b64
+        )
+    }
+
+    #[tokio::test]
+    async fn test_sign_image_missing_key_file_errors_before_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.key");
+
+        let err = sign_image(
+            missing.to_str().unwrap(),
+            "registry.example.com",
+            "a3s/app",
+            "sha256:abc123",
+            "registry.example.com/a3s/app:latest",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("Failed to read signing key"));
+    }
+
+    #[tokio::test]
+    async fn test_sign_image_invalid_key_file_errors_before_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("cosign.key");
+        std::fs::write(&key_path, "not a pem").unwrap();
+
+        let err = sign_image(
+            key_path.to_str().unwrap(),
+            "registry.example.com",
+            "a3s/app",
+            "sha256:abc123",
+            "registry.example.com/a3s/app:latest",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("Failed to parse signing key"));
+    }
+
+    #[tokio::test]
+    async fn test_sign_image_invalid_signature_reference_after_payload_signing() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("cosign.key");
+        std::fs::write(&key_path, private_key_pem_for_signing_test()).unwrap();
+
+        let err = sign_image(
+            key_path.to_str().unwrap(),
+            "bad registry",
+            "a3s/app",
+            "sha256:abc123",
+            "registry.example.com/a3s/app:latest",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("Invalid signature reference"));
+    }
 
     #[test]
     fn test_base64_encode_roundtrip() {
@@ -976,6 +1108,14 @@ mod tests {
     fn test_parse_pem_private_key_invalid() {
         let result = parse_pem_private_key(b"not a pem file");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_pem_private_key_rejects_invalid_utf8() {
+        match parse_pem_private_key(&[0xff, 0xfe]) {
+            Ok(_) => panic!("invalid UTF-8 must not parse as a private key"),
+            Err(err) => assert!(err.contains("not valid UTF-8")),
+        }
     }
 
     #[test]
@@ -1039,6 +1179,17 @@ mod tests {
     fn test_extract_pem_content_missing_begin() {
         let result = extract_pem_content("no markers", "-----BEGIN X-----", "-----END X-----");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_pem_content_missing_end() {
+        let result = extract_pem_content(
+            "-----BEGIN X-----\nAQID",
+            "-----BEGIN X-----",
+            "-----END X-----",
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Missing PEM end marker"));
     }
 
     #[test]

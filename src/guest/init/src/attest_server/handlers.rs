@@ -1,8 +1,11 @@
 //! Request handlers for RA-TLS attestation server.
 
+#[cfg(target_os = "linux")]
 use std::io::Write;
+#[cfg(target_os = "linux")]
 use tracing::{debug, info, warn};
 
+#[cfg(target_os = "linux")]
 use super::frame::{read_frame, send_data_response, send_error_response};
 
 /// Directory where injected secrets are stored (tmpfs, never persisted to disk).
@@ -99,7 +102,7 @@ pub(super) fn handle_tls_connection(
 // ============================================================================
 
 /// Secret injection request from the host.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 #[derive(serde::Deserialize)]
 struct SecretInjectionRequest {
     /// Secrets to inject as key-value pairs.
@@ -107,7 +110,7 @@ struct SecretInjectionRequest {
 }
 
 /// A single secret entry.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 #[derive(serde::Deserialize)]
 struct SecretEntry {
     /// Secret name (used as filename and env var name).
@@ -119,13 +122,13 @@ struct SecretEntry {
     set_env: bool,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 fn default_true() -> bool {
     true
 }
 
 /// Secret injection response.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 #[derive(serde::Serialize)]
 struct SecretInjectionResponse {
     /// Number of secrets injected.
@@ -209,7 +212,7 @@ pub(super) fn is_valid_secret_name(name: &str) -> bool {
 // ============================================================================
 
 /// Process request from the host via SafeClaw.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 #[derive(serde::Deserialize)]
 struct ProcessRequest {
     /// Session identifier.
@@ -221,13 +224,13 @@ struct ProcessRequest {
     request_type: String,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 fn default_request_type() -> String {
     "process_message".to_string()
 }
 
 /// Process response returned to the host.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 #[derive(serde::Serialize)]
 struct ProcessResponse {
     /// Session identifier.
@@ -362,7 +365,7 @@ fn forward_to_agent(req: &ProcessRequest) -> std::result::Result<String, String>
 // ============================================================================
 
 /// Seal request from the host.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 #[derive(serde::Deserialize)]
 struct SealRequest {
     /// Data to seal (base64-encoded).
@@ -374,13 +377,13 @@ struct SealRequest {
     policy: String,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 fn default_policy() -> String {
     "MeasurementAndChip".to_string()
 }
 
 /// Seal response returned to the host.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 #[derive(serde::Serialize)]
 struct SealResponse {
     /// Sealed blob (base64-encoded): nonce || ciphertext || tag.
@@ -392,7 +395,7 @@ struct SealResponse {
 }
 
 /// Unseal request from the host.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 #[derive(serde::Deserialize)]
 struct UnsealRequest {
     /// Sealed blob (base64-encoded).
@@ -405,7 +408,7 @@ struct UnsealRequest {
 }
 
 /// Unseal response returned to the host.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 #[derive(serde::Serialize)]
 struct UnsealResponse {
     /// Decrypted data (base64-encoded).
@@ -681,4 +684,108 @@ pub(super) fn build_simulated_report(report_data: &[u8; super::SNP_USER_DATA_SIZ
     // signature at 0x2A0 — left as zeros (simulation marker)
 
     report
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secret_entry_defaults_to_exporting_environment_variable() {
+        let req: SecretInjectionRequest = serde_json::from_value(serde_json::json!({
+            "secrets": [
+                {"name": "API_KEY", "value": "secret"},
+                {"name": "CONFIG_PATH", "value": "/run/secrets/config", "set_env": false}
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(req.secrets.len(), 2);
+        assert_eq!(req.secrets[0].name, "API_KEY");
+        assert_eq!(req.secrets[0].value, "secret");
+        assert!(req.secrets[0].set_env);
+        assert!(!req.secrets[1].set_env);
+    }
+
+    #[test]
+    fn process_request_defaults_to_process_message() {
+        let req: ProcessRequest = serde_json::from_value(serde_json::json!({
+            "session_id": "s1",
+            "content": "hello"
+        }))
+        .unwrap();
+
+        assert_eq!(req.session_id, "s1");
+        assert_eq!(req.content, "hello");
+        assert_eq!(req.request_type, "process_message");
+    }
+
+    #[test]
+    fn seal_and_unseal_requests_default_to_strictest_policy() {
+        let seal: SealRequest = serde_json::from_value(serde_json::json!({
+            "data": "c2VjcmV0",
+            "context": "ctx"
+        }))
+        .unwrap();
+        let unseal: UnsealRequest = serde_json::from_value(serde_json::json!({
+            "blob": "c2VhbGVk",
+            "context": "ctx"
+        }))
+        .unwrap();
+
+        assert_eq!(seal.data, "c2VjcmV0");
+        assert_eq!(seal.context, "ctx");
+        assert_eq!(unseal.blob, "c2VhbGVk");
+        assert_eq!(unseal.context, "ctx");
+        assert_eq!(seal.policy, "MeasurementAndChip");
+        assert_eq!(unseal.policy, "MeasurementAndChip");
+    }
+
+    #[test]
+    fn response_dtos_serialize_expected_payloads() {
+        let secret_response = SecretInjectionResponse {
+            injected: 1,
+            errors: vec![],
+        };
+        let process_response = ProcessResponse {
+            session_id: "s1".to_string(),
+            content: "ok".to_string(),
+            success: true,
+            error: None,
+        };
+        let seal_response = SealResponse {
+            blob: "blob".to_string(),
+            policy: "MeasurementAndChip".to_string(),
+            context: "ctx".to_string(),
+        };
+        let unseal_response = UnsealResponse {
+            data: "cGxhaW4=".to_string(),
+        };
+
+        let secret_json = serde_json::to_value(secret_response).unwrap();
+        let process_json = serde_json::to_value(process_response).unwrap();
+        let seal_json = serde_json::to_value(seal_response).unwrap();
+        let unseal_json = serde_json::to_value(unseal_response).unwrap();
+
+        assert_eq!(secret_json, serde_json::json!({"injected": 1}));
+        assert_eq!(process_json["session_id"], "s1");
+        assert_eq!(process_json["success"], true);
+        assert_eq!(seal_json["policy"], "MeasurementAndChip");
+        assert_eq!(seal_json["context"], "ctx");
+        assert_eq!(unseal_json["data"], "cGxhaW4=");
+    }
+
+    #[test]
+    fn simulated_report_populates_measurement_chip_and_tcb_fields() {
+        let report_data = [0x5Au8; super::super::SNP_USER_DATA_SIZE];
+        let report = build_simulated_report(&report_data);
+
+        assert_eq!(&report[0x50..0x90], &report_data);
+        assert_eq!(report[0x38], 3);
+        assert_eq!(report[0x3E], 8);
+        assert_eq!(report[0x3F], 115);
+        assert_eq!(report[0x90], 0);
+        assert_eq!(report[0x91], 0xA3);
+        assert!(report[0x1A0..0x1E0].iter().all(|byte| *byte == 0xA3));
+    }
 }

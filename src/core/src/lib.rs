@@ -83,3 +83,45 @@ pub fn dirs_home() -> std::path::PathBuf {
         .map(|h| h.join(".a3s"))
         .unwrap_or_else(|| std::path::PathBuf::from(".a3s"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn dirs_home_prefers_a3s_home_environment_variable() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let previous = std::env::var_os("A3S_HOME");
+        let tmp = tempfile::tempdir().unwrap();
+
+        std::env::set_var("A3S_HOME", tmp.path());
+        assert_eq!(dirs_home(), tmp.path());
+
+        match previous {
+            Some(value) => std::env::set_var("A3S_HOME", value),
+            None => std::env::remove_var("A3S_HOME"),
+        }
+    }
+
+    #[test]
+    fn dirs_home_defaults_to_dot_a3s_under_user_home_when_env_absent() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let previous = std::env::var_os("A3S_HOME");
+
+        std::env::remove_var("A3S_HOME");
+        let home = dirs_home();
+
+        assert!(home.ends_with(".a3s"));
+        if let Some(user_home) = dirs::home_dir() {
+            assert_eq!(home, user_home.join(".a3s"));
+        }
+
+        match previous {
+            Some(value) => std::env::set_var("A3S_HOME", value),
+            None => std::env::remove_var("A3S_HOME"),
+        }
+    }
+}

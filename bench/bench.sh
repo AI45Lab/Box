@@ -49,8 +49,12 @@ require_kvm() {
 }
 
 # Count host-side resources that a leak would grow.
-shim_count() { pgrep -xc 'a3s-box-shim' 2>/dev/null || pgrep -fc 'a3s-box-shim' 2>/dev/null || echo 0; }
-mount_count() { mount 2>/dev/null | grep -c '/\.a3s/boxes\|/a3s/boxes' || echo 0; }
+shim_count() {
+  local count
+  count=$(pgrep -xc 'a3s-box-shim' 2>/dev/null || pgrep -fc 'a3s-box-shim' 2>/dev/null || true)
+  echo "${count:-0}"
+}
+mount_count() { mount 2>/dev/null | awk '/\/\.a3s\/boxes|\/a3s\/boxes/ { n++ } END { print n + 0 }'; }
 boxdir_count() { ls -1 "${HOME}/.a3s/boxes" 2>/dev/null | wc -l | tr -d ' '; }
 fd_count() { ls -1 "/proc/$$/fd" 2>/dev/null | wc -l | tr -d ' '; }
 

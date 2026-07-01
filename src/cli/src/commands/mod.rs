@@ -254,7 +254,16 @@ pub(crate) async fn tail_file(path: &std::path::Path) {
 /// stderr — used for the container's stderr console (console.err.log) so a
 /// foreground `run`/`attach` shows stdout and stderr like Docker.
 pub(crate) async fn tail_file_stream(path: &std::path::Path, to_stderr: bool) {
+    tail_file_stream_positioned(path, to_stderr, None).await;
+}
+
+pub(crate) async fn tail_file_stream_positioned(
+    path: &std::path::Path,
+    to_stderr: bool,
+    position: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+) {
     use std::io::Write as _;
+    use std::sync::atomic::Ordering;
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
     // Wait for file to exist
@@ -283,6 +292,9 @@ pub(crate) async fn tail_file_stream(path: &std::path::Path, to_stderr: bool) {
                 if let Ok(meta) = file.metadata().await {
                     if pos > meta.len() {
                         pos = file.seek(std::io::SeekFrom::Start(0)).await.unwrap_or(0);
+                        if let Some(position) = &position {
+                            position.store(pos, Ordering::Relaxed);
+                        }
                     }
                 }
                 tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
@@ -295,7 +307,12 @@ pub(crate) async fn tail_file_stream(path: &std::path::Path, to_stderr: bool) {
                     let _ = err.write_all(text.as_bytes());
                     let _ = err.flush();
                 } else {
-                    print!("{text}");
+                    let mut out = std::io::stdout();
+                    let _ = out.write_all(text.as_bytes());
+                    let _ = out.flush();
+                }
+                if let Some(position) = &position {
+                    position.store(pos, Ordering::Relaxed);
                 }
             }
             Err(_) => break,

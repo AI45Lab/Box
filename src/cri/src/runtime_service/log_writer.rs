@@ -151,6 +151,11 @@ mod tests {
     use a3s_box_core::exec::StreamType;
 
     #[tokio::test]
+    async fn open_empty_path_disables_log_writer() {
+        assert!(CriLogWriter::open("").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn write_chunk_caps_unbounded_partial_lines() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("c.log");
@@ -194,5 +199,54 @@ mod tests {
         assert_eq!(contents.matches(" stdout F ").count(), 2);
         assert!(contents.contains("hello") && contents.contains("world"));
         assert!(w.stdout_partial.is_empty());
+    }
+
+    #[tokio::test]
+    async fn flush_partials_keeps_stdout_and_stderr_independent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.log");
+        let mut w = CriLogWriter::open(path.to_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+
+        w.write_chunk(StreamType::Stdout, b"out").await.unwrap();
+        w.write_chunk(StreamType::Stderr, b"err").await.unwrap();
+        assert_eq!(w.stdout_partial, b"out");
+        assert_eq!(w.stderr_partial, b"err");
+
+        w.flush_partials().await.unwrap();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains(" stdout F out\n"));
+        assert!(contents.contains(" stderr F err\n"));
+        assert!(w.stdout_partial.is_empty());
+        assert!(w.stderr_partial.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reopen_flushes_old_file_and_appends_to_new_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("container.log");
+        let rotated = dir.path().join("container.log.1");
+        let mut w = CriLogWriter::open(path.to_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+
+        w.write_chunk(StreamType::Stdout, b"before-rotate")
+            .await
+            .unwrap();
+        std::fs::rename(&path, &rotated).unwrap();
+        w.reopen().await.unwrap();
+        w.write_chunk(StreamType::Stdout, b"after-rotate\n")
+            .await
+            .unwrap();
+        w.flush_partials().await.unwrap();
+
+        let old_contents = std::fs::read_to_string(&rotated).unwrap();
+        let new_contents = std::fs::read_to_string(&path).unwrap();
+        assert!(old_contents.contains(" stdout F before-rotate\n"));
+        assert!(new_contents.contains(" stdout F after-rotate\n"));
     }
 }

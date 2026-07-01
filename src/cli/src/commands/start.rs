@@ -33,11 +33,8 @@ pub async fn execute(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> 
 async fn start_one(state: &StateFile, query: &str) -> Result<(), Box<dyn std::error::Error>> {
     let record = resolve::resolve(state, query)?;
 
-    match record.status.as_str() {
-        "created" | "stopped" | "dead" => {}
-        "running" => return Err(format!("Box {} is already running", record.name).into()),
-        other => return Err(format!("Cannot start box in state: {other}").into()),
-    }
+    validate_start_status(&record.name, &record.status)
+        .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
 
     let box_id = record.id.clone();
     let name = record.name.clone();
@@ -57,4 +54,40 @@ async fn start_one(state: &StateFile, query: &str) -> Result<(), Box<dyn std::er
 
     println!("{name}");
     Ok(())
+}
+
+fn validate_start_status(name: &str, status: &str) -> Result<(), String> {
+    match status {
+        "created" | "stopped" | "dead" => Ok(()),
+        "running" => Err(format!("Box {name} is already running")),
+        other => Err(format!("Cannot start box in state: {other}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_start_status_accepts_startable_states() {
+        assert!(validate_start_status("web", "created").is_ok());
+        assert!(validate_start_status("web", "stopped").is_ok());
+        assert!(validate_start_status("web", "dead").is_ok());
+    }
+
+    #[test]
+    fn validate_start_status_rejects_running_box_by_name() {
+        assert_eq!(
+            validate_start_status("web", "running").unwrap_err(),
+            "Box web is already running"
+        );
+    }
+
+    #[test]
+    fn validate_start_status_rejects_other_states() {
+        assert_eq!(
+            validate_start_status("web", "paused").unwrap_err(),
+            "Cannot start box in state: paused"
+        );
+    }
 }

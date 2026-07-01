@@ -695,6 +695,200 @@ async fn write_pty_frame<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::*;
+    use crate::streaming::SessionKind;
+    use serde_json::Value;
+    use tokio::io::AsyncReadExt;
+
+    fn test_session() -> StreamingSession {
+        StreamingSession {
+            kind: SessionKind::Exec,
+            sandbox_id: "sandbox".to_string(),
+            cmd: vec!["echo".to_string(), "ok".to_string()],
+            rootfs: Some("/rootfs".to_string()),
+            tty: false,
+            stdin: false,
+            stdin_once: false,
+            stdout: true,
+            stderr: true,
+            ports: vec![],
+            attach_stream: None,
+            attach_stdin: None,
+            exec_socket_path: "/tmp/exec.sock".to_string(),
+            pty_socket_path: "/tmp/pty.sock".to_string(),
+            port_forward_socket_path: "/tmp/pf.sock".to_string(),
+        }
+    }
+
+    fn syn_stream(stream_id: u32) -> Vec<u8> {
+        let mut frame = vec![0x80, 0x03];
+        frame.extend_from_slice(&CTRL_SYN_STREAM.to_be_bytes());
+        frame.push(0);
+        frame.extend_from_slice(&10u32.to_be_bytes()[1..]);
+        frame.extend_from_slice(&(stream_id & 0x7fff_ffff).to_be_bytes());
+        frame.extend_from_slice(&0u32.to_be_bytes()); // associated stream id
+        frame.push(0); // priority / unused
+        frame.push(0); // slot
+        frame
+    }
+
+    #[tokio::test]
+    async fn read_frame_decodes_syn_stream_ping_and_data() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&syn_stream(0x8000_0005));
+        bytes.extend_from_slice(&ping_frame(42));
+        bytes.extend_from_slice(&data_frame(0x8000_0007, true, b"payload"));
+
+        let mut reader = std::io::Cursor::new(bytes);
+
+        match read_frame(&mut reader).await.unwrap().unwrap() {
+            Frame::SynStream { stream_id } => assert_eq!(stream_id, 5),
+            _ => panic!("expected SYN_STREAM"),
+        }
+        match read_frame(&mut reader).await.unwrap().unwrap() {
+            Frame::Ping { id } => assert_eq!(id, 42),
+            _ => panic!("expected PING"),
+        }
+        match read_frame(&mut reader).await.unwrap().unwrap() {
+            Frame::Data {
+                stream_id,
+                fin,
+                data,
+            } => {
+                assert_eq!(stream_id, 7);
+                assert!(fin);
+                assert_eq!(data, b"payload");
+            }
+            _ => panic!("expected DATA"),
+        }
+        assert!(read_frame(&mut reader).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn read_frame_errors_on_truncated_payload() {
+        let mut bytes = data_frame(3, false, b"abcd");
+        bytes.truncate(bytes.len() - 2);
+        let mut reader = std::io::Cursor::new(bytes);
+
+        let error = match read_frame(&mut reader).await {
+            Ok(_) => panic!("truncated SPDY payload should return an error"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn frame_serializers_mask_control_bit_and_encode_lengths() {
+        let data = data_frame(0x8000_0011, true, b"abc");
+        assert_eq!(&data[..4], &[0, 0, 0, 0x11]);
+        assert_eq!(data[4], FLAG_FIN);
+        assert_eq!(&data[5..8], &[0, 0, 3]);
+        assert_eq!(&data[8..], b"abc");
+
+        let ping = ping_frame(0x0102_0304);
+        assert_eq!(&ping[..8], &[0x80, 0x03, 0x00, 0x06, 0, 0, 0, 4]);
+        assert_eq!(&ping[8..], &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn expected_channels_match_remotecommand_open_order() {
+        let mut session = test_session();
+
+        assert_eq!(
+            expected_channels(&session),
+            vec![Channel::Error, Channel::Stdout, Channel::Stderr]
+        );
+
+        session.stdin = true;
+        assert_eq!(
+            expected_channels(&session),
+            vec![
+                Channel::Error,
+                Channel::Stdin,
+                Channel::Stdout,
+                Channel::Stderr
+            ]
+        );
+
+        session.tty = true;
+        assert_eq!(
+            expected_channels(&session),
+            vec![
+                Channel::Error,
+                Channel::Stdin,
+                Channel::Stdout,
+                Channel::Resize
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_streams_replies_to_syn_streams_and_echoes_pings() {
+        let mut input = Vec::new();
+        input.extend_from_slice(&ping_frame(9));
+        input.extend_from_slice(&syn_stream(3));
+        input.extend_from_slice(&syn_stream(5));
+        let mut reader = std::io::Cursor::new(input);
+        let mut writer = Vec::new();
+
+        let ids = collect_streams(&mut reader, &mut writer, &[Channel::Error, Channel::Stdout])
+            .await
+            .unwrap();
+
+        assert_eq!(ids.get(&Channel::Error), Some(&3));
+        assert_eq!(ids.get(&Channel::Stdout), Some(&5));
+
+        let mut written = std::io::Cursor::new(writer);
+        match read_frame(&mut written).await.unwrap().unwrap() {
+            Frame::Ping { id } => assert_eq!(id, 9),
+            _ => panic!("expected PING echo"),
+        }
+        for expected_stream_id in [3, 5] {
+            let mut header = [0u8; 8];
+            written.read_exact(&mut header).await.unwrap();
+            assert_eq!(&header[..4], &[0x80, 0x03, 0x00, 0x02]);
+            let len =
+                ((header[5] as usize) << 16) | ((header[6] as usize) << 8) | header[7] as usize;
+            assert!(len >= 4);
+            let mut payload = vec![0u8; len];
+            written.read_exact(&mut payload).await.unwrap();
+            assert_eq!(
+                u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]),
+                expected_stream_id
+            );
+        }
+        assert!(read_frame(&mut written).await.unwrap().is_none());
+    }
+
+    #[test]
+    fn exit_status_payload_is_absent_for_success_and_structured_for_failure() {
+        assert!(exit_status_payload(0).is_none());
+
+        let payload = exit_status_payload(137).unwrap();
+        let value: Value = serde_json::from_slice(&payload).unwrap();
+
+        assert_eq!(value["status"], "Failure");
+        assert_eq!(value["reason"], "NonZeroExitCode");
+        assert_eq!(value["details"]["causes"][0]["reason"], "ExitCode");
+        assert_eq!(value["details"]["causes"][0]["message"], "137");
+        assert!(value["message"].as_str().unwrap().contains("exit code 137"));
+    }
+
+    #[tokio::test]
+    async fn write_pty_frame_encodes_header_and_payload() {
+        let mut output = Vec::new();
+
+        write_pty_frame(&mut output, 0x03, b"resize").await.unwrap();
+
+        assert_eq!(&output[..5], &[0x03, 0, 0, 0, 6]);
+        assert_eq!(&output[5..], b"resize");
+    }
+}
+
 /// 101 response that upgrades the connection to SPDY for the `portforward.k8s.io`
 /// subprotocol. crictl/kubelet stream raw TCP bytes over a single SPDY data
 /// stream per forwarded port.

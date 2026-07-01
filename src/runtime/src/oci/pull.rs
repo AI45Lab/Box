@@ -4,6 +4,7 @@
 //! pull workflow. Images are checked in the local store first; if not found,
 //! they are pulled from the registry and stored locally.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use a3s_box_core::error::{BoxError, Result};
@@ -16,6 +17,9 @@ use super::store::ImageStore;
 
 /// Callback type for layer pull progress: `(current, total, digest, size_bytes)`.
 type PullProgressFn = Arc<dyn Fn(usize, usize, &str, i64) + Send + Sync>;
+
+/// Per-process counter for unique pull temp dirs.
+static PULL_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// High-level image puller with caching.
 pub struct ImagePuller {
@@ -240,16 +244,7 @@ impl ImagePuller {
         // Strip the "sha256:" prefix so the directory name is pure hex,
         // which is valid on all platforms (Windows forbids ':' in filenames).
         let digest_hex = digest.strip_prefix("sha256:").unwrap_or(&digest);
-        let tmp_dir = self.store.store_dir().join("tmp").join(digest_hex);
-        if tmp_dir.exists() {
-            std::fs::remove_dir_all(&tmp_dir).map_err(|e| {
-                BoxError::OciImageError(format!(
-                    "Failed to clean temp directory {}: {}",
-                    tmp_dir.display(),
-                    e
-                ))
-            })?;
-        }
+        let tmp_dir = unique_pull_tmp_dir(self.store.store_dir(), digest_hex);
 
         let pull_start = std::time::Instant::now();
         // Remove the partially-written temp directory on ANY failure so aborted
@@ -402,6 +397,13 @@ fn reference_from_repository(repository: &str, tag: Option<&str>, digest: Option
         reference.push_str(digest);
     }
     reference
+}
+
+fn unique_pull_tmp_dir(store_dir: &std::path::Path, digest_hex: &str) -> std::path::PathBuf {
+    let seq = PULL_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    store_dir
+        .join("tmp")
+        .join(format!("pull-{digest_hex}-{}-{seq}", std::process::id()))
 }
 
 fn push_unique(values: &mut Vec<String>, value: String) {
@@ -631,6 +633,22 @@ mod tests {
         assert!(digest_matches("sha256:abcdef123456", "sha256:abcdef"));
         assert!(!digest_matches("sha256:abcdef123456", "sha256:"));
         assert!(!digest_matches("sha256:abcdef123456", "abcdef"));
+    }
+
+    #[test]
+    fn test_unique_pull_tmp_dir_does_not_reuse_digest_path() {
+        let tmp = TempDir::new().unwrap();
+        let first = unique_pull_tmp_dir(tmp.path(), "abc123");
+        let second = unique_pull_tmp_dir(tmp.path(), "abc123");
+
+        assert_ne!(first, second);
+        assert_eq!(first.parent().unwrap(), tmp.path().join("tmp"));
+        assert_eq!(second.parent().unwrap(), tmp.path().join("tmp"));
+        assert!(first
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains("abc123"));
     }
 
     fn create_complete_oci_image(path: &Path) {

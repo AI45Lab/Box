@@ -50,3 +50,27 @@ pub(crate) fn is_mountpoint(path: &Path) -> bool {
 pub(crate) fn is_mountpoint(_path: &Path) -> bool {
     false
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_path_is_not_mountpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing");
+
+        assert!(!is_mountpoint(&missing));
+    }
+
+    #[test]
+    fn unmount_overlay_noops_for_non_mountpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let merged = temp.path().join("merged");
+        std::fs::create_dir(&merged).unwrap();
+
+        unmount_box_overlay(&merged);
+
+        assert!(merged.exists());
+    }
+}

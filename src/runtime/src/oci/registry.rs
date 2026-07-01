@@ -724,6 +724,15 @@ mod tests {
     use super::*;
     use std::sync::{Mutex, OnceLock};
 
+    fn test_image_reference() -> ImageReference {
+        ImageReference {
+            registry: "registry.example.com".to_string(),
+            repository: "a3s/app".to_string(),
+            tag: Some("latest".to_string()),
+            digest: None,
+        }
+    }
+
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
@@ -903,5 +912,161 @@ mod tests {
         };
         let oci_ref = puller.to_oci_reference(&img_ref).unwrap();
         assert!(oci_ref.to_string().contains("latest"));
+    }
+
+    #[test]
+    fn test_pusher_to_oci_reference_with_tag_and_default_latest() {
+        let pusher = RegistryPusher::new();
+        let tagged = test_image_reference();
+        assert_eq!(
+            pusher.to_oci_reference(&tagged).unwrap().to_string(),
+            "registry.example.com/a3s/app:latest"
+        );
+
+        let tagless = ImageReference {
+            tag: None,
+            ..test_image_reference()
+        };
+        assert_eq!(
+            pusher.to_oci_reference(&tagless).unwrap().to_string(),
+            "registry.example.com/a3s/app:latest"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_push_missing_index_fails_before_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = RegistryPusher::new()
+            .push(&test_image_reference(), dir.path())
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("Failed to read index.json"));
+    }
+
+    #[tokio::test]
+    async fn test_push_index_without_manifest_digest_fails_before_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("index.json"),
+            r#"{"schemaVersion":2,"manifests":[{}]}"#,
+        )
+        .unwrap();
+
+        let err = RegistryPusher::new()
+            .push(&test_image_reference(), dir.path())
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("No manifest digest in index.json"));
+    }
+
+    #[tokio::test]
+    async fn test_push_missing_manifest_blob_fails_before_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_digest = format!("sha256:{}", "a".repeat(64));
+        std::fs::write(
+            dir.path().join("index.json"),
+            serde_json::json!({
+                "schemaVersion": 2,
+                "manifests": [{"digest": manifest_digest}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let err = RegistryPusher::new()
+            .push(&test_image_reference(), dir.path())
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("Failed to read manifest blob"));
+    }
+
+    #[tokio::test]
+    async fn test_push_missing_config_blob_fails_before_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = dir.path().join("blobs/sha256");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let manifest_digest_hex = "a".repeat(64);
+        let config_digest = format!("sha256:{}", "b".repeat(64));
+        let manifest = OciImageManifest {
+            config: oci_distribution::manifest::OciDescriptor {
+                media_type: "application/vnd.oci.image.config.v1+json".to_string(),
+                digest: config_digest,
+                size: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        std::fs::write(
+            dir.path().join("index.json"),
+            serde_json::json!({
+                "schemaVersion": 2,
+                "manifests": [{"digest": format!("sha256:{manifest_digest_hex}")}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            blobs.join(&manifest_digest_hex),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let err = RegistryPusher::new()
+            .push(&test_image_reference(), dir.path())
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("Failed to read config blob"));
+    }
+
+    #[tokio::test]
+    async fn test_push_missing_layer_blob_fails_before_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = dir.path().join("blobs/sha256");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let manifest_digest_hex = "a".repeat(64);
+        let config_digest_hex = "b".repeat(64);
+        let layer_digest = format!("sha256:{}", "c".repeat(64));
+        let manifest = OciImageManifest {
+            config: oci_distribution::manifest::OciDescriptor {
+                media_type: "application/vnd.oci.image.config.v1+json".to_string(),
+                digest: format!("sha256:{config_digest_hex}"),
+                size: 2,
+                ..Default::default()
+            },
+            layers: vec![oci_distribution::manifest::OciDescriptor {
+                media_type: "application/vnd.oci.image.layer.v1.tar".to_string(),
+                digest: layer_digest.clone(),
+                size: 42,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        std::fs::write(
+            dir.path().join("index.json"),
+            serde_json::json!({
+                "schemaVersion": 2,
+                "manifests": [{"digest": format!("sha256:{manifest_digest_hex}")}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            blobs.join(&manifest_digest_hex),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(blobs.join(config_digest_hex), b"{}").unwrap();
+
+        let err = RegistryPusher::new()
+            .push(&test_image_reference(), dir.path())
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("Failed to read layer blob"));
+        assert!(err.to_string().contains(&layer_digest));
     }
 }

@@ -1309,6 +1309,32 @@ mod tests {
         }
     }
 
+    struct ExitStateHandler {
+        exited: bool,
+    }
+
+    impl VmHandler for ExitStateHandler {
+        fn stop(&mut self, _signal: i32, _timeout_ms: u64) -> Result<()> {
+            Ok(())
+        }
+
+        fn metrics(&self) -> crate::vmm::VmMetrics {
+            crate::vmm::VmMetrics::default()
+        }
+
+        fn is_running(&self) -> bool {
+            !self.exited
+        }
+
+        fn has_exited(&self) -> bool {
+            self.exited
+        }
+
+        fn pid(&self) -> u32 {
+            42
+        }
+    }
+
     /// A handler whose `stop` always fails — models a wedged VM that won't halt.
     struct FailingHandler;
 
@@ -1403,6 +1429,68 @@ mod tests {
         assert!(store.get("created-volume").unwrap().is_none());
         assert!(store.get("reused-volume").unwrap().is_some());
         assert!(!box_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_vm_running_returns_error_when_handler_exited() {
+        let vm = VmManager::with_box_id(
+            BoxConfig::default(),
+            EventEmitter::new(16),
+            "box-exited".to_string(),
+        );
+        *vm.handler.write().await = Some(Box::new(ExitStateHandler { exited: true }));
+
+        let err = vm.wait_for_vm_running().await.unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("VM process exited immediately after start"));
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_vm_running_succeeds_when_handler_stays_running() {
+        let config = BoxConfig {
+            restore_from: Some("snapshot-path".to_string()),
+            ..BoxConfig::default()
+        };
+        let vm = VmManager::with_box_id(config, EventEmitter::new(16), "box-running".to_string());
+        *vm.handler.write().await = Some(Box::new(ExitStateHandler { exited: false }));
+
+        vm.wait_for_vm_running().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_wait_for_exec_ready_returns_when_handler_already_exited() {
+        let mut vm = VmManager::with_box_id(
+            BoxConfig::default(),
+            EventEmitter::new(16),
+            "box-exec-exited".to_string(),
+        );
+        *vm.handler.write().await = Some(Box::new(ExitStateHandler { exited: true }));
+        let tmp = tempfile::tempdir().unwrap();
+
+        vm.wait_for_exec_ready(&tmp.path().join("missing-exec.sock"))
+            .await
+            .unwrap();
+
+        assert!(vm.exec_client.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_probe_exec_ready_once_ignores_missing_socket() {
+        let mut vm = VmManager::with_box_id(
+            BoxConfig::default(),
+            EventEmitter::new(16),
+            "box-probe".to_string(),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+
+        vm.probe_exec_ready_once(&tmp.path().join("missing-exec.sock"))
+            .await;
+
+        assert!(vm.exec_client.is_none());
     }
 
     #[cfg(unix)]

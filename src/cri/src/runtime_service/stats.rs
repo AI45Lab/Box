@@ -404,6 +404,67 @@ pub(super) fn pod_sandbox_metrics(
 mod stats_tests {
     use super::*;
 
+    fn test_sandbox(state: SandboxState) -> PodSandbox {
+        PodSandbox {
+            id: "sandbox-1".to_string(),
+            name: "web".to_string(),
+            namespace: "default".to_string(),
+            uid: "uid-1".to_string(),
+            attempt: 2,
+            state,
+            created_at: 1_000_000_000,
+            labels: HashMap::from([("app".to_string(), "web".to_string())]),
+            annotations: HashMap::from([("team".to_string(), "platform".to_string())]),
+            log_directory: "/var/log/pods/default_web_uid-1".to_string(),
+            runtime_handler: "a3s".to_string(),
+            network_ip: "10.244.0.2".to_string(),
+            additional_ips: vec![],
+            dns: crate::sandbox::SandboxDns::default(),
+            container_ports: vec![],
+        }
+    }
+
+    fn test_container(id: &str, state: ContainerState, rootfs_path: String) -> Container {
+        Container {
+            id: id.to_string(),
+            sandbox_id: "sandbox-1".to_string(),
+            name: format!("container-{id}"),
+            attempt: 1,
+            image_ref: "docker.io/library/nginx:latest".to_string(),
+            resolved_image_digest: "sha256:test".to_string(),
+            resolved_image_path: "/images/nginx".to_string(),
+            command: vec!["nginx".to_string()],
+            args: vec!["-g".to_string(), "daemon off;".to_string()],
+            env: vec![("ENV".to_string(), "test".to_string())],
+            working_dir: "/".to_string(),
+            user: None,
+            stdin: false,
+            stdin_once: false,
+            tty: false,
+            mounts: vec![],
+            state,
+            created_at: 1_000_000_000,
+            started_at: 2_000_000_000,
+            finished_at: 0,
+            exit_code: 0,
+            oom_killed: false,
+            labels: HashMap::from([("app".to_string(), "web".to_string())]),
+            annotations: HashMap::from([("container".to_string(), id.to_string())]),
+            log_path: format!("/var/log/pods/{id}.log"),
+            rootfs_path,
+            rootfs_guest_path: format!("/run/a3s/cri/container-rootfs/sandbox-1/{id}/rootfs"),
+        }
+    }
+
+    fn metric_value(metrics: &PodSandboxMetrics, name: &str) -> f64 {
+        metrics
+            .metrics
+            .iter()
+            .find(|metric| metric.name == name)
+            .unwrap_or_else(|| panic!("missing metric {name}"))
+            .value
+    }
+
     #[test]
     fn test_per_container_split_sums_to_total() {
         let total = VmUsage {
@@ -417,6 +478,225 @@ mod stats_tests {
         // pods get the whole VM's usage).
         assert_eq!(total.per_container(0).memory_bytes, 300);
         assert_eq!(total.per_container(1).cpu_core_nanos, 900);
+    }
+
+    #[test]
+    fn test_usage_builders_copy_vm_usage_into_cri_shapes() {
+        let usage = VmUsage {
+            cpu_core_nanos: 42,
+            memory_bytes: 2048,
+        };
+
+        let cpu = cpu_usage(123, usage);
+        assert_eq!(cpu.timestamp, 123);
+        assert_eq!(cpu.usage_core_nano_seconds.unwrap().value, 42);
+        assert_eq!(cpu.usage_nano_cores.unwrap().value, 0);
+
+        let memory = memory_usage(456, usage);
+        assert_eq!(memory.timestamp, 456);
+        assert_eq!(memory.working_set_bytes.unwrap().value, 2048);
+        assert_eq!(memory.usage_bytes.unwrap().value, 2048);
+        assert_eq!(memory.rss_bytes.unwrap().value, 2048);
+    }
+
+    #[test]
+    fn test_should_collect_rootfs_usage_rejects_empty_and_host_root() {
+        assert!(!should_collect_rootfs_usage(""));
+        assert!(!should_collect_rootfs_usage("   "));
+        assert!(!should_collect_rootfs_usage("/"));
+        assert!(should_collect_rootfs_usage("/tmp/a3s/rootfs"));
+    }
+
+    #[test]
+    fn test_collect_path_usage_counts_tree_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"abc").unwrap();
+        std::fs::create_dir(dir.path().join("nested")).unwrap();
+        std::fs::write(dir.path().join("nested").join("b.txt"), b"defg").unwrap();
+
+        let usage = collect_path_usage(dir.path()).unwrap();
+
+        assert_eq!(usage.inodes_used, 4);
+        assert!(usage.used_bytes >= 7);
+    }
+
+    #[test]
+    fn test_writable_layer_usage_omits_fs_id_for_uncollectable_paths() {
+        let root_usage = writable_layer_usage("/", None, 100);
+        assert!(root_usage.fs_id.is_none());
+        assert_eq!(root_usage.used_bytes.unwrap().value, 0);
+        assert!(root_usage.inodes_used.is_none());
+
+        let usage = writable_layer_usage(
+            "/tmp/rootfs",
+            Some(PathUsage {
+                used_bytes: 4096,
+                inodes_used: 12,
+            }),
+            200,
+        );
+        assert_eq!(usage.timestamp, 200);
+        assert_eq!(usage.fs_id.unwrap().mountpoint, "/tmp/rootfs");
+        assert_eq!(usage.used_bytes.unwrap().value, 4096);
+        assert_eq!(usage.inodes_used.unwrap().value, 12);
+    }
+
+    #[tokio::test]
+    async fn test_container_stats_includes_metadata_and_rootfs_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("layer.txt"), b"layer-data").unwrap();
+        let container = test_container(
+            "c1",
+            ContainerState::Running,
+            dir.path().to_string_lossy().to_string(),
+        );
+        let stats = container_stats(
+            &container,
+            VmUsage {
+                cpu_core_nanos: 99,
+                memory_bytes: 1024,
+            },
+        )
+        .await;
+
+        let attributes = stats.attributes.unwrap();
+        assert_eq!(attributes.id, "c1");
+        assert_eq!(attributes.metadata.unwrap().name, "container-c1");
+        assert_eq!(attributes.labels["app"], "web");
+        assert_eq!(
+            stats.cpu.unwrap().usage_core_nano_seconds.unwrap().value,
+            99
+        );
+        assert_eq!(stats.memory.unwrap().working_set_bytes.unwrap().value, 1024);
+
+        let writable = stats.writable_layer.unwrap();
+        assert_eq!(
+            writable.fs_id.unwrap().mountpoint,
+            dir.path().to_string_lossy()
+        );
+        assert!(writable.used_bytes.unwrap().value >= 10);
+        assert!(writable.inodes_used.unwrap().value >= 2);
+    }
+
+    #[tokio::test]
+    async fn test_pod_sandbox_stats_reports_vm_total_and_running_containers_only() {
+        let sandbox = test_sandbox(SandboxState::Ready);
+        let containers = vec![
+            test_container("running-1", ContainerState::Running, "/".to_string()),
+            test_container("running-2", ContainerState::Running, "/".to_string()),
+            test_container("exited", ContainerState::Exited, "/".to_string()),
+        ];
+
+        let stats = pod_sandbox_stats(
+            &sandbox,
+            containers,
+            VmUsage {
+                cpu_core_nanos: 1000,
+                memory_bytes: 3000,
+            },
+        )
+        .await;
+
+        let linux = stats.linux.unwrap();
+        assert_eq!(
+            linux.cpu.unwrap().usage_core_nano_seconds.unwrap().value,
+            1000
+        );
+        assert_eq!(linux.memory.unwrap().working_set_bytes.unwrap().value, 3000);
+        assert_eq!(linux.process.unwrap().process_count.unwrap().value, 2);
+        assert_eq!(linux.containers.len(), 2);
+        for container in linux.containers {
+            assert_eq!(
+                container
+                    .cpu
+                    .unwrap()
+                    .usage_core_nano_seconds
+                    .unwrap()
+                    .value,
+                500
+            );
+            assert_eq!(
+                container.memory.unwrap().working_set_bytes.unwrap().value,
+                1500
+            );
+        }
+    }
+
+    #[test]
+    fn test_metric_descriptors_cover_pod_sandbox_metrics() {
+        let descriptors = metric_descriptors();
+        let names: std::collections::HashSet<_> = descriptors
+            .iter()
+            .map(|descriptor| descriptor.name.as_str())
+            .collect();
+
+        assert_eq!(descriptors.len(), 5);
+        assert!(names.contains("a3s_box_pod_sandbox_ready"));
+        assert!(names.contains("a3s_box_pod_sandbox_vm_manager_present"));
+        assert!(names.contains("a3s_box_pod_sandbox_containers_total"));
+        assert!(names.contains("a3s_box_pod_sandbox_containers_running"));
+        assert!(names.contains("a3s_box_pod_sandbox_containers_exited"));
+        assert!(descriptors
+            .iter()
+            .all(|descriptor| descriptor.kind == "gauge"));
+    }
+
+    #[test]
+    fn test_pod_sandbox_metrics_labels_and_counts() {
+        let sandbox = test_sandbox(SandboxState::Ready);
+        let containers = vec![
+            test_container("created", ContainerState::Created, "/".to_string()),
+            test_container("running", ContainerState::Running, "/".to_string()),
+            test_container("exited", ContainerState::Exited, "/".to_string()),
+        ];
+
+        let metrics = pod_sandbox_metrics(&sandbox, &containers, true);
+
+        assert_eq!(metrics.pod_sandbox_id, "sandbox-1");
+        assert_eq!(metric_value(&metrics, "a3s_box_pod_sandbox_ready"), 1.0);
+        assert_eq!(
+            metric_value(&metrics, "a3s_box_pod_sandbox_vm_manager_present"),
+            1.0
+        );
+        assert_eq!(
+            metric_value(&metrics, "a3s_box_pod_sandbox_containers_total"),
+            3.0
+        );
+        assert_eq!(
+            metric_value(&metrics, "a3s_box_pod_sandbox_containers_running"),
+            1.0
+        );
+        assert_eq!(
+            metric_value(&metrics, "a3s_box_pod_sandbox_containers_exited"),
+            1.0
+        );
+
+        let ready_metric = metrics
+            .metrics
+            .iter()
+            .find(|metric| metric.name == "a3s_box_pod_sandbox_ready")
+            .unwrap();
+        assert_eq!(ready_metric.labels["pod_sandbox_id"], "sandbox-1");
+        assert_eq!(ready_metric.labels["namespace"], "default");
+        assert_eq!(ready_metric.labels["name"], "web");
+        assert_eq!(ready_metric.labels["uid"], "uid-1");
+        assert_eq!(ready_metric.labels["runtime_handler"], "a3s");
+    }
+
+    #[test]
+    fn test_pod_sandbox_metrics_not_ready_without_vm_manager() {
+        let sandbox = test_sandbox(SandboxState::NotReady);
+        let metrics = pod_sandbox_metrics(&sandbox, &[], false);
+
+        assert_eq!(metric_value(&metrics, "a3s_box_pod_sandbox_ready"), 0.0);
+        assert_eq!(
+            metric_value(&metrics, "a3s_box_pod_sandbox_vm_manager_present"),
+            0.0
+        );
+        assert_eq!(
+            metric_value(&metrics, "a3s_box_pod_sandbox_containers_total"),
+            0.0
+        );
     }
 
     #[cfg(target_os = "linux")]

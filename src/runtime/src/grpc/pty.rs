@@ -278,6 +278,18 @@ mod tests {
         }
     }
 
+    fn test_pty_request() -> a3s_box_core::pty::PtyRequest {
+        a3s_box_core::pty::PtyRequest {
+            cmd: vec!["/bin/sh".to_string()],
+            env: vec!["TERM=xterm".to_string()],
+            working_dir: Some("/workspace".to_string()),
+            rootfs: Some("/run/a3s/rootfs".to_string()),
+            user: Some("1000:1000".to_string()),
+            cols: 100,
+            rows: 30,
+        }
+    }
+
     #[tokio::test]
     async fn test_pty_client_connect_nonexistent() {
         let result = PtyClient::connect(Path::new("/tmp/nonexistent-pty-test.sock")).await;
@@ -323,6 +335,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_pty_send_request_serializes_payload() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sock_path = tmp.path().join("pty_request.sock");
+        let Some(listener) = bind_test_listener(&sock_path) else {
+            return;
+        };
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (r, _w) = tokio::io::split(stream);
+            let mut reader = a3s_transport::FrameReader::new(r);
+            reader.read_frame().await.unwrap().unwrap()
+        });
+
+        let mut client = PtyClient::connect(&sock_path).await.unwrap();
+        let req = test_pty_request();
+        client.send_request(&req).await.unwrap();
+
+        let frame = server.await.unwrap();
+        assert_eq!(frame.frame_type as u8, a3s_box_core::pty::FRAME_PTY_REQUEST);
+        let parsed: a3s_box_core::pty::PtyRequest = serde_json::from_slice(&frame.payload).unwrap();
+        assert_eq!(parsed.cmd, req.cmd);
+        assert_eq!(parsed.env, req.env);
+        assert_eq!(parsed.working_dir, req.working_dir);
+        assert_eq!(parsed.rootfs, req.rootfs);
+        assert_eq!(parsed.user, req.user);
+        assert_eq!(parsed.cols, 100);
+        assert_eq!(parsed.rows, 30);
+    }
+
+    #[tokio::test]
     async fn test_pty_send_resize() {
         let tmp = tempfile::TempDir::new().unwrap();
         let sock_path = tmp.path().join("pty_resize.sock");
@@ -350,6 +393,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_pty_stream_input_writes_stdin_and_resize_frames() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sock_path = tmp.path().join("pty_input.sock");
+        let Some(listener) = bind_test_listener(&sock_path) else {
+            return;
+        };
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (r, _w) = tokio::io::split(stream);
+            let mut reader = a3s_transport::FrameReader::new(r);
+
+            let request = reader.read_frame().await.unwrap().unwrap();
+            assert_eq!(
+                request.frame_type as u8,
+                a3s_box_core::pty::FRAME_PTY_REQUEST
+            );
+            let stdin = reader.read_frame().await.unwrap().unwrap();
+            let resize = reader.read_frame().await.unwrap().unwrap();
+            (stdin, resize)
+        });
+
+        let client = PtyClient::connect(&sock_path).await.unwrap();
+        let stream = client.start_stream(&test_pty_request()).await.unwrap();
+        let input = stream.input();
+        input.write_stdin(b"echo hi\n").await.unwrap();
+        input.resize(132, 43).await.unwrap();
+
+        let (stdin, resize) = server.await.unwrap();
+        assert_eq!(stdin.frame_type, a3s_transport::FrameType::Control);
+        assert_eq!(stdin.payload, b"echo hi\n");
+
+        assert_eq!(resize.frame_type, a3s_transport::FrameType::Heartbeat);
+        let resize: a3s_box_core::pty::PtyResize = serde_json::from_slice(&resize.payload).unwrap();
+        assert_eq!(resize.cols, 132);
+        assert_eq!(resize.rows, 43);
+    }
+
+    #[tokio::test]
     async fn test_pty_read_frame_eof() {
         let tmp = tempfile::TempDir::new().unwrap();
         let sock_path = tmp.path().join("pty_eof.sock");
@@ -365,6 +447,49 @@ mod tests {
         let mut client = PtyClient::connect(&sock_path).await.unwrap();
         let frame = client.read_frame().await.unwrap();
         assert!(frame.is_none()); // EOF
+    }
+
+    #[tokio::test]
+    async fn test_pty_stream_eof_marks_done_and_metrics_count_stdout() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sock_path = tmp.path().join("pty_stream_eof.sock");
+        let Some(listener) = bind_test_listener(&sock_path) else {
+            return;
+        };
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (r, w) = tokio::io::split(stream);
+            let mut reader = a3s_transport::FrameReader::new(r);
+            let mut writer = a3s_transport::FrameWriter::new(w);
+
+            let request = reader.read_frame().await.unwrap().unwrap();
+            assert_eq!(
+                request.frame_type as u8,
+                a3s_box_core::pty::FRAME_PTY_REQUEST
+            );
+            writer
+                .write_frame(&a3s_transport::Frame {
+                    frame_type: a3s_transport::FrameType::Control,
+                    payload: b"abc".to_vec(),
+                })
+                .await
+                .unwrap();
+        });
+
+        let client = PtyClient::connect(&sock_path).await.unwrap();
+        let mut stream = client.start_stream(&test_pty_request()).await.unwrap();
+        assert!(!stream.is_done());
+
+        match stream.next_event().await.unwrap().unwrap() {
+            a3s_box_core::exec::ExecEvent::Chunk(chunk) => assert_eq!(chunk.data, b"abc"),
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert_eq!(stream.metrics().stdout_bytes, 3);
+
+        assert!(stream.next_event().await.unwrap().is_none());
+        assert!(stream.is_done());
+        assert!(stream.next_event().await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -428,6 +553,79 @@ mod tests {
             a3s_box_core::exec::ExecEvent::Exit(exit) => assert_eq!(exit.exit_code, 9),
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_pty_stream_error_frame_marks_done() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sock_path = tmp.path().join("pty_stream_error.sock");
+        let Some(listener) = bind_test_listener(&sock_path) else {
+            return;
+        };
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (r, w) = tokio::io::split(stream);
+            let mut reader = a3s_transport::FrameReader::new(r);
+            let mut writer = a3s_transport::FrameWriter::new(w);
+
+            let request = reader.read_frame().await.unwrap().unwrap();
+            assert_eq!(
+                request.frame_type as u8,
+                a3s_box_core::pty::FRAME_PTY_REQUEST
+            );
+            writer
+                .write_frame(&a3s_transport::Frame {
+                    frame_type: a3s_transport::FrameType::Close,
+                    payload: b"terminal failed".to_vec(),
+                })
+                .await
+                .unwrap();
+        });
+
+        let client = PtyClient::connect(&sock_path).await.unwrap();
+        let mut stream = client.start_stream(&test_pty_request()).await.unwrap();
+
+        let err = stream.next_event().await.unwrap_err();
+        assert!(err.to_string().contains("terminal failed"));
+        assert!(stream.is_done());
+        assert!(stream.next_event().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_pty_stream_unexpected_frame_type_errors_without_marking_done() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sock_path = tmp.path().join("pty_stream_unexpected.sock");
+        let Some(listener) = bind_test_listener(&sock_path) else {
+            return;
+        };
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (r, w) = tokio::io::split(stream);
+            let mut reader = a3s_transport::FrameReader::new(r);
+            let mut writer = a3s_transport::FrameWriter::new(w);
+
+            let request = reader.read_frame().await.unwrap().unwrap();
+            assert_eq!(
+                request.frame_type as u8,
+                a3s_box_core::pty::FRAME_PTY_REQUEST
+            );
+            writer
+                .write_frame(&a3s_transport::Frame {
+                    frame_type: a3s_transport::FrameType::Data,
+                    payload: b"not a PTY data frame".to_vec(),
+                })
+                .await
+                .unwrap();
+        });
+
+        let client = PtyClient::connect(&sock_path).await.unwrap();
+        let mut stream = client.start_stream(&test_pty_request()).await.unwrap();
+
+        let err = stream.next_event().await.unwrap_err();
+        assert!(err.to_string().contains("Unexpected PTY frame type"));
+        assert!(!stream.is_done());
     }
 
     #[tokio::test]

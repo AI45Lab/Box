@@ -448,6 +448,152 @@ mod tests {
             .contains("image path not set"));
     }
 
+    #[test]
+    fn test_oci_rootfs_builder_uses_custom_resolv_conf_and_default_when_empty() {
+        let temp_dir = TempDir::new().unwrap();
+        let custom_rootfs = temp_dir.path().join("custom-rootfs");
+        let default_rootfs = temp_dir.path().join("default-rootfs");
+        let image = temp_dir.path().join("image");
+        create_test_oci_image(&image);
+
+        OciRootfsBuilder::new(&custom_rootfs)
+            .with_image(&image)
+            .with_resolv_conf("nameserver 10.0.0.10\nsearch svc.cluster.local\n")
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(custom_rootfs.join("etc/resolv.conf")).unwrap(),
+            "nameserver 10.0.0.10\nsearch svc.cluster.local\n"
+        );
+
+        OciRootfsBuilder::new(&default_rootfs)
+            .with_image(&image)
+            .with_resolv_conf("")
+            .build()
+            .unwrap();
+
+        let resolv_conf = fs::read_to_string(default_rootfs.join("etc/resolv.conf")).unwrap();
+        assert!(resolv_conf.contains("nameserver 8.8.8.8"));
+        assert!(resolv_conf.contains("nameserver 8.8.4.4"));
+    }
+
+    #[test]
+    fn test_oci_rootfs_builder_preserves_existing_passwd_and_group_entries() {
+        let temp_dir = TempDir::new().unwrap();
+        let rootfs_path = temp_dir.path().join("rootfs");
+        let image = temp_dir.path().join("image");
+
+        create_test_oci_image_with_files(
+            &image,
+            &[
+                (
+                    "etc/passwd",
+                    b"root:x:0:0:Root User:/root:/bin/bash\napp:x:1000:1000:App:/app:/bin/sh"
+                        .as_slice(),
+                ),
+                ("etc/group", b"root:x:0:\napp:x:1000:".as_slice()),
+            ],
+        );
+
+        OciRootfsBuilder::new(&rootfs_path)
+            .with_image(&image)
+            .build()
+            .unwrap();
+
+        let passwd = fs::read_to_string(rootfs_path.join("etc/passwd")).unwrap();
+        assert_eq!(entry_count(&passwd, "root"), 1);
+        assert!(passwd.contains("root:x:0:0:Root User:/root:/bin/bash\n"));
+        assert!(passwd.contains("app:x:1000:1000:App:/app:/bin/sh\n"));
+        assert!(passwd.contains("nobody:x:65534:65534:nobody:/:/bin/false\n"));
+
+        let group = fs::read_to_string(rootfs_path.join("etc/group")).unwrap();
+        assert_eq!(entry_count(&group, "root"), 1);
+        assert!(group.contains("root:x:0:\n"));
+        assert!(group.contains("app:x:1000:\n"));
+        assert!(group.contains("nogroup:x:65534:\n"));
+    }
+
+    #[test]
+    fn test_install_guest_init_only_noop_without_guest_init() {
+        let temp_dir = TempDir::new().unwrap();
+        let rootfs_path = temp_dir.path().join("rootfs");
+
+        OciRootfsBuilder::new(&rootfs_path)
+            .install_guest_init_only()
+            .unwrap();
+
+        assert!(!rootfs_path.exists());
+    }
+
+    #[test]
+    fn test_install_guest_init_only_replaces_existing_init_and_sets_permissions() {
+        let temp_dir = TempDir::new().unwrap();
+        let rootfs_path = temp_dir.path().join("rootfs");
+        let guest_init = temp_dir.path().join("guest-init");
+
+        fs::create_dir_all(rootfs_path.join("sbin")).unwrap();
+        fs::write(rootfs_path.join("sbin/init"), b"old init").unwrap();
+        fs::write(&guest_init, b"new guest init").unwrap();
+
+        OciRootfsBuilder::new(&rootfs_path)
+            .with_guest_init(&guest_init)
+            .install_guest_init_only()
+            .unwrap();
+
+        let installed = rootfs_path.join("sbin/init");
+        assert_eq!(fs::read(&installed).unwrap(), b"new guest init");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&installed).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+        }
+    }
+
+    #[test]
+    fn test_install_guest_init_only_errors_when_source_missing() {
+        let temp_dir = TempDir::new().unwrap();
+        let rootfs_path = temp_dir.path().join("rootfs");
+        let missing_guest_init = temp_dir.path().join("missing-guest-init");
+
+        let err = OciRootfsBuilder::new(&rootfs_path)
+            .with_guest_init(&missing_guest_init)
+            .install_guest_init_only()
+            .unwrap_err();
+
+        assert!(err.to_string().contains("Guest init binary not found"));
+    }
+
+    #[test]
+    fn test_oci_rootfs_builder_image_config_reads_oci_config() {
+        let temp_dir = TempDir::new().unwrap();
+        let image = temp_dir.path().join("image");
+        create_test_oci_image(&image);
+
+        let config = OciRootfsBuilder::new(temp_dir.path().join("rootfs"))
+            .with_image(&image)
+            .image_config()
+            .unwrap();
+
+        assert_eq!(
+            config.entrypoint,
+            Some(vec!["/usr/local/bin/app".to_string()])
+        );
+        assert_eq!(config.cmd, None);
+        assert_eq!(
+            config.env,
+            vec![(
+                "PATH".to_string(),
+                "/usr/local/bin:/usr/bin:/bin".to_string()
+            )]
+        );
+        assert_eq!(config.working_dir, Some("/app".to_string()));
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn test_install_guest_init_prefers_usr_sbin_when_sbin_missing() {
@@ -476,6 +622,17 @@ mod tests {
     }
 
     fn create_test_oci_image_with_file(path: &Path, filename: &str, content: &[u8]) {
+        create_test_oci_image_with_files(path, &[(filename, content)]);
+    }
+
+    fn entry_count(content: &str, name: &str) -> usize {
+        content
+            .lines()
+            .filter(|line| line.split(':').next() == Some(name))
+            .count()
+    }
+
+    fn create_test_oci_image_with_files(path: &Path, files: &[(&str, &[u8])]) {
         use flate2::write::GzEncoder;
         use flate2::Compression;
         use tar::Builder;
@@ -490,16 +647,20 @@ mod tests {
             let encoder = GzEncoder::new(file, Compression::default());
             let mut builder = Builder::new(encoder);
 
-            let mut header = tar::Header::new_gnu();
-            header.set_size(content.len() as u64);
-            header.set_mode(0o644);
-            // uid/gid must be set or a root-side ownership-preserving extraction
-            // can't parse the (blank) uid field. Real OCI layers always set them.
-            header.set_uid(0);
-            header.set_gid(0);
-            header.set_cksum();
+            for (filename, content) in files {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(content.len() as u64);
+                header.set_mode(0o644);
+                // uid/gid must be set or a root-side ownership-preserving extraction
+                // can't parse the (blank) uid field. Real OCI layers always set them.
+                header.set_uid(0);
+                header.set_gid(0);
+                header.set_cksum();
 
-            builder.append_data(&mut header, filename, content).unwrap();
+                builder
+                    .append_data(&mut header, *filename, *content)
+                    .unwrap();
+            }
             builder.finish().unwrap();
         }
 

@@ -58,3 +58,48 @@ impl FileLock {
         Ok(Self {})
     }
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn acquire_creates_sibling_lock_file_and_releases_on_drop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("networks.json");
+        let lock_path = tmp.path().join("networks.json.lock");
+
+        let guard = FileLock::acquire(&target).unwrap();
+        assert!(lock_path.exists());
+        drop(guard);
+
+        // Re-acquiring after drop proves the fd-backed flock was released.
+        let _guard = FileLock::acquire(&target).unwrap();
+    }
+
+    #[test]
+    fn exclusive_lock_blocks_other_file_descriptors_until_released() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("index.json");
+        let guard = FileLock::acquire(&target).unwrap();
+        let thread_target = target.clone();
+        let (tx, rx) = mpsc::channel();
+
+        let waiter = std::thread::spawn(move || {
+            let _guard = FileLock::acquire(&thread_target).unwrap();
+            tx.send(()).unwrap();
+        });
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "second lock acquisition should block while the first guard is alive"
+        );
+
+        drop(guard);
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("second lock acquisition should proceed after drop");
+        waiter.join().unwrap();
+    }
+}

@@ -36,7 +36,7 @@ As of **v2.4.0**, three adversarial audits — production-operability (24 findin
 
 | Area | Status today |
 | --- | --- |
-| Local CLI runtime | Implemented for macOS Apple Silicon/HVF and Linux/KVM style hosts. Real macOS HVF core smoke has passed with an offline Alpine OCI archive. |
+| Local CLI runtime | Implemented for macOS Apple Silicon/HVF and Linux/KVM style hosts. Real macOS HVF core and host smoke suites have passed with Alpine pulled from the registry; offline archive runs remain the release-gate default. |
 | OCI images | Pull, load, save, tag, inspect, history, remove, and local cache resolution are implemented. Push and cosign signing/verification paths exist and require registry access for end-to-end validation. |
 | Dockerfile build | Honest subset. `FROM`, metadata instructions, `COPY`/`ADD`, and shell-form `RUN` are implemented. `RUN` is isolated with Linux `chroot` and requires root-capable Linux; macOS fails by default unless explicitly unsafe host execution is enabled. |
 | Lifecycle and exec | `run`, `create`, `start`, `stop`, `restart`, `rm`, `wait`, foreground/detached runs, non-PTY exec, PTY exec, logs, stats, and inspect are implemented. |
@@ -71,9 +71,14 @@ The ignored `core_smoke` suite covers the core CLI path on a real MicroVM host:
 - named volumes, `cp`, `diff`, `export`, `commit`, `snapshot`, restart-policy monitor recovery, and Compose health/volume flow;
 - warm pool (`pool start`/`pool run`): pre-warmed sandboxes served over a socket, with backpressure and multi-image lazy pools; `--deferred` runs each command as the box's real main for full box semantics (real exit code + json-file console logs) with no cold boot; `--snapshot-fork` fills the pool by Copy-on-Write restore from one booted template instead of cold booting each sandbox.
 
-The most recent local record: all 14 ignored `core_smoke` tests passed on macOS
-HVF with an offline Alpine OCI archive, and the ignored `host_smoke` VM command
-matrix plus Compose smoke passed with the same archive.
+The most recent local record, on June 29, 2026: all 15 ignored `core_smoke`
+tests passed on macOS Apple Silicon/HVF with Alpine pulled from the registry,
+the ignored `host_smoke` VM command matrix plus Compose smoke passed, and a
+one-iteration real host soak rehearsal (`--core --host --soak --soak-no-bench`)
+produced a passing evidence bundle at
+`src/target/a3s-box-soak/20260629T120916Z-22543` with 407 seconds of runtime,
+4 resource samples, zero failed iterations, and no shim/mount/socket/box-dir
+growth.
 
 For **v2.4.0**, the merged tree was additionally validated on a real Linux
 `/dev/kvm` host: the composed-main CI integration suite passed; a **2-hour
@@ -85,6 +90,13 @@ containers passed: a named volume's data survived stop/start, a Redis instance's
 key survived a `restart` (`SET` → `SAVE` → `restart` → `GET`), and an nginx box
 served HTTP.
 
+For production Linux server clusters, the next validation tier is the
+explicitly enrolled cluster plan in
+[`docs/production-cluster-tests.md`](docs/production-cluster-tests.md). It keeps
+production nodes behind labels and taints, separates node-local CLI integration
+from RuntimeClass smoke, and defines 2-hour, 24-hour, and 72-hour soak gates
+with stop conditions and evidence recording.
+
 ## Install
 
 ```bash
@@ -92,7 +104,7 @@ served HTTP.
 brew install a3s-lab/tap/a3s-box
 
 # From source
-git clone https://github.com/AI45Lab/Box.git
+git clone https://github.com/A3S-Lab/Box.git
 cd Box/src
 cargo build --release
 ```
@@ -455,7 +467,7 @@ and `/dev/kvm`.
 
 ```bash
 # one-liner (downloads the pinned release artifacts from GitHub):
-curl -fsSL https://raw.githubusercontent.com/AI45Lab/Box/main/deploy/scripts/install-runtimeclass.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/A3S-Lab/Box/main/deploy/scripts/install-runtimeclass.sh | sudo bash
 
 # or from a checkout:
 sudo deploy/scripts/install-runtimeclass.sh                  # default version
@@ -496,6 +508,56 @@ EOF
 
 kubectl exec hello-a3s-box -- sh -c 'echo "hello from $(hostname)"; uname -m'
 ```
+
+For validation cohorts, use the checked-in manifests instead of pinning raw
+node names: `deploy/shim/test-pod.yaml` for a single smoke pod,
+`deploy/shim/runtimeclass-smoke.yaml` for one smoke pod per selected node, and
+`deploy/shim/soak-complex.yaml` for the long-lived Redis/Postgres/nginx/Python
+soak set. For the guarded cluster soak loop, run
+`deploy/scripts/runtimeclass-soak.sh`; it applies the smoke/complex workloads,
+submits short RuntimeClass job completions, writes an evidence bundle, and
+verifies it before returning success. The verifier requires
+`metadata.txt` with parseable `started_at`, boolean skip/cleanup flags, and
+positive Job completions when churn jobs run,
+`runtimeclass.yaml` with `metadata.name: a3s-box`, `handler: a3s-box`, and
+`scheduling.nodeSelector.a3s-box.io/runtime: "true"`,
+`resource-samples.tsv` with parseable monotonic timestamps, non-negative integer
+counters, one final sample, and a `summary.txt` duration that is not shorter
+than the sampled time span,
+`smoke-exec.txt` proving `kubectl exec` on every selected node,
+`complex-exec.txt` proving exec against every long-lived workload
+(`redis`, `postgres`, `nginx`, and `python`),
+`complex-logs.txt` with workload-prefixed `REDIS_SOAK`, `PG_SOAK`,
+`NGINX_SOAK`, and `PY_SOAK` markers,
+`final-pod-runtimeclasses.tsv`, and, when churn jobs run, `job-runtimeclass.txt`,
+proving `runtimeClassName: a3s-box`, `job-pod-statuses.tsv` proving exactly the
+declared number of Succeeded churn pods with zero restarts on selected nodes and
+covered by the final pod evidence, plus `job-logs.txt` with `A3S_BOX_JOB_START`,
+`A3S_BOX_JOB_RUNTIME_CLASS=a3s-box`, and `A3S_BOX_JOB_DONE` markers exactly
+matching the declared Job completion count; it
+rejects failed pods/jobs, unexpected pod restarts, Pending/Unknown final pods,
+active final jobs, pod artifacts that do not cover the same unique final pod
+set, per-pod final status artifacts with unresolved phases or restarts,
+incomplete or duplicate selected-node evidence, selected nodes missing the
+required production-soak labels in `selected-node-labels.tsv`, pods assigned
+outside `selected-node-names.txt`, missing artifacts, wrong RuntimeClass
+handlers, incomplete per-node exec proof, incomplete Job completions,
+Kubernetes `Warning` events in `events.tsv`, and nonzero generated workload
+counts or timestamps earlier than the final resource sample in the single-row
+`post-cleanup-counts.tsv` when `--cleanup` is enabled.
+Structural Kubernetes artifacts, including post-cleanup listings, must be real
+command output, not captured `kubectl` connection or API errors.
+Use `--preflight-only` first when checking cluster
+readiness without applying workloads. Pass the runner
+`--verify-*` gate options for 2-hour, 24-hour, or 72-hour gates, then use
+`deploy/scripts/verify-soak-evidence.sh` with the matching `--min-*` and
+`--max-sample-gap-secs` options to re-check saved bundles. Recorded verifier
+gates in `metadata.txt` are also enforced during later re-checks, even when the
+re-check command omits those options. Successful runner verification, or the
+concrete verifier failure, is captured in `verify.out`.
+Failed cluster runs also write `summary.txt` with `result=fail`, `exit_code`,
+`failed_at`, and `failed_command` so the partial evidence bundle can be triaged
+later.
 
 ## Architecture
 
@@ -560,6 +622,7 @@ Or run the macOS/Linux validation ladder from `crates/box`:
 
 ```bash
 cd crates/box
+deploy/scripts/soak-evidence-self-test.sh
 scripts/host-integration-smoke.sh
 ```
 
@@ -582,7 +645,7 @@ sudo -E scripts/host-integration-smoke.sh --linux-run --no-pure
 
 The Linux `RUN` smoke must run as root on a root-capable Linux builder.
 See `docs/host-integration.md` for the macOS HVF, Linux KVM, host command
-matrix, and CRI smoke procedures.
+matrix, CRI smoke, and host soak procedures.
 
 ## Environment variables
 
@@ -597,6 +660,22 @@ matrix, and CRI smoke procedures.
 | `A3S_BOX_TEST_ALPINE_TAR` | Shared offline Alpine OCI archive for core and host smoke suites. |
 | `A3S_BOX_ALLOW_REGISTRY_PULL` | Set to `1` to let the host integration runner use live registry pulls when no OCI archive is provided. |
 | `A3S_BOX_HOST_SMOKE_TIMEOUT_SECS` | Boot timeout override for ignored host smoke tests. |
+| `A3S_BOX_SOAK_DURATION_SECS` | Default duration for `scripts/host-integration-smoke.sh --soak`. Default: 7200. |
+| `A3S_BOX_SOAK_ITERATIONS` | Optional iteration cap for `--soak`; `0` means time-based only. |
+| `A3S_BOX_SOAK_OUTPUT_DIR` | Evidence directory for `--soak` metadata, resource samples, logs, and CLI snapshots. |
+| `A3S_BOX_SOAK_VERIFY_MIN_DURATION_SECS` | Optional host soak evidence gate for minimum `summary.txt` duration. |
+| `A3S_BOX_SOAK_VERIFY_MIN_SAMPLES` | Optional host soak evidence gate for minimum resource sample count. |
+| `A3S_BOX_SOAK_VERIFY_MIN_SAMPLE_SPAN_SECS` | Optional host soak evidence gate for first-to-last sample span. |
+| `A3S_BOX_SOAK_VERIFY_MAX_SAMPLE_GAP_SECS` | Optional host soak evidence gate for maximum consecutive sample gap. |
+| `A3S_BOX_CLUSTER_SOAK_JOBS` | RuntimeClass cluster soak job completions for `deploy/scripts/runtimeclass-soak.sh`. Default: 500. |
+| `A3S_BOX_CLUSTER_SOAK_PARALLELISM` | RuntimeClass cluster soak Job parallelism. Default: 25. |
+| `A3S_BOX_CLUSTER_SOAK_DURATION_SECS` | RuntimeClass cluster observation window after workload submission. Default: 7200. |
+| `A3S_BOX_CLUSTER_SOAK_OUTPUT_DIR` | Evidence directory for RuntimeClass cluster soak bundles. |
+| `A3S_BOX_CLUSTER_SOAK_VERIFY_MIN_DURATION_SECS` | Optional RuntimeClass soak evidence gate for minimum `summary.txt` duration. |
+| `A3S_BOX_CLUSTER_SOAK_VERIFY_MIN_SAMPLES` | Optional RuntimeClass soak evidence gate for minimum resource sample count. |
+| `A3S_BOX_CLUSTER_SOAK_VERIFY_MIN_SAMPLE_SPAN_SECS` | Optional RuntimeClass soak evidence gate for first-to-last sample span. |
+| `A3S_BOX_CLUSTER_SOAK_VERIFY_MAX_SAMPLE_GAP_SECS` | Optional RuntimeClass soak evidence gate for maximum consecutive sample gap. |
+| `A3S_BOX_CLUSTER_SOAK_CLEANUP_TIMEOUT_SECS` | RuntimeClass cleanup wait before collecting `post-cleanup-counts.tsv`. Default: 300. |
 | `A3S_BOX_UNSAFE_HOST_RUN` | Opt into unsafe macOS host execution for Dockerfile `RUN` experiments. |
 | `A3S_BOX_BUILDCACHE_MAX_BYTES` | Cap on the total size of cached build layers at `~/.a3s/buildcache` (oldest evicted first). Default: 2 GiB. |
 | `A3S_BOX_MAX_LAYER_BYTES` | Cap on total decompressed bytes per OCI image layer during `pull` (decompression-bomb guard). Default: 16 GiB. |

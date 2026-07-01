@@ -48,15 +48,6 @@ impl ImageStore {
             ))
         })?;
 
-        // Sweep leftover pull staging directories from prior crashed/aborted
-        // pulls so they don't linger under store_dir/tmp forever.
-        let tmp_dir = store_dir.join("tmp");
-        if tmp_dir.is_dir() {
-            if let Err(e) = std::fs::remove_dir_all(&tmp_dir) {
-                tracing::debug!(path = %tmp_dir.display(), error = %e, "Failed to sweep image store tmp dir");
-            }
-        }
-
         let mut store = Self {
             store_dir: store_dir.to_path_buf(),
             index: Arc::new(RwLock::new(HashMap::new())),
@@ -531,12 +522,41 @@ mod tests {
         std::fs::write(dir.join("blobs/sha256/testblob"), "x".repeat(1024)).unwrap();
     }
 
+    fn stored_image(reference: &str, digest: &str, path: PathBuf) -> StoredImage {
+        let now = Utc::now();
+        StoredImage {
+            reference: reference.to_string(),
+            digest: digest.to_string(),
+            size_bytes: 1024,
+            pulled_at: now,
+            last_used: now,
+            path,
+        }
+    }
+
     #[tokio::test]
     async fn test_new_creates_directory() {
         let tmp = TempDir::new().unwrap();
         let store_dir = tmp.path().join("images");
         let store = ImageStore::new(&store_dir, 1024 * 1024).unwrap();
         assert!(store_dir.exists());
+        assert_eq!(store.total_size().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_new_keeps_existing_tmp_dir_for_concurrent_pulls() {
+        let tmp = TempDir::new().unwrap();
+        let store_dir = tmp.path().join("images");
+        let tmp_dir = store_dir.join("tmp");
+        std::fs::create_dir_all(tmp_dir.join("pull-1")).unwrap();
+        std::fs::write(tmp_dir.join("pull-1/layer"), b"partial").unwrap();
+
+        let store = ImageStore::new(&store_dir, 1024 * 1024).unwrap();
+
+        assert!(
+            tmp_dir.join("pull-1/layer").exists(),
+            "constructing a store must not delete another process' active pull"
+        );
         assert_eq!(store.total_size().await, 0);
     }
 
@@ -590,6 +610,33 @@ mod tests {
 
         store.remove("nginx:latest").await.unwrap();
         assert!(store.get("nginx:latest").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_remove_one_tag_keeps_shared_digest_until_last_reference() {
+        let tmp = TempDir::new().unwrap();
+        let store_dir = tmp.path().join("store");
+        let source_dir = tmp.path().join("source");
+        create_test_oci_layout(&source_dir);
+
+        let store = ImageStore::new(&store_dir, 10 * 1024 * 1024).unwrap();
+        store
+            .put("img:v1", "sha256:shared", &source_dir)
+            .await
+            .unwrap();
+        let stored = store
+            .put("img:latest", "sha256:shared", &source_dir)
+            .await
+            .unwrap();
+        let path = stored.path.clone();
+
+        store.remove("img:v1").await.unwrap();
+        assert!(store.get("img:v1").await.is_none());
+        assert!(store.get("img:latest").await.is_some());
+        assert!(path.exists(), "shared layout should remain in use");
+
+        store.remove("img:latest").await.unwrap();
+        assert!(!path.exists(), "layout should be removed after final tag");
     }
 
     #[tokio::test]
@@ -730,6 +777,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_resolve_invalid_reference_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let store = ImageStore::new(tmp.path(), 1024 * 1024).unwrap();
+
+        assert!(store.resolve("registry.example.com/").await.is_none());
+        assert!(store.resolve("busybox@not-a-digest").await.is_none());
+    }
+
+    #[tokio::test]
     async fn test_remove_nonexistent() {
         let tmp = TempDir::new().unwrap();
         let store = ImageStore::new(tmp.path(), 1024 * 1024).unwrap();
@@ -806,6 +862,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_evict_empty_and_under_limit_returns_empty() {
+        let tmp = TempDir::new().unwrap();
+        let store_dir = tmp.path().join("store");
+        let source_dir = tmp.path().join("source");
+        create_test_oci_layout(&source_dir);
+
+        let store = ImageStore::new(&store_dir, u64::MAX).unwrap();
+        assert!(store.evict().await.unwrap().is_empty());
+
+        store
+            .put("tiny:latest", "sha256:tiny", &source_dir)
+            .await
+            .unwrap();
+        assert!(store.evict().await.unwrap().is_empty());
+        assert!(store.get("tiny:latest").await.is_some());
+    }
+
+    #[tokio::test]
     async fn test_index_persistence() {
         let tmp = TempDir::new().unwrap();
         let store_dir = tmp.path().join("store");
@@ -866,6 +940,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn load_index_skips_missing_paths_and_unreadable_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().join("images");
+        let live_path = store_dir.join("sha256/live");
+        let missing_path = store_dir.join("sha256/missing");
+        create_test_oci_layout(&live_path);
+
+        let live = stored_image("live:latest", "sha256:live", live_path);
+        let missing = stored_image("missing:latest", "sha256:missing", missing_path);
+        let index = serde_json::json!({
+            "images": [
+                serde_json::to_value(&live).unwrap(),
+                serde_json::to_value(&missing).unwrap(),
+                {
+                    "reference": "broken:latest",
+                    "digest": false
+                }
+            ]
+        });
+        std::fs::write(
+            store_dir.join("index.json"),
+            serde_json::to_vec_pretty(&index).unwrap(),
+        )
+        .unwrap();
+
+        let store = ImageStore::new(&store_dir, u64::MAX).unwrap();
+        let images = store.list().await;
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].reference, "live:latest");
+        assert!(store.get("missing:latest").await.is_none());
+        assert!(std::fs::read_dir(&store_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .contains("index.json.corrupt-")));
+    }
+
+    #[tokio::test]
     async fn corrupt_index_is_quarantined_not_fatal() {
         let tmp = tempfile::tempdir().unwrap();
         let store_dir = tmp.path().join("images");
@@ -894,5 +1009,34 @@ mod tests {
             quarantined,
             "corrupt index.json must be quarantined to a sibling"
         );
+    }
+
+    #[test]
+    fn copy_dir_recursive_copies_nested_files_and_dir_size_sums() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir_all(src.join("nested")).unwrap();
+        std::fs::write(src.join("root.txt"), b"abc").unwrap();
+        std::fs::write(src.join("nested/leaf.txt"), b"hello").unwrap();
+
+        copy_dir_recursive(&src, &dst).unwrap();
+
+        assert_eq!(std::fs::read(dst.join("root.txt")).unwrap(), b"abc");
+        assert_eq!(
+            std::fs::read(dst.join("nested/leaf.txt")).unwrap(),
+            b"hello"
+        );
+        assert_eq!(dir_size(&dst), 8);
+        assert_eq!(dir_size(&tmp.path().join("missing")), 0);
+    }
+
+    #[test]
+    fn copy_dir_recursive_fails_for_missing_source() {
+        let tmp = TempDir::new().unwrap();
+        let err = copy_dir_recursive(&tmp.path().join("missing"), &tmp.path().join("dst"))
+            .expect_err("missing source should fail");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 }

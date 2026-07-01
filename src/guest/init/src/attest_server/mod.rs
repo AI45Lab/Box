@@ -16,30 +16,29 @@
 
 use tracing::info;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 mod frame;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 mod handlers;
 #[cfg(target_os = "linux")]
 mod snp;
 
 #[cfg(test)]
-#[cfg(target_os = "linux")]
 mod tests;
 
 /// Vsock port for the attestation server.
 pub const ATTEST_VSOCK_PORT: u32 = a3s_transport::ports::TEE_CHANNEL;
 
 /// Size of the report_data field in the SNP report request.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 pub(super) const SNP_USER_DATA_SIZE: usize = 64;
 
 /// OID for the SNP attestation report extension.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 const OID_SNP_REPORT: &[u64] = &[1, 3, 6, 1, 4, 1, 58270, 1, 1];
 
 /// OID for the certificate chain extension.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 const OID_CERT_CHAIN: &[u64] = &[1, 3, 6, 1, 4, 1, 58270, 1, 2];
 
 // ============================================================================

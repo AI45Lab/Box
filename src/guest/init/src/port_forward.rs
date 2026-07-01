@@ -336,3 +336,65 @@ fn write_frame(writer: &SharedWriter, kind: u8, stream_id: u32, payload: &[u8]) 
     }
     guard.flush()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Cursor, ErrorKind, Seek, SeekFrom};
+
+    #[test]
+    fn write_then_read_frame_round_trips_kind_stream_and_payload() {
+        let file = tempfile::tempfile().unwrap();
+        let writer = Arc::new(Mutex::new(file));
+
+        write_frame(&writer, FRAME_DATA, 0x0102_0304, b"hello").unwrap();
+
+        let mut guard = writer.lock().unwrap();
+        guard.seek(SeekFrom::Start(0)).unwrap();
+        let frame = read_frame(&mut *guard).unwrap().unwrap();
+
+        assert_eq!(frame.kind, FRAME_DATA);
+        assert_eq!(frame.stream_id, 0x0102_0304);
+        assert_eq!(frame.payload, b"hello");
+    }
+
+    #[test]
+    fn write_then_read_frame_supports_empty_payload() {
+        let file = tempfile::tempfile().unwrap();
+        let writer = Arc::new(Mutex::new(file));
+
+        write_frame(&writer, FRAME_CLOSE, 7, &[]).unwrap();
+
+        let mut guard = writer.lock().unwrap();
+        guard.seek(SeekFrom::Start(0)).unwrap();
+        let frame = read_frame(&mut *guard).unwrap().unwrap();
+
+        assert_eq!(frame.kind, FRAME_CLOSE);
+        assert_eq!(frame.stream_id, 7);
+        assert!(frame.payload.is_empty());
+    }
+
+    #[test]
+    fn read_frame_returns_none_on_clean_eof_before_header() {
+        let mut cursor = Cursor::new(Vec::<u8>::new());
+
+        assert!(read_frame(&mut cursor).unwrap().is_none());
+    }
+
+    #[test]
+    fn read_frame_errors_on_truncated_payload() {
+        let bytes = vec![
+            FRAME_DATA, 0, 0, 0, 9, // stream id
+            0, 0, 0, 4, // payload length
+            b'o', b'k',
+        ];
+        let mut cursor = Cursor::new(bytes);
+
+        let err = match read_frame(&mut cursor) {
+            Ok(_) => panic!("truncated payload should return an error"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
+    }
+}

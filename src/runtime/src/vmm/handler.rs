@@ -305,6 +305,56 @@ mod tests {
     }
 
     #[test]
+    fn test_shim_handler_try_wait_exit_captures_child_exit_code() {
+        let child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 7")
+            .spawn()
+            .unwrap();
+        let mut handler = ShimHandler::from_child(child, "box-child-exit".to_string());
+
+        let exit_code = loop {
+            if let Some(code) = handler.try_wait_exit().unwrap() {
+                break code;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+
+        assert_eq!(exit_code, 7);
+        assert_eq!(handler.exit_code(), Some(7));
+        assert_eq!(handler.try_wait_exit().unwrap(), Some(7));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_shim_handler_stop_terminates_owned_child() {
+        let child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("trap 'exit 0' TERM; while :; do sleep 0.05; done")
+            .spawn()
+            .unwrap();
+        let mut handler = ShimHandler::from_child(child, "box-child-stop".to_string());
+
+        assert!(handler.is_running());
+        handler.stop(libc::SIGTERM, 2_000).unwrap();
+
+        assert!(!handler.is_running());
+        assert_eq!(handler.exit_code(), None);
+        assert_eq!(handler.try_wait_exit().unwrap(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_shim_handler_stop_attached_missing_pid_is_ok() {
+        let mut handler = ShimHandler::from_pid(999_999_999, "missing".to_string());
+
+        handler.stop(libc::SIGTERM, 10).unwrap();
+
+        assert!(!handler.is_running());
+        assert_eq!(handler.exit_code(), None);
+    }
+
+    #[test]
     fn test_shim_handler_is_running_nonexistent_pid() {
         // PID 999999999 should not exist
         let handler = ShimHandler::from_pid(999_999_999, "test".to_string());

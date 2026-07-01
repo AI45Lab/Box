@@ -289,7 +289,10 @@ mod tests {
 
     #[test]
     fn test_is_dangling_reference() {
+        assert!(is_dangling_reference(""));
+        assert!(is_dangling_reference("   "));
         assert!(is_dangling_reference("sha256:abcdef"));
+        assert!(is_dangling_reference("<none>"));
         assert!(is_dangling_reference("<none>:<none>"));
         assert!(!is_dangling_reference("alpine:latest"));
         assert!(!is_dangling_reference("docker.io/library/alpine:latest"));
@@ -352,6 +355,20 @@ mod tests {
     }
 
     #[test]
+    fn test_reference_aliases_trim_empty_input() {
+        assert!(reference_aliases("").is_empty());
+        assert!(reference_aliases("   ").is_empty());
+    }
+
+    #[test]
+    fn test_reference_aliases_keep_original_and_normalized_reference() {
+        let aliases = reference_aliases("not a valid image reference");
+
+        assert!(aliases.contains("not a valid image reference"));
+        assert!(aliases.contains("docker.io/library/not a valid image reference:latest"));
+    }
+
+    #[test]
     fn test_resolve_stored_image_matches_normalized_alias() {
         let images = vec![stored("docker.io/library/alpine:latest", "sha256:abc")];
 
@@ -360,6 +377,44 @@ mod tests {
             .unwrap();
 
         assert_eq!(resolved.reference, "docker.io/library/alpine:latest");
+    }
+
+    #[test]
+    fn test_resolve_stored_image_empty_query_returns_none() {
+        let images = vec![stored("docker.io/library/alpine:latest", "sha256:abc")];
+
+        let resolved = resolve_stored_image(&images, "   ").unwrap();
+
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn test_resolve_stored_image_prefers_exact_reference_over_aliases() {
+        let images = vec![
+            stored("alpine:latest", "sha256:111"),
+            stored("docker.io/library/alpine:latest", "sha256:222"),
+        ];
+
+        let resolved = resolve_stored_image(&images, "alpine:latest")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(resolved.reference, "alpine:latest");
+        assert_eq!(resolved.digest, "sha256:111");
+    }
+
+    #[test]
+    fn test_resolve_stored_image_reports_ambiguous_alias() {
+        let images = vec![
+            stored("alpine:latest", "sha256:111"),
+            stored("docker.io/library/alpine:latest", "sha256:222"),
+        ];
+
+        let error = resolve_stored_image(&images, "library/alpine:latest").unwrap_err();
+
+        assert!(error.contains("ambiguous"));
+        assert!(error.contains("alpine:latest"));
+        assert!(error.contains("docker.io/library/alpine:latest"));
     }
 
     #[test]
@@ -416,12 +471,68 @@ mod tests {
     }
 
     #[test]
+    fn test_all_matching_images_empty_query_returns_empty() {
+        let images = vec![stored("docker.io/library/alpine:latest", "sha256:abc")];
+
+        assert!(all_matching_images(&images, " ").is_empty());
+    }
+
+    #[test]
+    fn test_all_matching_images_uses_first_matching_mode() {
+        let images = vec![
+            stored("alpine:latest", "sha256:111"),
+            stored("docker.io/library/alpine:latest", "sha256:222"),
+        ];
+
+        let matches = all_matching_images(&images, "alpine:latest");
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].reference, "alpine:latest");
+    }
+
+    #[test]
+    fn test_all_matching_images_returns_all_digest_matches() {
+        let images = vec![
+            stored("alpine:latest", "sha256:abcdef111111"),
+            stored("busybox:latest", "sha256:abcdef222222"),
+            stored("redis:latest", "sha256:999999999999"),
+        ];
+
+        let matches = all_matching_images(&images, "sha256:abcdef");
+        let refs: std::collections::HashSet<_> = matches
+            .iter()
+            .map(|image| image.reference.as_str())
+            .collect();
+
+        assert_eq!(refs.len(), 2);
+        assert!(refs.contains("alpine:latest"));
+        assert!(refs.contains("busybox:latest"));
+    }
+
+    #[test]
+    fn test_resolve_required_stored_image_reports_not_found() {
+        let images = vec![stored("docker.io/library/alpine:latest", "sha256:abc")];
+
+        let error = resolve_required_stored_image(&images, "missing:latest").unwrap_err();
+
+        assert_eq!(error, "Image not found: missing:latest");
+    }
+
+    #[test]
     fn test_normalize_reference() {
         assert_eq!(
             normalize_reference("alpine:latest"),
             "docker.io/library/alpine:latest"
         );
         assert_eq!(normalize_reference("sha256:abcdef"), "sha256:abcdef");
+    }
+
+    #[test]
+    fn test_normalize_reference_matches_image_reference_parser() {
+        assert_eq!(
+            normalize_reference("not a valid image reference"),
+            "docker.io/library/not a valid image reference:latest"
+        );
     }
 
     #[test]

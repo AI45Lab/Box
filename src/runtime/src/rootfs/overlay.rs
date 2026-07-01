@@ -225,6 +225,20 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn test_overlay_mount_rejects_comma_in_mount_option_paths() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lower = tmp.path().join("lower,with-comma");
+        let upper = tmp.path().join("upper");
+        let work = tmp.path().join("work");
+        let merged = tmp.path().join("merged");
+
+        let err = overlay_mount(&lower, &upper, &work, &merged).unwrap_err();
+
+        assert!(err.to_string().contains("contains a comma"));
+        assert!(err.to_string().contains("lower,with-comma"));
+    }
+
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn test_overlay_unmount_noop_on_non_linux() {
